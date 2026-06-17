@@ -88,7 +88,8 @@ class RunClassifyInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     root: str | None = Field(default=None, description="Runs root to scan (defaults to the scratch runs root).")
     depth_grouped: bool = Field(
-        default=False, description="True for the campaign-nested layout; False for a legacy flat RUN_* tree."
+        default=True,
+        description="Campaign-nested <root>/<campaign>/RUN_* layout (register's default); False for a flat RUN_* tree.",
     )
 
 

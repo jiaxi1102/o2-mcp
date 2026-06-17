@@ -1,7 +1,7 @@
 """Run-organization conventions: layout, manifest, classifier, registry, planners.
 
 A *run* is one self-describing, relocatable unit with an explicit lifecycle that
-maps onto the three O2 storage tiers (see ``docs/RUN_ORGANIZATION.md``)::
+maps onto the three O2 storage tiers::
 
     active ───promote──▶ kept ───archive──▶ archived ───gc──▶ purged
    (scratch)            (group)            (standby)         (tombstone)

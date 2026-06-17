@@ -172,3 +172,23 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     assert promote.started is False and "rsync" in promote.script
     archive = runs.archive(rd, dry_run=True)
     assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
+
+
+def test_read_manifest_consults_policy_legacy_reader(tmp_path):
+    sentinel = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    calls = []
+
+    def reader(run_dir, *, read):
+        calls.append(run_dir)
+        return sentinel
+
+    policy = RunPolicy(legacy_manifest_reader=reader)
+    runs = _runs(tmp_path, responder=lambda argv, inp: ("", "", 0), policy=policy)  # run.json absent
+    got = runs.read_manifest("/scratch/runs/camp/RUN_20260101T000000Z_camp__v1")
+    assert got is sentinel and calls == ["/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"]

@@ -95,13 +95,23 @@ class O2Runs:
         return [line for line in res.stdout.splitlines() if line.strip()]
 
     def read_manifest(self, run_dir: str) -> RunManifest | None:
-        """Return the run.json manifest, synthesizing one from legacy metadata if absent."""
+        """Return the run.json manifest; else the policy's legacy reader; else built-in synthesis.
+
+        When run.json is missing/unparsable, a project may supply a
+        ``policy.legacy_manifest_reader(run_dir, *, read)`` to synthesize one from its own
+        legacy metadata (``read`` runs a remote command); otherwise a minimal manifest is
+        built from the run-id + policy.
+        """
         cat = self._run(f"cat {shlex.quote(posixpath.join(run_dir, 'run.json'))} 2>/dev/null", timeout=60)
         if cat.ok and cat.stdout.strip():
             try:
                 return RunManifest.from_json(cat.stdout)
             except (ValueError, TypeError):
                 pass
+        if self.policy.legacy_manifest_reader is not None:
+            synthesized = self.policy.legacy_manifest_reader(run_dir, read=self._run)
+            if synthesized is not None:
+                return synthesized
         return self._synthesize_manifest(run_dir)
 
     def _synthesize_manifest(self, run_dir: str) -> RunManifest:
