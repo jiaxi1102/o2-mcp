@@ -238,7 +238,10 @@ def register(mcp, runs_factory: RunsFactory, run_tool: RunToolWrapper) -> None:
         """
 
         def work() -> dict[str, Any]:
-            return {"ok": True, **_plan_payload(runs_factory().promote(params.run_dir, dry_run=params.dry_run))}
+            plan = runs_factory().promote(params.run_dir, dry_run=params.dry_run)
+            # dry_run intentionally returns the script unexecuted (started=False); only a
+            # real promote that fails to launch is an error.
+            return {"ok": params.dry_run or plan.started, **_plan_payload(plan)}
 
         return await run_tool(work)
 
@@ -261,7 +264,10 @@ def register(mcp, runs_factory: RunsFactory, run_tool: RunToolWrapper) -> None:
         """
 
         def work() -> dict[str, Any]:
-            return {"ok": True, **_plan_payload(runs_factory().archive(params.run_dir, dry_run=params.dry_run))}
+            plan = runs_factory().archive(params.run_dir, dry_run=params.dry_run)
+            # dry_run intentionally returns the script unexecuted (started=False); only a
+            # real archive that fails to launch is an error.
+            return {"ok": params.dry_run or plan.started, **_plan_payload(plan)}
 
         return await run_tool(work)
 

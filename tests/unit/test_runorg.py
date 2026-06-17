@@ -192,3 +192,13 @@ def test_read_manifest_consults_policy_legacy_reader(tmp_path):
     runs = _runs(tmp_path, responder=lambda argv, inp: ("", "", 0), policy=policy)  # run.json absent
     got = runs.read_manifest("/scratch/runs/camp/RUN_20260101T000000Z_camp__v1")
     assert got is sentinel and calls == ["/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"]
+
+
+def test_classify_and_list_run_dirs_default_to_grouped_layout():
+    # The programmatic defaults must agree (regression: classify once defaulted False
+    # while list_run_dirs and the o2_run_classify tool defaulted True → empty scans).
+    import inspect
+
+    default = lambda fn: inspect.signature(fn).parameters["depth_grouped"].default  # noqa: E731
+    assert default(O2Runs.classify) is True
+    assert default(O2Runs.list_run_dirs) is True

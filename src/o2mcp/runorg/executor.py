@@ -366,8 +366,13 @@ class O2Runs:
         return payload
 
     # -- classify --------------------------------------------------------------
-    def classify(self, root: str | None = None, *, depth_grouped: bool = False) -> list[dict[str, Any]]:
-        """Read every run under ``root`` and tag it keep/sweep (advisory)."""
+    def classify(self, root: str | None = None, *, depth_grouped: bool = True) -> list[dict[str, Any]]:
+        """Read every run under ``root`` and tag it keep/sweep (advisory).
+
+        ``depth_grouped`` defaults True to match :meth:`list_run_dirs` and the
+        ``o2_run_classify`` tool — i.e. the campaign-nested ``<root>/<campaign>/RUN_*``
+        layout that :meth:`register` creates; pass False for a flat ``<root>/RUN_*`` tree.
+        """
         run_dirs = self.list_run_dirs(root, depth_grouped=depth_grouped)
         manifests: list[tuple[str, RunManifest]] = []
         for run_dir in run_dirs:

@@ -89,3 +89,36 @@ async def test_run_register_refuses_without_dataset(tmp_path):
     mcp = _build(tmp_path)
     with pytest.raises(ToolError):  # pydantic min_length=1 rejects empty datasets
         await mcp.call_tool("o2_run_register", {"params": {"campaign": "c", "pipeline": "grid", "datasets": []}})
+
+
+def test_classify_tool_defaults_to_grouped_layout():
+    # The tool default must match the programmatic O2Runs.classify/list_run_dirs defaults.
+    assert tools.RunClassifyInput().depth_grouped is True
+
+
+@pytest.mark.anyio
+async def test_transition_ok_reflects_started():
+    """promote/archive report ok from plan.started for real runs; dry-run is always ok."""
+    from o2mcp.runorg.executor import TransitionPlan
+
+    class _Plans:
+        def __init__(self, started):
+            self._started = started
+
+        def promote(self, run_dir, *, dry_run):
+            return TransitionPlan(run_id="r", action="promote", script="rsync ...", started=self._started)
+
+        def archive(self, run_dir, *, dry_run):
+            return TransitionPlan(run_id="r", action="archive", script="tar ...", started=self._started)
+
+    def build(started):
+        mcp = FastMCP("probe")
+        tools.register(mcp, runs_factory=lambda: _Plans(started), run_tool=_run_tool)
+        return mcp
+
+    dry = await _call(build(False), "o2_run_promote", {"params": {"run_dir": "/x/RUN_1", "dry_run": True}})
+    assert dry["ok"] is True and dry["started"] is False  # dry-run: unexecuted is success
+    failed = await _call(build(False), "o2_run_archive", {"params": {"run_dir": "/x/RUN_1", "dry_run": False}})
+    assert failed["ok"] is False  # real run that never launched is a failure
+    ok = await _call(build(True), "o2_run_promote", {"params": {"run_dir": "/x/RUN_1", "dry_run": False}})
+    assert ok["ok"] is True and ok["started"] is True
