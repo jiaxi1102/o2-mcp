@@ -1,0 +1,77 @@
+name: CI
+
+# Lint + format + the offline test suite. The core (o2mcp.{config,connection,sync,
+# slurm,async_transfer,keepalive,workspace,workspace_exec}) is pure-stdlib and runs on
+# 3.9; the MCP server needs the mcp SDK (3.10+), so its tests are exercised on the 3.11
+# lane and skipped (importorskip) on 3.9. Live-cluster tests are marked `o2` and excluded.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint, format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ruff lint (library + tests)
+        run: ruff check src tests
+      - name: Black formatting check (library + tests)
+        run: black --check src tests
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dev (+ mcp on 3.10+) dependencies
+        # The [o2] extra pins mcp behind a python_version >= 3.10 marker, so on 3.9 only
+        # the stdlib core + dev tools install and the server tests importorskip themselves.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,o2]"
+      - name: Run test suite (excludes live-O2 tests)
+        run: pytest -p no:cacheprovider -m "not o2" -q
+
+  all-green:
+    # Single stable required-status-check for branch protection: succeeds only when every
+    # other job did. `if: always()` so a failed/cancelled dependency reports red here.
+    name: All green
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        run: |
+          if [ "${{ needs.lint.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::A required CI job did not succeed (lint=${{ needs.lint.result }}, test=${{ needs.test.result }})"
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."

@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "o2mcp"
+version = "0.1.0"
+description = "Generic HMS O2 cluster access + MCP server: Duo-frugal SSH ControlMaster, Slurm submit/monitor, rsync transfers (blocking + non-blocking), and workspace/disk hygiene."
+requires-python = ">=3.9"
+readme = "README.md"
+license = { text = "Internal research use" }
+keywords = ["hpc", "slurm", "o2", "rsync", "mcp", "ssh-controlmaster"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: System :: Distributed Computing",
+]
+
+# The core (o2mcp.{config,connection,sync,slurm,async_transfer,keepalive,workspace,
+# workspace_exec}) is pure-stdlib and works on Python 3.9 — it has no runtime deps.
+dependencies = []
+
+[project.optional-dependencies]
+# The MCP server (o2mcp.server) needs the mcp SDK (which pulls pydantic + anyio) and
+# Python >= 3.10. Install with: pip install -e ".[o2]" on a 3.10+ env.
+o2 = [
+    "mcp>=1.2.0; python_version >= '3.10'",
+]
+dev = [
+    # Formatters/linters are version-pinned so CI agrees with local runs (a new black
+    # reformats files the old one left alone). Bump deliberately, reformat in the same commit.
+    "black==25.11.0",
+    "ruff==0.15.17",
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+o2-mcp = "o2mcp.server:main"
+o2-mcp-keepalive = "o2mcp.keepalive:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+o2mcp = ["py.typed"]
+
+[tool.black]
+line-length = 120
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["SIM108"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "o2: tests that require a live HMS O2 cluster connection (skipped locally)",
+]
