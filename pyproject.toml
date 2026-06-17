@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "o2mcp"
-version = "0.1.0"
-description = "Generic HMS O2 cluster access + MCP server: Duo-frugal SSH ControlMaster, Slurm submit/monitor, rsync transfers (blocking + non-blocking), and workspace/disk hygiene."
+version = "0.2.0"
+description = "Generic HMS O2 cluster access + MCP server: Duo-frugal SSH ControlMaster, Slurm submit/monitor, rsync transfers (blocking + non-blocking), workspace/disk hygiene, and a project-parameterized run-organization engine."
 requires-python = ">=3.9"
 readme = "README.md"
 license = { text = "Internal research use" }
