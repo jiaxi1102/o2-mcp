@@ -75,6 +75,16 @@ class O2Config:
     # How many timestamped DB/registry snapshots to retain when pruning snapshot history.
     snapshot_keep: int = field(default_factory=lambda: int(os.environ.get("O2_SNAPSHOT_KEEP", "2")))
 
+    # VPN egress guard. Declared LAST so inserting it never shifts the positional argument
+    # order of the existing public fields for any caller that constructs O2Config positionally
+    # (the dataclass is not kw_only — that needs Python 3.10, but this core stays 3.9-safe).
+    # Refuse to open a NEW O2 login unless the route to O2 egresses via a VPN tunnel interface
+    # (prefix below): O2 autopushes Duo to any non-HMS source IP, so a login leaving via a
+    # physical interface (en0) instead of the HMS VPN triggers a phone prompt. O2_REQUIRE_VPN=0
+    # disables the guard; O2_VPN_IFACE_PREFIX overrides the expected tunnel-interface prefix.
+    require_vpn: bool = field(default_factory=lambda: os.environ.get("O2_REQUIRE_VPN", "1") != "0")
+    vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
+
     def base_ssh_opts(self) -> list[str]:
         """SSH options enforcing public-key/batch mode (never password or Duo).
 

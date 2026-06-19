@@ -17,6 +17,7 @@ from o2mcp import (
     O2Connection,
     O2LockedError,
     O2MasterUnavailableError,
+    O2OffVpnError,
     O2Slurm,
     O2Sync,
 )
@@ -135,6 +136,78 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
     assert result.ok
     assert "-MNf" in runner.calls[-1]["argv"]
     assert runner.calls[-1]["argv"][-1] == "o2-transfer"
+
+
+# --- VPN egress guard (HMS O2 Duos non-HMS source IPs) -----------------------
+def _vpn_responder(interface):
+    """Responder answering the guard's `ssh -G` (HostName) and `route get` (interface)."""
+
+    def responder(argv, input_text):
+        if argv[:2] == ["ssh", "-G"]:
+            return ("hostname o2.hms.harvard.edu\n", "", 0)
+        if argv[:2] == ["route", "get"]:
+            if interface is None:
+                return ("", "no route to host", 1)  # undetermined -> caller fails open
+            return (f"   route to: o2\n   interface: {interface}\n   gateway: x\n", "", 0)
+        return ("", "", 0)
+
+    return responder
+
+
+def test_start_master_refuses_off_vpn(tmp_path):
+    # Route egresses via a physical interface (en0) -> a fresh login would Duo. Refuse,
+    # and never open the login (-MNf is never invoked).
+    runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    with pytest.raises(O2OffVpnError):
+        conn.start_master(allow_new_login=True)
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
+
+
+def test_start_master_allows_on_vpn(tmp_path):
+    # Route egresses via the VPN tunnel (utun*) -> proceed to open the master.
+    runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    result = conn.start_master(allow_new_login=True)
+    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+
+
+def test_start_master_offvpn_override(tmp_path):
+    # allow_offvpn=True bypasses the guard even on a physical interface.
+    runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    result = conn.start_master(allow_new_login=True, allow_offvpn=True)
+    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+
+
+def test_start_master_failopen_when_iface_undetermined(tmp_path):
+    # If the interface can't be determined (route unavailable), proceed rather than lock out.
+    runner = RecordingRunner(master=False, responder=_vpn_responder(None))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    result = conn.start_master(allow_new_login=True)
+    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+
+
+def test_start_master_guard_disabled_via_config(tmp_path):
+    # O2_REQUIRE_VPN=0 (config.require_vpn=False) disables the guard entirely.
+    config = _config(tmp_path)
+    config.require_vpn = False
+    runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
+    conn = O2Connection(config, runner=runner)
+    result = conn.start_master(allow_new_login=True)
+    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    # Guard disabled -> no egress probing at all.
+    assert not any(call["argv"][:2] == ["route", "get"] for call in runner.calls)
+
+
+def test_o2config_vpn_fields_appended_last():
+    # The VPN fields must come AFTER the existing public fields so a positional
+    # O2Config(...) caller isn't silently shifted (e.g. default_user -> require_vpn).
+    from dataclasses import fields
+
+    names = [f.name for f in fields(O2Config)]
+    assert names.index("require_vpn") > names.index("default_log_dir")
+    assert names.index("vpn_iface_prefix") > names.index("default_user")
 
 
 # --- Slurm submit/monitor ----------------------------------------------------
