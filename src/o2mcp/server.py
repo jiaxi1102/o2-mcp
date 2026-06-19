@@ -48,6 +48,7 @@ from o2mcp import (
     O2Connection,
     O2LockedError,
     O2MasterUnavailableError,
+    O2OffVpnError,
     O2Slurm,
     O2Workspace,
     transfer_tools,
@@ -83,6 +84,8 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "o2_locked", "message": str(exc)}
     except O2MasterUnavailableError as exc:
         payload = {"ok": False, "error": "no_master", "message": str(exc)}
+    except O2OffVpnError as exc:
+        payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
         payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
     return json.dumps(payload, indent=2)
@@ -107,6 +110,15 @@ class StartMasterInput(BaseModel):
             "so a transfer-node move (o2_run_promote / o2_run_archive, or o2_push/pull "
             "with use_transfer_node) needs this opened once (one more approved push) "
             "in addition to the login master."
+        ),
+    )
+    allow_offvpn: bool = Field(
+        default=False,
+        description=(
+            "Override the HMS-VPN egress guard. By default opening a master is refused "
+            "when the route to O2 does NOT go through a VPN tunnel interface, because a "
+            "login from a non-HMS IP triggers a Duo push. Set true only if you intend to "
+            "connect off-VPN and accept that push (or set O2_REQUIRE_VPN=0 to disable)."
         ),
     )
 
@@ -211,7 +223,9 @@ async def o2_start_master(params: StartMasterInput) -> str:
     def work() -> dict[str, Any]:
         conn = _connection()
         alias = conn.config.transfer_alias if params.transfer else None
-        result = conn.start_master(allow_new_login=params.allow_new_login, alias=alias)
+        result = conn.start_master(
+            allow_new_login=params.allow_new_login, alias=alias, allow_offvpn=params.allow_offvpn
+        )
         return {"ok": result.ok, "alias": alias or conn.config.host_alias, **_command_payload(result)}
 
     return await _run_tool(work)
