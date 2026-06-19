@@ -23,6 +23,16 @@ Never open the master in a loop or run these tools on a short timer — a period
 is what causes "a Duo call every minute". The `.agent_locks/O2_DISABLED` lock file is a hard
 stop honored by every operation.
 
+**Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
+when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
+interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), even the one
+`o2_start_master` login comes from a non-HMS IP and Duo-pushes, and so does every reconnect
+after the master drops. To make this failure impossible, `o2_start_master` **refuses to open a
+new login unless the route to O2 egresses via a VPN tunnel interface** (it checks `route get`
+locally — no connection, no Duo). Override with `allow_offvpn: true` on the tool, or disable the
+guard with `O2_REQUIRE_VPN=0`; tune the expected interface prefix with `O2_VPN_IFACE_PREFIX`
+(default `utun`).
+
 ## Install
 
 ```bash

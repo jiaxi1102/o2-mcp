@@ -41,6 +41,12 @@ class O2Config:
     connect_timeout: int = field(default_factory=lambda: int(os.environ.get("O2_SSH_CONNECT_TIMEOUT_SECONDS", "20")))
     lock_file: Path = field(default_factory=_default_lock_file)
     ignore_lock: bool = field(default_factory=lambda: os.environ.get("O2_IGNORE_LOCAL_LOCK", "0") == "1")
+    # Refuse to open a NEW login unless the route to O2 egresses via a VPN tunnel
+    # interface (prefix below). O2 lives in HMS space and autopushes Duo to any
+    # non-HMS source IP, so a login that leaves via a physical interface (en0)
+    # instead of the HMS VPN triggers a phone prompt. Set O2_REQUIRE_VPN=0 to disable.
+    require_vpn: bool = field(default_factory=lambda: os.environ.get("O2_REQUIRE_VPN", "1") != "0")
+    vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
     default_user: str | None = field(default_factory=lambda: os.environ.get("O2_USER") or None)
     default_log_dir: str = field(default_factory=lambda: os.environ.get("O2_LOG_DIR", "~/logs/o2"))
 

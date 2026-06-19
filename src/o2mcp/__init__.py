@@ -20,6 +20,7 @@ from o2mcp.connection import (
     O2Connection,
     O2LockedError,
     O2MasterUnavailableError,
+    O2OffVpnError,
     default_runner,
 )
 from o2mcp.slurm import O2Slurm, SubmitResult
@@ -33,6 +34,7 @@ __all__ = [
     "CommandResult",
     "O2LockedError",
     "O2MasterUnavailableError",
+    "O2OffVpnError",
     "default_runner",
     "O2Slurm",
     "SubmitResult",

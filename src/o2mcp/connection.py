@@ -30,6 +30,10 @@ class O2MasterUnavailableError(RuntimeError):
     """Raised when a command needs the ControlMaster but none is running."""
 
 
+class O2OffVpnError(RuntimeError):
+    """Raised when opening a new login would egress off the HMS VPN (→ a Duo push)."""
+
+
 @dataclass
 class CommandResult:
     """The outcome of a single subprocess invocation."""
@@ -98,7 +102,51 @@ class O2Connection:
         )
         return result.ok
 
-    def start_master(self, *, allow_new_login: bool = False, alias: str | None = None) -> CommandResult:
+    def _egress_interface(self, alias: str) -> str | None:
+        """Local-only: the network interface a NEW connection to ``alias`` would use.
+
+        Resolves the alias's ``HostName`` via ``ssh -G`` (a config dump — NO connection,
+        no Duo) and asks the OS routing table (``route get``). Returns the interface name
+        (e.g. ``"utun6"``, ``"en0"``) or ``None`` when it can't be determined (e.g. the
+        ``route`` tool is unavailable), so the caller can fail OPEN instead of locking out.
+        """
+        cfg = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
+        host = None
+        for line in cfg.stdout.splitlines():
+            if line[:9].lower() == "hostname ":
+                host = line.split(None, 1)[1].strip()
+                break
+        if not host:
+            return None
+        route = self._runner(["route", "get", host], self.config.connect_timeout, None)
+        if not route.ok:
+            return None
+        for line in route.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("interface:"):
+                return stripped.split(":", 1)[1].strip()
+        return None
+
+    def _require_on_vpn(self, target: str) -> None:
+        """Refuse a new login that would leave via a non-VPN (physical) interface.
+
+        O2 autopushes Duo to non-HMS source IPs, so a login egressing via ``en0``
+        instead of the HMS VPN tunnel triggers a phone prompt. Only refuse when the
+        interface is KNOWN and is not a VPN tunnel; if it can't be determined, proceed
+        (fail open) so an unusual setup is never locked out.
+        """
+        iface = self._egress_interface(target)
+        if iface and not iface.startswith(self.config.vpn_iface_prefix):
+            raise O2OffVpnError(
+                f"O2 ('{target}') currently routes via '{iface}', not the HMS VPN tunnel "
+                f"('{self.config.vpn_iface_prefix}*'). A fresh login from a non-HMS IP triggers a Duo "
+                "push. Connect the HMS VPN (GlobalProtect) so `route get` shows a VPN interface, then "
+                "retry — or pass allow_offvpn=True (or set O2_REQUIRE_VPN=0) to override and accept the push."
+            )
+
+    def start_master(
+        self, *, allow_new_login: bool = False, alias: str | None = None, allow_offvpn: bool = False
+    ) -> CommandResult:
         """Open the persistent ControlMaster for ``alias`` (default the login host).
 
         O2 autopushes Duo on every new connection, so opening a master costs one
@@ -107,7 +155,9 @@ class O2Connection:
         action — never something a loop can do. Pass ``alias=config.transfer_alias``
         to open the transfer node's own master (a separate host/socket) so a
         transfer-node rsync/ssh has a master to reuse instead of opening a fresh
-        Duo-pushing login.
+        Duo-pushing login. Unless ``allow_offvpn=True`` (or ``O2_REQUIRE_VPN=0``), a new
+        login is refused with :class:`O2OffVpnError` when the route to ``target`` does not
+        egress via a VPN tunnel interface — opening from a non-HMS IP would trigger a Duo push.
         """
         self._require_unlocked()
         target = alias or self.config.host_alias
@@ -119,6 +169,8 @@ class O2Connection:
                 "O2 autopushes Duo on a new connection; call again with allow_new_login=True to perform "
                 "exactly one approved login, then reuse it for the rest of the session."
             )
+        if self.config.require_vpn and not allow_offvpn:
+            self._require_on_vpn(target)
         return self._runner(
             ["ssh", *self.config.base_ssh_opts(), "-MNf", target],
             self.config.connect_timeout + 30,
