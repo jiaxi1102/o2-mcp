@@ -200,6 +200,16 @@ def test_start_master_guard_disabled_via_config(tmp_path):
     assert not any(call["argv"][:2] == ["route", "get"] for call in runner.calls)
 
 
+def test_o2config_vpn_fields_appended_last():
+    # The VPN fields must come AFTER the existing public fields so a positional
+    # O2Config(...) caller isn't silently shifted (e.g. default_user -> require_vpn).
+    from dataclasses import fields
+
+    names = [f.name for f in fields(O2Config)]
+    assert names.index("require_vpn") > names.index("default_log_dir")
+    assert names.index("vpn_iface_prefix") > names.index("default_user")
+
+
 # --- Slurm submit/monitor ----------------------------------------------------
 def test_submit_parses_job_id(tmp_path):
     runner = RecordingRunner(master=True, responder=lambda argv, _i: ("Submitted batch job 38874784\n", "", 0))
