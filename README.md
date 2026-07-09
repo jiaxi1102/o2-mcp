@@ -58,7 +58,7 @@ Requires `Host o2` (and optionally `Host o2-transfer`) blocks in `~/.ssh/config`
 |------|---------|------|
 | `o2_status` | Lock state, ControlMaster state, `hostname; whoami; date` probe | read-only |
 | `o2_start_master` | Open the persistent SSH master (needs `allow_new_login`) | write |
-| `o2_run` | Run an arbitrary command on a login node | write |
+| `o2_exec` | Run an arbitrary command on a login node | write |
 | `o2_submit_job` | `sbatch` a script (existing path or staged `script_text`); returns the job id | write |
 | `o2_squeue` | `squeue -u <user>` as structured rows | read-only |
 | `o2_job_status` | `sacct -j <id>` accounting (state, elapsed, exit code, MaxRSS) | read-only |

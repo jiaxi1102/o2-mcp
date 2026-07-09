@@ -77,7 +77,7 @@ async def test_tool_registry_and_annotations():
     assert set(tools) == {
         "o2_status",
         "o2_start_master",
-        "o2_run",
+        "o2_exec",
         "o2_submit_job",
         "o2_squeue",
         "o2_job_status",
@@ -173,7 +173,7 @@ async def test_status_reports_not_connected(monkeypatch, tmp_path):
 @pytest.mark.anyio
 async def test_run_without_master_is_actionable(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=False)
-    payload = await _call("o2_run", {"params": {"command": "squeue"}})
+    payload = await _call("o2_exec", {"params": {"command": "squeue"}})
     assert payload["ok"] is False
     assert payload["error"] == "no_master"
     assert "ControlMaster" in payload["message"]
@@ -189,7 +189,7 @@ async def test_start_master_refused_without_optin(monkeypatch, tmp_path):
 @pytest.mark.anyio
 async def test_lock_blocks_tool(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
-    payload = await _call("o2_run", {"params": {"command": "hostname"}})
+    payload = await _call("o2_exec", {"params": {"command": "hostname"}})
     assert payload["ok"] is False and payload["error"] == "o2_locked"
 
 
@@ -247,7 +247,7 @@ async def test_invalid_input_is_rejected(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True)
     # Empty command violates min_length=1; the MCP layer must reject it.
     with pytest.raises(ToolError):
-        await o2server.mcp.call_tool("o2_run", {"params": {"command": ""}})
+        await o2server.mcp.call_tool("o2_exec", {"params": {"command": ""}})
 
 
 @pytest.mark.anyio
