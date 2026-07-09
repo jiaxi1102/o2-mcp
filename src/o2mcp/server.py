@@ -218,10 +218,10 @@ async def o2_start_master(params: StartMasterInput) -> str:
 
 
 @mcp.tool(
-    name="o2_run",
+    name="o2_exec",
     annotations={"title": "Run a command on O2", "readOnlyHint": False, "openWorldHint": True},
 )
-async def o2_run(params: RunInput) -> str:
+async def o2_exec(params: RunInput) -> str:
     """Run an arbitrary shell command on an O2 login node (debugging / inspection).
 
     Reuses the existing ControlMaster (no extra Duo push) and refuses if none is
