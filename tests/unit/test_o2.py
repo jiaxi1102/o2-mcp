@@ -188,6 +188,23 @@ def test_start_master_failopen_when_iface_undetermined(tmp_path):
     assert result.ok and "-MNf" in runner.calls[-1]["argv"]
 
 
+def test_start_master_failopen_when_route_binary_missing(tmp_path):
+    # A missing `route` binary makes the runner raise FileNotFoundError (exactly as
+    # subprocess.run does) BEFORE any CommandResult.ok check — the probe must swallow it
+    # and fail OPEN, not propagate the error and block an otherwise-legitimate login.
+    def responder(argv, _input):
+        if argv[:2] == ["ssh", "-G"]:
+            return ("hostname o2.hms.harvard.edu\n", "", 0)
+        if argv[:2] == ["route", "get"]:
+            raise FileNotFoundError(2, "No such file or directory", "route")
+        return ("", "", 0)
+
+    runner = RecordingRunner(master=False, responder=responder)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    result = conn.start_master(allow_new_login=True)
+    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+
+
 def test_start_master_guard_disabled_via_config(tmp_path):
     # O2_REQUIRE_VPN=0 (config.require_vpn=False) disables the guard entirely.
     config = _config(tmp_path)

@@ -110,22 +110,28 @@ class O2Connection:
         (e.g. ``"utun6"``, ``"en0"``) or ``None`` when it can't be determined (e.g. the
         ``route`` tool is unavailable), so the caller can fail OPEN instead of locking out.
         """
-        cfg = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
-        host = None
-        for line in cfg.stdout.splitlines():
-            if line[:9].lower() == "hostname ":
-                host = line.split(None, 1)[1].strip()
-                break
-        if not host:
+        try:
+            cfg = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
+            host = None
+            for line in cfg.stdout.splitlines():
+                if line[:9].lower() == "hostname ":
+                    host = line.split(None, 1)[1].strip()
+                    break
+            if not host:
+                return None
+            route = self._runner(["route", "get", host], self.config.connect_timeout, None)
+            if not route.ok:
+                return None
+            for line in route.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("interface:"):
+                    return stripped.split(":", 1)[1].strip()
             return None
-        route = self._runner(["route", "get", host], self.config.connect_timeout, None)
-        if not route.ok:
+        except (OSError, subprocess.TimeoutExpired):
+            # Best-effort probe: a missing `route`/`ssh` binary (FileNotFoundError) or a probe
+            # timeout must fail OPEN (return None) — matching this method's contract — never
+            # propagate and block an otherwise-legitimate login.
             return None
-        for line in route.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("interface:"):
-                return stripped.split(":", 1)[1].strip()
-        return None
 
     def _require_on_vpn(self, target: str) -> None:
         """Refuse a new login that would leave via a non-VPN (physical) interface.
