@@ -53,14 +53,27 @@ Runner = Callable[[list[str], Optional[float], Optional[str]], CommandResult]
 
 
 def default_runner(argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
-    """Run a command via subprocess, capturing output (the real I/O seam)."""
+    """Run a command via subprocess without exposing the MCP protocol stream.
+
+    ``o2-mcp`` is a stdio MCP server, so inheriting the parent process's stdin
+    would let a child ``ssh``/``rsync`` process consume JSON-RPC messages meant
+    for FastMCP. Commands that do not explicitly need input therefore receive
+    ``/dev/null``. Callers that provide ``input_text`` still get an isolated
+    pipe, which is required when staging scripts and other small remote files.
+    """
+
+    # `subprocess.run(input=...)` creates its own PIPE and rejects a simultaneous
+    # `stdin=` argument. Build the two modes explicitly so no-input commands are
+    # disconnected from the server's protocol stream while payload commands keep
+    # their intentional pipe.
+    stdin_kwargs = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
     proc = subprocess.run(
         argv,
         capture_output=True,
         text=True,
         timeout=timeout,
-        input=input_text,
         check=False,
+        **stdin_kwargs,
     )
     return CommandResult(argv=list(argv), returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 

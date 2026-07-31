@@ -26,7 +26,10 @@ dependencies = []
 # The MCP server (o2mcp.server) needs the mcp SDK (which pulls pydantic + anyio) and
 # Python >= 3.10. Install with: pip install -e ".[o2]" on a 3.10+ env.
 o2 = [
-    "mcp>=1.2.0; python_version >= '3.10'",
+    # o2mcp uses the MCP v1 FastMCP API (`mcp.server.fastmcp`). MCP v2 removed
+    # that module, so fail dependency resolution rather than install a runtime
+    # that cannot import the server entry point.
+    "mcp>=1.2.0,<2; python_version >= '3.10'",
 ]
 dev = [
     # Formatters/linters are version-pinned so CI agrees with local runs (a new black
