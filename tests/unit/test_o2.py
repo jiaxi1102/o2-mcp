@@ -7,6 +7,7 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from o2mcp import (
     O2OffVpnError,
     O2Slurm,
     O2Sync,
+    default_runner,
 )
 from o2mcp import keepalive as o2keepalive
 
@@ -59,6 +61,44 @@ def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
     if locked:
         lock.write_text("disabled")
     return O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+
+
+# --- subprocess stdio isolation ---------------------------------------------
+def test_default_runner_uses_devnull_without_input(monkeypatch):
+    """A child command must never inherit the stdio MCP server's JSON-RPC input."""
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("o2mcp.connection.subprocess.run", fake_run)
+
+    result = default_runner(["ssh", "o2", "hostname"], timeout=5.0, input_text=None)
+
+    assert result.ok
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert "input" not in captured
+
+
+def test_default_runner_pipes_explicit_input(monkeypatch):
+    """Explicit staging content must use a private pipe rather than `/dev/null`."""
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("o2mcp.connection.subprocess.run", fake_run)
+
+    payload = "#!/bin/bash\necho staged\n"
+    result = default_runner(["ssh", "o2", "cat > job.sh"], timeout=5.0, input_text=payload)
+
+    assert result.ok
+    assert captured["input"] == payload
+    assert "stdin" not in captured
 
 
 # --- safety lock -------------------------------------------------------------
