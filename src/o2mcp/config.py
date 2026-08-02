@@ -14,11 +14,18 @@ from pathlib import Path
 
 
 def _default_lock_file() -> Path:
-    """The O2 safety lock path (``.agent_locks/O2_DISABLED`` under the repo)."""
+    """Return the process-independent O2 safety lock path.
+
+    MCP servers are started once per Codex task, and those task processes may
+    have different working directories. A lock beneath ``Path.cwd()`` therefore
+    cannot reliably stop every task. The user-level default gives all O2 clients
+    on this workstation one authoritative emergency stop while keeping
+    ``O2_SSH_LOCK_FILE`` available for an explicit deployment-specific path.
+    """
     env = os.environ.get("O2_SSH_LOCK_FILE")
     if env:
         return Path(env).expanduser()
-    return Path.cwd() / ".agent_locks" / "O2_DISABLED"
+    return Path.home() / ".agent_locks" / "O2_DISABLED"
 
 
 @dataclass
@@ -29,8 +36,9 @@ class O2Config:
         host_alias: SSH alias for login/compute commands (the ControlMaster host).
         transfer_alias: SSH alias for bulk rsync transfers (the O2 transfer node).
         connect_timeout: SSH ``ConnectTimeout`` in seconds.
-        lock_file: If this path exists, every O2 operation refuses to run (the
-            project's hard stop against repeated Duo/MFA prompts).
+        lock_file: If this path exists, every O2 operation refuses to run. The
+            default is the workstation-wide ``~/.agent_locks/O2_DISABLED`` so
+            independently launched MCP processes share the same emergency stop.
         ignore_lock: Mirror of ``O2_IGNORE_LOCAL_LOCK=1`` to bypass the lock.
         default_user: Username for ``squeue -u`` etc.; ``None`` resolves to ``$USER`` remotely.
         default_log_dir: Remote directory pattern where Slurm logs land.

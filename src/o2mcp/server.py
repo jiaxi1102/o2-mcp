@@ -22,7 +22,7 @@ minute". To completely avoid Duo, don't poll O2 from here at all (have O2 push
 results out via Globus/OnDemand) or ask HMS RC for SSH-certificate access; see
 ``docs/O2_MCP.md``.
 
-The ``.agent_locks/O2_DISABLED`` lock is honored as a hard stop on every tool.
+The user-level ``~/.agent_locks/O2_DISABLED`` lock is honored as a hard stop on every tool.
 
 Run as a local stdio server:
 
@@ -47,6 +47,7 @@ from o2mcp import (
     CommandResult,
     O2Connection,
     O2LockedError,
+    O2LoginCoordinationError,
     O2MasterUnavailableError,
     O2OffVpnError,
     O2Slurm,
@@ -86,6 +87,8 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "no_master", "message": str(exc)}
     except O2OffVpnError as exc:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
+    except O2LoginCoordinationError as exc:
+        payload = {"ok": False, "error": "login_coordination_failed", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
         payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
     return json.dumps(payload, indent=2)

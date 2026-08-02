@@ -15,7 +15,7 @@ this off-network. On-network (VPN), connections are stable and Duo-free, so it i
 safe and useful there.
 
 Safety invariants (enforced via ``O2Connection``): honors the
-``.agent_locks/O2_DISABLED`` lock, and never opens a master itself — a dead
+``~/.agent_locks/O2_DISABLED`` lock, and never opens a master itself — a dead
 master means "skip", not "reconnect".
 """
 

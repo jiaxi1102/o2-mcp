@@ -3,7 +3,7 @@
 A Python port of ``scripts/o2_ssh_master.sh`` that preserves its safety contract
 exactly, but is testable and composable:
 
-- The ``.agent_locks/O2_DISABLED`` lock is a hard stop on every operation.
+- The user-level ``~/.agent_locks/O2_DISABLED`` lock is a hard stop on every operation.
 - All SSH uses BatchMode (public key only) — a dead master or missing key fails
   fast instead of triggering a Duo/MFA phone prompt.
 - Remote commands run only through an already-established ControlMaster socket;
@@ -15,8 +15,12 @@ tested offline without ever touching the network.
 
 from __future__ import annotations
 
+import fcntl
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 from o2mcp.config import O2Config
@@ -32,6 +36,10 @@ class O2MasterUnavailableError(RuntimeError):
 
 class O2OffVpnError(RuntimeError):
     """Raised when opening a new login would egress off the HMS VPN (→ a Duo push)."""
+
+
+class O2LoginCoordinationError(RuntimeError):
+    """Raised when a new O2 login cannot be serialized safely across processes."""
 
 
 @dataclass
@@ -97,6 +105,63 @@ class O2Connection:
                 "Refusing every O2 SSH/rsync command to prevent repeated Duo/MFA prompts. "
                 "Remove that file (or set O2_IGNORE_LOCAL_LOCK=1) only after confirming O2 access is safe."
             )
+
+    def _master_start_lock_file(self) -> Path:
+        """Return the interprocess mutex used for every new O2 master login.
+
+        The mutex is deliberately shared by the login and transfer aliases.
+        Those aliases use different SSH sockets, but both can trigger Duo; one
+        workstation must never attempt both authentications concurrently. The
+        file sits beside the configured emergency lock so all clients that share
+        the safety boundary also share the login boundary.
+        """
+
+        return self.config.lock_file.with_name("O2_LOGIN_START.lock")
+
+    @contextmanager
+    def _serialized_master_start(self) -> Iterator[None]:
+        """Hold a workstation-wide mutex while deciding whether to log in.
+
+        ``master_running()`` followed by ``ssh -MNf`` is otherwise a classic
+        check-then-act race: two Codex task processes can both observe no socket
+        and each initiate a Duo-pushing login. ``flock`` is released by the OS
+        if a process exits, so a crashed MCP server cannot leave a stale lock.
+
+        Coordination failures fail closed. Opening an uncoordinated O2 login is
+        more harmful than asking the caller to repair local lock permissions.
+        """
+
+        lock_path = self._master_start_lock_file()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_handle = lock_path.open("a+")
+        except OSError as exc:
+            raise O2LoginCoordinationError(
+                f"Cannot create the O2 login coordination lock at {lock_path}; "
+                "refusing to risk concurrent Duo prompts."
+            ) from exc
+
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            # The file was opened but never locked. Close it directly rather than
+            # running the normal unlock path and potentially masking the useful
+            # coordination failure with a second OS error.
+            lock_handle.close()
+            raise O2LoginCoordinationError(
+                f"Cannot acquire the O2 login coordination lock at {lock_path}; "
+                "refusing to risk concurrent Duo prompts."
+            ) from exc
+
+        try:
+            yield
+        finally:
+            # Closing the descriptor releases flock even if the guarded SSH call
+            # raises. The explicit unlock keeps the lifetime obvious in review.
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_handle.close()
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def master_running(self, alias: str | None = None) -> bool:
@@ -188,13 +253,21 @@ class O2Connection:
                 "O2 autopushes Duo on a new connection; call again with allow_new_login=True to perform "
                 "exactly one approved login, then reuse it for the rest of the session."
             )
-        if self.config.require_vpn and not allow_offvpn:
-            self._require_on_vpn(target)
-        return self._runner(
-            ["ssh", *self.config.base_ssh_opts(), "-MNf", target],
-            self.config.connect_timeout + 30,
-            None,
-        )
+        with self._serialized_master_start():
+            # Another Codex task may have opened the requested master while this
+            # process waited for the mutex. Recheck both the emergency stop and
+            # the socket *inside* the critical section; only the first contender
+            # is then allowed to execute the Duo-pushing command.
+            self._require_unlocked()
+            if self.master_running(target):
+                return CommandResult(["ssh", "-O", "check", target], 0, "master already running", "")
+            if self.config.require_vpn and not allow_offvpn:
+                self._require_on_vpn(target)
+            return self._runner(
+                ["ssh", *self.config.base_ssh_opts(), "-MNf", target],
+                self.config.connect_timeout + 30,
+                None,
+            )
 
     def stop_master(self) -> CommandResult:
         """Close the persistent ControlMaster (non-fatal if already closed)."""

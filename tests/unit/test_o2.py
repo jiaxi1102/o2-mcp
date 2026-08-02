@@ -8,6 +8,8 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 from __future__ import annotations
 
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from o2mcp import (
     O2Config,
     O2Connection,
     O2LockedError,
+    O2LoginCoordinationError,
     O2MasterUnavailableError,
     O2OffVpnError,
     O2Slurm,
@@ -56,11 +59,67 @@ class RecordingRunner:
         return cmds
 
 
+class ConcurrentStartRunner:
+    """Model two MCP processes racing to create the same SSH master.
+
+    The barrier forces both callers to complete their initial no-master check
+    before either can proceed. A correct interprocess guard then lets only one
+    caller execute ``ssh -MNf``; the second sees the master on its guarded
+    recheck and returns the existing-master result.
+    """
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._initial_check_barrier = threading.Barrier(2)
+        self._initial_checks = 0
+        self.master = False
+        self.start_count = 0
+
+    def __call__(self, argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
+        """Return deterministic SSH-check/start results for the race test."""
+
+        if "-O" in argv and "check" in argv:
+            with self._state_lock:
+                synchronize_initial_check = not self.master and self._initial_checks < 2
+                if synchronize_initial_check:
+                    self._initial_checks += 1
+                master = self.master
+            if synchronize_initial_check:
+                self._initial_check_barrier.wait(timeout=5)
+            return CommandResult(list(argv), 0 if master else 255, "", "")
+
+        if "-MNf" in argv:
+            with self._state_lock:
+                self.start_count += 1
+                self.master = True
+            return CommandResult(list(argv), 0, "", "")
+
+        return CommandResult(list(argv), 0, "", "")
+
+
 def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
     return O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+
+
+def test_default_lock_is_workstation_wide(monkeypatch, tmp_path):
+    """Unconfigured clients must converge on one user-level emergency stop."""
+
+    monkeypatch.delenv("O2_SSH_LOCK_FILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert O2Config().lock_file == tmp_path / ".agent_locks" / "O2_DISABLED"
+
+
+def test_explicit_lock_path_still_overrides_global_default(monkeypatch, tmp_path):
+    """Deployments may intentionally provide another shared lock location."""
+
+    explicit = tmp_path / "shared" / "O2_DISABLED"
+    monkeypatch.setenv("O2_SSH_LOCK_FILE", str(explicit))
+
+    assert O2Config().lock_file == explicit
 
 
 # --- subprocess stdio isolation ---------------------------------------------
@@ -176,6 +235,40 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
     assert result.ok
     assert "-MNf" in runner.calls[-1]["argv"]
     assert runner.calls[-1]["argv"][-1] == "o2-transfer"
+
+
+def test_concurrent_master_starts_execute_one_login(tmp_path):
+    """Concurrent task processes must not each trigger an O2/Duo login."""
+
+    runner = ConcurrentStartRunner()
+    config = _config(tmp_path)
+    connections = [O2Connection(config, runner=runner) for _ in range(2)]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda conn: conn.start_master(allow_new_login=True), connections))
+
+    assert runner.start_count == 1
+    assert all(result.ok for result in results)
+    assert sum("already running" in result.stdout for result in results) == 1
+
+
+def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(tmp_path):
+    """A broken mutex location must never fall back to an uncoordinated login."""
+
+    non_directory = tmp_path / "not-a-directory"
+    non_directory.write_text("occupied")
+    config = O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=non_directory / "O2_DISABLED",
+    )
+    runner = RecordingRunner(master=False)
+
+    with pytest.raises(O2LoginCoordinationError):
+        O2Connection(config, runner=runner).start_master(allow_new_login=True)
+
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
 # --- VPN egress guard (HMS O2 Duos non-HMS source IPs) -----------------------

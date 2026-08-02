@@ -13,15 +13,22 @@ package rather than living in it.
 ## Duo model (read this first)
 
 HMS O2 uses Duo **autopush**: every *new* SSH connection fires a Duo push, even key-only /
-BatchMode. The tools are built so this costs exactly **one push per session**:
+BatchMode. The tools are built so ordinary login-node work costs exactly **one push per
+ControlMaster session**:
 
 1. Call `o2_start_master` **once** (one push you approve) to open a persistent SSH
    **ControlMaster** (stays up ~8h via `ControlPersist`).
 2. Every other tool reuses that master and costs **no** additional push.
 
+The optional `o2-transfer` alias is a different host and therefore needs its own separately
+approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
+but it does not pretend those two distinct O2 authentications are one session.
+
 Never open the master in a loop or run these tools on a short timer — a periodic reconnect
-is what causes "a Duo call every minute". The `.agent_locks/O2_DISABLED` lock file is a hard
-stop honored by every operation.
+is what causes "a Duo call every minute". The workstation-wide
+`~/.agent_locks/O2_DISABLED` lock file is a hard stop honored by every operation. New master
+starts are also serialized across MCP processes, so concurrent Codex tasks cannot both pass
+the no-master check and initiate overlapping Duo authentications.
 
 **Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
@@ -52,7 +59,7 @@ pip install -e ".[o2]"     # on a 3.10+ env
       "env": {
         "O2_SSH_HOST_ALIAS": "o2",
         "O2_SSH_TRANSFER_ALIAS": "o2-transfer",
-        "O2_SSH_LOCK_FILE": "/path/to/.agent_locks/O2_DISABLED"
+        "O2_SSH_LOCK_FILE": "/Users/you/.agent_locks/O2_DISABLED"
       }
     }
   }
@@ -98,7 +105,10 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   instead of triggering an interactive MFA prompt.
 - Remote commands run only through an already-established ControlMaster; opening a new login
   requires explicit opt-in (`allow_new_login`).
-- The `O2_DISABLED` lock hard-stops every operation.
+- The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks.
+- A file mutex beside the safety lock serializes new login and transfer-master starts across
+  MCP processes; after waiting, each contender rechecks the socket and becomes a no-op when
+  another task already established it.
 - Destructive/transfer-node operations default to dry-run where applicable and verify before
   freeing scratch.
 
