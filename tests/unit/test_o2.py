@@ -785,6 +785,23 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     assert separated_argument[1] == "-e"
     assert "PreferredAuthentications=none" in separated_argument[2]
 
+    # Long options can also consume the next argv element. A pattern named
+    # ``-e`` is valid data for --exclude, not a second remote-shell declaration.
+    conn.run_raw(["rsync", "--exclude", "-e", "x", "o2:/p"])
+    long_argument = runner.calls[-1]["argv"]
+    exclude_index = long_argument.index("--exclude")
+    assert long_argument[exclude_index + 1] == "-e"
+    assert long_argument[1] == "-e"
+    assert "PreferredAuthentications=none" in long_argument[2]
+
+    # An equals-attached long-option value stays inside its own token and does
+    # not hide the following real remote-shell option from normalization.
+    conn.run_raw(["rsync", "--exclude=-e", "-e", "ssh", "x", "o2:/p"])
+    attached_long_argument = runner.calls[-1]["argv"]
+    assert "--exclude=-e" in attached_long_argument
+    explicit_transport = attached_long_argument[attached_long_argument.index("-e") + 1]
+    assert "PreferredAuthentications=none" in explicit_transport
+
     # Rsync also accepts ``-o=argument``. Preserve the equals sign while
     # hardening the attached remote shell.
     conn.run_raw(["rsync", "-avze=ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])

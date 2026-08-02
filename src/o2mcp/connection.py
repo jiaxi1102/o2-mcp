@@ -117,6 +117,80 @@ class O2Connection:
     # would reject valid transfers such as ``-M--fake-super`` or ``-T/cache``.
     _RSYNC_SHORT_OPTIONS_WITH_ARGUMENTS = frozenset({"@", "B", "e", "f", "M", "T"})
 
+    # Long options can likewise take their argument from the next argv element.
+    # Keep the argument-taking names explicit so a value such as the ``-e`` in
+    # ``--exclude -e`` is not reinterpreted as an SSH transport. This set follows
+    # rsync's client option table (all string/integer arguments, including
+    # compatibility aliases); options with an attached ``=value`` do not consume
+    # the next element and are handled naturally by the parser below.
+    _RSYNC_LONG_OPTIONS_WITH_ARGUMENTS = frozenset(
+        {
+            "address",
+            "backup-dir",
+            "block-size",
+            "bwlimit",
+            "cc",
+            "checksum-choice",
+            "checksum-seed",
+            "chmod",
+            "chown",
+            "compare-dest",
+            "compress-choice",
+            "compress-level",
+            "compress-threads",
+            "config",
+            "contimeout",
+            "copy-as",
+            "copy-dest",
+            "debug",
+            "dparam",
+            "early-input",
+            "exclude",
+            "exclude-from",
+            "files-from",
+            "filter",
+            "groupmap",
+            "iconv",
+            "include",
+            "include-from",
+            "info",
+            "link-dest",
+            "log-file",
+            "log-file-format",
+            "log-format",
+            "max-alloc",
+            "max-delete",
+            "max-size",
+            "min-size",
+            "modify-window",
+            "only-write-batch",
+            "out-format",
+            "outbuf",
+            "partial-dir",
+            "password-file",
+            "port",
+            "protocol",
+            "read-batch",
+            "remote-option",
+            "rsh",
+            "rsync-path",
+            "skip-compress",
+            "sockopts",
+            "stderr",
+            "stop-after",
+            "stop-at",
+            "suffix",
+            "temp-dir",
+            "time-limit",
+            "timeout",
+            "usermap",
+            "write-batch",
+            "zc",
+            "zl",
+            "zt",
+        }
+    )
+
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
         self._runner = runner
@@ -680,6 +754,17 @@ class O2Connection:
                 transport = token.split("=", 1)[1]
                 hardened[index] = "--rsh=" + self._reuse_only_ssh_command(transport, alias)
                 found_transport = True
+            elif token.startswith("--"):
+                # A separate value for an argument-taking long option is data,
+                # even when that value is literally ``-e`` or ``--rsh``. Skip it
+                # now so the next loop iteration cannot mistake it for transport
+                # configuration. ``--name=value`` already carries its argument
+                # in this token and therefore does not consume the next element.
+                option_name, equals, _attached_argument = token[2:].partition("=")
+                if not equals and option_name in self._RSYNC_LONG_OPTIONS_WITH_ARGUMENTS:
+                    if index + 1 >= len(hardened):
+                        raise O2UnsafeTransportError(f"{token} requires an argument.")
+                    index += 1
             elif token.startswith("-") and not token.startswith("--"):
                 # Rsync permits clustered short options, but options that take
                 # arguments terminate the cluster: their attached remainder (or
