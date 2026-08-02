@@ -7,7 +7,11 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 
 from __future__ import annotations
 
+import json
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,6 +21,7 @@ from o2mcp import (
     O2Config,
     O2Connection,
     O2LockedError,
+    O2LoginCoordinationError,
     O2MasterUnavailableError,
     O2OffVpnError,
     O2Slurm,
@@ -24,6 +29,13 @@ from o2mcp import (
     default_runner,
 )
 from o2mcp import keepalive as o2keepalive
+
+
+@pytest.fixture(autouse=True)
+def isolate_user_level_o2_files(monkeypatch, tmp_path):
+    """Keep global-lock and login-mutex tests out of the developer's real home."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "test-home"))
 
 
 class RecordingRunner:
@@ -56,11 +68,70 @@ class RecordingRunner:
         return cmds
 
 
+class ConcurrentStartRunner:
+    """Model two MCP processes racing to create the same SSH master.
+
+    The barrier forces both callers to complete their initial no-master check
+    before either can proceed. A correct interprocess guard then lets only one
+    caller execute ``ssh -MNf``; the second sees the master on its guarded
+    recheck and returns the existing-master result.
+    """
+
+    def __init__(self, *, start_returncode: int = 0) -> None:
+        self._state_lock = threading.Lock()
+        self._initial_check_barrier = threading.Barrier(2)
+        self._initial_checks = 0
+        self._start_returncode = start_returncode
+        self.master = False
+        self.start_count = 0
+
+    def __call__(self, argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
+        """Return deterministic SSH-check/start results for the race test."""
+
+        if "-O" in argv and "check" in argv:
+            with self._state_lock:
+                synchronize_initial_check = not self.master and self._initial_checks < 2
+                if synchronize_initial_check:
+                    self._initial_checks += 1
+                master = self.master
+            if synchronize_initial_check:
+                self._initial_check_barrier.wait(timeout=5)
+            return CommandResult(list(argv), 0 if master else 255, "", "")
+
+        if "-MNf" in argv:
+            with self._state_lock:
+                self.start_count += 1
+                if self._start_returncode == 0:
+                    self.master = True
+            stderr = "" if self._start_returncode == 0 else "simulated start failure"
+            return CommandResult(list(argv), self._start_returncode, "", stderr)
+
+        return CommandResult(list(argv), 0, "", "")
+
+
 def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
     return O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+
+
+def test_default_lock_is_workstation_wide(monkeypatch, tmp_path):
+    """Unconfigured clients must converge on one user-level emergency stop."""
+
+    monkeypatch.delenv("O2_SSH_LOCK_FILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert O2Config().lock_file == tmp_path / ".agent_locks" / "O2_DISABLED"
+
+
+def test_explicit_lock_path_still_overrides_global_default(monkeypatch, tmp_path):
+    """Deployments may intentionally provide another shared lock location."""
+
+    explicit = tmp_path / "shared" / "O2_DISABLED"
+    monkeypatch.setenv("O2_SSH_LOCK_FILE", str(explicit))
+
+    assert O2Config().lock_file == explicit
 
 
 # --- subprocess stdio isolation ---------------------------------------------
@@ -115,6 +186,27 @@ def test_lock_blocks_everything(tmp_path):
     assert runner.calls == []
 
 
+def test_legacy_project_lock_remains_a_hard_stop(monkeypatch, tmp_path):
+    """Upgrading must not bypass an existing cwd-scoped emergency lock."""
+
+    project = tmp_path / "legacy-project"
+    legacy_lock = project / ".agent_locks" / "O2_DISABLED"
+    legacy_lock.parent.mkdir(parents=True)
+    legacy_lock.write_text("disabled before global-lock migration")
+    monkeypatch.chdir(project)
+
+    # The configured global-style lock is intentionally absent. The connection
+    # must still find the historical project lock before executing any SSH.
+    config = O2Config(lock_file=tmp_path / "user-lock" / "O2_DISABLED")
+    runner = RecordingRunner()
+    conn = O2Connection(config, runner=runner)
+
+    assert conn.is_locked() is True
+    with pytest.raises(O2LockedError, match=str(legacy_lock)):
+        conn.run("hostname")
+    assert runner.calls == []
+
+
 # --- ControlMaster guards ----------------------------------------------------
 def test_run_requires_master(tmp_path):
     runner = RecordingRunner(master=False)
@@ -164,6 +256,7 @@ def test_start_master_noop_when_running(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
     result = conn.start_master(allow_new_login=False)
     assert result.ok and "already running" in result.stdout
+    assert result.argv == ["ssh", *conn.config.base_ssh_opts(), "-O", "check", "o2"]
 
 
 def test_start_master_can_open_the_transfer_alias(tmp_path):
@@ -176,6 +269,129 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
     assert result.ok
     assert "-MNf" in runner.calls[-1]["argv"]
     assert runner.calls[-1]["argv"][-1] == "o2-transfer"
+
+
+def test_concurrent_master_starts_execute_one_login(tmp_path):
+    """Even legacy project configs must share one O2/Duo login mutex."""
+
+    runner = ConcurrentStartRunner()
+    configs = [
+        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        for project in ("clock-project", "diffusion-project")
+    ]
+    connections = [O2Connection(config, runner=runner) for config in configs]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda conn: conn.start_master(allow_new_login=True), connections))
+
+    assert runner.start_count == 1
+    assert all(result.ok for result in results)
+    assert sum("already running" in result.stdout for result in results) == 1
+    reused = next(result for result in results if "already running" in result.stdout)
+    assert reused.argv == ["ssh", *configs[0].base_ssh_opts(), "-O", "check", "o2"]
+
+    mutex_paths = {conn._master_start_lock_file() for conn in connections}
+    assert mutex_paths == {tmp_path / "test-home" / ".agent_locks" / "O2_LOGIN_START.lock"}
+    assert not connections[0]._master_start_attempt_file().exists()
+
+
+def test_concurrent_callers_do_not_retry_a_failed_login(tmp_path):
+    """One failed SSH start must put every queued contender into cooldown."""
+
+    runner = ConcurrentStartRunner(start_returncode=255)
+    configs = [
+        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        for project in ("clock-project", "diffusion-project")
+    ]
+    connections = [O2Connection(config, runner=runner) for config in configs]
+
+    def invoke(conn):
+        """Return either the first command result or the queued caller's guard error."""
+
+        try:
+            return conn.start_master(allow_new_login=True)
+        except O2LoginCoordinationError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(invoke, connections))
+
+    command_results = [outcome for outcome in outcomes if isinstance(outcome, CommandResult)]
+    guard_errors = [outcome for outcome in outcomes if isinstance(outcome, O2LoginCoordinationError)]
+    assert runner.start_count == 1
+    assert len(command_results) == 1 and command_results[0].returncode == 255
+    assert len(guard_errors) == 1 and "refusing another Duo-pushing login" in str(guard_errors[0])
+
+    receipt = json.loads(connections[0]._master_start_attempt_file().read_text())
+    assert receipt["returncode"] == 255
+
+
+def test_expired_failed_attempt_allows_one_new_login(tmp_path):
+    """The shared failure receipt must not block intentional retries forever."""
+
+    runner = RecordingRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    receipt_path = conn._master_start_attempt_file()
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "started_at": time.time() - conn.LOGIN_RETRY_COOLDOWN_SECONDS - 1.0,
+                "pid": 1,
+                "target": "o2",
+                "returncode": 255,
+            }
+        )
+    )
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    assert not receipt_path.exists()
+
+
+def test_timed_out_login_leaves_cooldown_for_the_next_caller(tmp_path):
+    """An SSH exception must not let the following task generate another Duo call."""
+
+    class TimeoutStartRunner(RecordingRunner):
+        """Raise exactly where a real SSH master start can time out."""
+
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if "-MNf" in argv:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return super().__call__(argv, timeout, input_text)
+
+    runner = TimeoutStartRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        conn.start_master(allow_new_login=True)
+    with pytest.raises(O2LoginCoordinationError, match="refusing another Duo-pushing login"):
+        conn.start_master(allow_new_login=True)
+
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["returncode"] is None
+
+
+def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(monkeypatch, tmp_path):
+    """A broken mutex location must never fall back to an uncoordinated login."""
+
+    non_directory = tmp_path / "not-a-directory"
+    non_directory.write_text("occupied")
+    config = _config(tmp_path)
+    runner = RecordingRunner(master=False)
+    conn = O2Connection(config, runner=runner)
+    monkeypatch.setattr(conn, "_master_start_lock_file", lambda: non_directory / "O2_LOGIN_START.lock")
+
+    with pytest.raises(O2LoginCoordinationError) as exc_info:
+        conn.start_master(allow_new_login=True)
+
+    assert "OS error:" in str(exc_info.value)
+    assert str(non_directory) in str(exc_info.value)
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
 # --- VPN egress guard (HMS O2 Duos non-HMS source IPs) -----------------------

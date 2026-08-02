@@ -167,7 +167,21 @@ async def test_workspace_gc_dry_run_returns_script(monkeypatch, tmp_path):
 async def test_status_reports_not_connected(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=False)
     payload = await _call("o2_status", {})
-    assert payload == {"ok": True, "locked": False, "master_running": False, "probe": None}
+    assert payload == {"ok": True, "locked": False, "lock_file": None, "master_running": False, "probe": None}
+
+
+@pytest.mark.anyio
+async def test_status_identifies_the_active_safety_lock(monkeypatch, tmp_path):
+    """Diagnostics should name the exact lock that is preventing O2 access."""
+
+    _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
+    payload = await _call("o2_status", {})
+
+    assert payload["ok"] is True
+    assert payload["locked"] is True
+    assert payload["lock_file"] == str(tmp_path / "O2_DISABLED")
+    assert payload["master_running"] is False
+    assert payload["probe"] is None
 
 
 @pytest.mark.anyio

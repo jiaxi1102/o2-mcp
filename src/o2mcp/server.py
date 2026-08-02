@@ -22,7 +22,7 @@ minute". To completely avoid Duo, don't poll O2 from here at all (have O2 push
 results out via Globus/OnDemand) or ask HMS RC for SSH-certificate access; see
 ``docs/O2_MCP.md``.
 
-The ``.agent_locks/O2_DISABLED`` lock is honored as a hard stop on every tool.
+The user-level ``~/.agent_locks/O2_DISABLED`` lock is honored as a hard stop on every tool.
 
 Run as a local stdio server:
 
@@ -47,6 +47,7 @@ from o2mcp import (
     CommandResult,
     O2Connection,
     O2LockedError,
+    O2LoginCoordinationError,
     O2MasterUnavailableError,
     O2OffVpnError,
     O2Slurm,
@@ -86,6 +87,8 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "no_master", "message": str(exc)}
     except O2OffVpnError as exc:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
+    except O2LoginCoordinationError as exc:
+        payload = {"ok": False, "error": "login_coordination_failed", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
         payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
     return json.dumps(payload, indent=2)
@@ -191,17 +194,26 @@ class PlaceInput(BaseModel):
 async def o2_status() -> str:
     """Report O2 access state: safety lock, ControlMaster, and a connectivity probe.
 
-    Returns JSON: {"locked": bool, "master_running": bool, "probe": {...}|null}.
+    Returns JSON with the lock state and exact active lock path, the ControlMaster
+    state, and an optional connectivity probe. If locked or disconnected, no
+    remote command is attempted.
     When no master is running, probe is null and you must start one
     (o2_start_master) before running commands or submitting jobs.
     """
 
     def work() -> dict[str, Any]:
         conn = _connection()
-        locked = conn.is_locked()
+        active_lock = conn.active_lock_file()
+        locked = active_lock is not None
         master = (not locked) and conn.master_running()
         probe = _command_payload(conn.probe()) if master else None
-        return {"ok": True, "locked": locked, "master_running": master, "probe": probe}
+        return {
+            "ok": True,
+            "locked": locked,
+            "lock_file": str(active_lock) if active_lock is not None else None,
+            "master_running": master,
+            "probe": probe,
+        }
 
     return await _run_tool(work)
 
