@@ -30,6 +30,11 @@ is what causes "a Duo call every minute". The workstation-wide
 starts are also serialized across MCP processes, so concurrent Codex tasks cannot both pass
 the no-master check and initiate overlapping Duo authentications.
 
+If a serialized master start fails, times out, or crashes, a shared attempt receipt suppresses
+all queued retries for five minutes. This converts a burst of simultaneous requests into one
+authorization attempt instead of a sequence of repeated Duo calls. A successful start clears
+the receipt immediately.
+
 For upgrade safety, the historical project-local
 `<current-working-directory>/.agent_locks/O2_DISABLED` path is also honored. This prevents an
 engaged older lock from becoming ineffective merely because the package was updated.
@@ -115,6 +120,8 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   processes, even when upgraded configurations retain different legacy safety-lock paths;
   after waiting, each contender rechecks the socket and becomes a no-op when another task
   already established it.
+- A pre-SSH attempt receipt applies a five-minute, workstation-wide cooldown after a failed,
+  timed-out, or crashed start, preventing already-queued callers from retrying sequentially.
 - Destructive/transfer-node operations default to dry-run where applicable and verify before
   freeing scratch.
 

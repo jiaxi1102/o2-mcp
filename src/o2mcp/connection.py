@@ -17,9 +17,13 @@ tested offline without ever touching the network.
 from __future__ import annotations
 
 import fcntl
+import json
+import math
+import os
 import subprocess
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -88,7 +92,15 @@ def default_runner(argv: list[str], timeout: float | None, input_text: str | Non
 
 
 class O2Connection:
-    """Manage and use the persistent O2 SSH ControlMaster connection."""
+    """Manage and use the persistent O2 SSH ControlMaster connection.
+
+    ``LOGIN_RETRY_COOLDOWN_SECONDS`` is deliberately process-independent and
+    non-configurable. Different Codex tasks must agree on the same retry window;
+    a per-process environment override would recreate the coordination gap this
+    class exists to close.
+    """
+
+    LOGIN_RETRY_COOLDOWN_SECONDS = 300.0
 
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
@@ -139,6 +151,103 @@ class O2Connection:
         """
 
         return Path.home() / ".agent_locks" / "O2_LOGIN_START.lock"
+
+    def _master_start_attempt_file(self) -> Path:
+        """Return the shared receipt that suppresses retries after a failed start."""
+
+        return Path.home() / ".agent_locks" / "O2_LOGIN_START_ATTEMPT.json"
+
+    def _record_master_start_attempt(self, target: str, *, returncode: int | None = None) -> None:
+        """Persist a start receipt before SSH so queued callers cannot retry it.
+
+        The file is intentionally written directly and fsynced while the login
+        mutex is held. If the process crashes mid-write, the recent file's mtime
+        still activates the cooldown; a partially written receipt therefore
+        fails safe rather than allowing the next queued process to call SSH.
+        """
+
+        receipt_path = self._master_start_attempt_file()
+        payload = {
+            "started_at": time.time(),
+            "pid": os.getpid(),
+            "target": target,
+            "returncode": returncode,
+        }
+        try:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            with receipt_path.open("w") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise O2LoginCoordinationError(
+                f"Cannot persist the O2 login-attempt receipt at {receipt_path}; "
+                f"refusing to start SSH because queued callers could repeat Duo. OS error: {exc}"
+            ) from exc
+
+    def _clear_master_start_attempt(self) -> None:
+        """Remove the retry-suppression receipt after a confirmed successful start."""
+
+        receipt_path = self._master_start_attempt_file()
+        # A live master is authoritative and all callers will reuse it. Keep a
+        # receipt that cannot be removed as a conservative guard if the master
+        # immediately disappears; never turn a good login into a reported
+        # failure merely because local cleanup was unavailable.
+        with suppress(OSError):
+            receipt_path.unlink(missing_ok=True)
+
+    def _require_login_retry_ready(self) -> None:
+        """Refuse a fresh login while a recent process-wide attempt is cooling down.
+
+        The receipt is created *before* ``ssh -MNf``. It therefore covers a
+        normal nonzero result, a timeout/exception, or a process crash. Corrupt
+        receipts use their filesystem mtime, preserving the safety window even
+        when the writer died before completing JSON serialization.
+        """
+
+        receipt_path = self._master_start_attempt_file()
+        try:
+            stat = receipt_path.stat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise O2LoginCoordinationError(
+                f"Cannot inspect the O2 login-attempt receipt at {receipt_path}; "
+                f"refusing an uncoordinated retry. OS error: {exc}"
+            ) from exc
+
+        started_at = stat.st_mtime
+        try:
+            payload = json.loads(receipt_path.read_text())
+            candidate = payload.get("started_at") if isinstance(payload, dict) else None
+            # ``bool`` is an ``int`` subclass and JSON also permits non-finite
+            # floats in Python's permissive decoder. Neither is a trustworthy
+            # timestamp; retain the fail-safe mtime for those values.
+            if type(candidate) in (int, float) and math.isfinite(float(candidate)):
+                started_at = float(candidate)
+        except (OSError, ValueError, TypeError):
+            # A recent malformed receipt most likely means its owner crashed
+            # during the login attempt. The mtime is the safest fallback.
+            pass
+
+        age = max(0.0, time.time() - started_at)
+        remaining = self.LOGIN_RETRY_COOLDOWN_SECONDS - age
+        if remaining > 0:
+            raise O2LoginCoordinationError(
+                f"A workstation-wide O2 login attempt occurred {age:.1f}s ago; refusing another Duo-pushing "
+                f"login for {remaining:.1f}s. Receipt: {receipt_path}"
+            )
+
+        try:
+            receipt_path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise O2LoginCoordinationError(
+                f"Cannot clear the expired O2 login-attempt receipt at {receipt_path}; "
+                f"refusing an uncoordinated retry. OS error: {exc}"
+            ) from exc
 
     @contextmanager
     def _serialized_master_start(self) -> Iterator[None]:
@@ -288,14 +397,28 @@ class O2Connection:
             # is then allowed to execute the Duo-pushing command.
             self._require_unlocked()
             if self.master_running(target):
+                self._clear_master_start_attempt()
                 return CommandResult(self._master_check_argv(target), 0, "master already running", "")
+            self._require_login_retry_ready()
             if self.config.require_vpn and not allow_offvpn:
                 self._require_on_vpn(target)
-            return self._runner(
+            # Persist before invoking SSH. A nonzero result, exception, or
+            # process crash leaves the receipt in place so every process that was
+            # already queued behind this mutex fails closed during the cooldown.
+            self._record_master_start_attempt(target)
+            result = self._runner(
                 ["ssh", *self.config.base_ssh_opts(), "-MNf", target],
                 self.config.connect_timeout + 30,
                 None,
             )
+            if result.ok:
+                self._clear_master_start_attempt()
+            else:
+                # Best-effort enrichment makes local incident diagnosis easier;
+                # the pre-SSH receipt already provides the fail-closed guarantee.
+                with suppress(O2LoginCoordinationError):
+                    self._record_master_start_attempt(target, returncode=result.returncode)
+            return result
 
     def stop_master(self) -> CommandResult:
         """Close the persistent ControlMaster (non-fatal if already closed)."""

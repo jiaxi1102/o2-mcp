@@ -7,8 +7,10 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -75,10 +77,11 @@ class ConcurrentStartRunner:
     recheck and returns the existing-master result.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_returncode: int = 0) -> None:
         self._state_lock = threading.Lock()
         self._initial_check_barrier = threading.Barrier(2)
         self._initial_checks = 0
+        self._start_returncode = start_returncode
         self.master = False
         self.start_count = 0
 
@@ -98,8 +101,10 @@ class ConcurrentStartRunner:
         if "-MNf" in argv:
             with self._state_lock:
                 self.start_count += 1
-                self.master = True
-            return CommandResult(list(argv), 0, "", "")
+                if self._start_returncode == 0:
+                    self.master = True
+            stderr = "" if self._start_returncode == 0 else "simulated start failure"
+            return CommandResult(list(argv), self._start_returncode, "", stderr)
 
         return CommandResult(list(argv), 0, "", "")
 
@@ -287,6 +292,88 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
 
     mutex_paths = {conn._master_start_lock_file() for conn in connections}
     assert mutex_paths == {tmp_path / "test-home" / ".agent_locks" / "O2_LOGIN_START.lock"}
+    assert not connections[0]._master_start_attempt_file().exists()
+
+
+def test_concurrent_callers_do_not_retry_a_failed_login(tmp_path):
+    """One failed SSH start must put every queued contender into cooldown."""
+
+    runner = ConcurrentStartRunner(start_returncode=255)
+    configs = [
+        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        for project in ("clock-project", "diffusion-project")
+    ]
+    connections = [O2Connection(config, runner=runner) for config in configs]
+
+    def invoke(conn):
+        """Return either the first command result or the queued caller's guard error."""
+
+        try:
+            return conn.start_master(allow_new_login=True)
+        except O2LoginCoordinationError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(invoke, connections))
+
+    command_results = [outcome for outcome in outcomes if isinstance(outcome, CommandResult)]
+    guard_errors = [outcome for outcome in outcomes if isinstance(outcome, O2LoginCoordinationError)]
+    assert runner.start_count == 1
+    assert len(command_results) == 1 and command_results[0].returncode == 255
+    assert len(guard_errors) == 1 and "refusing another Duo-pushing login" in str(guard_errors[0])
+
+    receipt = json.loads(connections[0]._master_start_attempt_file().read_text())
+    assert receipt["returncode"] == 255
+
+
+def test_expired_failed_attempt_allows_one_new_login(tmp_path):
+    """The shared failure receipt must not block intentional retries forever."""
+
+    runner = RecordingRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    receipt_path = conn._master_start_attempt_file()
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "started_at": time.time() - conn.LOGIN_RETRY_COOLDOWN_SECONDS - 1.0,
+                "pid": 1,
+                "target": "o2",
+                "returncode": 255,
+            }
+        )
+    )
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    assert not receipt_path.exists()
+
+
+def test_timed_out_login_leaves_cooldown_for_the_next_caller(tmp_path):
+    """An SSH exception must not let the following task generate another Duo call."""
+
+    class TimeoutStartRunner(RecordingRunner):
+        """Raise exactly where a real SSH master start can time out."""
+
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if "-MNf" in argv:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return super().__call__(argv, timeout, input_text)
+
+    runner = TimeoutStartRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        conn.start_master(allow_new_login=True)
+    with pytest.raises(O2LoginCoordinationError, match="refusing another Duo-pushing login"):
+        conn.start_master(allow_new_login=True)
+
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["returncode"] is None
 
 
 def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(monkeypatch, tmp_path):
