@@ -438,7 +438,9 @@ class O2Connection:
                         # diagnostic below preserves output from the start step.
                         argv=self._master_check_argv(target),
                         returncode=255,
-                        stdout=result.stdout,
+                        # No verification subprocess completed, so there is no
+                        # stdout belonging to the reported command outcome.
+                        stdout="",
                         stderr=self._master_verification_error(target, detail, result.stderr),
                     )
 
@@ -455,7 +457,7 @@ class O2Connection:
                     return CommandResult(
                         argv=verification.argv,
                         returncode=verification.returncode or 255,
-                        stdout=result.stdout,
+                        stdout=verification.stdout,
                         stderr=self._master_verification_error(target, detail, result.stderr),
                     )
             else:
