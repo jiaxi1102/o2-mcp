@@ -108,6 +108,15 @@ class O2Connection:
 
     LOGIN_RETRY_COOLDOWN_SECONDS = 300.0
 
+    # Rsync accepts short options in clusters, but these options consume an
+    # argument. Once one appears, the remainder of the token (or the following
+    # argv element when there is no remainder) is data, not more option letters.
+    # This list mirrors rsync's documented short forms: --modify-window (-@),
+    # --block-size (-B), --rsh (-e), --filter (-f), --remote-option (-M), and
+    # --temp-dir (-T). Treating an ``e`` inside one of those arguments as ``-e``
+    # would reject valid transfers such as ``-M--fake-super`` or ``-T/cache``.
+    _RSYNC_SHORT_OPTIONS_WITH_ARGUMENTS = frozenset({"@", "B", "e", "f", "M", "T"})
+
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
         self._runner = runner
@@ -672,24 +681,45 @@ class O2Connection:
                 hardened[index] = "--rsh=" + self._reuse_only_ssh_command(transport, alias)
                 found_transport = True
             elif token.startswith("-") and not token.startswith("--"):
-                # Rsync permits clustered short options. If ``e`` is present it
-                # consumes either the remainder of this token (``-avzessh``) or
-                # the next token (``-avze ssh``). Normalize both forms; merely
-                # inserting an earlier safe ``-e`` is insufficient because rsync
-                # uses the later cluster's remote shell.
+                # Rsync permits clustered short options, but options that take
+                # arguments terminate the cluster: their attached remainder (or
+                # the next argv element) is data. Walk the cluster in order so an
+                # ``e`` inside ``-M--fake-super`` or ``-T/tmp/cache`` is not
+                # misidentified as the remote-shell option.
                 cluster = token[1:]
-                if "e" in cluster:
-                    option_index = cluster.index("e")
-                    attached_transport = cluster[option_index + 1 :]
-                    prefix = token[: option_index + 2]
-                    if attached_transport:
-                        hardened[index] = prefix + self._reuse_only_ssh_command(attached_transport, alias)
-                    else:
+                for option_index, option in enumerate(cluster):
+                    if option not in self._RSYNC_SHORT_OPTIONS_WITH_ARGUMENTS:
+                        continue
+
+                    attached_argument = cluster[option_index + 1 :]
+                    if option == "e":
+                        # A clustered ``-e`` consumes either the remainder of
+                        # this token (``-avzessh`` / ``-avze=ssh``) or the next
+                        # token (``-avze ssh``). Normalize either representation;
+                        # merely inserting an earlier safe ``-e`` would not help
+                        # because rsync honors the later transport override.
+                        prefix = token[: option_index + 2]
+                        equals = "=" if attached_argument.startswith("=") else ""
+                        transport = attached_argument[len(equals) :]
+                        if transport:
+                            hardened[index] = prefix + equals + self._reuse_only_ssh_command(transport, alias)
+                        else:
+                            if index + 1 >= len(hardened):
+                                raise O2UnsafeTransportError(f"{token} requires an SSH transport argument.")
+                            hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1], alias)
+                            index += 1
+                        found_transport = True
+                    elif not attached_argument:
+                        # The next argv element belongs to this non-transport
+                        # option. Skip it even when it resembles ``-e`` so it is
+                        # never reinterpreted as a second rsync option.
                         if index + 1 >= len(hardened):
-                            raise O2UnsafeTransportError(f"{token} requires an SSH transport argument.")
-                        hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1], alias)
+                            raise O2UnsafeTransportError(f"{token} requires an argument.")
                         index += 1
-                    found_transport = True
+
+                    # Any argument-taking option ends short-option parsing for
+                    # this token because every remaining character is its data.
+                    break
             index += 1
 
         if not found_transport:

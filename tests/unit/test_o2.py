@@ -766,6 +766,32 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     transport = next(token[len("-avze") :] for token in attached if token.startswith("-avze"))
     assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
 
+    # Rsync options that consume arguments end a short-option cluster. The
+    # letters inside those arguments are data, so an ``e`` in --fake-super or a
+    # temp path must not be mistaken for another remote-shell option.
+    conn.run_raw(["rsync", "-M--fake-super", "-T/tmp/cache", "x", "o2:/p"])
+    argument_clusters = runner.calls[-1]["argv"]
+    assert "-M--fake-super" in argument_clusters
+    assert "-T/tmp/cache" in argument_clusters
+    inserted_transport = argument_clusters[argument_clusters.index("-e") + 1]
+    assert "PreferredAuthentications=none" in inserted_transport
+
+    # The same rule applies when a non-transport option takes its argument from
+    # the next argv element. Even an argument literally named ``-e`` remains an
+    # argument to ``-M``; the guard inserts its own separate hardened transport.
+    conn.run_raw(["rsync", "-M", "-e", "x", "o2:/p"])
+    separated_argument = runner.calls[-1]["argv"]
+    assert separated_argument[separated_argument.index("-M") + 1] == "-e"
+    assert separated_argument[1] == "-e"
+    assert "PreferredAuthentications=none" in separated_argument[2]
+
+    # Rsync also accepts ``-o=argument``. Preserve the equals sign while
+    # hardening the attached remote shell.
+    conn.run_raw(["rsync", "-avze=ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    equals_cluster = runner.calls[-1]["argv"]
+    equals_transport = next(token[len("-avze=") :] for token in equals_cluster if token.startswith("-avze="))
+    assert equals_transport.index("PubkeyAuthentication=no") < equals_transport.index("PubkeyAuthentication=yes")
+
 
 def test_run_raw_rejects_non_ssh_remote_shell(tmp_path):
     """An arbitrary rsync remote shell would bypass the ControlMaster contract."""
