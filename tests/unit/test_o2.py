@@ -41,16 +41,23 @@ def isolate_user_level_o2_files(monkeypatch, tmp_path):
 class RecordingRunner:
     """A fake subprocess runner: records calls, answers via a response function."""
 
-    def __init__(self, *, master: bool = True, responder=None):
+    def __init__(self, *, master: bool = True, responder=None, start_persists: bool = True):
         self.calls = []
         self.master = master
         self._responder = responder
+        self._start_persists = start_persists
 
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if self.master else 255, "", "")
         if "-MNf" in argv:
+            # A successful fake startup normally creates a reusable master so
+            # the production postcondition is exercised. Tests can disable this
+            # transition to reproduce SSH returning zero before its background
+            # connection disappears.
+            if self._start_persists:
+                self.master = True
             return CommandResult(list(argv), 0, "", "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
@@ -249,7 +256,32 @@ def test_start_master_requires_opt_in(tmp_path):
     # Opt-in opens the master with -MNf.
     result = conn.start_master(allow_new_login=True)
     assert result.ok
-    assert "-MNf" in runner.calls[-1]["argv"]
+    assert any("-MNf" in call["argv"] for call in runner.calls)
+    assert runner.calls[-1]["argv"] == conn._master_check_argv("o2")
+
+
+def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path):
+    """A zero exit from ``ssh -MNf`` is not success without a live socket."""
+
+    runner = RecordingRunner(master=False, start_persists=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok is False
+    assert result.returncode == 255
+    assert "post-start control-socket check failed" in result.stderr
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+
+    # The failed postcondition is retained as a workstation-wide cooldown
+    # receipt. A second caller must fail closed before another Duo-pushing SSH
+    # process can start.
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["target"] == "o2"
+    assert receipt["returncode"] == 255
+    with pytest.raises(O2LoginCoordinationError, match="refusing another Duo-pushing login"):
+        conn.start_master(allow_new_login=True)
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
 
 
 def test_start_master_noop_when_running(tmp_path):
@@ -267,8 +299,9 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True, alias=conn.config.transfer_alias)
     assert result.ok
-    assert "-MNf" in runner.calls[-1]["argv"]
-    assert runner.calls[-1]["argv"][-1] == "o2-transfer"
+    starts = [call for call in runner.calls if "-MNf" in call["argv"]]
+    assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
+    assert runner.calls[-1]["argv"] == conn._master_check_argv("o2-transfer")
 
 
 def test_concurrent_master_starts_execute_one_login(tmp_path):
@@ -425,7 +458,7 @@ def test_start_master_allows_on_vpn(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_offvpn_override(tmp_path):
@@ -433,7 +466,7 @@ def test_start_master_offvpn_override(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True, allow_offvpn=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_failopen_when_iface_undetermined(tmp_path):
@@ -441,7 +474,7 @@ def test_start_master_failopen_when_iface_undetermined(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder(None))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_failopen_when_route_binary_missing(tmp_path):
@@ -458,7 +491,7 @@ def test_start_master_failopen_when_route_binary_missing(tmp_path):
     runner = RecordingRunner(master=False, responder=responder)
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_guard_disabled_via_config(tmp_path):
@@ -468,7 +501,7 @@ def test_start_master_guard_disabled_via_config(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(config, runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
     # Guard disabled -> no egress probing at all.
     assert not any(call["argv"][:2] == ["route", "get"] for call in runner.calls)
 

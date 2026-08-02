@@ -28,19 +28,29 @@ from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
 from o2mcp import server as o2server  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolate_user_level_o2_files(monkeypatch, tmp_path):
+    """Prevent protocol tests from writing login receipts into the real home."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "test-home"))
+
+
 class FakeRunner:
     """Deterministic stand-in for the subprocess runner (records calls)."""
 
-    def __init__(self, *, master: bool = True, responder=None):
+    def __init__(self, *, master: bool = True, responder=None, start_persists: bool = True):
         self.calls = []
         self.master = master
         self._responder = responder
+        self._start_persists = start_persists
 
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         self.calls.append({"argv": list(argv), "input": input_text})
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if self.master else 255, "", "")
         if "-MNf" in argv:
+            if self._start_persists:
+                self.master = True
             return CommandResult(list(argv), 0, "", "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
@@ -48,7 +58,9 @@ class FakeRunner:
         return CommandResult(list(argv), 0, "", "")
 
 
-def _patch_connection(monkeypatch, tmp_path, *, master=True, responder=None, locked=False) -> FakeRunner:
+def _patch_connection(
+    monkeypatch, tmp_path, *, master=True, responder=None, locked=False, start_persists=True
+) -> FakeRunner:
     cfg = O2Config(
         host_alias="o2",
         transfer_alias="o2-transfer",
@@ -57,7 +69,7 @@ def _patch_connection(monkeypatch, tmp_path, *, master=True, responder=None, loc
     )
     if locked:
         cfg.lock_file.write_text("disabled")
-    runner = FakeRunner(master=master, responder=responder)
+    runner = FakeRunner(master=master, responder=responder, start_persists=start_persists)
     monkeypatch.setattr(o2server, "_connection", lambda: O2Connection(cfg, runner=runner))
     return runner
 
@@ -198,6 +210,19 @@ async def test_start_master_refused_without_optin(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=False)
     payload = await _call("o2_start_master", {"params": {"allow_new_login": False}})
     assert payload["ok"] is False and payload["error"] == "no_master"
+
+
+@pytest.mark.anyio
+async def test_start_master_reports_failed_post_start_verification(monkeypatch, tmp_path):
+    """The MCP response must not call a vanished background master successful."""
+
+    _patch_connection(monkeypatch, tmp_path, master=False, start_persists=False)
+
+    payload = await _call("o2_start_master", {"params": {"allow_new_login": True}})
+
+    assert payload["ok"] is False
+    assert payload["returncode"] == 255
+    assert "post-start control-socket check failed" in payload["stderr"]
 
 
 @pytest.mark.anyio

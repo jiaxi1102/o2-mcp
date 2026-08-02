@@ -412,13 +412,71 @@ class O2Connection:
                 None,
             )
             if result.ok:
-                self._clear_master_start_attempt()
+                # ``ssh -f`` can return zero after authentication and then lose
+                # its backgrounded connection immediately. Treating the parent
+                # process's exit code as the whole startup contract created a
+                # dangerous false positive: callers believed they had a reusable
+                # master, the retry receipt was removed, and a later command could
+                # initiate another user-approved login attempt. Verify the actual
+                # control socket before reporting success or clearing the receipt.
+                try:
+                    verification = self._runner(
+                        self._master_check_argv(target),
+                        self.config.connect_timeout + 5,
+                        None,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    # The pre-start receipt deliberately remains in place. A
+                    # local verification failure is ambiguous, so the safest
+                    # behavior is to suppress automatic retries for the normal
+                    # cooldown window rather than risk another Duo prompt.
+                    detail = f"{type(exc).__name__}: {exc}"
+                    return CommandResult(
+                        argv=result.argv,
+                        returncode=255,
+                        stdout=result.stdout,
+                        stderr=self._master_verification_error(target, detail, result.stderr),
+                    )
+
+                if verification.ok:
+                    self._clear_master_start_attempt()
+                else:
+                    # Record the failed control-socket check rather than the
+                    # misleading zero returned by ``ssh -MNf``. This receipt is
+                    # the cross-process evidence that a fresh login was already
+                    # attempted and must not be retried immediately.
+                    with suppress(O2LoginCoordinationError):
+                        self._record_master_start_attempt(target, returncode=verification.returncode)
+                    detail = verification.stderr.strip() or verification.stdout.strip() or "no SSH diagnostics"
+                    return CommandResult(
+                        argv=result.argv,
+                        returncode=verification.returncode or 255,
+                        stdout=result.stdout,
+                        stderr=self._master_verification_error(target, detail, result.stderr),
+                    )
             else:
                 # Best-effort enrichment makes local incident diagnosis easier;
                 # the pre-SSH receipt already provides the fail-closed guarantee.
                 with suppress(O2LoginCoordinationError):
                     self._record_master_start_attempt(target, returncode=result.returncode)
             return result
+
+    def _master_verification_error(self, target: str, detail: str, start_stderr: str) -> str:
+        """Describe a zero-exit SSH start whose reusable socket did not survive.
+
+        Preserve any diagnostic text emitted by the original ``ssh -MNf`` call,
+        because HMS login banners or disconnect messages can explain why the
+        backgrounded master vanished. The message also makes the retained retry
+        receipt explicit so an operator knows not to launch another login loop.
+        """
+
+        message = (
+            f"SSH reported success starting the O2 ControlMaster for '{target}', but the post-start "
+            f"control-socket check failed: {detail}. The login-attempt receipt remains active; do not "
+            "retry automatically."
+        )
+        prior = start_stderr.strip()
+        return f"{prior}\n{message}" if prior else message
 
     def stop_master(self) -> CommandResult:
         """Close the persistent ControlMaster (non-fatal if already closed)."""
