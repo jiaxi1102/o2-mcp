@@ -174,6 +174,27 @@ def test_lock_blocks_everything(tmp_path):
     assert runner.calls == []
 
 
+def test_legacy_project_lock_remains_a_hard_stop(monkeypatch, tmp_path):
+    """Upgrading must not bypass an existing cwd-scoped emergency lock."""
+
+    project = tmp_path / "legacy-project"
+    legacy_lock = project / ".agent_locks" / "O2_DISABLED"
+    legacy_lock.parent.mkdir(parents=True)
+    legacy_lock.write_text("disabled before global-lock migration")
+    monkeypatch.chdir(project)
+
+    # The configured global-style lock is intentionally absent. The connection
+    # must still find the historical project lock before executing any SSH.
+    config = O2Config(lock_file=tmp_path / "user-lock" / "O2_DISABLED")
+    runner = RecordingRunner()
+    conn = O2Connection(config, runner=runner)
+
+    assert conn.is_locked() is True
+    with pytest.raises(O2LockedError, match=str(legacy_lock)):
+        conn.run("hostname")
+    assert runner.calls == []
+
+
 # --- ControlMaster guards ----------------------------------------------------
 def test_run_requires_master(tmp_path):
     runner = RecordingRunner(master=False)

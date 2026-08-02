@@ -3,7 +3,8 @@
 A Python port of ``scripts/o2_ssh_master.sh`` that preserves its safety contract
 exactly, but is testable and composable:
 
-- The user-level ``~/.agent_locks/O2_DISABLED`` lock is a hard stop on every operation.
+- The user-level ``~/.agent_locks/O2_DISABLED`` lock and legacy project lock are
+  hard stops on every operation.
 - All SSH uses BatchMode (public key only) — a dead master or missing key fails
   fast instead of triggering a Duo/MFA phone prompt.
 - Remote commands run only through an already-established ControlMaster socket;
@@ -94,14 +95,34 @@ class O2Connection:
         self._runner = runner
 
     # -- safety -----------------------------------------------------------------
+    def active_lock_file(self) -> Path | None:
+        """Return the safety lock currently blocking O2, if any.
+
+        The configured/user-level lock is authoritative for new installations.
+        The working-directory lock preserves the pre-0.2 safety contract during
+        migration: an upgrade must never silently bypass an already-engaged
+        project emergency stop. Duplicate paths are harmless and are collapsed
+        to keep the check and any error message deterministic.
+        """
+
+        if self.config.ignore_lock:
+            return None
+        configured = self.config.lock_file
+        legacy = Path.cwd() / ".agent_locks" / "O2_DISABLED"
+        for candidate in dict.fromkeys((configured, legacy)):
+            if candidate.exists():
+                return candidate
+        return None
+
     def is_locked(self) -> bool:
         """Whether the local O2 safety lock is engaged."""
-        return self.config.lock_file.exists() and not self.config.ignore_lock
+        return self.active_lock_file() is not None
 
     def _require_unlocked(self) -> None:
-        if self.is_locked():
+        active_lock = self.active_lock_file()
+        if active_lock is not None:
             raise O2LockedError(
-                f"O2 access is locally disabled by {self.config.lock_file}. "
+                f"O2 access is locally disabled by {active_lock}. "
                 "Refusing every O2 SSH/rsync command to prevent repeated Duo/MFA prompts. "
                 "Remove that file (or set O2_IGNORE_LOCAL_LOCK=1) only after confirming O2 access is safe."
             )

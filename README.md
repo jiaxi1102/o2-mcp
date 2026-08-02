@@ -30,6 +30,10 @@ is what causes "a Duo call every minute". The workstation-wide
 starts are also serialized across MCP processes, so concurrent Codex tasks cannot both pass
 the no-master check and initiate overlapping Duo authentications.
 
+For upgrade safety, the historical project-local
+`<current-working-directory>/.agent_locks/O2_DISABLED` path is also honored. This prevents an
+engaged older lock from becoming ineffective merely because the package was updated.
+
 **Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), even the one
@@ -105,7 +109,8 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   instead of triggering an interactive MFA prompt.
 - Remote commands run only through an already-established ControlMaster; opening a new login
   requires explicit opt-in (`allow_new_login`).
-- The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks.
+- The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;
+  the legacy current-project lock remains an additional hard stop for safe upgrades.
 - A file mutex beside the safety lock serializes new login and transfer-master starts across
   MCP processes; after waiting, each contender rechecks the socket and becomes a no-op when
   another task already established it.

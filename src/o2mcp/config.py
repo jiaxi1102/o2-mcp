@@ -39,6 +39,8 @@ class O2Config:
         lock_file: If this path exists, every O2 operation refuses to run. The
             default is the workstation-wide ``~/.agent_locks/O2_DISABLED`` so
             independently launched MCP processes share the same emergency stop.
+            The legacy current-working-directory lock remains an additional stop
+            in :class:`o2mcp.connection.O2Connection` for upgrade compatibility.
         ignore_lock: Mirror of ``O2_IGNORE_LOCAL_LOCK=1`` to bypass the lock.
         default_user: Username for ``squeue -u`` etc.; ``None`` resolves to ``$USER`` remotely.
         default_log_dir: Remote directory pattern where Slurm logs land.

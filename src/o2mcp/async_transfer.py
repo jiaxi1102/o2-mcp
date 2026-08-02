@@ -191,10 +191,10 @@ class O2AsyncTransfer:
         return self._launch("pull", local=local_path, remote=remote_path, transfer=transfer)
 
     def _launch(self, direction: str, *, local: str, remote: str, transfer: bool) -> TransferHandle:
-        if self.conn.is_locked():
+        active_lock = self.conn.active_lock_file()
+        if active_lock is not None:
             raise O2LockedError(
-                f"O2 access is locally disabled by {self.conn.config.lock_file}. "
-                "Refusing to launch a background transfer."
+                f"O2 access is locally disabled by {active_lock}. " "Refusing to launch a background transfer."
             )
         alias = self.sync._alias(transfer)
         if not self.conn.master_running(alias):

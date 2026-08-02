@@ -194,17 +194,26 @@ class PlaceInput(BaseModel):
 async def o2_status() -> str:
     """Report O2 access state: safety lock, ControlMaster, and a connectivity probe.
 
-    Returns JSON: {"locked": bool, "master_running": bool, "probe": {...}|null}.
+    Returns JSON with the lock state and exact active lock path, the ControlMaster
+    state, and an optional connectivity probe. If locked or disconnected, no
+    remote command is attempted.
     When no master is running, probe is null and you must start one
     (o2_start_master) before running commands or submitting jobs.
     """
 
     def work() -> dict[str, Any]:
         conn = _connection()
-        locked = conn.is_locked()
+        active_lock = conn.active_lock_file()
+        locked = active_lock is not None
         master = (not locked) and conn.master_running()
         probe = _command_payload(conn.probe()) if master else None
-        return {"ok": True, "locked": locked, "master_running": master, "probe": probe}
+        return {
+            "ok": True,
+            "locked": locked,
+            "lock_file": str(active_lock) if active_lock is not None else None,
+            "master_running": master,
+            "probe": probe,
+        }
 
     return await _run_tool(work)
 
