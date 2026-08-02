@@ -244,6 +244,7 @@ def test_start_master_noop_when_running(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
     result = conn.start_master(allow_new_login=False)
     assert result.ok and "already running" in result.stdout
+    assert result.argv == ["ssh", *conn.config.base_ssh_opts(), "-O", "check", "o2"]
 
 
 def test_start_master_can_open_the_transfer_alias(tmp_path):
@@ -271,6 +272,8 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
     assert runner.start_count == 1
     assert all(result.ok for result in results)
     assert sum("already running" in result.stdout for result in results) == 1
+    reused = next(result for result in results if "already running" in result.stdout)
+    assert reused.argv == ["ssh", *config.base_ssh_opts(), "-O", "check", "o2"]
 
 
 def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(tmp_path):
@@ -286,9 +289,11 @@ def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(tmp_
     )
     runner = RecordingRunner(master=False)
 
-    with pytest.raises(O2LoginCoordinationError):
+    with pytest.raises(O2LoginCoordinationError) as exc_info:
         O2Connection(config, runner=runner).start_master(allow_new_login=True)
 
+    assert "OS error:" in str(exc_info.value)
+    assert str(non_directory) in str(exc_info.value)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 

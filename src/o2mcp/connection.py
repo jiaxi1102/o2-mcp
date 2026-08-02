@@ -159,7 +159,7 @@ class O2Connection:
         except OSError as exc:
             raise O2LoginCoordinationError(
                 f"Cannot create the O2 login coordination lock at {lock_path}; "
-                "refusing to risk concurrent Duo prompts."
+                f"refusing to risk concurrent Duo prompts. OS error: {exc}"
             ) from exc
 
         try:
@@ -171,7 +171,7 @@ class O2Connection:
             lock_handle.close()
             raise O2LoginCoordinationError(
                 f"Cannot acquire the O2 login coordination lock at {lock_path}; "
-                "refusing to risk concurrent Duo prompts."
+                f"refusing to risk concurrent Duo prompts. OS error: {exc}"
             ) from exc
 
         try:
@@ -185,6 +185,11 @@ class O2Connection:
                 lock_handle.close()
 
     # -- ControlMaster lifecycle ------------------------------------------------
+    def _master_check_argv(self, alias: str) -> list[str]:
+        """Build the exact local-only SSH command used to probe a master socket."""
+
+        return ["ssh", *self.config.base_ssh_opts(), "-O", "check", alias]
+
     def master_running(self, alias: str | None = None) -> bool:
         """Return whether a reusable ControlMaster socket is alive for ``alias``.
 
@@ -194,8 +199,9 @@ class O2Connection:
         """
         if self.is_locked():
             return False
+        target = alias or self.config.host_alias
         result = self._runner(
-            ["ssh", *self.config.base_ssh_opts(), "-O", "check", alias or self.config.host_alias],
+            self._master_check_argv(target),
             self.config.connect_timeout + 5,
             None,
         )
@@ -267,7 +273,7 @@ class O2Connection:
         self._require_unlocked()
         target = alias or self.config.host_alias
         if self.master_running(target):
-            return CommandResult(["ssh", "-O", "check", target], 0, "master already running", "")
+            return CommandResult(self._master_check_argv(target), 0, "master already running", "")
         if not allow_new_login:
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{target}' and allow_new_login is False. "
@@ -281,7 +287,7 @@ class O2Connection:
             # is then allowed to execute the Duo-pushing command.
             self._require_unlocked()
             if self.master_running(target):
-                return CommandResult(["ssh", "-O", "check", target], 0, "master already running", "")
+                return CommandResult(self._master_check_argv(target), 0, "master already running", "")
             if self.config.require_vpn and not allow_offvpn:
                 self._require_on_vpn(target)
             return self._runner(
