@@ -60,6 +60,11 @@ class RecordingRunner:
             if self._start_persists:
                 self.master = True
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            # Config expansion is a local-only prerequisite, not the remote
+            # command under test. Model both values production code consumes.
+            out = f"hostname {argv[-1]}.example\ncontrolpath /tmp/{argv[-1]}-control.sock\n"
+            return CommandResult(list(argv), 0, out, "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
             return CommandResult(list(argv), rc, out, err)
@@ -71,7 +76,7 @@ class RecordingRunner:
         cmds = []
         for call in self.calls:
             argv = call["argv"]
-            if argv and argv[0] == "ssh" and "-O" not in argv and "-MNf" not in argv:
+            if argv and argv[0] == "ssh" and "-O" not in argv and "-MNf" not in argv and "-G" not in argv:
                 cmds.append(argv[-1])
         return cmds
 
@@ -271,11 +276,38 @@ def test_run_uses_reuse_only_authentication_and_alias(tmp_path):
     assert result.ok
     last = runner.calls[-1]["argv"]
     assert last[0] == "ssh"
-    assert last[1 : 1 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert last[:3] == ["ssh", "-S", "/tmp/o2-control.sock"]
+    assert last[3 : 3 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
     assert "PreferredAuthentications=none" in last
     assert "PubkeyAuthentication=no" in last
     assert last[-2] == "o2"
     assert last[-1] == "hostname; whoami"
+
+
+def test_run_pins_proxy_derived_control_path_before_disabling_proxy(tmp_path):
+    """ProxyJump-dependent ``%C`` sockets retain their original identity."""
+
+    class ProxyConfigRunner(RecordingRunner):
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if argv[:2] == ["ssh", "-G"]:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                return CommandResult(
+                    list(argv),
+                    0,
+                    "proxyjump bastion.example\ncontrolpath /tmp/cm-original-jump-hash\n",
+                    "",
+                )
+            return super().__call__(argv, timeout, input_text)
+
+    runner = ProxyConfigRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.run("hostname")
+
+    assert result.ok
+    command = runner.calls[-1]["argv"]
+    assert command[:3] == ["ssh", "-S", "/tmp/cm-original-jump-hash"]
+    assert "ProxyJump=none" in command and "ProxyCommand=none" in command
 
 
 def test_run_rejects_cold_connection_opt_out(tmp_path):
@@ -331,6 +363,27 @@ def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path)
     with pytest.raises(O2LoginCoordinationError, match="refusing another Duo-pushing login"):
         conn.start_master(allow_new_login=True)
     assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+
+
+def test_start_master_records_post_start_verification_timeout(tmp_path):
+    """A timed-out socket postcondition retains an actionable cooldown receipt."""
+
+    class VerificationTimeoutRunner(RecordingRunner):
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if "-O" in argv and "check" in argv and self.master:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return super().__call__(argv, timeout, input_text)
+
+    runner = VerificationTimeoutRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok is False and result.returncode == 255
+    assert "TimeoutExpired" in result.stderr
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["returncode"] == 255
 
 
 def test_start_master_noop_when_running(tmp_path):
@@ -665,7 +718,8 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
 
     conn.run_raw(["ssh", "o2", "hostname"])
     direct = runner.calls[-1]["argv"]
-    assert direct[1 : 1 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert direct[:3] == ["ssh", "-S", "/tmp/o2-control.sock"]
+    assert direct[3 : 3 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
 
     # A later raw ProxyJump request cannot win over the earlier command-line
     # `ProxyJump=none`. Otherwise the child proxy SSH could authenticate even
@@ -701,6 +755,16 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     ]
     assert all("PubkeyAuthentication=no" in transport for transport in transports)
     assert all("PreferredAuthentications=none" in transport for transport in transports)
+
+    conn.run_raw(["rsync", "-avze", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    clustered = runner.calls[-1]["argv"]
+    transport = clustered[clustered.index("-avze") + 1]
+    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
+
+    conn.run_raw(["rsync", "-avzessh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    attached = runner.calls[-1]["argv"]
+    transport = next(token[len("-avze") :] for token in attached if token.startswith("-avze"))
+    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
 
 
 def test_run_raw_rejects_non_ssh_remote_shell(tmp_path):
@@ -758,6 +822,8 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
@@ -772,6 +838,8 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     conn = O2Connection(_config(tmp_path), runner=runner)
@@ -849,6 +917,8 @@ def test_keepalive_clears_stale_master_on_timeout(tmp_path, monkeypatch):
             return CommandResult(list(argv), 0, "", "")  # local master process "running"
         if "-O" in argv and "exit" in argv:
             return CommandResult(list(argv), 0, "exit sent", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         if argv[-1] == "true":
             raise sp.TimeoutExpired(argv, timeout)  # connection dead -> ping stalls
         return CommandResult(list(argv), 0, "", "")

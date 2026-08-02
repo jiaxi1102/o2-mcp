@@ -56,9 +56,9 @@ class O2Sync:
     def __init__(self, connection: O2Connection) -> None:
         self.conn = connection
 
-    def _rsync_e_opt(self) -> str:
+    def _rsync_e_opt(self, alias: str) -> str:
         """Return the ``-e`` transport that can only reuse an existing master."""
-        return "ssh " + " ".join(self.conn.config.reuse_only_ssh_opts())
+        return self.conn.reuse_only_ssh_transport(alias)
 
     def _alias(self, transfer: bool) -> str:
         return self.conn.config.transfer_alias if transfer else self.conn.config.host_alias
@@ -124,12 +124,24 @@ class O2Sync:
         return self.conn.run_raw(argv, timeout=timeout, master_alias=self._alias(transfer))
 
     def _build_rsync(self, *, source: str, dest: str, extra_args: list[str] | None) -> list[str]:
+        alias = self._alias_from_remote(source, dest)
         return [
             "rsync",
             *_DEFAULT_RSYNC_ARGS,
             "-e",
-            self._rsync_e_opt(),
+            self._rsync_e_opt(alias),
             *(extra_args or []),
             source,
             dest,
         ]
+
+    def _alias_from_remote(self, source: str, dest: str) -> str:
+        """Return the configured alias embedded in one side of an rsync transfer."""
+
+        for alias in (self.conn.config.transfer_alias, self.conn.config.host_alias):
+            if source.startswith(f"{alias}:") or dest.startswith(f"{alias}:"):
+                return alias
+        # O2Sync always constructs one remote endpoint itself. Retain a safe
+        # login-alias default for programmatic callers that invoke this private
+        # builder directly with two local-looking paths.
+        return self.conn.config.host_alias

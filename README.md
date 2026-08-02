@@ -27,8 +27,9 @@ that key-based fallback can generate an unexpected Duo request. The MCP therefor
 keyboard-interactive, GSSAPI, and host-based authentication for every non-start operation.
 It also disables `ProxyJump` and `ProxyCommand`, because proxy SSH subprocesses would not
 inherit the outer client's authentication restrictions. Those options still permit reuse of
-an already-authenticated master, but make a missing or failed socket terminate locally instead
-of opening a replacement login.
+an already-authenticated master: the MCP first resolves the alias's original `ControlPath` and
+pins that expanded socket with `-S`, preserving `%C` paths whose hash includes a jump host.
+A missing or failed socket then terminates locally instead of opening a replacement login.
 
 The optional `o2-transfer` alias is a different host and therefore needs its own separately
 approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,

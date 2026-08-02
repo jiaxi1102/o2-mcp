@@ -52,6 +52,8 @@ class FakeRunner:
             if self._start_persists:
                 self.master = True
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
             return CommandResult(list(argv), rc, out, err)

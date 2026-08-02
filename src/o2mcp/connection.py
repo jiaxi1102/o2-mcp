@@ -111,6 +111,10 @@ class O2Connection:
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
         self._runner = runner
+        # Resolving ``ControlPath`` via ``ssh -G`` is local-only but not free.
+        # One connection object may build an rsync argv and then validate/run it,
+        # so cache each alias's expanded path for that short-lived operation.
+        self._control_paths: dict[str, str] = {}
 
     # -- safety -----------------------------------------------------------------
     def active_lock_file(self) -> Path | None:
@@ -436,6 +440,8 @@ class O2Connection:
                     # local verification failure is ambiguous, so the safest
                     # behavior is to suppress automatic retries for the normal
                     # cooldown window rather than risk another Duo prompt.
+                    with suppress(O2LoginCoordinationError):
+                        self._record_master_start_attempt(target, returncode=255)
                     detail = f"{type(exc).__name__}: {exc}"
                     return CommandResult(
                         # Report the step that failed. Keeping the verification
@@ -534,7 +540,7 @@ class O2Connection:
                 "commands cannot fall back to a new Duo-triggering SSH connection."
             )
         return self._runner(
-            ["ssh", *self.config.reuse_only_ssh_opts(), target, command],
+            [*self._reuse_only_ssh_prefix(target), target, command],
             timeout,
             input_text,
         )
@@ -556,7 +562,52 @@ class O2Connection:
                 return alias
         return None
 
-    def _reuse_only_ssh_command(self, command: str) -> str:
+    def _resolved_control_path(self, alias: str) -> str:
+        """Return the alias's original, fully expanded ControlPath.
+
+        Reuse-only commands disable ProxyJump/ProxyCommand so those helpers cannot
+        start independently authenticating SSH subprocesses. ``%C`` ControlPath
+        templates include the jump-host identity, however, so disabling the proxy
+        while letting SSH recompute the path would point at a different socket.
+        Resolve the path from the unmodified alias first and pin it with ``-S``.
+
+        ``ssh -G`` only expands local configuration; it does not open a network
+        connection. Failure or an absent ControlPath is nevertheless a hard stop,
+        because continuing would restore OpenSSH's ordinary cold-login fallback.
+        """
+        # Even config expansion is forbidden under the incident lock. Keeping
+        # this check here protects argv-only builders such as async rsync, which
+        # resolve the socket before their eventual subprocess launch.
+        self._require_unlocked()
+        cached = self._control_paths.get(alias)
+        if cached is not None:
+            return cached
+
+        result = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise O2UnsafeTransportError(f"Could not resolve ControlPath for '{alias}': {detail}")
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition(" ")
+            if separator and key.lower() == "controlpath" and value.strip().lower() != "none":
+                path = value.strip()
+                self._control_paths[alias] = path
+                return path
+        raise O2UnsafeTransportError(
+            f"SSH alias '{alias}' has no ControlPath; refusing an authentication-capable fallback."
+        )
+
+    def _reuse_only_ssh_prefix(self, alias: str) -> list[str]:
+        """Return ``ssh`` plus a pinned socket and fail-closed client options."""
+
+        return ["ssh", "-S", self._resolved_control_path(alias), *self.config.reuse_only_ssh_opts()]
+
+    def reuse_only_ssh_transport(self, alias: str) -> str:
+        """Return the shell-form SSH transport used by rsync ``-e``."""
+
+        return shlex.join(self._reuse_only_ssh_prefix(alias))
+
+    def _reuse_only_ssh_command(self, command: str, alias: str) -> str:
         """Harden an rsync ``-e`` transport so it cannot authenticate anew.
 
         ``rsync`` receives its remote-shell transport as one shell-like string.
@@ -571,12 +622,12 @@ class O2Connection:
             raise O2UnsafeTransportError(f"Invalid rsync SSH transport: {exc}") from exc
         if not tokens or Path(tokens[0]).name != "ssh":
             raise O2UnsafeTransportError("O2 rsync transports must use ssh through the configured ControlMaster.")
-        safe = self.config.reuse_only_ssh_opts()
+        safe = self._reuse_only_ssh_prefix(alias)[1:]
         if tokens[1 : 1 + len(safe)] != safe:
             tokens = [tokens[0], *safe, *tokens[1:]]
         return shlex.join(tokens)
 
-    def _harden_raw_transport_argv(self, argv: list[str]) -> list[str]:
+    def _harden_raw_transport_argv(self, argv: list[str], alias: str) -> list[str]:
         """Return an SSH/rsync argv whose fallback path cannot authenticate.
 
         ``run_raw`` is intentionally limited to the two transport executables the
@@ -590,7 +641,7 @@ class O2Connection:
         hardened = list(argv)
         executable = Path(hardened[0]).name
         if executable == "ssh":
-            safe = self.config.reuse_only_ssh_opts()
+            safe = self._reuse_only_ssh_prefix(alias)[1:]
             if hardened[1 : 1 + len(safe)] != safe:
                 hardened[1:1] = safe
             return hardened
@@ -604,27 +655,45 @@ class O2Connection:
         index = 1
         while index < len(hardened):
             token = hardened[index]
+            if token == "--":
+                # Everything after rsync's option terminator is a path, even if
+                # it begins with ``-e``; never rewrite user data as transport
+                # configuration.
+                break
             if token in {"-e", "--rsh"}:
                 if index + 1 >= len(hardened):
                     raise O2UnsafeTransportError(f"{token} requires an SSH transport argument.")
-                hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1])
+                hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1], alias)
                 found_transport = True
                 index += 2
                 continue
             if token.startswith("--rsh="):
                 transport = token.split("=", 1)[1]
-                hardened[index] = "--rsh=" + self._reuse_only_ssh_command(transport)
+                hardened[index] = "--rsh=" + self._reuse_only_ssh_command(transport, alias)
                 found_transport = True
-            elif token.startswith("-e") and token != "-e":
-                # rsync accepts the compact ``-essh`` spelling. Harden it too;
-                # otherwise a later compact option could override an earlier safe
-                # ``-e`` transport depending on rsync's option precedence.
-                hardened[index] = "-e" + self._reuse_only_ssh_command(token[2:])
-                found_transport = True
+            elif token.startswith("-") and not token.startswith("--"):
+                # Rsync permits clustered short options. If ``e`` is present it
+                # consumes either the remainder of this token (``-avzessh``) or
+                # the next token (``-avze ssh``). Normalize both forms; merely
+                # inserting an earlier safe ``-e`` is insufficient because rsync
+                # uses the later cluster's remote shell.
+                cluster = token[1:]
+                if "e" in cluster:
+                    option_index = cluster.index("e")
+                    attached_transport = cluster[option_index + 1 :]
+                    prefix = token[: option_index + 2]
+                    if attached_transport:
+                        hardened[index] = prefix + self._reuse_only_ssh_command(attached_transport, alias)
+                    else:
+                        if index + 1 >= len(hardened):
+                            raise O2UnsafeTransportError(f"{token} requires an SSH transport argument.")
+                        hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1], alias)
+                        index += 1
+                    found_transport = True
             index += 1
 
         if not found_transport:
-            hardened[1:1] = ["-e", self._reuse_only_ssh_command("ssh")]
+            hardened[1:1] = ["-e", self._reuse_only_ssh_command("ssh", alias)]
         return hardened
 
     def run_raw(
@@ -656,8 +725,9 @@ class O2Connection:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
             )
-        hardened = self._harden_raw_transport_argv(argv)
-        effective_alias = master_alias if master_alias is not None else self._target_alias_from_argv(hardened)
+        effective_alias = master_alias if master_alias is not None else self._target_alias_from_argv(argv)
+        target = effective_alias or self.config.host_alias
+        hardened = self._harden_raw_transport_argv(argv, target)
         if not self.master_running(effective_alias):
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{effective_alias or self.config.host_alias}'; refusing a raw "

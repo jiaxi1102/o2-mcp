@@ -72,6 +72,8 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
     def runner(argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if master else 255, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     return O2Connection(cfg, runner=runner)

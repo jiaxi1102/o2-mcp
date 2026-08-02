@@ -30,6 +30,8 @@ class _Runner:
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:  # master is up
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")  # registry read etc. -> empty/ok
 
 

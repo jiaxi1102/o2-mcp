@@ -48,6 +48,8 @@ class _Runner:
         self.calls.append({"argv": list(argv), "input": input_text})
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
             return CommandResult(list(argv), rc, out, err)
@@ -200,7 +202,8 @@ def test_live_transition_uses_reuse_only_transfer_master(tmp_path):
     assert plan.started is True and plan.pid == "4321"
     transfer_launch = next(call["argv"] for call in runner.calls if call["argv"][-1].startswith("nohup bash "))
     assert transfer_launch[-2] == "o2-transfer"
-    assert transfer_launch[1 : 1 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
+    assert transfer_launch[:3] == ["ssh", "-S", "/tmp/o2-transfer-control.sock"]
+    assert transfer_launch[3 : 3 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
 
 
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
