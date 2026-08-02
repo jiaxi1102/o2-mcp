@@ -111,9 +111,10 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   requires explicit opt-in (`allow_new_login`).
 - The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;
   the legacy current-project lock remains an additional hard stop for safe upgrades.
-- A file mutex beside the safety lock serializes new login and transfer-master starts across
-  MCP processes; after waiting, each contender rechecks the socket and becomes a no-op when
-  another task already established it.
+- A fixed user-level file mutex serializes new login and transfer-master starts across MCP
+  processes, even when upgraded configurations retain different legacy safety-lock paths;
+  after waiting, each contender rechecks the socket and becomes a no-op when another task
+  already established it.
 - Destructive/transfer-node operations default to dry-run where applicable and verify before
   freeing scratch.
 

@@ -29,6 +29,13 @@ from o2mcp import (
 from o2mcp import keepalive as o2keepalive
 
 
+@pytest.fixture(autouse=True)
+def isolate_user_level_o2_files(monkeypatch, tmp_path):
+    """Keep global-lock and login-mutex tests out of the developer's real home."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "test-home"))
+
+
 class RecordingRunner:
     """A fake subprocess runner: records calls, answers via a response function."""
 
@@ -260,11 +267,14 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
 
 
 def test_concurrent_master_starts_execute_one_login(tmp_path):
-    """Concurrent task processes must not each trigger an O2/Duo login."""
+    """Even legacy project configs must share one O2/Duo login mutex."""
 
     runner = ConcurrentStartRunner()
-    config = _config(tmp_path)
-    connections = [O2Connection(config, runner=runner) for _ in range(2)]
+    configs = [
+        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        for project in ("clock-project", "diffusion-project")
+    ]
+    connections = [O2Connection(config, runner=runner) for config in configs]
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda conn: conn.start_master(allow_new_login=True), connections))
@@ -273,24 +283,24 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
     assert all(result.ok for result in results)
     assert sum("already running" in result.stdout for result in results) == 1
     reused = next(result for result in results if "already running" in result.stdout)
-    assert reused.argv == ["ssh", *config.base_ssh_opts(), "-O", "check", "o2"]
+    assert reused.argv == ["ssh", *configs[0].base_ssh_opts(), "-O", "check", "o2"]
+
+    mutex_paths = {conn._master_start_lock_file() for conn in connections}
+    assert mutex_paths == {tmp_path / "test-home" / ".agent_locks" / "O2_LOGIN_START.lock"}
 
 
-def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(tmp_path):
+def test_master_start_fails_closed_when_coordination_lock_cannot_be_created(monkeypatch, tmp_path):
     """A broken mutex location must never fall back to an uncoordinated login."""
 
     non_directory = tmp_path / "not-a-directory"
     non_directory.write_text("occupied")
-    config = O2Config(
-        host_alias="o2",
-        transfer_alias="o2-transfer",
-        connect_timeout=20,
-        lock_file=non_directory / "O2_DISABLED",
-    )
+    config = _config(tmp_path)
     runner = RecordingRunner(master=False)
+    conn = O2Connection(config, runner=runner)
+    monkeypatch.setattr(conn, "_master_start_lock_file", lambda: non_directory / "O2_LOGIN_START.lock")
 
     with pytest.raises(O2LoginCoordinationError) as exc_info:
-        O2Connection(config, runner=runner).start_master(allow_new_login=True)
+        conn.start_master(allow_new_login=True)
 
     assert "OS error:" in str(exc_info.value)
     assert str(non_directory) in str(exc_info.value)

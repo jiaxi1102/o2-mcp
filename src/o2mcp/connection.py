@@ -132,12 +132,13 @@ class O2Connection:
 
         The mutex is deliberately shared by the login and transfer aliases.
         Those aliases use different SSH sockets, but both can trigger Duo; one
-        workstation must never attempt both authentications concurrently. The
-        file sits beside the configured emergency lock so all clients that share
-        the safety boundary also share the login boundary.
+        workstation must never attempt both authentications concurrently. Its
+        path is deliberately independent of ``O2_SSH_LOCK_FILE``: upgraded MCP
+        registrations may still name different legacy project locks, but every
+        process for this user must converge on one login-coordination boundary.
         """
 
-        return self.config.lock_file.with_name("O2_LOGIN_START.lock")
+        return Path.home() / ".agent_locks" / "O2_LOGIN_START.lock"
 
     @contextmanager
     def _serialized_master_start(self) -> Iterator[None]:
