@@ -270,6 +270,7 @@ def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path)
 
     assert result.ok is False
     assert result.returncode == 255
+    assert result.argv == conn._master_check_argv("o2")
     assert "post-start control-socket check failed" in result.stderr
     assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
 

@@ -432,7 +432,11 @@ class O2Connection:
                     # cooldown window rather than risk another Duo prompt.
                     detail = f"{type(exc).__name__}: {exc}"
                     return CommandResult(
-                        argv=result.argv,
+                        # Report the step that failed. Keeping the verification
+                        # command paired with its synthetic SSH failure code
+                        # makes CommandResult internally consistent while the
+                        # diagnostic below preserves output from the start step.
+                        argv=self._master_check_argv(target),
                         returncode=255,
                         stdout=result.stdout,
                         stderr=self._master_verification_error(target, detail, result.stderr),
@@ -449,7 +453,7 @@ class O2Connection:
                         self._record_master_start_attempt(target, returncode=verification.returncode)
                     detail = verification.stderr.strip() or verification.stdout.strip() or "no SSH diagnostics"
                     return CommandResult(
-                        argv=result.argv,
+                        argv=verification.argv,
                         returncode=verification.returncode or 255,
                         stdout=result.stdout,
                         stderr=self._master_verification_error(target, detail, result.stderr),
