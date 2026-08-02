@@ -104,6 +104,9 @@ def test_push_async_launches_detached_with_escaped_remote(tmp_path):
     rsync_argv = wrapped[5:]
     assert rsync_argv == O2Sync(_conn(tmp_path)).push_argv("/local/Human", remote)
     assert rsync_argv[0] == "rsync"
+    transport = rsync_argv[rsync_argv.index("-e") + 1]
+    assert "PreferredAuthentications=none" in transport
+    assert "PubkeyAuthentication=no" in transport
     assert rsync_argv[-1] == "o2:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
 
     # metadata persisted (the schema status() reads); argv stored is the rsync argv, not the wrapper.

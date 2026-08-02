@@ -174,6 +174,35 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
 
 
+def test_live_transition_uses_reuse_only_transfer_master(tmp_path):
+    """A detached promotion launch cannot cold-connect to the transfer node."""
+
+    manifest_json = (
+        '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
+        '"created_utc":"20260101T000000Z","status":"active","datasets":["d"]}'
+    )
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest_json, "", 0)
+        if command.startswith("nohup bash "):
+            return ("PID 4321\n", "", 0)
+        return ("", "", 0)
+
+    runner = _Runner(responder)
+    config = _cfg(tmp_path)
+    runs = O2Runs(O2Connection(config, runner=runner), TEST_POLICY)
+    run_dir = "/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"
+
+    plan = runs.promote(run_dir, dry_run=False)
+
+    assert plan.started is True and plan.pid == "4321"
+    transfer_launch = next(call["argv"] for call in runner.calls if call["argv"][-1].startswith("nohup bash "))
+    assert transfer_launch[-2] == "o2-transfer"
+    assert transfer_launch[1 : 1 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
+
+
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
     sentinel = RunManifest(
         run_id="RUN_20260101T000000Z_camp__v1",

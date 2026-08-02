@@ -351,6 +351,9 @@ async def test_push_async_returns_transfer_id_without_blocking(monkeypatch, tmp_
     assert payload["pid"] == 4321
     # launched the detached bash-wrapped rsync, with the remote path escaped.
     assert launched and launched[0][0] == "bash"
+    transport = launched[0][launched[0].index("-e") + 1]
+    assert "PreferredAuthentications=none" in transport
+    assert "PubkeyAuthentication=no" in transport
     assert launched[0][-1] == "o2:" + remote.replace(" ", "\\ ")
 
 

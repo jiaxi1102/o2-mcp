@@ -5,8 +5,9 @@ exactly, but is testable and composable:
 
 - The user-level ``~/.agent_locks/O2_DISABLED`` lock and legacy project lock are
   hard stops on every operation.
-- All SSH uses BatchMode (public key only) — a dead master or missing key fails
-  fast instead of triggering a Duo/MFA phone prompt.
+- Only ``start_master`` can authenticate. Every other SSH/rsync subprocess has
+  all authentication methods disabled, so OpenSSH cannot silently replace a
+  missing multiplexed connection with a Duo-triggering standalone login.
 - Remote commands run only through an already-established ControlMaster socket;
   opening a NEW login requires an explicit opt-in (one approved MFA verification).
 
@@ -20,6 +21,7 @@ import fcntl
 import json
 import math
 import os
+import shlex
 import subprocess
 import time
 from collections.abc import Iterator
@@ -45,6 +47,10 @@ class O2OffVpnError(RuntimeError):
 
 class O2LoginCoordinationError(RuntimeError):
     """Raised when a new O2 login cannot be serialized safely across processes."""
+
+
+class O2UnsafeTransportError(RuntimeError):
+    """Raised when a caller requests a transport that could authenticate anew."""
 
 
 @dataclass
@@ -500,21 +506,35 @@ class O2Connection:
         timeout: float | None = 120.0,
         require_master: bool = True,
         input_text: str | None = None,
+        alias: str | None = None,
     ) -> CommandResult:
-        """Run a remote shell command over the existing ControlMaster.
+        """Run a remote shell command over an existing ControlMaster only.
 
-        By default this refuses unless a master is already running, so accidental
-        polling loops fail fast rather than spawning new O2 logins. ``input_text``
-        is piped to the remote command's stdin (used to stage scripts remotely).
+        ``alias`` defaults to the login host and may name the separately approved
+        transfer master. The historical ``require_master`` parameter remains for
+        source compatibility, but passing ``False`` is now rejected: a cold SSH
+        connection is never a safe fallback for an O2 MCP operation.
+
+        The socket check is intentionally paired with authentication-disabled SSH
+        options. A check alone has a race: the master can die before this second
+        subprocess starts, and OpenSSH would normally authenticate a new standalone
+        connection. With every authentication method disabled, that race fails
+        closed without generating a Duo request. ``input_text`` is piped to the
+        remote command's stdin when staging scripts or other small payloads.
         """
         self._require_unlocked()
-        if require_master and not self.master_running():
+        if not require_master:
+            raise O2UnsafeTransportError(
+                "Cold O2 SSH execution is disabled. Start one explicitly authorized ControlMaster, then retry."
+            )
+        target = alias or self.config.host_alias
+        if not self.master_running(target):
             raise O2MasterUnavailableError(
-                "No O2 ControlMaster is running. Start one first (start_master with allow_new_login=True, "
-                "or the local Terminal/tmux bridge) so commands reuse a single authenticated connection."
+                f"No O2 ControlMaster is running for '{target}'. Start one explicitly, then retry; ordinary "
+                "commands cannot fall back to a new Duo-triggering SSH connection."
             )
         return self._runner(
-            ["ssh", *self.config.base_ssh_opts(), self.config.host_alias, command],
+            ["ssh", *self.config.reuse_only_ssh_opts(), target, command],
             timeout,
             input_text,
         )
@@ -536,6 +556,77 @@ class O2Connection:
                 return alias
         return None
 
+    def _reuse_only_ssh_command(self, command: str) -> str:
+        """Harden an rsync ``-e`` transport so it cannot authenticate anew.
+
+        ``rsync`` receives its remote-shell transport as one shell-like string.
+        We parse that string, require SSH (rather than an arbitrary executable),
+        and prepend the reuse-only options before caller-provided options. OpenSSH
+        keeps the first value supplied for an option, so an unsafe later override
+        cannot re-enable authentication.
+        """
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            raise O2UnsafeTransportError(f"Invalid rsync SSH transport: {exc}") from exc
+        if not tokens or Path(tokens[0]).name != "ssh":
+            raise O2UnsafeTransportError("O2 rsync transports must use ssh through the configured ControlMaster.")
+        safe = self.config.reuse_only_ssh_opts()
+        if tokens[1 : 1 + len(safe)] != safe:
+            tokens = [tokens[0], *safe, *tokens[1:]]
+        return shlex.join(tokens)
+
+    def _harden_raw_transport_argv(self, argv: list[str]) -> list[str]:
+        """Return an SSH/rsync argv whose fallback path cannot authenticate.
+
+        ``run_raw`` is intentionally limited to the two transport executables the
+        package owns. Direct SSH gets the guard options prepended. Rsync receives
+        the same options through its ``-e``/``--rsh`` transport, including when a
+        library caller supplied an incomplete or permissive transport string.
+        """
+        if not argv:
+            raise O2UnsafeTransportError("Refusing an empty raw O2 transport command.")
+
+        hardened = list(argv)
+        executable = Path(hardened[0]).name
+        if executable == "ssh":
+            safe = self.config.reuse_only_ssh_opts()
+            if hardened[1 : 1 + len(safe)] != safe:
+                hardened[1:1] = safe
+            return hardened
+        if executable != "rsync":
+            raise O2UnsafeTransportError("run_raw accepts only ssh or rsync O2 transports.")
+
+        # An explicit rsync remote shell overrides RSYNC_RSH and the user's
+        # environment. Normalize every supported spelling so detached and
+        # synchronous transfers share the same fail-closed transport contract.
+        found_transport = False
+        index = 1
+        while index < len(hardened):
+            token = hardened[index]
+            if token in {"-e", "--rsh"}:
+                if index + 1 >= len(hardened):
+                    raise O2UnsafeTransportError(f"{token} requires an SSH transport argument.")
+                hardened[index + 1] = self._reuse_only_ssh_command(hardened[index + 1])
+                found_transport = True
+                index += 2
+                continue
+            if token.startswith("--rsh="):
+                transport = token.split("=", 1)[1]
+                hardened[index] = "--rsh=" + self._reuse_only_ssh_command(transport)
+                found_transport = True
+            elif token.startswith("-e") and token != "-e":
+                # rsync accepts the compact ``-essh`` spelling. Harden it too;
+                # otherwise a later compact option could override an earlier safe
+                # ``-e`` transport depending on rsync's option precedence.
+                hardened[index] = "-e" + self._reuse_only_ssh_command(token[2:])
+                found_transport = True
+            index += 1
+
+        if not found_transport:
+            hardened[1:1] = ["-e", self._reuse_only_ssh_command("ssh")]
+        return hardened
+
     def run_raw(
         self,
         argv: list[str],
@@ -544,28 +635,34 @@ class O2Connection:
         require_master: bool = True,
         master_alias: str | None = None,
     ) -> CommandResult:
-        """Run a local command (e.g. rsync) after the safety-lock + master checks.
+        """Run a fail-closed SSH/rsync transport after lock and master checks.
 
         rsync opens its own ssh via ``-e`` and is meant to reuse the existing
         ControlMaster socket from the SSH config. By default this refuses unless a
-        master is already running, so a transfer can never silently open a fresh
-        connection — which on O2 means an out-of-band Duo push (a brand-new MFA
-        login) outside the one approved master. The guard verifies the master for
+        master is already running. The transport is also rewritten with every SSH
+        authentication method disabled; this closes the check/use race where a
+        dying socket could otherwise make OpenSSH fall back to a brand-new MFA
+        login. The guard verifies the master for
         the alias the command actually targets: ``master_alias`` if given, else the
         alias inferred from ``argv`` (an ``<alias>:path`` rsync target or a bare
         ``<alias>`` ssh host), else the login alias. So a transfer-node transfer
         (``o2-transfer``) is never validated against the login master even when the
         caller forgets to pass ``master_alias``. Like :meth:`run`, the local lock is
-        honored first. Pass ``require_master=False`` only for a transport that
-        deliberately tolerates a cold connection.
+        honored first. ``require_master=False`` is retained only to give existing
+        callers an actionable error; cold transports are no longer supported.
         """
         self._require_unlocked()
-        effective_alias = master_alias if master_alias is not None else self._target_alias_from_argv(argv)
-        if require_master and not self.master_running(effective_alias):
+        if not require_master:
+            raise O2UnsafeTransportError(
+                "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
+            )
+        hardened = self._harden_raw_transport_argv(argv)
+        effective_alias = master_alias if master_alias is not None else self._target_alias_from_argv(hardened)
+        if not self.master_running(effective_alias):
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{effective_alias or self.config.host_alias}'; refusing a raw "
                 "transport (rsync/ssh) that would open a fresh Duo-pushing login. Start one first (start_master "
                 "with allow_new_login=True, or the local Terminal/tmux bridge) so transfers reuse the single "
                 "authenticated connection."
             )
-        return self._runner(list(argv), timeout, None)
+        return self._runner(hardened, timeout, None)

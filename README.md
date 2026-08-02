@@ -20,6 +20,14 @@ ControlMaster session**:
    **ControlMaster** (stays up ~8h via `ControlPersist`).
 2. Every other tool reuses that master and costs **no** additional push.
 
+Ordinary commands and transfers are authentication-disabled on purpose. OpenSSH normally
+falls back to a standalone connection when a configured control socket disappears; on O2,
+that key-based fallback can generate an unexpected Duo request. The MCP therefore passes
+`ControlMaster=no`, `PreferredAuthentications=none`, and disables public-key, password,
+keyboard-interactive, GSSAPI, and host-based authentication for every non-start operation.
+Those options still permit reuse of an already-authenticated master, but make a missing or
+failed socket terminate locally instead of opening a replacement login.
+
 The optional `o2-transfer` alias is a different host and therefore needs its own separately
 approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
 but it does not pretend those two distinct O2 authentications are one session.
@@ -111,10 +119,12 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 
 ## Safety contract
 
-- All SSH uses `BatchMode=yes` (public key only) — a dead master or missing key fails fast
-  instead of triggering an interactive MFA prompt.
-- Remote commands run only through an already-established ControlMaster; opening a new login
-  requires explicit opt-in (`allow_new_login`).
+- Only `o2_start_master` is permitted to authenticate, and it requires explicit opt-in
+  (`allow_new_login`). Remote commands, synchronous transfers, detached transfers, and
+  transfer-node lifecycle launches disable every SSH authentication method, so OpenSSH's
+  normal missing-socket fallback cannot generate a new Duo request.
+- The library retains its historical `require_master` parameters for source compatibility,
+  but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;
   the legacy current-project lock remains an additional hard stop for safe upgrades.
 - A fixed user-level file mutex serializes new login and transfer-master starts across MCP

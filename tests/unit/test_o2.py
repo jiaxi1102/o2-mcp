@@ -26,6 +26,7 @@ from o2mcp import (
     O2OffVpnError,
     O2Slurm,
     O2Sync,
+    O2UnsafeTransportError,
     default_runner,
 )
 from o2mcp import keepalive as o2keepalive
@@ -141,6 +142,28 @@ def test_explicit_lock_path_still_overrides_global_default(monkeypatch, tmp_path
     assert O2Config().lock_file == explicit
 
 
+def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
+    """Ordinary commands must be unable to authenticate if multiplexing fails."""
+
+    opts = _config(tmp_path).reuse_only_ssh_opts()
+    option_values = {opts[index + 1] for index, token in enumerate(opts[:-1]) if token == "-o"}
+
+    # BatchMode alone is insufficient on O2 because successful key authentication
+    # can itself trigger Duo. Disabling the key and every alternate authentication
+    # mechanism ensures a missing socket produces a local SSH failure, not a login.
+    assert {
+        "ControlMaster=no",
+        "ConnectionAttempts=1",
+        "PreferredAuthentications=none",
+        "PubkeyAuthentication=no",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "GSSAPIAuthentication=no",
+        "HostbasedAuthentication=no",
+        "NumberOfPasswordPrompts=0",
+    } <= option_values
+
+
 # --- subprocess stdio isolation ---------------------------------------------
 def test_default_runner_uses_devnull_without_input(monkeypatch):
     """A child command must never inherit the stdio MCP server's JSON-RPC input."""
@@ -231,21 +254,38 @@ def test_run_raw_requires_master(tmp_path):
     assert conn.master_running() is False
     with pytest.raises(O2MasterUnavailableError):
         conn.run_raw(["rsync", "x", "y"])
-    # An explicit opt-out is still honored for a deliberately-cold transport.
-    conn.run_raw(["rsync", "x", "y"], require_master=False)
-    assert runner.calls[-1]["argv"][0] == "rsync"
+    # The former escape hatch is retained only as an explicit failure so an old
+    # caller cannot silently regain cold-connection behavior after upgrading.
+    calls_before_opt_out = len(runner.calls)
+    with pytest.raises(O2UnsafeTransportError, match="Cold O2 SSH/rsync execution is disabled"):
+        conn.run_raw(["rsync", "x", "y"], require_master=False)
+    assert len(runner.calls) == calls_before_opt_out
 
 
-def test_run_uses_batchmode_and_alias(tmp_path):
+def test_run_uses_reuse_only_authentication_and_alias(tmp_path):
     runner = RecordingRunner(master=True)
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.run("hostname; whoami")
     assert result.ok
     last = runner.calls[-1]["argv"]
     assert last[0] == "ssh"
-    assert "BatchMode=yes" in last
+    assert last[1 : 1 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert "PreferredAuthentications=none" in last
+    assert "PubkeyAuthentication=no" in last
     assert last[-2] == "o2"
     assert last[-1] == "hostname; whoami"
+
+
+def test_run_rejects_cold_connection_opt_out(tmp_path):
+    """No library caller may bypass the master-only contract."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="Cold O2 SSH execution is disabled"):
+        conn.run("hostname", require_master=False)
+
+    assert runner.calls == []
 
 
 def test_start_master_requires_opt_in(tmp_path):
@@ -256,7 +296,12 @@ def test_start_master_requires_opt_in(tmp_path):
     # Opt-in opens the master with -MNf.
     result = conn.start_master(allow_new_login=True)
     assert result.ok
-    assert any("-MNf" in call["argv"] for call in runner.calls)
+    starts = [call["argv"] for call in runner.calls if "-MNf" in call["argv"]]
+    assert len(starts) == 1
+    # The explicitly authorized start is the only path allowed to authenticate;
+    # reuse-only options would make creation of the initial master impossible.
+    assert "PubkeyAuthentication=no" not in starts[0]
+    assert "PreferredAuthentications=none" not in starts[0]
     assert runner.calls[-1]["argv"] == conn._master_check_argv("o2")
 
 
@@ -599,6 +644,8 @@ def test_push_pull_build_rsync(tmp_path):
     assert "-e" in argv
     e_opt = argv[argv.index("-e") + 1]
     assert e_opt.startswith("ssh ") and "BatchMode=yes" in e_opt
+    assert "PreferredAuthentications=none" in e_opt
+    assert "PubkeyAuthentication=no" in e_opt
     assert argv[-2] == "./local/run.sbatch"
     assert argv[-1] == "o2:/scratch/jobs/run.sbatch"
 
@@ -606,6 +653,48 @@ def test_push_pull_build_rsync(tmp_path):
     argv = runner.calls[-1]["argv"]
     assert argv[-2] == "o2-transfer:/scratch/out/results"
     assert argv[-1] == "./local/results"
+
+
+def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
+    """Library callers cannot smuggle an authentication-capable raw transport."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    conn.run_raw(["ssh", "o2", "hostname"])
+    direct = runner.calls[-1]["argv"]
+    assert direct[1 : 1 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+
+    conn.run_raw(["rsync", "-e", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    rsync = runner.calls[-1]["argv"]
+    transport = rsync[rsync.index("-e") + 1]
+    # The safe option is prepended, and OpenSSH honors the first command-line
+    # value, so the caller's later attempt to re-enable keys is ineffective.
+    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
+    assert "PreferredAuthentications=none" in transport
+
+    # Every remote-shell option is normalized, not just the first. This prevents
+    # a later compact/long-form override from restoring a cold-login path.
+    conn.run_raw(["rsync", "-e", "ssh", "-essh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    rsync = runner.calls[-1]["argv"]
+    transports = [
+        rsync[rsync.index("-e") + 1],
+        next(token[2:] for token in rsync if token.startswith("-e") and token != "-e"),
+    ]
+    assert all("PubkeyAuthentication=no" in transport for transport in transports)
+    assert all("PreferredAuthentications=none" in transport for transport in transports)
+
+
+def test_run_raw_rejects_non_ssh_remote_shell(tmp_path):
+    """An arbitrary rsync remote shell would bypass the ControlMaster contract."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="must use ssh"):
+        conn.run_raw(["rsync", "-e", "custom-rsh", "x", "o2:/p"])
+
+    assert runner.calls == []
 
 
 def test_remote_path_with_spaces_is_escaped(tmp_path):

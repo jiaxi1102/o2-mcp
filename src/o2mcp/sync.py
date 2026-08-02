@@ -1,10 +1,11 @@
 """File transfer to/from O2 via rsync over the existing SSH connection.
 
 rsync reuses the ControlMaster configured in the SSH config (so no extra login),
-and the ``-e`` transport is pinned to BatchMode so a missing key fails fast
-instead of prompting for Duo. Large transfers can opt into the dedicated O2
-transfer node; by default we reuse the login alias to keep to a single
-authenticated connection.
+and the ``-e`` transport disables every authentication method. This is stronger
+than BatchMode alone: if the master disappears after the local socket check,
+OpenSSH cannot fall back to a fresh key-based connection that triggers Duo.
+Large transfers can opt into the dedicated O2 transfer node; by default we reuse
+the login alias to keep to a single authenticated connection.
 
 Remote paths are backslash-escaped for the remote shell. rsync hands the
 post-colon path to a *remote* shell, which otherwise word-splits a path
@@ -56,8 +57,8 @@ class O2Sync:
         self.conn = connection
 
     def _rsync_e_opt(self) -> str:
-        """The ``-e`` ssh transport string enforcing batch mode."""
-        return "ssh " + " ".join(self.conn.config.base_ssh_opts())
+        """Return the ``-e`` transport that can only reuse an existing master."""
+        return "ssh " + " ".join(self.conn.config.reuse_only_ssh_opts())
 
     def _alias(self, transfer: bool) -> str:
         return self.conn.config.transfer_alias if transfer else self.conn.config.host_alias

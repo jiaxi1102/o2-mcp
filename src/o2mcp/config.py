@@ -96,11 +96,13 @@ class O2Config:
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
 
     def base_ssh_opts(self) -> list[str]:
-        """SSH options enforcing public-key/batch mode (never password or Duo).
+        """Return baseline SSH options shared by login and reuse operations.
 
-        These match the project's SSH-config contract: batch mode, no TTY, no
-        keyboard-interactive fallback, so a missing key or dead master fails fast
-        instead of triggering an interactive MFA prompt.
+        These options make subprocesses non-interactive, but they intentionally do
+        not disable public-key authentication: :meth:`O2Connection.start_master`
+        needs public-key authentication for the one explicitly authorized login.
+        Ordinary commands and transfers must use :meth:`reuse_only_ssh_opts`
+        instead so a missing ControlMaster cannot fall back to a fresh connection.
         """
         return [
             "-o",
@@ -109,4 +111,41 @@ class O2Config:
             "RequestTTY=no",
             "-o",
             f"ConnectTimeout={self.connect_timeout}",
+        ]
+
+    def reuse_only_ssh_opts(self) -> list[str]:
+        """Return SSH options that can reuse a master but cannot authenticate anew.
+
+        OpenSSH multiplex clients normally fall back to a standalone connection
+        when ``ControlPath`` is missing or stops listening. On HMS O2 that fallback
+        is unsafe because even a key-based connection can trigger an automatic Duo
+        request. These command-line options leave multiplexing enabled as a client
+        (``ControlMaster=no`` still reuses an existing configured socket) while
+        disabling every authentication method that could establish a new session.
+
+        The options are passed on the command line so they take precedence over a
+        permissive user SSH config. If the master disappears between the explicit
+        socket check and command execution, SSH therefore fails with authentication
+        disabled rather than contacting Duo.
+        """
+        return [
+            *self.base_ssh_opts(),
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "PreferredAuthentications=none",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "GSSAPIAuthentication=no",
+            "-o",
+            "HostbasedAuthentication=no",
+            "-o",
+            "NumberOfPasswordPrompts=0",
         ]

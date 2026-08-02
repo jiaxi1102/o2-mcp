@@ -51,6 +51,7 @@ from o2mcp import (
     O2MasterUnavailableError,
     O2OffVpnError,
     O2Slurm,
+    O2UnsafeTransportError,
     O2Workspace,
     transfer_tools,
 )
@@ -89,6 +90,8 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
     except O2LoginCoordinationError as exc:
         payload = {"ok": False, "error": "login_coordination_failed", "message": str(exc)}
+    except O2UnsafeTransportError as exc:
+        payload = {"ok": False, "error": "unsafe_transport", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
         payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
     return json.dumps(payload, indent=2)

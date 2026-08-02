@@ -435,11 +435,11 @@ class O2Runs:
                 run_id, action, script, started=False, message=stage.stderr.strip() or "staging failed"
             )
         launch = f"nohup bash {shlex.quote(script_path)} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo PID $!"
-        argv = ["ssh", *self.conn.config.base_ssh_opts(), self.conn.config.transfer_alias, launch]
-        # This raw ssh targets the transfer node, so verify the transfer master
-        # (not the login master) — otherwise a down transfer master would let ssh
-        # open a fresh Duo-pushing login here.
-        res = self.conn.run_raw(argv, timeout=60, master_alias=self.conn.config.transfer_alias)
+        # Reuse the transfer master through the same authentication-disabled path
+        # as ordinary commands. Centralizing argv construction in O2Connection
+        # prevents this detached lifecycle operation from becoming an accidental
+        # cold-login escape hatch.
+        res = self.conn.run(launch, timeout=60, alias=self.conn.config.transfer_alias)
         pid = ""
         for token in res.stdout.split():
             if token.isdigit():
