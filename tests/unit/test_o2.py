@@ -154,6 +154,8 @@ def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_pat
     assert {
         "ControlMaster=no",
         "ConnectionAttempts=1",
+        "ProxyCommand=none",
+        "ProxyJump=none",
         "PreferredAuthentications=none",
         "PubkeyAuthentication=no",
         "PasswordAuthentication=no",
@@ -665,13 +667,29 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     direct = runner.calls[-1]["argv"]
     assert direct[1 : 1 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
 
-    conn.run_raw(["rsync", "-e", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    # A later raw ProxyJump request cannot win over the earlier command-line
+    # `ProxyJump=none`. Otherwise the child proxy SSH could authenticate even
+    # though the outer O2 client has every authentication method disabled.
+    conn.run_raw(["ssh", "-J", "proxy.example", "o2", "hostname"])
+    direct = runner.calls[-1]["argv"]
+    assert direct.index("ProxyJump=none") < direct.index("-J")
+
+    conn.run_raw(
+        [
+            "rsync",
+            "-e",
+            "ssh -o PubkeyAuthentication=yes -o ProxyCommand='ssh proxy.example'",
+            "x",
+            "o2:/p",
+        ]
+    )
     rsync = runner.calls[-1]["argv"]
     transport = rsync[rsync.index("-e") + 1]
     # The safe option is prepended, and OpenSSH honors the first command-line
     # value, so the caller's later attempt to re-enable keys is ineffective.
     assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
     assert "PreferredAuthentications=none" in transport
+    assert transport.index("ProxyCommand=none") < transport.index("ProxyCommand=ssh proxy.example")
 
     # Every remote-shell option is normalized, not just the first. This prevents
     # a later compact/long-form override from restoring a cold-login path.

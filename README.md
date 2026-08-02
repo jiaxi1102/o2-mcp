@@ -25,8 +25,10 @@ falls back to a standalone connection when a configured control socket disappear
 that key-based fallback can generate an unexpected Duo request. The MCP therefore passes
 `ControlMaster=no`, `PreferredAuthentications=none`, and disables public-key, password,
 keyboard-interactive, GSSAPI, and host-based authentication for every non-start operation.
-Those options still permit reuse of an already-authenticated master, but make a missing or
-failed socket terminate locally instead of opening a replacement login.
+It also disables `ProxyJump` and `ProxyCommand`, because proxy SSH subprocesses would not
+inherit the outer client's authentication restrictions. Those options still permit reuse of
+an already-authenticated master, but make a missing or failed socket terminate locally instead
+of opening a replacement login.
 
 The optional `o2-transfer` alias is a different host and therefore needs its own separately
 approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
@@ -122,7 +124,8 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 - Only `o2_start_master` is permitted to authenticate, and it requires explicit opt-in
   (`allow_new_login`). Remote commands, synchronous transfers, detached transfers, and
   transfer-node lifecycle launches disable every SSH authentication method, so OpenSSH's
-  normal missing-socket fallback cannot generate a new Duo request.
+  normal missing-socket fallback cannot generate a new Duo request. Reuse-only operations
+  also disable SSH proxy subprocesses, which otherwise have independent authentication.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;

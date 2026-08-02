@@ -120,8 +120,11 @@ class O2Config:
         when ``ControlPath`` is missing or stops listening. On HMS O2 that fallback
         is unsafe because even a key-based connection can trigger an automatic Duo
         request. These command-line options leave multiplexing enabled as a client
-        (``ControlMaster=no`` still reuses an existing configured socket) while
-        disabling every authentication method that could establish a new session.
+        (OpenSSH documents ``ControlMaster=no`` clients as able to reuse an existing
+        configured socket) while disabling every authentication method that could
+        establish a new session. ProxyJump and ProxyCommand are also disabled: an
+        SSH proxy is a separate subprocess whose authentication settings would not
+        inherit the outer client's fail-closed restrictions.
 
         The options are passed on the command line so they take precedence over a
         permissive user SSH config. If the master disappears between the explicit
@@ -134,6 +137,10 @@ class O2Config:
             "ControlMaster=no",
             "-o",
             "ConnectionAttempts=1",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
             "-o",
             "PreferredAuthentications=none",
             "-o",
