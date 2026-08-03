@@ -28,6 +28,15 @@ def _default_lock_file() -> Path:
     return Path.home() / ".agent_locks" / "O2_DISABLED"
 
 
+def _default_ssh_config_file() -> Path:
+    """Return the user SSH config that defines the governed O2 aliases."""
+
+    configured = os.environ.get("O2_SSH_CONFIG_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".ssh" / "config"
+
+
 @dataclass
 class O2Config:
     """Connection settings for HMS O2.
@@ -44,6 +53,9 @@ class O2Config:
         ignore_lock: Mirror of ``O2_IGNORE_LOCAL_LOCK=1`` to bypass the lock.
         default_user: Username for ``squeue -u`` etc.; ``None`` resolves to ``$USER`` remotely.
         default_log_dir: Remote directory pattern where Slurm logs land.
+        ssh_config_file: User SSH config containing the O2 alias definitions.
+            The connection layer reads and flattens this file without executing
+            ``Match exec`` predicates before asking OpenSSH to expand a socket.
     """
 
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
@@ -85,15 +97,17 @@ class O2Config:
     # How many timestamped DB/registry snapshots to retain when pruning snapshot history.
     snapshot_keep: int = field(default_factory=lambda: int(os.environ.get("O2_SNAPSHOT_KEEP", "2")))
 
-    # VPN egress guard. Declared LAST so inserting it never shifts the positional argument
-    # order of the existing public fields for any caller that constructs O2Config positionally
-    # (the dataclass is not kw_only — that needs Python 3.10, but this core stays 3.9-safe).
+    # VPN egress guard. These settings were appended so they did not shift the
+    # positional order of the original public fields (the dataclass is not
+    # kw_only because this core stays Python 3.9-compatible). New fields continue
+    # to be appended below for the same compatibility reason.
     # Refuse to open a NEW O2 login unless the route to O2 egresses via a VPN tunnel interface
     # (prefix below): O2 autopushes Duo to any non-HMS source IP, so a login leaving via a
     # physical interface (en0) instead of the HMS VPN triggers a phone prompt. O2_REQUIRE_VPN=0
     # disables the guard; O2_VPN_IFACE_PREFIX overrides the expected tunnel-interface prefix.
     require_vpn: bool = field(default_factory=lambda: os.environ.get("O2_REQUIRE_VPN", "1") != "0")
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
+    ssh_config_file: Path = field(default_factory=_default_ssh_config_file)
 
     def base_ssh_opts(self) -> list[str]:
         """Return baseline SSH options shared by login and reuse operations.
@@ -124,7 +138,9 @@ class O2Config:
         configured socket) while disabling every authentication method that could
         establish a new session. ProxyJump and ProxyCommand are also disabled: an
         SSH proxy is a separate subprocess whose authentication settings would not
-        inherit the outer client's fail-closed restrictions.
+        inherit the outer client's fail-closed restrictions. LocalCommand and
+        KnownHostsCommand hooks are disabled for the same reason: neither may be
+        allowed to spawn an authentication-capable helper from a reuse-only call.
 
         The options are passed on the command line so they take precedence over a
         permissive user SSH config. If the master disappears between the explicit
@@ -141,6 +157,10 @@ class O2Config:
             "ProxyCommand=none",
             "-o",
             "ProxyJump=none",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "KnownHostsCommand=none",
             "-o",
             "PreferredAuthentications=none",
             "-o",

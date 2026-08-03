@@ -6,8 +6,9 @@ exactly, but is testable and composable:
 - The user-level ``~/.agent_locks/O2_DISABLED`` lock and legacy project lock are
   hard stops on every operation.
 - Only ``start_master`` can authenticate. Every other SSH/rsync subprocess has
-  all authentication methods disabled, so OpenSSH cannot silently replace a
-  missing multiplexed connection with a Duo-triggering standalone login.
+  all authentication methods disabled and uses an inspected, pinned socket with
+  live SSH config disabled, so OpenSSH cannot silently replace a missing
+  multiplexed connection with a Duo-triggering standalone login.
 - Remote commands run only through an already-established ControlMaster socket;
   opening a NEW login requires an explicit opt-in (one approved MFA verification).
 
@@ -18,11 +19,13 @@ tested offline without ever touching the network.
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import math
 import os
 import shlex
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -191,13 +194,22 @@ class O2Connection:
         }
     )
 
+    # OpenSSH short options that consume either the rest of their token or the
+    # following argv element. The sanitizer uses this to keep scanning past
+    # benign options such as ``-p 22`` instead of mistaking their argument for
+    # the destination and leaving a later ``-S`` override untouched.
+    _SSH_SHORT_OPTIONS_WITH_ARGUMENTS = frozenset(
+        {"B", "D", "E", "F", "I", "J", "L", "O", "P", "Q", "R", "S", "W", "b", "c", "e", "i", "l", "m", "o", "p", "w"}
+    )
+
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
         self._runner = runner
-        # Resolving ``ControlPath`` via ``ssh -G`` is local-only but not free.
-        # One connection object may build an rsync argv and then validate/run it,
-        # so cache each alias's expanded path for that short-lived operation.
-        self._control_paths: dict[str, str] = {}
+        # A connection may build an rsync argv and then validate/run it. Cache the
+        # safely expanded config for each target so those two steps cannot drift
+        # and do not repeatedly parse the same local files.
+        self._resolved_ssh_configs: dict[str, dict[str, str]] = {}
+        self._safe_ssh_config_text_cache: str | None = None
 
     # -- safety -----------------------------------------------------------------
     def active_lock_file(self) -> Path | None:
@@ -389,9 +401,25 @@ class O2Connection:
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def _master_check_argv(self, alias: str) -> list[str]:
-        """Build the exact local-only SSH command used to probe a master socket."""
+        """Build a config-isolated command that probes one exact master socket.
 
-        return ["ssh", *self.config.base_ssh_opts(), "-O", "check", alias]
+        ``-F /dev/null`` prevents a later probe from evaluating user config (and
+        especially ``Match exec``) after the socket has already been resolved by
+        the safe parser. The explicit ``-S`` is sufficient for a control command;
+        no network connection or authentication is attempted.
+        """
+
+        return [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-S",
+            self._resolved_control_path(alias),
+            *self.config.base_ssh_opts(),
+            "-O",
+            "check",
+            alias,
+        ]
 
     def master_running(self, alias: str | None = None) -> bool:
         """Return whether a reusable ControlMaster socket is alive for ``alias``.
@@ -413,18 +441,15 @@ class O2Connection:
     def _egress_interface(self, alias: str) -> str | None:
         """Local-only: the network interface a NEW connection to ``alias`` would use.
 
-        Resolves the alias's ``HostName`` via ``ssh -G`` (a config dump — NO connection,
-        no Duo) and asks the OS routing table (``route get``). Returns the interface name
-        (e.g. ``"utun6"``, ``"en0"``) or ``None`` when it can't be determined (e.g. the
-        ``route`` tool is unavailable), so the caller can fail OPEN instead of locking out.
+        Resolves the alias's ``HostName`` from the safely flattened SSH config and
+        asks the OS routing table (``route get``). Returns the interface name (e.g.
+        ``"utun6"``, ``"en0"``) or ``None`` when it can't be determined (e.g. the
+        ``route`` tool is unavailable), so the caller can fail OPEN instead of
+        locking out. Unsafe SSH config is not an indeterminate route and therefore
+        propagates as a hard failure.
         """
         try:
-            cfg = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
-            host = None
-            for line in cfg.stdout.splitlines():
-                if line[:9].lower() == "hostname ":
-                    host = line.split(None, 1)[1].strip()
-                    break
+            host = self._resolved_ssh_config(alias).get("hostname")
             if not host:
                 return None
             route = self._runner(["route", "get", host], self.config.connect_timeout, None)
@@ -499,11 +524,25 @@ class O2Connection:
             # process crash leaves the receipt in place so every process that was
             # already queued behind this mutex fails closed during the cooldown.
             self._record_master_start_attempt(target)
-            result = self._runner(
-                ["ssh", *self.config.base_ssh_opts(), "-MNf", target],
-                self.config.connect_timeout + 30,
-                None,
-            )
+            # Run the one authentication-capable operation against a flattened
+            # copy of the user's SSH config that has been inspected for Match
+            # directives. The exact resolved socket is pinned explicitly so the
+            # post-start check and all reuse-only clients address the same master.
+            with self._safe_ssh_config_path() as safe_config:
+                result = self._runner(
+                    [
+                        "ssh",
+                        "-F",
+                        safe_config,
+                        "-S",
+                        self._resolved_control_path(target),
+                        *self.config.base_ssh_opts(),
+                        "-MNf",
+                        target,
+                    ],
+                    self.config.connect_timeout + 30,
+                    None,
+                )
             if result.ok:
                 # ``ssh -f`` can return zero after authentication and then lose
                 # its backgrounded connection immediately. Treating the parent
@@ -581,8 +620,19 @@ class O2Connection:
 
     def stop_master(self) -> CommandResult:
         """Close the persistent ControlMaster (non-fatal if already closed)."""
+        target = self.config.host_alias
         return self._runner(
-            ["ssh", *self.config.base_ssh_opts(), "-O", "exit", self.config.host_alias],
+            [
+                "ssh",
+                "-F",
+                "/dev/null",
+                "-S",
+                self._resolved_control_path(target),
+                *self.config.base_ssh_opts(),
+                "-O",
+                "exit",
+                target,
+            ],
             self.config.connect_timeout + 5,
             None,
         )
@@ -657,50 +707,260 @@ class O2Connection:
                     return endpoint
         return None
 
-    def _resolved_control_path(self, alias: str) -> str:
-        """Return the alias's original, fully expanded ControlPath.
+    def _flatten_ssh_config(self, path: Path, *, stack: tuple[Path, ...] = ()) -> str:
+        """Read an SSH config and inline ``Include`` files without executing it.
 
-        Reuse-only commands disable ProxyJump/ProxyCommand so those helpers cannot
-        start independently authenticating SSH subprocesses. ``%C`` ControlPath
-        templates include the jump-host identity, however, so disabling the proxy
-        while letting SSH recompute the path would point at a different socket.
-        Resolve the path from the unmodified alias first and pin it with ``-S``.
+        OpenSSH evaluates ``Match exec`` predicates even for ``ssh -G``. A
+        predicate can run an arbitrary shell command, including another SSH
+        process that authenticates and triggers Duo. This reader therefore
+        inspects the literal config graph first and rejects every ``Match`` block
+        before OpenSSH is allowed to expand host tokens.
 
-        ``ssh -G`` only expands local configuration; it does not open a network
-        connection. Failure or an absent ControlPath is nevertheless a hard stop,
-        because continuing would restore OpenSSH's ordinary cold-login fallback.
+        Includes are flattened into a temporary config so the subsequently
+        executed ``ssh -G -F <temporary>`` cannot discover an uninspected file.
+        OpenSSH resolves relative paths in user-config ``Include`` directives
+        beneath ``~/.ssh`` (even when ``-F`` names another file), so this reader
+        does the same; absolute paths and ``~`` are also supported. Tokenized
+        include paths (for example ``%d``) are rejected because reproducing
+        OpenSSH's expansion incorrectly would risk selecting a different socket.
         """
-        # Even config expansion is forbidden under the incident lock. Keeping
-        # this check here protects argv-only builders such as async rsync, which
-        # resolve the socket before their eventual subprocess launch.
+
+        expanded_path = path.expanduser().resolve()
+        if expanded_path in stack:
+            chain = " -> ".join(str(item) for item in (*stack, expanded_path))
+            raise O2UnsafeTransportError(f"SSH config Include cycle while resolving O2: {chain}")
+        try:
+            lines = expanded_path.read_text().splitlines(keepends=True)
+        except OSError as exc:
+            raise O2UnsafeTransportError(f"Cannot read O2 SSH config {expanded_path}: {exc}") from exc
+
+        flattened: list[str] = []
+        next_stack = (*stack, expanded_path)
+        for line_number, raw_line in enumerate(lines, start=1):
+            try:
+                fields = shlex.split(raw_line, comments=True, posix=True)
+            except ValueError as exc:
+                raise O2UnsafeTransportError(
+                    f"Cannot safely parse SSH config {expanded_path}:{line_number}: {exc}"
+                ) from exc
+            if not fields:
+                flattened.append(raw_line)
+                continue
+
+            directive = fields[0].lower()
+            if directive == "match":
+                raise O2UnsafeTransportError(
+                    f"SSH config {expanded_path}:{line_number} contains Match. "
+                    "O2 refuses configs whose Match predicates could execute a fresh SSH/Duo probe; "
+                    "move the O2 alias to a Match-free config selected by O2_SSH_CONFIG_FILE."
+                )
+            if directive != "include":
+                flattened.append(raw_line)
+                continue
+            if len(fields) == 1:
+                raise O2UnsafeTransportError(f"SSH config {expanded_path}:{line_number} has an empty Include.")
+
+            for pattern_text in fields[1:]:
+                if "%" in pattern_text:
+                    raise O2UnsafeTransportError(
+                        f"SSH config {expanded_path}:{line_number} uses a tokenized Include path; "
+                        "set O2_SSH_CONFIG_FILE to a Match-free, explicit O2 config instead."
+                    )
+                pattern = Path(pattern_text).expanduser()
+                if not pattern.is_absolute():
+                    pattern = Path.home() / ".ssh" / pattern
+                # OpenSSH silently ignores Include globs with no matches. Sort
+                # matches so the flattened file preserves deterministic option
+                # precedence across filesystems.
+                for included_name in sorted(glob.glob(str(pattern))):
+                    flattened.append(self._flatten_ssh_config(Path(included_name), stack=next_stack))
+
+        text = "".join(flattened)
+        # Prevent an included file whose final line lacks a newline from being
+        # concatenated with the caller's next directive in the flattened copy.
+        return text if not text or text.endswith("\n") else text + "\n"
+
+    def _safe_ssh_config_text(self) -> str:
+        """Return one inspected, Match-free SSH configuration snapshot."""
+
+        if self._safe_ssh_config_text_cache is None:
+            self._safe_ssh_config_text_cache = self._flatten_ssh_config(self.config.ssh_config_file)
+        return self._safe_ssh_config_text_cache
+
+    @contextmanager
+    def _safe_ssh_config_path(self) -> Iterator[str]:
+        """Yield a private temporary path containing the inspected SSH config."""
+
+        # NamedTemporaryFile uses mode 0600 by default. Keep it open while SSH
+        # reads it; this is safe on the supported Unix/macOS deployment and
+        # ensures the file is removed even when the runner raises or times out.
+        with tempfile.NamedTemporaryFile(mode="w", prefix="o2-mcp-ssh-", suffix=".config") as handle:
+            handle.write(self._safe_ssh_config_text())
+            handle.flush()
+            yield handle.name
+
+    def _resolved_ssh_config(self, target: str) -> dict[str, str]:
+        """Expand one target through an inspected config without ``Match exec``."""
+
+        # Even local config expansion is forbidden under the incident lock. This
+        # protects argv-only builders such as async rsync, which resolve their
+        # socket before the eventual subprocess launch.
         self._require_unlocked()
-        cached = self._control_paths.get(alias)
+        cached = self._resolved_ssh_configs.get(target)
         if cached is not None:
             return cached
 
-        result = self._runner(["ssh", "-G", alias], self.config.connect_timeout, None)
+        with self._safe_ssh_config_path() as safe_config:
+            result = self._runner(
+                ["ssh", "-G", "-F", safe_config, target],
+                self.config.connect_timeout,
+                None,
+            )
         if not result.ok:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            raise O2UnsafeTransportError(f"Could not resolve ControlPath for '{alias}': {detail}")
+            raise O2UnsafeTransportError(f"Could not safely resolve SSH config for '{target}': {detail}")
+
+        resolved: dict[str, str] = {}
         for line in result.stdout.splitlines():
             key, separator, value = line.partition(" ")
-            if separator and key.lower() == "controlpath" and value.strip().lower() != "none":
-                path = value.strip()
-                self._control_paths[alias] = path
-                return path
+            if separator:
+                resolved.setdefault(key.lower(), value.strip())
+        self._resolved_ssh_configs[target] = resolved
+        return resolved
+
+    def _resolved_control_path(self, target: str) -> str:
+        """Return the target's original, safely expanded ControlPath.
+
+        Reuse-only commands disable ProxyJump/ProxyCommand so those helpers cannot
+        start independently authenticating SSH subprocesses. ``%C`` ControlPath
+        templates include the jump-host identity, however, so letting a guarded
+        command recompute the path after disabling its proxy would select a
+        different socket. Expand the inspected original config first, then pin
+        that exact path with ``-S`` while all later SSH invocations use
+        ``-F /dev/null``.
+        """
+
+        path = self._resolved_ssh_config(target).get("controlpath")
+        if path and path.lower() != "none":
+            return path
         raise O2UnsafeTransportError(
-            f"SSH alias '{alias}' has no ControlPath; refusing an authentication-capable fallback."
+            f"SSH target '{target}' has no ControlPath; refusing an authentication-capable fallback."
         )
 
     def _reuse_only_ssh_prefix(self, alias: str) -> list[str]:
         """Return ``ssh`` plus a pinned socket and fail-closed client options."""
 
-        return ["ssh", "-S", self._resolved_control_path(alias), *self.config.reuse_only_ssh_opts()]
+        return [
+            "ssh",
+            "-F",
+            "/dev/null",
+            "-S",
+            self._resolved_control_path(alias),
+            *self.config.reuse_only_ssh_opts(),
+        ]
 
     def reuse_only_ssh_transport(self, alias: str) -> str:
         """Return the shell-form SSH transport used by rsync ``-e``."""
 
         return shlex.join(self._reuse_only_ssh_prefix(alias))
+
+    @staticmethod
+    def _ssh_o_option_name(option: str) -> str:
+        """Return the case-normalized keyword from one ``ssh -o`` argument."""
+
+        normalized = option.lstrip("=").strip()
+        return normalized.replace("=", " ", 1).split(None, 1)[0].lower() if normalized else ""
+
+    def _sanitize_caller_ssh_options(self, tokens: list[str], *, stop_at_host: bool) -> list[str]:
+        """Remove socket/config overrides and reject alternate SSH users.
+
+        The guarded prefix owns ``-F`` and ``-S``. OpenSSH gives a later ``-S``
+        precedence, so merely prepending the pinned socket is insufficient; every
+        caller-supplied config-file, ControlPath, and socket override is removed.
+        ``-l`` and ``-o User=...`` are rejected because selecting a user through
+        transport options would make the already-resolved ``%r`` socket stale.
+        Callers can express the user safely as ``user@alias``, which is retained
+        during target inference and socket resolution.
+
+        For a direct SSH argv, option parsing stops at the destination so a remote
+        command argument named ``-S`` remains ordinary data. Rsync's ``-e`` value
+        contains only the SSH executable and its options, so its entire token list
+        is inspected.
+        """
+
+        sanitized: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                sanitized.extend(tokens[index:])
+                break
+            if token == "-" or not token.startswith("-"):
+                if stop_at_host:
+                    sanitized.extend(tokens[index:])
+                    break
+                sanitized.append(token)
+                index += 1
+                continue
+            if token.startswith("--"):
+                # SSH has no long client options. Preserve the token so OpenSSH
+                # can report the invalid input rather than guessing its meaning.
+                sanitized.append(token)
+                index += 1
+                continue
+
+            cluster = token[1:]
+            kept_flags: list[str] = []
+            handled_argument_option = False
+            for option_index, option in enumerate(cluster):
+                if option not in self._SSH_SHORT_OPTIONS_WITH_ARGUMENTS:
+                    kept_flags.append(option)
+                    continue
+
+                handled_argument_option = True
+                attached_argument = cluster[option_index + 1 :]
+                if attached_argument:
+                    argument = attached_argument
+                    consumes_next = False
+                else:
+                    if index + 1 >= len(tokens):
+                        raise O2UnsafeTransportError(f"SSH option -{option} requires an argument.")
+                    argument = tokens[index + 1]
+                    consumes_next = True
+
+                if option in {"F", "S"}:
+                    # Preserve any preceding flag-only cluster (e.g. the ``v``
+                    # in ``-vS/path``), but discard the unsafe option and value.
+                    if kept_flags:
+                        sanitized.append("-" + "".join(kept_flags))
+                elif option == "l":
+                    raise O2UnsafeTransportError(
+                        "SSH user options are disabled for guarded O2 transports; use user@o2 or user@o2-transfer."
+                    )
+                elif option == "o" and self._ssh_o_option_name(argument) in {"controlpath", "user"}:
+                    if self._ssh_o_option_name(argument) == "user":
+                        raise O2UnsafeTransportError(
+                            "SSH User options are disabled for guarded O2 transports; use user@o2 or "
+                            "user@o2-transfer."
+                        )
+                    if kept_flags:
+                        sanitized.append("-" + "".join(kept_flags))
+                else:
+                    # This argument-taking option is unrelated to socket/user
+                    # identity. Preserve its exact representation and value.
+                    sanitized.append(token)
+                    if consumes_next:
+                        sanitized.append(argument)
+
+                if consumes_next:
+                    index += 1
+                break
+
+            if not handled_argument_option:
+                sanitized.append(token)
+            index += 1
+
+        return sanitized
 
     def _reuse_only_ssh_command(self, command: str, alias: str) -> str:
         """Harden an rsync ``-e`` transport so it cannot authenticate anew.
@@ -718,9 +978,11 @@ class O2Connection:
         if not tokens or Path(tokens[0]).name != "ssh":
             raise O2UnsafeTransportError("O2 rsync transports must use ssh through the configured ControlMaster.")
         safe = self._reuse_only_ssh_prefix(alias)[1:]
-        if tokens[1 : 1 + len(safe)] != safe:
-            tokens = [tokens[0], *safe, *tokens[1:]]
-        return shlex.join(tokens)
+        caller_tokens = tokens[1:]
+        if caller_tokens[: len(safe)] == safe:
+            caller_tokens = caller_tokens[len(safe) :]
+        caller_tokens = self._sanitize_caller_ssh_options(caller_tokens, stop_at_host=False)
+        return shlex.join([tokens[0], *safe, *caller_tokens])
 
     def _harden_raw_transport_argv(self, argv: list[str], alias: str) -> list[str]:
         """Return an SSH/rsync argv whose fallback path cannot authenticate.
@@ -737,9 +999,11 @@ class O2Connection:
         executable = Path(hardened[0]).name
         if executable == "ssh":
             safe = self._reuse_only_ssh_prefix(alias)[1:]
-            if hardened[1 : 1 + len(safe)] != safe:
-                hardened[1:1] = safe
-            return hardened
+            caller_tokens = hardened[1:]
+            if caller_tokens[: len(safe)] == safe:
+                caller_tokens = caller_tokens[len(safe) :]
+            caller_tokens = self._sanitize_caller_ssh_options(caller_tokens, stop_at_host=True)
+            return [hardened[0], *safe, *caller_tokens]
         if executable != "rsync":
             raise O2UnsafeTransportError("run_raw accepts only ssh or rsync O2 transports.")
 

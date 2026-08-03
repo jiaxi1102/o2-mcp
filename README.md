@@ -26,10 +26,20 @@ that key-based fallback can generate an unexpected Duo request. The MCP therefor
 `ControlMaster=no`, `PreferredAuthentications=none`, and disables public-key, password,
 keyboard-interactive, GSSAPI, and host-based authentication for every non-start operation.
 It also disables `ProxyJump` and `ProxyCommand`, because proxy SSH subprocesses would not
-inherit the outer client's authentication restrictions. Those options still permit reuse of
-an already-authenticated master: the MCP first resolves the alias's original `ControlPath` and
-pins that expanded socket with `-S`, preserving `%C` paths whose hash includes a jump host.
-A missing or failed socket then terminates locally instead of opening a replacement login.
+inherit the outer client's authentication restrictions, and disables local/known-host command
+hooks that could launch another process. Those options still permit reuse of an
+already-authenticated master: the MCP first resolves the alias's original `ControlPath` from
+an inspected, flattened SSH config and pins that expanded socket with `-S`, preserving `%C`
+paths whose hash includes a jump host. Every reuse command then uses `-F /dev/null`; caller
+`-F`, `-S`, and `ControlPath` overrides are removed, while `-l`/`User` overrides are rejected
+in favor of the unambiguous `user@alias` form. A missing or failed socket terminates locally
+instead of opening a replacement login.
+
+OpenSSH evaluates `Match exec` shell predicates even for its nominally local `ssh -G` config
+dump. The MCP therefore reads the configured SSH file and recursively flattens `Include`
+directives itself, rejects any `Match` block before launching OpenSSH, and runs `ssh -G` only
+against that private inspected snapshot. If your normal SSH config contains `Match`, put the
+O2 `Host` blocks in a separate Match-free file and set `O2_SSH_CONFIG_FILE` to it.
 
 The optional `o2-transfer` alias is a different host and therefore needs its own separately
 approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
@@ -80,6 +90,7 @@ pip install -e ".[o2]"     # on a 3.10+ env
       "env": {
         "O2_SSH_HOST_ALIAS": "o2",
         "O2_SSH_TRANSFER_ALIAS": "o2-transfer",
+        "O2_SSH_CONFIG_FILE": "/Users/you/.ssh/config",
         "O2_SSH_LOCK_FILE": "/Users/you/.agent_locks/O2_DISABLED"
       }
     }
@@ -126,7 +137,8 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   (`allow_new_login`). Remote commands, synchronous transfers, detached transfers, and
   transfer-node lifecycle launches disable every SSH authentication method, so OpenSSH's
   normal missing-socket fallback cannot generate a new Duo request. Reuse-only operations
-  also disable SSH proxy subprocesses, which otherwise have independent authentication.
+  also disable SSH proxy/local command subprocesses, isolate themselves from live SSH config,
+  and remove caller socket/config overrides.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;

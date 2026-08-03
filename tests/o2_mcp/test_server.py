@@ -63,11 +63,23 @@ class FakeRunner:
 def _patch_connection(
     monkeypatch, tmp_path, *, master=True, responder=None, locked=False, start_persists=True
 ) -> FakeRunner:
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        "Host o2-transfer\n"
+        "  HostName transfer.rc.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-transfer-control.sock\n"
+    )
     cfg = O2Config(
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
         lock_file=tmp_path / "O2_DISABLED",
+        ssh_config_file=ssh_config,
     )
     if locked:
         cfg.lock_file.write_text("disabled")

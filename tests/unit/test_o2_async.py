@@ -67,7 +67,20 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
-    cfg = O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2 o2-transfer\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/%n-control.sock\n"
+    )
+    cfg = O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=lock,
+        ssh_config_file=ssh_config,
+    )
 
     def runner(argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:

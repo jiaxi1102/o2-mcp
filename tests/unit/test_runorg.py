@@ -57,8 +57,19 @@ class _Runner:
 
 
 def _cfg(tmp_path):
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2 o2-transfer\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/%n-control.sock\n"
+    )
     return O2Config(
-        host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=tmp_path / "O2_DISABLED"
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=tmp_path / "O2_DISABLED",
+        ssh_config_file=ssh_config,
     )
 
 
@@ -202,8 +213,8 @@ def test_live_transition_uses_reuse_only_transfer_master(tmp_path):
     assert plan.started is True and plan.pid == "4321"
     transfer_launch = next(call["argv"] for call in runner.calls if call["argv"][-1].startswith("nohup bash "))
     assert transfer_launch[-2] == "o2-transfer"
-    assert transfer_launch[:3] == ["ssh", "-S", "/tmp/o2-transfer-control.sock"]
-    assert transfer_launch[3 : 3 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
+    assert transfer_launch[:5] == ["ssh", "-F", "/dev/null", "-S", "/tmp/o2-transfer-control.sock"]
+    assert transfer_launch[5 : 5 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
 
 
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):

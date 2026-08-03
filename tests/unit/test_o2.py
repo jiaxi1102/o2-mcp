@@ -102,6 +102,9 @@ class ConcurrentStartRunner:
     def __call__(self, argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
         """Return deterministic SSH-check/start results for the race test."""
 
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, "controlpath /tmp/o2-control.sock\n", "")
+
         if "-O" in argv and "check" in argv:
             with self._state_lock:
                 synchronize_initial_check = not self.master and self._initial_checks < 2
@@ -127,7 +130,24 @@ def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
-    return O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        "Host o2-transfer\n"
+        "  HostName transfer.rc.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-transfer-control.sock\n"
+    )
+    return O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=lock,
+        ssh_config_file=ssh_config,
+    )
 
 
 def test_default_lock_is_workstation_wide(monkeypatch, tmp_path):
@@ -277,10 +297,12 @@ def test_run_uses_reuse_only_authentication_and_alias(tmp_path):
     assert result.ok
     last = runner.calls[-1]["argv"]
     assert last[0] == "ssh"
-    assert last[:3] == ["ssh", "-S", "/tmp/o2-control.sock"]
-    assert last[3 : 3 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert last[:5] == ["ssh", "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert last[5 : 5 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
     assert "PreferredAuthentications=none" in last
     assert "PubkeyAuthentication=no" in last
+    assert "PermitLocalCommand=no" in last
+    assert "KnownHostsCommand=none" in last
     assert last[-2] == "o2"
     assert last[-1] == "hostname; whoami"
 
@@ -307,8 +329,52 @@ def test_run_pins_proxy_derived_control_path_before_disabling_proxy(tmp_path):
 
     assert result.ok
     command = runner.calls[-1]["argv"]
-    assert command[:3] == ["ssh", "-S", "/tmp/cm-original-jump-hash"]
+    assert command[:5] == ["ssh", "-F", "/dev/null", "-S", "/tmp/cm-original-jump-hash"]
     assert "ProxyJump=none" in command and "ProxyCommand=none" in command
+
+
+def test_match_ssh_config_is_rejected_before_openssh_runs(tmp_path):
+    """Socket expansion must never execute a Match predicate's shell command."""
+
+    config = _config(tmp_path)
+    config.ssh_config_file.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        'Match exec "ssh unsafe-probe.example true"\n'
+        "  ServerAliveInterval 30\n"
+    )
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(config, runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="contains Match"):
+        conn.run("hostname")
+
+    # The rejection comes from literal file inspection. In particular, not even
+    # `ssh -G` is launched, because that command evaluates Match exec itself.
+    assert runner.calls == []
+
+
+def test_match_in_included_ssh_config_is_rejected(tmp_path):
+    """An Include cannot hide an executable Match block from the safety scan."""
+
+    config = _config(tmp_path)
+    included = tmp_path / "o2-extra.conf"
+    included.write_text('Match exec "ssh unsafe-probe.example true"\n  ServerAliveInterval 30\n')
+    config.ssh_config_file.write_text(
+        f"Include {included}\n"
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+    )
+    runner = RecordingRunner(master=True)
+
+    with pytest.raises(O2UnsafeTransportError, match="contains Match"):
+        O2Connection(config, runner=runner).run("hostname")
+
+    assert runner.calls == []
 
 
 def test_run_rejects_cold_connection_opt_out(tmp_path):
@@ -391,7 +457,17 @@ def test_start_master_noop_when_running(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
     result = conn.start_master(allow_new_login=False)
     assert result.ok and "already running" in result.stdout
-    assert result.argv == ["ssh", *conn.config.base_ssh_opts(), "-O", "check", "o2"]
+    assert result.argv == [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-S",
+        "/tmp/o2-control.sock",
+        *conn.config.base_ssh_opts(),
+        "-O",
+        "check",
+        "o2",
+    ]
 
 
 def test_start_master_can_open_the_transfer_alias(tmp_path):
@@ -411,8 +487,13 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
     """Even legacy project configs must share one O2/Duo login mutex."""
 
     runner = ConcurrentStartRunner()
+    ssh_config_file = _config(tmp_path).ssh_config_file
     configs = [
-        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        O2Config(
+            host_alias="o2",
+            lock_file=tmp_path / project / "O2_DISABLED",
+            ssh_config_file=ssh_config_file,
+        )
         for project in ("clock-project", "diffusion-project")
     ]
     connections = [O2Connection(config, runner=runner) for config in configs]
@@ -424,7 +505,17 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
     assert all(result.ok for result in results)
     assert sum("already running" in result.stdout for result in results) == 1
     reused = next(result for result in results if "already running" in result.stdout)
-    assert reused.argv == ["ssh", *configs[0].base_ssh_opts(), "-O", "check", "o2"]
+    assert reused.argv == [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-S",
+        "/tmp/o2-control.sock",
+        *configs[0].base_ssh_opts(),
+        "-O",
+        "check",
+        "o2",
+    ]
 
     mutex_paths = {conn._master_start_lock_file() for conn in connections}
     assert mutex_paths == {tmp_path / "test-home" / ".agent_locks" / "O2_LOGIN_START.lock"}
@@ -435,8 +526,13 @@ def test_concurrent_callers_do_not_retry_a_failed_login(tmp_path):
     """One failed SSH start must put every queued contender into cooldown."""
 
     runner = ConcurrentStartRunner(start_returncode=255)
+    ssh_config_file = _config(tmp_path).ssh_config_file
     configs = [
-        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        O2Config(
+            host_alias="o2",
+            lock_file=tmp_path / project / "O2_DISABLED",
+            ssh_config_file=ssh_config_file,
+        )
         for project in ("clock-project", "diffusion-project")
     ]
     connections = [O2Connection(config, runner=runner) for config in configs]
@@ -609,14 +705,15 @@ def test_start_master_guard_disabled_via_config(tmp_path):
     assert not any(call["argv"][:2] == ["route", "get"] for call in runner.calls)
 
 
-def test_o2config_vpn_fields_appended_last():
-    # The VPN fields must come AFTER the existing public fields so a positional
+def test_o2config_new_fields_are_appended_for_positional_compatibility():
+    # Safety fields must come AFTER the original public fields so a positional
     # O2Config(...) caller isn't silently shifted (e.g. default_user -> require_vpn).
     from dataclasses import fields
 
     names = [f.name for f in fields(O2Config)]
     assert names.index("require_vpn") > names.index("default_log_dir")
     assert names.index("vpn_iface_prefix") > names.index("default_user")
+    assert names.index("ssh_config_file") > names.index("vpn_iface_prefix")
 
 
 # --- Slurm submit/monitor ----------------------------------------------------
@@ -719,8 +816,8 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
 
     conn.run_raw(["ssh", "o2", "hostname"])
     direct = runner.calls[-1]["argv"]
-    assert direct[:3] == ["ssh", "-S", "/tmp/o2-control.sock"]
-    assert direct[3 : 3 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert direct[:5] == ["ssh", "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert direct[5 : 5 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
 
     # A later raw ProxyJump request cannot win over the earlier command-line
     # `ProxyJump=none`. Otherwise the child proxy SSH could authenticate even
@@ -728,6 +825,30 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     conn.run_raw(["ssh", "-J", "proxy.example", "o2", "hostname"])
     direct = runner.calls[-1]["argv"]
     assert direct.index("ProxyJump=none") < direct.index("-J")
+
+    # Caller-selected config/socket paths are stripped, including after another
+    # option with a separate argument. The guarded /dev/null config and resolved
+    # socket remain the only effective values.
+    conn.run_raw(
+        [
+            "ssh",
+            "-p",
+            "22",
+            "-F",
+            "/tmp/unsafe-config",
+            "-S",
+            "/tmp/unsafe-socket",
+            "-o",
+            "ControlPath=/tmp/also-unsafe",
+            "o2",
+            "hostname",
+        ]
+    )
+    direct = runner.calls[-1]["argv"]
+    assert direct[:5] == ["ssh", "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert "/tmp/unsafe-config" not in direct
+    assert "/tmp/unsafe-socket" not in direct
+    assert "ControlPath=/tmp/also-unsafe" not in direct
 
     conn.run_raw(
         [
@@ -745,6 +866,24 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
     assert "PreferredAuthentications=none" in transport
     assert transport.index("ProxyCommand=none") < transport.index("ProxyCommand=ssh proxy.example")
+
+    conn.run_raw(
+        [
+            "rsync",
+            "-e",
+            "ssh -F /tmp/unsafe-config -S /tmp/unsafe-socket -o ControlPath=/tmp/also-unsafe",
+            "x",
+            "o2:/p",
+        ]
+    )
+    rsync = runner.calls[-1]["argv"]
+    transport = rsync[rsync.index("-e") + 1]
+    assert "-F /dev/null" in transport
+    assert "-S /tmp/o2-control.sock" in transport
+    assert "/tmp/unsafe-config" not in transport
+    assert "/tmp/unsafe-socket" not in transport
+    assert "/tmp/also-unsafe" not in transport
+    assert "PreferredAuthentications=none" in transport
 
     # Every remote-shell option is normalized, not just the first. This prevents
     # a later compact/long-form override from restoring a cold-login path.
@@ -809,6 +948,30 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     equals_cluster = runner.calls[-1]["argv"]
     equals_transport = next(token[len("-avze=") :] for token in equals_cluster if token.startswith("-avze="))
     assert equals_transport.index("PubkeyAuthentication=no") < equals_transport.index("PubkeyAuthentication=yes")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ssh", "-l", "alice", "o2", "hostname"],
+        ["ssh", "-o", "User=alice", "o2", "hostname"],
+        ["rsync", "-e", "ssh -l alice", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o User=alice", "x", "o2:/p"],
+    ],
+)
+def test_run_raw_rejects_ssh_user_options(tmp_path, argv):
+    """User selection must use user@alias so socket resolution retains %r."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="user options|User options"):
+        conn.run_raw(argv)
+
+    assert not any(
+        call["argv"] and call["argv"][0] in {"ssh", "rsync"} and "-O" not in call["argv"] and "-G" not in call["argv"]
+        for call in runner.calls
+    )
 
 
 def test_run_raw_rejects_non_ssh_remote_shell(tmp_path):
