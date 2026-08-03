@@ -427,6 +427,11 @@ class BrokerClient:
         except BrokerProtocolError as exc:
             raise ValueError(f"encoded broker request exceeds the frame contract: {exc}") from exc
         client = self._connect(timeout=5.0)
+        # The five-second socket deadline guards only the local connect. Clear
+        # it before writing: a large valid frame can fill the Unix send buffer
+        # while this serialized broker is serving an earlier command, and its
+        # queue wait is intentionally unbounded until dispatch acknowledgement.
+        client.settimeout(None)
         dispatched = False
         try:
             with client.makefile("rwb", buffering=0) as stream:
@@ -435,7 +440,6 @@ class BrokerClient:
                 # writes `dispatched` only after this request reaches the front
                 # and policy still permits its remote frame. If this caller
                 # disconnects first, the daemon cancels the queued request.
-                client.settimeout(None)
                 response = read_frame(stream)
                 if response.get("type") == "error" and response.get("error") == "policy_denied":
                     raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))

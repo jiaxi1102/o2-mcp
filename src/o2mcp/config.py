@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from o2mcp.broker_protocol import MAX_TIMEOUT_SECONDS
+
 
 def default_policy_file() -> Path:
     """Return the single workstation-wide O2 policy-state path.
@@ -178,8 +180,21 @@ class O2Config:
                 raise ValueError(f"Could not compare O2 broker directory identities: {exc}") from exc
         if same_authority:
             raise ValueError("O2 login and transfer brokers must use different authority directories")
-        if not math.isfinite(self.broker_start_timeout) or self.broker_start_timeout <= 0:
-            raise ValueError("O2 broker start timeout must be greater than zero")
+        # Validate the exact daemon-side contract while configuration is still
+        # local and no one-shot authorization can have been consumed. In
+        # particular, ``bool`` is an ``int`` subclass and must not become a
+        # surprising one-second startup allowance.
+        if (
+            isinstance(self.broker_start_timeout, bool)
+            or not isinstance(self.broker_start_timeout, (int, float))
+            or not math.isfinite(self.broker_start_timeout)
+            or self.broker_start_timeout <= 0
+            or self.broker_start_timeout > MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "O2 broker start timeout must be a finite positive number "
+                f"no greater than {MAX_TIMEOUT_SECONDS} seconds"
+            )
 
     def base_ssh_opts(self) -> list[str]:
         """Return baseline SSH options shared by login and reuse operations.

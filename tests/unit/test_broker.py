@@ -601,6 +601,79 @@ def test_command_timeout_starts_only_after_dispatch(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
+def test_connect_deadline_is_cleared_before_a_large_queued_request_write(broker_root, monkeypatch):
+    """The connect-only timeout must not govern queue backpressure on writes."""
+
+    class ObservedDuplex:
+        """Minimal framed stream that asserts the socket deadline at first write."""
+
+        def __init__(self, owner):
+            self.owner = owner
+            self.responses = io.BytesIO()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def write(self, data):
+            # A queued one-MiB frame may block here behind the current command.
+            # Any inherited five-second connect deadline would make that valid
+            # queue wait fail before the daemon can acknowledge dispatch.
+            assert self.owner.timeout is None
+            request = read_frame(io.BytesIO(bytes(data)))
+            request_id = request["id"]
+            self.responses = io.BytesIO(
+                encode_frame({"type": "dispatched", "id": request_id})
+                + encode_frame(
+                    {
+                        "type": "result",
+                        "id": request_id,
+                        "returncode": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "timed_out": False,
+                        "duration_seconds": 0.0,
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                    }
+                )
+            )
+            return len(data)
+
+        def flush(self):
+            return None
+
+        def read(self, size):
+            return self.responses.read(size)
+
+    class ObservedSocket:
+        """Record deadline changes without opening a real broker connection."""
+
+        def __init__(self):
+            self.timeout = 5.0
+            self.stream = ObservedDuplex(self)
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def makefile(self, *_args, **_kwargs):
+            return self.stream
+
+        def close(self):
+            return None
+
+    client = BrokerClient(broker_root)
+    observed = ObservedSocket()
+    monkeypatch.setattr(client, "_connect", lambda **_kwargs: observed)
+
+    result = client.execute("cat >/dev/null", timeout=5, input_text="x" * MAX_STDIN_BYTES)
+
+    assert result.returncode == 0
+    assert observed.timeout == 15.0
+
+
 def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_path, broker_root):
     """Same-user socket access cannot crash the helper with an invalid timeout."""
 

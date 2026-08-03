@@ -33,6 +33,7 @@ from o2mcp import (
 )
 from o2mcp import keepalive as o2keepalive
 from o2mcp.broker import BrokerExecutionResult, O2BrokerUnavailableError
+from o2mcp.broker_protocol import MAX_TIMEOUT_SECONDS
 
 
 class O2Connection(_ProductionO2Connection):
@@ -186,6 +187,18 @@ def test_role_specific_broker_directories_are_absolute_and_distinct(tmp_path):
         O2Config(
             broker_dir=root / "login",
             transfer_broker_dir=linked_root / "login",
+        )
+
+
+@pytest.mark.parametrize("invalid_timeout", [True, 0, float("inf"), MAX_TIMEOUT_SECONDS + 1])
+def test_broker_start_timeout_is_rejected_before_authorized_launch(tmp_path, invalid_timeout):
+    """Configuration cannot defer an invalid timeout until after grant use."""
+
+    with pytest.raises(ValueError, match="broker start timeout"):
+        O2Config(
+            broker_dir=tmp_path / "login-broker",
+            transfer_broker_dir=tmp_path / "transfer-broker",
+            broker_start_timeout=invalid_timeout,
         )
 
 
