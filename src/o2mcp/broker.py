@@ -36,8 +36,10 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from o2mcp.broker_protocol import (
+    MAX_COMMAND_BYTES,
     PROTOCOL_VERSION,
     BrokerProtocolError,
+    command_within_exec_limit,
     read_frame,
     write_frame,
 )
@@ -366,6 +368,8 @@ class BrokerClient:
 
         if not isinstance(command, str) or not command:
             raise ValueError("broker command must be a non-empty string")
+        if not command_within_exec_limit(command):
+            raise ValueError(f"broker command exceeds the {MAX_COMMAND_BYTES}-byte maximum")
         valid_timeout = (
             isinstance(timeout, (int, float))
             and not isinstance(timeout, bool)
@@ -837,6 +841,7 @@ class BrokerServer:
                 and bool(request["id"])
                 and isinstance(request.get("command"), str)
                 and bool(request["command"])
+                and command_within_exec_limit(request["command"])
                 and valid_timeout
                 and (request.get("stdin") is None or isinstance(request.get("stdin"), str))
             )

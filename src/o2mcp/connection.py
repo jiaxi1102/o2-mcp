@@ -347,6 +347,7 @@ class O2Connection:
             "requesttty",
             "securitykeyprovider",
             "sessiontype",
+            "stdinnull",
             "user",
         }
     )
@@ -514,6 +515,8 @@ class O2Connection:
             "ForkAfterAuthentication=no",
             "-o",
             "PKCS11Provider=none",
+            "-o",
+            "StdinNull=no",
             "-o",
             "ServerAliveInterval=30",
             "-o",

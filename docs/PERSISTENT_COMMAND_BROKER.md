@@ -60,6 +60,12 @@ Every frame is:
 UTF-8 JSON object of exactly that length
 ```
 
+Logical command text is capped at 64 KiB because it becomes a remote
+`bash -c` argument; this keeps a valid frame below the host's `execve` argument
+limit. Larger scripts must be transferred as files and invoked with a short
+command. Process-spawn failures return an ordinary command result and do not
+terminate the persistent helper.
+
 The daemon may scan through at most 64 KiB of unframed output before the first
 remote hello, accommodating a login-shell banner. Every later frame is strict.
 

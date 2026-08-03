@@ -38,6 +38,7 @@ from o2mcp.broker import (
 )
 from o2mcp.broker_protocol import (
     FRAME_MAGIC,
+    MAX_COMMAND_BYTES,
     MAX_OUTPUT_BYTES,
     PROTOCOL_VERSION,
     BrokerProtocolError,
@@ -147,6 +148,8 @@ def test_frame_rejects_oversized_and_truncated_payloads():
 
     with pytest.raises(BrokerProtocolError, match="maximum"):
         encode_frame({"value": "too large"}, max_bytes=4)
+    with pytest.raises(BrokerProtocolError, match="not JSON serializable"):
+        encode_frame({"command": "\ud800"})
     with pytest.raises(BrokerProtocolError, match="expected bytes"):
         read_frame(io.BytesIO(FRAME_MAGIC + struct.pack("!I", 10) + b"{}"))
 
@@ -213,6 +216,43 @@ def test_remote_output_is_truncated_while_channel_remains_usable(tmp_path, broke
         assert noisy.stdout_truncated is True and noisy.stderr_truncated is True
         assert client.execute("printf after-noise", timeout=5).stdout == "after-noise"
         assert server.transport.pid == ssh_pid
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_oversized_command_is_rejected_without_losing_persistent_channel(tmp_path, broker_root):
+    """An exec-safe command bound must reject locally and preserve one SSH session."""
+
+    _policy, server, thread, client = _start_local_broker(tmp_path, broker_root)
+    oversized = "x" * (MAX_COMMAND_BYTES + 1)
+    try:
+        ssh_pid = server.transport.pid
+        with pytest.raises(ValueError, match="byte maximum"):
+            client.execute(oversized, timeout=5)
+
+        # A same-user caller may bypass BrokerClient and write directly to the
+        # Unix socket. The daemon must reject that frame before acknowledging
+        # dispatch, so the remote helper and sole transport remain untouched.
+        direct = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        direct.connect(str(client.paths.socket))
+        with direct.makefile("rwb", buffering=0) as stream:
+            write_frame(
+                stream,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "oversized-command",
+                    "command": oversized,
+                    "timeout_seconds": 5,
+                    "stdin": None,
+                },
+            )
+            assert read_frame(stream) == {"type": "error", "error": "invalid_request"}
+        direct.close()
+
+        assert client.execute("printf still-alive", timeout=5).stdout == "still-alive"
+        assert server.transport.pid == ssh_pid
+        assert client.ping()["commands_completed"] == 1
     finally:
         _stop_local_broker(thread, client)
 
@@ -827,6 +867,7 @@ def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path
                     # not override the broker's hard-coded safety contract.
                     "proxycommand unsafe-helper",
                     "controlpath /tmp/unsafe.sock",
+                    "stdinnull yes",
                 ]
             )
             + "\n",
@@ -862,11 +903,13 @@ def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path
         "CanonicalizeHostname=no",
         "ForkAfterAuthentication=no",
         "PKCS11Provider=none",
+        "StdinNull=no",
         "identityfile=/tmp/id_one",
         "identityfile=/tmp/id_two",
     } <= option_values
     assert "proxycommand=unsafe-helper" not in option_values
     assert "controlpath=/tmp/unsafe.sock" not in option_values
+    assert "stdinnull=yes" not in option_values
     assert argv[-2] == config.host_alias
     assert "python3 -u -c" in argv[-1]
 

@@ -25,6 +25,11 @@ PROTOCOL_VERSION = 2
 FRAME_MAGIC = b"O2B1"
 HEADER_SIZE = len(FRAME_MAGIC) + 4
 MAX_FRAME_BYTES = 16 * 1024 * 1024
+# Commands become one ``bash -c`` argv entry on the remote host. Keep them far
+# below Linux's aggregate ``execve`` argument/environment limit so a valid
+# protocol frame cannot kill the sole persistent channel during process spawn.
+# Large scripts should be transferred as files and invoked by a short command.
+MAX_COMMAND_BYTES = 64 * 1024
 # JSON escaping can expand arbitrary command bytes substantially (for example,
 # every NUL becomes six ASCII characters). A one-MiB per-stream source bound
 # therefore keeps even worst-case escaped stdout+stderr below the 16-MiB frame.
@@ -34,6 +39,22 @@ MAX_STARTUP_PREAMBLE_BYTES = 64 * 1024
 
 class BrokerProtocolError(RuntimeError):
     """Raised when a peer sends a malformed, oversized, or truncated frame."""
+
+
+def command_within_exec_limit(value: Any) -> bool:
+    """Return whether text is a valid, non-empty, exec-safe broker command.
+
+    JSON can represent unpaired Unicode surrogates that cannot become a Unix
+    argv byte string. Treat those as invalid input rather than allowing an
+    encoding exception to terminate the local daemon or remote helper.
+    """
+
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= MAX_COMMAND_BYTES
+    except UnicodeEncodeError:
+        return False
 
 
 def encode_frame(payload: Mapping[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -> bytes:
@@ -47,7 +68,7 @@ def encode_frame(payload: Mapping[str, Any], *, max_bytes: int = MAX_FRAME_BYTES
 
     try:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, UnicodeError) as exc:
         raise BrokerProtocolError(f"broker payload is not JSON serializable: {exc}") from exc
     if not body:
         raise BrokerProtocolError("broker frames may not be empty")
@@ -162,6 +183,7 @@ def remote_helper_source() -> str:
         PROTOCOL_VERSION = {PROTOCOL_VERSION}
         FRAME_MAGIC = b"O2B1"
         MAX_FRAME_BYTES = {MAX_FRAME_BYTES}
+        MAX_COMMAND_BYTES = {MAX_COMMAND_BYTES}
         MAX_OUTPUT_BYTES = {MAX_OUTPUT_BYTES}
 
         def read_exact(size):
@@ -201,6 +223,14 @@ def remote_helper_source() -> str:
                 raise ValueError(\"response frame exceeds protocol limit\")
             write_all(FRAME_MAGIC + struct.pack(\"!I\", len(body)) + body)
             sys.stdout.buffer.flush()
+
+        def command_within_exec_limit(value):
+            if not isinstance(value, str) or not value:
+                return False
+            try:
+                return len(value.encode(\"utf-8\")) <= MAX_COMMAND_BYTES
+            except UnicodeEncodeError:
+                return False
 
         def drain_bounded(stream, captures, key):
             parts = []
@@ -248,14 +278,26 @@ def remote_helper_source() -> str:
             # or slow profile from contaminating every logical command.
             command_env = os.environ.copy()
             command_env.pop(\"BASH_ENV\", None)
-            process = subprocess.Popen(
-                [\"/bin/bash\", \"--noprofile\", \"--norc\", \"-c\", command],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=command_env,
-                start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    [\"/bin/bash\", \"--noprofile\", \"--norc\", \"-c\", command],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=command_env,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                # Resource exhaustion or a platform argv limit must fail this
+                # logical command, not terminate the one authenticated helper.
+                return (
+                    126,
+                    \"\",
+                    \"command could not be started inside persistent O2 broker: \" + str(exc),
+                    False,
+                    False,
+                    False,
+                )
             captures = {{}}
             stdout_thread = threading.Thread(
                 target=drain_bounded, args=(process.stdout, captures, \"stdout\"), daemon=True
@@ -319,7 +361,8 @@ def remote_helper_source() -> str:
             stdin_text = request.get(\"stdin\")
             valid_timeout = (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
                              and math.isfinite(timeout) and timeout > 0)
-            if not isinstance(command, str) or not command or not valid_timeout:
+            valid_command = command_within_exec_limit(command)
+            if not valid_command or not valid_timeout:
                 write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})
                 continue
             if stdin_text is not None and not isinstance(stdin_text, str):
