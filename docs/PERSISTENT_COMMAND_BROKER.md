@@ -38,11 +38,11 @@ the local detached daemon, then releases it so the daemon can perform its own
 authorization gate. Immediately around SSH creation, the daemon reacquires the
 mutex and verifies that the grant id, role, originating client, and parent PID
 still match the active consumed attempt. A policy disable therefore either wins
-the handoff and prevents SSH or follows an already-started operation. The
-canonical launch file is atomically claimed and erased before this check, so a
-stale recipe cannot be replayed after the broker stops. The daemon records the
-login attempt as successful only after the remote helper sends the expected
-protocol hello.
+the handoff and prevents SSH or follows an already-started operation. Launch
+data is sent only through a bounded anonymous pipe inherited by that child; no
+same-UID-replaceable path or durable recipe exists. The daemon records the login
+attempt as successful only after the remote helper sends the expected protocol
+hello.
 
 There is no automatic retry or reconnect. The remote protocol hello has the same
 finite startup deadline as the launcher, so a silent child cannot retain the
@@ -98,9 +98,10 @@ automatic retry.
   `~/.agent_locks/o2-transfer-broker` default to distinct physical owner-only
   mode-0700 directories. `O2_BROKER_DIR` and `O2_TRANSFER_BROKER_DIR` may
   override them only with distinct absolute paths.
-- `command.sock`, state, one-shot launch capability, config snapshot, lock, and
-  log are owner-only. Symlinked or permissive authority files fail closed. The
-  daemon atomically removes the launch capability before any SSH spawn.
+- `command.sock`, state, config snapshot, lock, and log are owner-only.
+  Symlinked or permissive authority files fail closed. Authentication-capable
+  launch data never enters the filesystem; it is consumed once from a bounded
+  inherited descriptor before any SSH spawn.
 - A client connects only when a physical mode-0600 state receipt positively
   reports `ready` under the exact protocol version; missing, malformed, or
   stale-version receipts are not treated as compatible defaults.
@@ -136,7 +137,9 @@ SSH only for commands; replacing rsync's distinct session boundary remains
 future work. New rsync operations default to the dedicated transfer alias because
 that role retains an explicit grant-gated master startup. Login-alias rsync can
 reuse a legacy master but cannot create one through either the MCP wrapper or
-the public connection API.
+the public connection API. `o2_stop_master` and
+`O2Connection.stop_master()` close the supported transfer master locally through
+its exact socket.
 
 ## Offline validation
 

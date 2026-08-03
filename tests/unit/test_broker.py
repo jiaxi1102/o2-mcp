@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shlex
 import shutil
 import socket
@@ -25,14 +26,14 @@ import pytest
 
 from o2mcp import O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp.broker import (
+    MAX_LAUNCH_BYTES,
     MAX_UNIX_SOCKET_PATH_BYTES,
     BrokerClient,
     BrokerExecutionResult,
     BrokerServer,
     O2BrokerError,
-    O2BrokerStartupError,
     O2BrokerUnavailableError,
-    _consume_launch,
+    _read_launch_fd,
     prepare_broker_directory,
 )
 from o2mcp.broker_protocol import (
@@ -521,7 +522,7 @@ def test_overlong_socket_path_fails_before_directory_or_transport_creation(tmp_p
     assert not long_root.exists()
 
 
-def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
+def test_broker_state_is_json_serializable(tmp_path, broker_root):
     """Broker receipts remain ordinary operator-readable JSON objects."""
 
     _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
@@ -534,8 +535,8 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
-def test_launch_capability_is_canonical_and_one_shot(broker_root):
-    """A retained or copied launch recipe cannot be consumed a second time."""
+def test_launch_capability_is_an_inherited_one_shot_descriptor(broker_root):
+    """Launch metadata is consumed from a bounded pipe, never a replaceable path."""
 
     paths = prepare_broker_directory(broker_root)
     payload = {
@@ -551,13 +552,21 @@ def test_launch_capability_is_canonical_and_one_shot(broker_root):
         "startup_timeout": 5.0,
         "transport_argv": [sys.executable, "-c", "pass"],
     }
-    paths.launch.write_text(json.dumps(payload))
-    paths.launch.chmod(0o600)
+    read_fd, write_fd = os.pipe()
+    try:
+        serialized = json.dumps(payload).encode("utf-8")
+        assert len(serialized) < MAX_LAUNCH_BYTES
+        os.write(write_fd, serialized)
+        os.close(write_fd)
+        write_fd = -1
 
-    assert _consume_launch(paths.launch)["grant_id"] == "one-shot-grant"
-    assert not paths.launch.exists()
-    with pytest.raises(O2BrokerStartupError, match="absent or already consumed"):
-        _consume_launch(paths.launch)
+        assert _read_launch_fd(read_fd)["grant_id"] == "one-shot-grant"
+        read_fd = -1  # _read_launch_fd owns and closes the inherited descriptor.
+        assert not (paths.root / "launch.json").exists()
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 @pytest.mark.parametrize(
@@ -906,7 +915,7 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
         started = connection.start_broker(grant_id=grant.id, transfer=transfer)
         first_pid = started["daemon"]["pid"]
         assert set(started["destination"]) == {"hostname", "user", "port"}
-        assert not client.paths.launch.exists(), "the authentication-capable launch recipe must be one-shot"
+        assert not (client.paths.root / "launch.json").exists(), "launch data must never enter the filesystem"
         alias = config.transfer_alias if transfer else config.host_alias
         assert connection.run("printf launched", alias=alias, timeout=5).stdout == "launched"
 

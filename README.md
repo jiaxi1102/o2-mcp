@@ -147,6 +147,7 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_start_broker` | Consume one role-matched grant and open that host role's persistent command channel (`transfer=true` for the transfer host) | write |
 | `o2_stop_broker` | Locally close one role-specific broker and its SSH process; no policy change | **destructive/local** |
 | `o2_start_master` | Transfer compatibility only; login-master starts are rejected | write |
+| `o2_stop_master` | Locally close the transfer rsync master through its exact socket | **destructive/local** |
 | `o2_probe` | One explicit fixed command through the existing broker; never retried | read-only |
 | `o2_exec` | Run an arbitrary command on a login node | write |
 | `o2_submit_job` | `sbatch` a script (existing path or staged `script_text`); returns the job id | write |
@@ -184,9 +185,9 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   compatibility start can authenticate, and only after atomically consuming a
   matching client/host/off-VPN-scoped grant. The parent starts only a local
   daemon under the policy mutex; that daemon revalidates the exact active
-  attempt and holds the mutex around its sole SSH spawn. Its canonical
-  `launch.json` is atomically claimed and erased before SSH, so it cannot be
-  replayed as a durable authentication recipe.
+  attempt and holds the mutex around its sole SSH spawn. Launch data travels
+  only through a bounded inherited anonymous pipe, so another same-UID task
+  cannot replace it through the filesystem or replay a durable recipe.
 - Login and transfer-host commands never invoke SSH directly and never open a
   new ControlMaster session channel. Raw SSH through `run_raw` is rejected in
   production. Rsync remains the explicitly isolated compatibility boundary.

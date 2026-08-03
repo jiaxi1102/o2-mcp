@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -121,6 +121,22 @@ def default_runner(argv: list[str], timeout: float | None, input_text: str | Non
         **stdin_kwargs,
     )
     return CommandResult(argv=list(argv), returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+
+def _write_all_fd(fd: int, payload: bytes) -> None:
+    """Write a complete local handoff payload to an anonymous descriptor.
+
+    ``os.write`` may complete only a prefix even for a small pipe payload. Loop
+    explicitly so the child either receives the exact JSON bytes or the parent
+    surfaces a local handoff failure before releasing its authorization mutex.
+    """
+
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("broker launch descriptor accepted no bytes")
+        view = view[written:]
 
 
 def _guarded_default_runner(
@@ -505,38 +521,47 @@ class O2Connection:
             "startup_timeout": self.config.broker_start_timeout,
             "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
         }
-        atomic_private_text_write(paths.launch, json.dumps(launch_payload, indent=2, sort_keys=True) + "\n")
+        launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
 
+        launch_read_fd, launch_write_fd = os.pipe()
+        ack_read_fd, ack_write_fd = os.pipe()
         daemon_argv = [
             sys.executable,
             "-c",
             "from o2mcp.broker import main; raise SystemExit(main())",
             "--serve",
-            "--launch-file",
-            str(paths.launch),
+            "--launch-fd",
+            str(launch_read_fd),
         ]
-        read_fd, write_fd = os.pipe()
         consumed = None
         daemon: subprocess.Popen[bytes] | None = None
         try:
             with open_private_append(paths.log) as log:  # noqa: SIM117 - fd must outlive Popen only
                 with self.policy.consume_login_grant_for_launch(grant_id, logical_target) as consumed:
                     daemon = subprocess.Popen(
-                        [*daemon_argv, "--ack-fd", str(write_fd)],
+                        [*daemon_argv, "--ack-fd", str(ack_write_fd)],
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=log,
                         start_new_session=True,
                         close_fds=True,
-                        pass_fds=(write_fd,),
+                        pass_fds=(launch_read_fd, ack_write_fd),
                     )
-                    os.close(write_fd)
-                    write_fd = -1
+                    os.close(launch_read_fd)
+                    launch_read_fd = -1
+                    # The anonymous pipe is the launch capability. Another
+                    # same-UID task cannot replace its bytes through the broker
+                    # directory while this approved handoff is in flight.
+                    _write_all_fd(launch_write_fd, launch_bytes)
+                    os.close(launch_write_fd)
+                    launch_write_fd = -1
+                    os.close(ack_write_fd)
+                    ack_write_fd = -1
             # Waiting while still holding the policy mutex would deadlock the
             # daemon's own active-attempt verification. It is safe to release
             # here: the daemon acquires the mutex immediately around SSH Popen,
             # and its policy check fails if a disable wins the handoff race.
-            ready, _, _ = select.select([read_fd], [], [], 5.0)
+            ready, _, _ = select.select([ack_read_fd], [], [], 5.0)
             if not ready:
                 assert daemon is not None
                 daemon.terminate()
@@ -548,24 +573,20 @@ class O2Connection:
                 raise O2BrokerStartupError(
                     "Broker daemon did not acknowledge its SSH spawn within 5 seconds; it was stopped. Do not retry."
                 )
-            acknowledgement = os.read(read_fd, 4096).decode("utf-8", errors="replace").strip()
+            acknowledgement = os.read(ack_read_fd, 4096).decode("utf-8", errors="replace").strip()
             if not acknowledgement.startswith("SPAWNED "):
                 raise O2BrokerStartupError(
                     f"Broker daemon rejected the authorized launch: {acknowledgement or 'no detail'}"
                 )
         except Exception:
-            # If the daemon never atomically claimed the launch capability,
-            # remove it here. A failed local handoff must not leave an
-            # authentication-capable recipe for later inspection or replay.
-            with suppress(FileNotFoundError):
-                paths.launch.unlink()
             if consumed is not None and (daemon is None or daemon.poll() is not None):
                 self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
             raise
         finally:
-            os.close(read_fd)
-            if write_fd >= 0:
-                os.close(write_fd)
+            os.close(ack_read_fd)
+            for fd in (launch_read_fd, launch_write_fd, ack_write_fd):
+                if fd >= 0:
+                    os.close(fd)
 
         client.wait_until_ready(timeout=self.config.broker_start_timeout)
         return client.local_status()
@@ -807,9 +828,21 @@ class O2Connection:
         prior = start_stderr.strip()
         return f"{prior}\n{message}" if prior else message
 
-    def stop_master(self) -> CommandResult:
-        """Close the persistent ControlMaster (non-fatal if already closed)."""
-        target = self.config.host_alias
+    def stop_master(self, *, alias: str | None = None) -> CommandResult:
+        """Close the retained transfer ControlMaster through its exact socket.
+
+        Login-master startup is retired, so the corresponding public stop API
+        defaults to the only master this package can create. An explicit alias
+        remains available for callers that track role names themselves, but it
+        must resolve to the configured transfer role.
+        """
+
+        target = alias or self.config.transfer_alias
+        if target != self.config.transfer_alias:
+            raise O2UnsafeTransportError(
+                f"Only the governed transfer ControlMaster may be stopped here, not '{target}'. "
+                "Stop login command sessions through stop_broker instead."
+            )
         return self._runner(
             [
                 self.SSH_EXECUTABLE,

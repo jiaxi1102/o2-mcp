@@ -135,6 +135,7 @@ async def test_tool_registry_and_annotations():
         "o2_policy_enable_reuse",
         "o2_authorize_login",
         "o2_start_master",
+        "o2_stop_master",
         "o2_start_broker",
         "o2_stop_broker",
         "o2_exec",
@@ -161,6 +162,7 @@ async def test_tool_registry_and_annotations():
     assert tools["o2_probe"].annotations.openWorldHint is True
     assert tools["o2_submit_job"].annotations.readOnlyHint is False
     assert tools["o2_cancel_job"].annotations.destructiveHint is True
+    assert tools["o2_stop_master"].annotations.destructiveHint is True
     assert tools["o2_stop_broker"].annotations.destructiveHint is True
     assert tools["o2_workspace_gc"].annotations.destructiveHint is True
     assert tools["o2_disk_report"].annotations.readOnlyHint is True
@@ -341,6 +343,20 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
     assert payload["ok"] is False
     assert payload["returncode"] == 255
     assert "post-start control-socket check failed" in payload["stderr"]
+
+
+@pytest.mark.anyio
+async def test_stop_master_targets_transfer_role_and_rejects_login(monkeypatch, tmp_path):
+    """The MCP can retire its supported rsync master without raw SSH fallback."""
+
+    runner = _patch_connection(monkeypatch, tmp_path, master=True)
+
+    stopped = await _call("o2_stop_master", {"params": {"transfer": True}})
+    rejected = await _call("o2_stop_master", {"params": {"transfer": False}})
+
+    assert stopped["ok"] is True and stopped["alias"] == "o2-transfer"
+    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
+    assert rejected["ok"] is False and rejected["error"] == "login_master_retired"
 
 
 @pytest.mark.anyio

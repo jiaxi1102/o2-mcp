@@ -601,6 +601,21 @@ def test_start_master_can_open_the_transfer_alias_with_transfer_grant(tmp_path):
     assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
 
 
+def test_stop_master_targets_only_the_supported_transfer_role(tmp_path):
+    """The public lifecycle API can retire the master it is allowed to create."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.stop_master()
+
+    assert result.ok
+    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
+    assert runner.calls[-1]["argv"][-1] == conn.config.transfer_alias
+    with pytest.raises(O2UnsafeTransportError, match="Only the governed transfer ControlMaster"):
+        conn.stop_master(alias=conn.config.host_alias)
+
+
 def test_default_master_start_is_retired_even_when_aliases_are_identical(tmp_path):
     """Alias equality cannot turn the unsafe default login role into transfer."""
 

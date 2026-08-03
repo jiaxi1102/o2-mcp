@@ -139,6 +139,16 @@ class StartMasterInput(BaseModel):
     )
 
 
+class StopMasterInput(BaseModel):
+    """Select the sole retained ControlMaster role for local shutdown."""
+
+    model_config = ConfigDict(extra="forbid")
+    transfer: bool = Field(
+        default=True,
+        description="Must remain true; login-role masters are retired and command brokers have their own stop tool.",
+    )
+
+
 class StartBrokerInput(BaseModel):
     """Consume one role-matched grant to start a persistent command channel."""
 
@@ -543,6 +553,32 @@ async def o2_start_master(params: StartMasterInput) -> str:
             login_target=login_target,
         )
         return {"ok": result.ok, "alias": alias or conn.config.host_alias, **_command_payload(result)}
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
+    name="o2_stop_master",
+    annotations={
+        "title": "Stop O2 transfer master",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
+)
+async def o2_stop_master(params: StopMasterInput) -> str:
+    """Close only the local transfer rsync ControlMaster, even if disabled."""
+
+    def work() -> dict[str, Any]:
+        if not params.transfer:
+            return {
+                "ok": False,
+                "error": "login_master_retired",
+                "message": "Login command sessions are brokers; stop them with o2_stop_broker instead.",
+            }
+        conn = _connection()
+        result = conn.stop_master(alias=conn.config.transfer_alias)
+        return {"ok": result.ok, "alias": conn.config.transfer_alias, **_command_payload(result)}
 
     return await _run_tool(work)
 

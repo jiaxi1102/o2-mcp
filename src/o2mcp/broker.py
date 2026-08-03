@@ -68,6 +68,10 @@ class _O2BrokerTransportError(O2BrokerError):
 # null. Use a slightly smaller portable ceiling so an overlong custom
 # O2_BROKER_DIR fails before an approved SSH attempt is consumed.
 MAX_UNIX_SOCKET_PATH_BYTES = 100
+# The private launch payload contains only paths, grant metadata, SSH argv, and
+# the embedded helper source. Bound descriptor reads so a malformed parent
+# cannot make the daemon accumulate unbounded local data before policy checks.
+MAX_LAUNCH_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -93,12 +97,6 @@ class BrokerPaths:
         """Return the lifetime lock held by the sole broker daemon."""
 
         return self.root / "daemon.lock"
-
-    @property
-    def launch(self) -> Path:
-        """Return the private one-shot daemon launch specification path."""
-
-        return self.root / "launch.json"
 
     @property
     def ssh_config(self) -> Path:
@@ -183,11 +181,11 @@ def prepare_broker_directory(path: Path) -> BrokerPaths:
 
 
 def atomic_private_text_write(path: Path, text: str) -> None:
-    """Atomically write one mode-0600 UTF-8 launcher artifact.
+    """Atomically write one mode-0600 UTF-8 broker artifact.
 
-    Launch specifications and inspected SSH config can contain usernames,
-    identity paths, or remote helper source. They share the receipt writer's
-    ownership and permission guarantees but are intentionally plain text.
+    The inspected SSH config can contain usernames and identity paths. It shares
+    the receipt writer's ownership and permission guarantees but is
+    intentionally plain text for direct OpenSSH consumption.
     """
 
     _validate_private_directory(path.parent, create=True)
@@ -975,15 +973,9 @@ class BrokerServer:
         return 0 if outcome == "stopped" else 1
 
 
-def _load_launch(path: Path) -> dict[str, Any]:
-    """Load and validate a privately claimed launch file."""
+def _validate_launch_payload(payload: Any) -> dict[str, Any]:
+    """Validate launch data received only through the inherited pipe."""
 
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-        raise O2BrokerStartupError("broker launch file is not a caller-owned regular file")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise O2BrokerStartupError("broker launch file must have mode 0600")
-    payload = json.loads(path.read_text(encoding="utf-8"))
     required_strings = (
         "broker_dir",
         "policy_file",
@@ -992,8 +984,12 @@ def _load_launch(path: Path) -> dict[str, Any]:
         "login_target",
         "launcher_client_id",
     )
-    if not isinstance(payload, dict) or any(not isinstance(payload.get(key), str) for key in required_strings):
-        raise O2BrokerStartupError("broker launch file is missing required string fields")
+    if not isinstance(payload, dict):
+        raise O2BrokerStartupError("broker launch payload must be a JSON object")
+    if payload.get("schema_version") != 1:
+        raise O2BrokerStartupError("broker launch payload has an unsupported schema version")
+    if any(not isinstance(payload.get(key), str) or not payload[key] for key in required_strings):
+        raise O2BrokerStartupError("broker launch payload is missing required string fields")
     if payload["login_target"] not in {"login", "transfer"}:
         raise O2BrokerStartupError("broker launch login_target must be 'login' or 'transfer'")
     launcher_pid = payload.get("launcher_pid")
@@ -1018,32 +1014,36 @@ def _load_launch(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _consume_launch(path: Path) -> dict[str, Any]:
-    """Atomically claim, validate, and erase one launch capability.
+def _read_launch_fd(fd: int) -> dict[str, Any]:
+    """Read one bounded, one-shot launch payload from an inherited pipe.
 
-    ``launch.json`` contains authentication-capable transport arguments. It is
-    never a durable recipe: exactly one daemon may rename it away, and the
-    claimed copy is removed before policy authorization or SSH spawning. The
-    canonical-path check also rejects copied launch data supplied through an
-    arbitrary mode-0600 file.
+    Unlike a mode-0600 path, an anonymous pipe cannot be replaced by another
+    same-UID task between parent authorization and child consumption. The
+    daemon closes its sole descriptor after EOF, so no durable launch recipe
+    remains available for replay.
     """
 
-    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
+    if type(fd) is not int or fd < 0:
+        raise O2BrokerStartupError("broker launch descriptor must be a non-negative integer")
+    chunks: list[bytes] = []
+    total = 0
     try:
-        os.replace(path, claimed)
-    except FileNotFoundError as exc:
-        raise O2BrokerStartupError("broker launch capability is absent or already consumed") from exc
-    except OSError as exc:
-        raise O2BrokerStartupError(f"cannot atomically claim broker launch capability: {exc}") from exc
-    try:
-        payload = _load_launch(claimed)
-        canonical = BrokerPaths(Path(payload["broker_dir"]).expanduser()).launch
-        if path.absolute() != canonical.absolute():
-            raise O2BrokerStartupError(f"broker launch capability must use its canonical private path {canonical}")
-        return payload
+        while True:
+            chunk = os.read(fd, min(65536, MAX_LAUNCH_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_LAUNCH_BYTES:
+                raise O2BrokerStartupError(f"broker launch payload exceeds {MAX_LAUNCH_BYTES} bytes")
     finally:
-        with suppress(FileNotFoundError):
-            claimed.unlink()
+        with suppress(OSError):
+            os.close(fd)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise O2BrokerStartupError(f"broker launch payload is not valid UTF-8 JSON: {exc}") from exc
+    return _validate_launch_payload(payload)
 
 
 def _install_signal_handlers(server: BrokerServer) -> None:
@@ -1061,14 +1061,14 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serve", action="store_true", help="run the broker daemon")
-    parser.add_argument("--launch-file", type=Path, required=True)
+    parser.add_argument("--launch-fd", type=int, required=True)
     parser.add_argument("--ack-fd", type=int, required=True)
     args = parser.parse_args(argv)
     if not args.serve:
         parser.error("--serve is required")
 
     try:
-        payload = _consume_launch(args.launch_file)
+        payload = _read_launch_fd(args.launch_fd)
         server = BrokerServer(
             paths=BrokerPaths(Path(payload["broker_dir"])),
             policy_file=Path(payload["policy_file"]),
