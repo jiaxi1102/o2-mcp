@@ -81,13 +81,14 @@ def _start_local_broker(tmp_path, broker_root):
     thread = threading.Thread(target=server.serve_forever, name="offline-o2-broker", daemon=True)
     thread.start()
     client = BrokerClient(paths.root)
-    # Production waits for a pipe acknowledgement emitted after the daemon has
-    # acquired this lock and spawned SSH. The in-process test has no parent
-    # launcher, so model that ordering explicitly before calling wait_until_ready.
-    deadline = time.monotonic() + 5
-    while not client.launch_in_progress() and time.monotonic() < deadline:
+    # Production waits for a pipe acknowledgement emitted after SSH spawn. This
+    # in-process test has no parent launcher, so wait on the server's own listener
+    # publication instead of racing a transient lock observation on a busy CI VM.
+    deadline = time.monotonic() + 10
+    while server.listener is None and thread.is_alive() and time.monotonic() < deadline:
         time.sleep(0.01)
-    client.wait_until_ready(timeout=5)
+    assert server.listener is not None, client.local_status()
+    client.ping(timeout=1)
     return policy, server, thread, client
 
 
