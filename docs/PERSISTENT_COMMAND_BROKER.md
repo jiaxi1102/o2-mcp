@@ -65,7 +65,8 @@ Logical command text is capped at 64 KiB because it becomes a remote
 limit. Larger scripts must be transferred as files and invoked with a short
 command. Process-spawn failures return an ordinary command result and do not
 terminate the persistent helper. The client validates the complete JSON-escaped
-request before connecting, so stdin expansion cannot fail after dispatch.
+request before connecting, and stdin is capped at 1 MiB, so expansion cannot
+fail after dispatch and bulk payloads remain on the transfer path.
 
 The daemon may scan through at most 64 KiB of unframed output before the first
 remote hello, accommodating a login-shell banner. Every later frame is strict.
@@ -107,7 +108,9 @@ automatic retry.
 - `~/.agent_locks/o2-broker` and
   `~/.agent_locks/o2-transfer-broker` default to distinct physical owner-only
   mode-0700 directories. `O2_BROKER_DIR` and `O2_TRANSFER_BROKER_DIR` may
-  override them only with distinct absolute paths.
+  override them only with distinct absolute filesystem authorities; paths are
+  canonicalized and existing identities compared so `..` or symlinked
+  ancestors cannot make both roles share one socket/lock directory.
 - `command.sock`, state, lock, and log are owner-only.
   Symlinked or permissive authority files fail closed. Authentication-capable
   launch data never enters the filesystem; it is consumed once from a bounded
@@ -125,9 +128,11 @@ automatic retry.
 - One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.
-- The remote frame write has a five-second deadline while the policy mutex is
-  held. If SSH stops draining stdin, the daemon terminates that broken transport
-  and releases global policy authority instead of blocking incident disable.
+- The remote frame write has a five-second inactivity deadline plus a
+  frame-size-scaled total deadline while the policy mutex is held. Continued
+  progress is allowed at slow-link rates; a stalled SSH stdin terminates that
+  broken transport and releases global policy authority instead of blocking
+  incident disable.
 - Disabling policy does not kill an already-running command or broker. It blocks
   the next frame. `o2_stop_broker` is an explicit local process-control action.
 - If SSH exits or framing fails, the daemon removes its socket, writes a failed

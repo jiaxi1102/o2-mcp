@@ -37,8 +37,8 @@ from typing import Any, BinaryIO, Callable
 
 from o2mcp.broker_protocol import (
     MAX_COMMAND_BYTES,
-    MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
+    MAX_STDIN_BYTES,
     MAX_TIMEOUT_SECONDS,
     PROTOCOL_VERSION,
     BrokerProtocolError,
@@ -83,6 +83,7 @@ MAX_LAUNCH_BYTES = 1024 * 1024
 # Five seconds is ample for a <=16 MiB local pipe write while still keeping a
 # global incident stop responsive when the remote side no longer drains input.
 DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS = 5.0
+MIN_REMOTE_WRITE_BYTES_PER_SECOND = 128 * 1024
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -405,10 +406,10 @@ class BrokerClient:
             raise ValueError("broker stdin must be text or None")
         if input_text is not None and not utf8_text_within_limit(
             input_text,
-            MAX_FRAME_BYTES,
+            MAX_STDIN_BYTES,
             allow_empty=True,
         ):
-            raise ValueError("broker stdin must be valid UTF-8 within the frame limit")
+            raise ValueError(f"broker stdin must be valid UTF-8 within the {MAX_STDIN_BYTES}-byte limit")
         request_id = str(uuid.uuid4())
         request = {
             "type": "exec",
@@ -786,26 +787,51 @@ class BrokerServer:
         policy mutex can be released for an incident disable.
         """
 
-        outcome: dict[str, BaseException] = {}
+        frame = memoryview(encode_frame(request))
+        frame_size = len(frame)
+        started = time.monotonic()
+        inactivity_deadline = started + self.remote_write_timeout
+        absolute_deadline = started + self.remote_write_timeout + (frame_size / MIN_REMOTE_WRITE_BYTES_PER_SECOND)
+        try:
+            descriptor = remote_in.fileno()
+            was_blocking = os.get_blocking(descriptor)
+            os.set_blocking(descriptor, False)
+        except (OSError, ValueError) as exc:
+            raise _O2BrokerTransportError(f"persistent remote stream is not writable: {exc}") from exc
 
-        def write_request() -> None:
-            try:
-                write_frame(remote_in, request)
-            except BaseException as exc:  # surfaced synchronously below
-                outcome["error"] = exc
-
-        writer = threading.Thread(target=write_request, name="o2-broker-frame-write", daemon=True)
-        writer.start()
-        writer.join(timeout=self.remote_write_timeout)
-        if writer.is_alive():
-            self._terminate_transport(timeout=1.0)
-            writer.join(timeout=1.0)
-            raise _O2BrokerTransportError(
-                f"persistent remote frame write exceeded {self.remote_write_timeout:.1f}s; transport stopped"
-            )
-        error = outcome.get("error")
-        if error is not None:
-            raise _O2BrokerTransportError(f"persistent remote stream failed: {error}") from error
+        try:
+            while frame:
+                now = time.monotonic()
+                remaining = min(inactivity_deadline, absolute_deadline) - now
+                if remaining <= 0:
+                    self._terminate_transport(timeout=1.0)
+                    raise _O2BrokerTransportError(
+                        "persistent remote frame write exceeded its progress/size deadline; transport stopped"
+                    )
+                _, writable, _ = select.select([], [descriptor], [], remaining)
+                if not writable:
+                    self._terminate_transport(timeout=1.0)
+                    raise _O2BrokerTransportError(
+                        "persistent remote frame write made no progress before its deadline; transport stopped"
+                    )
+                try:
+                    written = os.write(descriptor, frame[:65536])
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise O2BrokerError("persistent remote stream accepted no frame bytes")
+                frame = frame[written:]
+                # Continued progress may use the size-scaled total budget, while
+                # a fully stalled channel is still detected within the fixed
+                # inactivity window so policy disable remains responsive.
+                inactivity_deadline = time.monotonic() + self.remote_write_timeout
+        except _O2BrokerTransportError:
+            raise
+        except (OSError, ValueError, O2BrokerError) as exc:
+            raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
+        finally:
+            with suppress(OSError, ValueError):
+                os.set_blocking(descriptor, was_blocking)
 
     def _bind_listener(self) -> None:
         """Publish the local endpoint only after the remote helper is ready."""
@@ -907,11 +933,13 @@ class BrokerServer:
             stdin_text = request.get("stdin")
             valid_stdin = stdin_text is None or utf8_text_within_limit(
                 stdin_text,
-                MAX_FRAME_BYTES,
+                MAX_STDIN_BYTES,
                 allow_empty=True,
             )
+            expected_keys = {"type", "protocol", "id", "command", "timeout_seconds", "stdin"}
             valid_request = (
-                request.get("protocol") == PROTOCOL_VERSION
+                set(request) == expected_keys
+                and request.get("protocol") == PROTOCOL_VERSION
                 and valid_request_id
                 and command_within_exec_limit(request.get("command"))
                 and valid_timeout
@@ -921,6 +949,10 @@ class BrokerServer:
                 with suppress(OSError, BrokerProtocolError):
                     write_frame(local, {"type": "error", "error": "invalid_request"})
                 return
+            # Never forward caller-owned container structure. Rebuilding the
+            # exact wire object keeps local/remote validation independent of
+            # JSON parser recursion behavior across Python versions.
+            remote_request = {key: request[key] for key in expected_keys}
 
             # The client checks policy before connecting, while this second gate
             # blocks hand-crafted local socket requests that try to bypass the
@@ -939,7 +971,7 @@ class BrokerServer:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})
                     except (OSError, BrokerProtocolError):
                         return
-                    self._write_remote_frame_with_deadline(remote_in, request)
+                    self._write_remote_frame_with_deadline(remote_in, remote_request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
                     write_frame(local, {"type": "error", "error": "policy_denied", "message": str(exc)})

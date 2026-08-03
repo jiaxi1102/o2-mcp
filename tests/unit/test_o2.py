@@ -172,6 +172,22 @@ def test_role_specific_broker_directories_are_absolute_and_distinct(tmp_path):
     with pytest.raises(ValueError, match="must use different authority directories"):
         O2Config(broker_dir=shared, transfer_broker_dir=shared)
 
+    root = tmp_path / "authority-root"
+    root.mkdir()
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(
+            broker_dir=root / "login",
+            transfer_broker_dir=root / "temporary" / ".." / "login",
+        )
+
+    linked_root = tmp_path / "linked-authority-root"
+    linked_root.symlink_to(root, target_is_directory=True)
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(
+            broker_dir=root / "login",
+            transfer_broker_dir=linked_root / "login",
+        )
+
 
 def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
     """Ordinary commands must be unable to authenticate if multiplexing fails."""

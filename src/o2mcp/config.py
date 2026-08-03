@@ -154,13 +154,29 @@ class O2Config:
                 "O2 policy path must be absolute; set O2_POLICY_FILE to one " "workstation-wide absolute path"
             )
         self.ssh_config_file = Path(self.ssh_config_file).expanduser()
-        self.broker_dir = Path(self.broker_dir).expanduser()
-        if not self.broker_dir.is_absolute():
+        broker_dir = Path(self.broker_dir).expanduser()
+        if not broker_dir.is_absolute():
             raise ValueError("O2 broker directory must be one workstation-wide absolute path")
-        self.transfer_broker_dir = Path(self.transfer_broker_dir).expanduser()
-        if not self.transfer_broker_dir.is_absolute():
+        transfer_broker_dir = Path(self.transfer_broker_dir).expanduser()
+        if not transfer_broker_dir.is_absolute():
             raise ValueError("O2 transfer broker directory must be one workstation-wide absolute path")
-        if self.transfer_broker_dir == self.broker_dir:
+        try:
+            # ``strict=False`` collapses ``..`` and resolves every existing
+            # symlinked ancestor without requiring the final authority
+            # directory to exist yet. Persist the canonical paths so later
+            # clients, stops, and receipts all address the same filesystem
+            # authority that was compared here.
+            self.broker_dir = broker_dir.resolve(strict=False)
+            self.transfer_broker_dir = transfer_broker_dir.resolve(strict=False)
+        except OSError as exc:
+            raise ValueError(f"Could not canonicalize O2 broker directories: {exc}") from exc
+        same_authority = self.transfer_broker_dir == self.broker_dir
+        if not same_authority and self.broker_dir.exists() and self.transfer_broker_dir.exists():
+            try:
+                same_authority = os.path.samefile(self.broker_dir, self.transfer_broker_dir)
+            except OSError as exc:
+                raise ValueError(f"Could not compare O2 broker directory identities: {exc}") from exc
+        if same_authority:
             raise ValueError("O2 login and transfer brokers must use different authority directories")
         if not math.isfinite(self.broker_start_timeout) or self.broker_start_timeout <= 0:
             raise ValueError("O2 broker start timeout must be greater than zero")

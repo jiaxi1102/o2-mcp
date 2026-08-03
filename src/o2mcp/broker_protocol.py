@@ -38,6 +38,10 @@ MAX_REQUEST_ID_BYTES = 128
 # caller that truly needs no deadline must send JSON null / Python ``None``
 # explicitly rather than approximating infinity with a huge number.
 MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+# Stdin shares a request frame with command metadata and crosses the policy
+# mutex-protected transport write. Keep it bounded independently from the much
+# larger response frame; bulk payloads belong on the governed transfer path.
+MAX_STDIN_BYTES = 1 * 1024 * 1024
 # JSON escaping can expand arbitrary command bytes substantially (for example,
 # every NUL becomes six ASCII characters). A one-MiB per-stream source bound
 # therefore keeps even worst-case escaped stdout+stderr below the 16-MiB frame.
@@ -200,6 +204,7 @@ def remote_helper_source() -> str:
         MAX_COMMAND_BYTES = {MAX_COMMAND_BYTES}
         MAX_REQUEST_ID_BYTES = {MAX_REQUEST_ID_BYTES}
         MAX_TIMEOUT_SECONDS = {MAX_TIMEOUT_SECONDS}
+        MAX_STDIN_BYTES = {MAX_STDIN_BYTES}
         MAX_OUTPUT_BYTES = {MAX_OUTPUT_BYTES}
 
         def read_exact(size):
@@ -390,7 +395,8 @@ def remote_helper_source() -> str:
                 break
             request_id = request.get(\"id\")
             valid_request_id = utf8_text_within_limit(request_id, MAX_REQUEST_ID_BYTES)
-            if request.get(\"type\") != \"exec\" or not valid_request_id:
+            expected_keys = {{\"type\", \"protocol\", \"id\", \"command\", \"timeout_seconds\", \"stdin\"}}
+            if set(request) != expected_keys or request.get(\"type\") != \"exec\" or not valid_request_id:
                 write_frame({{"type": "error", "id": None, "error": "invalid_request"}})
                 continue
             command = request.get(\"command\")
@@ -400,7 +406,7 @@ def remote_helper_source() -> str:
             valid_command = command_within_exec_limit(command)
             valid_stdin = (
                 stdin_text is None
-                or utf8_text_within_limit(stdin_text, MAX_FRAME_BYTES, allow_empty=True)
+                or utf8_text_within_limit(stdin_text, MAX_STDIN_BYTES, allow_empty=True)
             )
             if not valid_command or not valid_timeout or not valid_stdin:
                 write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})

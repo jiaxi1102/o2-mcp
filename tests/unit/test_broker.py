@@ -41,9 +41,9 @@ from o2mcp.broker import (
 from o2mcp.broker_protocol import (
     FRAME_MAGIC,
     MAX_COMMAND_BYTES,
-    MAX_FRAME_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_REQUEST_ID_BYTES,
+    MAX_STDIN_BYTES,
     MAX_TIMEOUT_SECONDS,
     PROTOCOL_VERSION,
     BrokerProtocolError,
@@ -272,7 +272,7 @@ def test_blocked_stdin_feeder_kills_inheriting_descendant(tmp_path, broker_root)
         result = client.execute(
             "python3 -c " + shlex.quote(script),
             timeout=5,
-            input_text="x" * (2 * 1024 * 1024),
+            input_text="x" * (512 * 1024),
         )
         descendant_pid = int(result.stdout.strip())
 
@@ -342,6 +342,15 @@ def test_oversized_command_is_rejected_without_losing_persistent_channel(tmp_pat
                 "command": "cat",
                 "timeout_seconds": 5,
                 "stdin": "\ud800",
+            },
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "unexpected-structure",
+                "command": "printf must-not-run",
+                "timeout_seconds": 5,
+                "stdin": None,
+                "unused_nested_field": {"value": [[[[1]]]]},
             },
         )
         for request in unsafe_text_requests:
@@ -656,14 +665,14 @@ def test_client_rejects_unencodable_stdin_before_socket_access(tmp_path):
     assert not client.paths.root.exists()
 
 
-def test_client_rejects_json_expanded_stdin_before_socket_access(tmp_path):
-    """Escaping overhead must be included in the pre-dispatch frame bound."""
+def test_client_rejects_oversized_stdin_before_socket_access(tmp_path):
+    """Command stdin stays bounded independently from the response-frame limit."""
 
     client = BrokerClient(tmp_path / "absent")
-    expanding_stdin = "\0" * ((MAX_FRAME_BYTES // 6) + 1024)
+    oversized_stdin = "x" * (MAX_STDIN_BYTES + 1)
 
-    with pytest.raises(ValueError, match="encoded broker request exceeds"):
-        client.execute("cat", timeout=1, input_text=expanding_stdin)
+    with pytest.raises(ValueError, match="stdin must be valid UTF-8"):
+        client.execute("cat", timeout=1, input_text=oversized_stdin)
 
     assert not client.paths.root.exists()
 
@@ -686,34 +695,90 @@ def test_stalled_remote_write_releases_policy_after_stopping_transport(tmp_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    entered = threading.Event()
-
-    class _StalledWriter:
-        """Model a pipe write that unblocks only when SSH is terminated."""
-
-        def write(self, _value):
-            entered.set()
-            while server.transport.poll() is None:
-                time.sleep(0.005)
-            raise BrokenPipeError("transport stopped")
-
-        def flush(self):
-            return None
+    read_fd, write_fd = os.pipe()
+    remote_writer = os.fdopen(write_fd, "wb", buffering=0)
 
     started = time.monotonic()
     try:
-        with pytest.raises(O2BrokerError, match="frame write exceeded"), policy.serialize_reuse_launch():
+        with pytest.raises(O2BrokerError, match="frame write made no progress"), policy.serialize_reuse_launch():
             server._write_remote_frame_with_deadline(
-                _StalledWriter(),
-                {"type": "exec", "id": "stalled-write"},
+                remote_writer,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "stalled-write",
+                    "command": "cat",
+                    "timeout_seconds": 5,
+                    "stdin": "x" * (256 * 1024),
+                },
             )
 
-        assert entered.is_set()
         assert time.monotonic() - started < 2
         assert server.transport.poll() is not None
         disabled = policy.disable(reason="write deadline released policy mutex")
         assert disabled["mode"] == "disabled"
     finally:
+        if server.transport.poll() is None:
+            server.transport.kill()
+            server.transport.wait(timeout=2)
+        remote_writer.close()
+        os.close(read_fd)
+
+
+def test_slow_progressing_remote_write_uses_size_scaled_deadline(tmp_path, broker_root):
+    """Continued pipe progress may use the larger frame-size total budget."""
+
+    policy = _reuse_policy(tmp_path)
+    server = BrokerServer(
+        paths=prepare_broker_directory(broker_root),
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-c", "pass"],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        remote_write_timeout=0.05,
+    )
+    server.transport = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    read_fd, write_fd = os.pipe()
+    remote_writer = os.fdopen(write_fd, "wb", buffering=0)
+    received = bytearray()
+
+    def drain_slowly() -> None:
+        """Read often enough for progress while staying slower than five seconds total."""
+
+        while True:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                return
+            received.extend(chunk)
+            time.sleep(0.01)
+
+    reader = threading.Thread(target=drain_slowly, daemon=True)
+    reader.start()
+    try:
+        with policy.serialize_reuse_launch():
+            server._write_remote_frame_with_deadline(
+                remote_writer,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "slow-progress",
+                    "command": "cat",
+                    "timeout_seconds": 5,
+                    "stdin": "x" * (128 * 1024),
+                },
+            )
+
+        assert received
+        assert server.transport.poll() is None
+    finally:
+        remote_writer.close()
+        reader.join(timeout=2)
+        os.close(read_fd)
         if server.transport.poll() is None:
             server.transport.kill()
             server.transport.wait(timeout=2)
