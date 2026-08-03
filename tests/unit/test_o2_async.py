@@ -275,6 +275,20 @@ def test_status_isolates_corrupt_metadata_when_listing(tmp_path):
     assert invalid["error"] == "invalid_transfer_metadata"
 
 
+def test_status_isolates_non_finite_numeric_metadata(tmp_path):
+    """JSON infinity cannot escape the corrupt-receipt diagnostic boundary."""
+
+    mgr = _mgr(tmp_path, FakeSpawner())
+    corrupt = mgr.state_dir / "push-20260617-001234-99-0001.json"
+    mgr.state_dir.mkdir(parents=True)
+    corrupt.write_text('{"id":"push-20260617-001234-99-0001","pid":1e999}')
+
+    result = mgr.status("push-20260617-001234-99-0001")
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_transfer_metadata"
+
+
 def test_progress_parsing_rsync_tochk():
     # Real rsync: a running to-chk=remaining/total gives exact done/total.
     log = (

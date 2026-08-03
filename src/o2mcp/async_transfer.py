@@ -274,7 +274,7 @@ class O2AsyncTransfer:
 
         try:
             return self._status_from_meta(meta_path, log_tail=log_tail)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, OverflowError, KeyError, TypeError) as exc:
             return {
                 "ok": False,
                 "error": "invalid_transfer_metadata",

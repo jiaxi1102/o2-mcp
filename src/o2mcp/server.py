@@ -316,7 +316,7 @@ def _local_status_payload() -> dict[str, Any]:
         grant = {**grant, "owned_by_this_client": grant.get("client_id") == conn.policy.client_id}
     try:
         transfers = O2AsyncTransfer(conn).status()
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, OverflowError, KeyError, TypeError) as exc:
         # Policy recovery must remain visible even when the transfer directory
         # itself is unreadable. Individual malformed receipts are normally
         # isolated by O2AsyncTransfer.status; this is the directory-level guard.
