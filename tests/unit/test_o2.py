@@ -342,7 +342,7 @@ def test_match_ssh_config_is_rejected_before_openssh_runs(tmp_path):
         "  HostName o2.hms.harvard.edu\n"
         "  User jiz947\n"
         "  ControlPath /tmp/o2-control.sock\n"
-        'Match exec "ssh unsafe-probe.example true"\n'
+        'Match=exec "ssh unsafe-probe.example true"\n'
         "  ServerAliveInterval 30\n"
     )
     runner = RecordingRunner(master=True)
@@ -363,7 +363,7 @@ def test_match_in_included_ssh_config_is_rejected(tmp_path):
     included = tmp_path / "o2-extra.conf"
     included.write_text('Match exec "ssh unsafe-probe.example true"\n  ServerAliveInterval 30\n')
     config.ssh_config_file.write_text(
-        f"Include {included}\n"
+        f"Include={included}\n"
         "Host o2\n"
         "  HostName o2.hms.harvard.edu\n"
         "  User jiz947\n"
@@ -1073,6 +1073,19 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
     transport = shlex.split(raw_rsync[raw_rsync.index("-e") + 1])
     assert transport[transport.index("-S") + 1] == "/tmp/alice@o2-transfer-control.sock"
     assert any(call["argv"][-1] == "alice@o2-transfer" and "-O" in call["argv"] for call in recording_runner.calls)
+
+    # Only SSH's destination operand selects a socket. An alias appearing in the
+    # remote command is ordinary data and must not override the actual `o2` host.
+    recording_conn.run_raw(["ssh", "o2", "echo", "o2-transfer"])
+    raw_ssh = recording_runner.calls[-1]["argv"]
+    assert raw_ssh[raw_ssh.index("-S") + 1] == "/tmp/o2-control.sock"
+
+    # Likewise, an rsync option argument can resemble a remote endpoint without
+    # being a source or destination. Target inference must ignore that value.
+    recording_conn.run_raw(["rsync", "--exclude", "o2-transfer:/ignored", "x", "o2:/p"])
+    raw_rsync = recording_runner.calls[-1]["argv"]
+    transport = shlex.split(raw_rsync[raw_rsync.index("-e") + 1])
+    assert transport[transport.index("-S") + 1] == "/tmp/o2-control.sock"
 
 
 def test_rsync_blocked_by_lock(tmp_path):

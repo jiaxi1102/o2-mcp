@@ -682,25 +682,112 @@ class O2Connection:
         """Lightweight connectivity check: ``hostname; whoami; date`` on O2."""
         return self.run("hostname; whoami; date", timeout=self.config.connect_timeout + 5)
 
-    def _target_alias_from_argv(self, argv: list[str]) -> str | None:
-        """Infer the configured O2 target a raw rsync/SSH argv connects to.
+    def _ssh_destination_from_argv(self, argv: list[str]) -> str | None:
+        """Return the destination operand from one raw SSH command.
 
-        Rsync targets appear as ``[user@]<alias>:<path>`` and raw SSH hosts as a
-        bare ``[user@]<alias>`` token. Strip the optional user qualifier only for
-        host comparison, then return the full ``[user@]alias`` endpoint. Keeping
-        that user is essential because ``%r``-based ControlPath templates resolve
-        different sockets for different SSH users. The transfer alias is checked
-        first so a transfer-node command is never validated against the (different)
-        login master. Returns ``None`` when no configured alias appears, leaving
-        the login alias as the default.
+        Only the first non-option operand is the SSH destination; everything
+        after it is the remote command and must not influence which ControlMaster
+        socket is selected. Argument-taking short options are skipped using the
+        same option table as the transport sanitizer, including attached values
+        such as ``-p22`` and separate values such as ``-p 22``.
         """
+
+        index = 1
+        while index < len(argv):
+            token = argv[index]
+            if token == "--":
+                return argv[index + 1] if index + 1 < len(argv) else None
+            if token == "-" or not token.startswith("-"):
+                return token
+            if token.startswith("--"):
+                # OpenSSH has no long client options. Leave validation of an
+                # invalid spelling to SSH, but do not treat it as a destination.
+                index += 1
+                continue
+
+            cluster = token[1:]
+            for option_index, option in enumerate(cluster):
+                if option not in self._SSH_SHORT_OPTIONS_WITH_ARGUMENTS:
+                    continue
+                # If no value is attached to this short option, its following
+                # argv element is option data rather than the destination.
+                if not cluster[option_index + 1 :]:
+                    index += 1
+                break
+            index += 1
+        return None
+
+    def _rsync_operands_from_argv(self, argv: list[str]) -> list[str]:
+        """Return rsync path operands while excluding option arguments.
+
+        Alias-like text in an option value (for example an exclude pattern)
+        cannot identify the remote endpoint. This parser mirrors the hardening
+        parser's treatment of argument-taking short and long options so target
+        inference considers only actual source/destination operands.
+        """
+
+        operands: list[str] = []
+        index = 1
+        options_finished = False
+        while index < len(argv):
+            token = argv[index]
+            if options_finished:
+                operands.append(token)
+                index += 1
+                continue
+            if token == "--":
+                options_finished = True
+                index += 1
+                continue
+            if token == "-" or not token.startswith("-"):
+                operands.append(token)
+                index += 1
+                continue
+            if token.startswith("--"):
+                option_name, equals, _attached_argument = token[2:].partition("=")
+                if not equals and option_name in self._RSYNC_LONG_OPTIONS_WITH_ARGUMENTS:
+                    index += 1
+                index += 1
+                continue
+
+            cluster = token[1:]
+            for option_index, option in enumerate(cluster):
+                if option not in self._RSYNC_SHORT_OPTIONS_WITH_ARGUMENTS:
+                    continue
+                if not cluster[option_index + 1 :]:
+                    index += 1
+                break
+            index += 1
+        return operands
+
+    def _target_alias_from_argv(self, argv: list[str]) -> str | None:
+        """Infer the configured O2 endpoint used by a raw rsync/SSH argv.
+
+        Rsync endpoints appear as ``[user@]<alias>:<path>`` while raw SSH has one
+        destination operand. Parse each command's option structure first so an
+        alias mentioned in an option value or remote command cannot select the
+        wrong socket. Strip the optional user qualifier only for host comparison,
+        then return the full ``[user@]alias`` endpoint because ``%r``-based
+        ControlPath templates resolve different sockets for different users.
+        """
+
+        if not argv:
+            return None
+        executable = Path(argv[0]).name
+        if executable == "ssh":
+            destination = self._ssh_destination_from_argv(argv)
+            candidates = [destination] if destination is not None else []
+        elif executable == "rsync":
+            # A colon distinguishes remote-shell/daemon operands from ordinary
+            # local paths, which may coincidentally equal an O2 alias.
+            candidates = [operand for operand in self._rsync_operands_from_argv(argv) if ":" in operand]
+        else:
+            candidates = []
+
         for alias in (self.config.transfer_alias, self.config.host_alias):
             if not alias:
                 continue
-            for token in argv:
-                # The first colon separates an rsync host from its remote path;
-                # the last at-sign in the host portion separates an optional
-                # user. Configured aliases themselves contain neither delimiter.
+            for token in candidates:
                 endpoint = token.split(":", 1)[0]
                 host = endpoint.rsplit("@", 1)[-1]
                 if host == alias:
@@ -747,7 +834,21 @@ class O2Connection:
                 flattened.append(raw_line)
                 continue
 
-            directive = fields[0].lower()
+            # OpenSSH accepts both ``Keyword value`` and ``Keyword=value`` (with
+            # optional whitespace around ``=``). Normalize those spellings before
+            # classifying the directive; otherwise ``Match=exec`` would evade the
+            # literal safety scan and be executed by the later ``ssh -G`` call.
+            keyword, attached_separator, attached_argument = fields[0].partition("=")
+            directive = keyword.lower()
+            arguments = list(fields[1:])
+            if attached_separator:
+                if attached_argument:
+                    arguments.insert(0, attached_argument)
+            elif arguments and arguments[0].startswith("="):
+                equals_argument = arguments.pop(0)[1:]
+                if equals_argument:
+                    arguments.insert(0, equals_argument)
+
             if directive == "match":
                 raise O2UnsafeTransportError(
                     f"SSH config {expanded_path}:{line_number} contains Match. "
@@ -757,10 +858,10 @@ class O2Connection:
             if directive != "include":
                 flattened.append(raw_line)
                 continue
-            if len(fields) == 1:
+            if not arguments:
                 raise O2UnsafeTransportError(f"SSH config {expanded_path}:{line_number} has an empty Include.")
 
-            for pattern_text in fields[1:]:
+            for pattern_text in arguments:
                 if "%" in pattern_text:
                     raise O2UnsafeTransportError(
                         f"SSH config {expanded_path}:{line_number} uses a tokenized Include path; "
