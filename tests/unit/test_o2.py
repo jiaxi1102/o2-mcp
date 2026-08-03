@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -402,6 +403,57 @@ def test_start_master_requires_one_shot_grant(tmp_path):
     assert "PubkeyAuthentication=no" not in starts[0]
     assert conn.policy.snapshot().state["login_grant"] is None
     assert conn.policy.snapshot().state["login_attempt"]["outcome"] == "success"
+
+
+def test_policy_disable_cannot_complete_between_consumption_and_launch(tmp_path):
+    """A safety stop is serialized with the sole authentication-capable call."""
+
+    class DisableDuringLaunchRunner(RecordingRunner):
+        """Start a competing disable while the launch runner still owns control."""
+
+        def __init__(self, policy, **kwargs):
+            super().__init__(**kwargs)
+            self._policy = policy
+            self.disable_started = threading.Event()
+            self.disable_finished = threading.Event()
+            self.disable_thread = None
+
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            result = super().__call__(argv, timeout, input_text)
+            if "-MNf" not in argv:
+                return result
+
+            def disable() -> None:
+                self.disable_started.set()
+                self._policy.disable(reason="concurrent incident stop")
+                self.disable_finished.set()
+
+            self.disable_thread = threading.Thread(target=disable)
+            self.disable_thread.start()
+            assert self.disable_started.wait(timeout=1)
+            # The launch runner is still executing inside the policy context,
+            # so disable must remain blocked on the workstation mutex.
+            assert not self.disable_finished.wait(timeout=0.1)
+            return result
+
+    config = _config(tmp_path)
+    bootstrap = O2Connection(config, runner=RecordingRunner(master=False))
+    runner = DisableDuringLaunchRunner(
+        bootstrap.policy,
+        master=False,
+        responder=_vpn_responder("utun6"),
+    )
+    conn = O2Connection(config, runner=runner, policy=bootstrap.policy)
+    grant = _authorize(conn)
+
+    result = conn.start_master(grant_id=grant.id)
+
+    assert runner.disable_thread is not None
+    runner.disable_thread.join(timeout=2)
+    assert not runner.disable_thread.is_alive()
+    assert runner.disable_finished.is_set()
+    assert result.ok
+    assert conn.policy.snapshot().effective_mode == "disabled"
 
 
 def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path):

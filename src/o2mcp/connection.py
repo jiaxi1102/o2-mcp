@@ -372,13 +372,18 @@ class O2Connection:
         grant = self.policy.preview_login_grant(grant_id, logical_target)
         if not grant.allow_offvpn:
             self._require_on_vpn(target)
-        # Consumption is the cross-process serialization point. Another client
-        # can neither consume this grant nor issue a second one while its attempt
-        # receipt is active.
-        consumed = self.policy.consume_login_grant(grant_id, logical_target)
-
+        consumed = None
         try:
-            with self._safe_ssh_config_path() as safe_config:
+            # Consumption and the authentication-capable runner call share the
+            # workstation policy mutex. A concurrent disable therefore wins
+            # before consumption or completes only after launch; it can never
+            # persist disabled in the gap between those two actions. Contexts
+            # enter left-to-right so safe config preparation still happens
+            # before the one-shot grant is consumed.
+            with (
+                self._safe_ssh_config_path() as safe_config,
+                self.policy.consume_login_grant_for_launch(grant_id, logical_target) as consumed,
+            ):
                 result = self._runner(
                     [
                         self.SSH_EXECUTABLE,
@@ -394,10 +399,12 @@ class O2Connection:
                     None,
                 )
         except subprocess.TimeoutExpired:
-            self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
+            if consumed is not None:
+                self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
             raise
         except Exception:
-            self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            if consumed is not None:
+                self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
             raise
 
         if not result.ok:

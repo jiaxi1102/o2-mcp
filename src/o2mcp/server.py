@@ -255,7 +255,14 @@ def _local_socket_inventory() -> list[dict[str, Any]]:
     for root in roots:
         if not root.is_dir():
             continue
-        for candidate in sorted(root.iterdir()):
+        try:
+            candidates = sorted(root.iterdir())
+        except OSError:
+            # Socket inventory is only one local diagnostic facet. A directory
+            # permission race or removal must not hide the independently useful
+            # policy generation/revision, process list, and transfer receipts.
+            continue
+        for candidate in candidates:
             try:
                 metadata = candidate.lstat()
             except OSError:

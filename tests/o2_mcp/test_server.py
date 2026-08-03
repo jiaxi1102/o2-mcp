@@ -9,6 +9,7 @@ default 3.9 test environment (install with ``pip install -e ".[dev,o2]"`` on a 3
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -251,6 +252,31 @@ async def test_local_status_preserves_policy_when_transfer_metadata_is_corrupt(m
     assert payload["policy"]["effective_mode"] == "disabled"
     assert payload["policy"]["generation"]
     assert payload["transfers"][0]["error"] == "invalid_transfer_metadata"
+    assert runner.calls == []
+
+
+@pytest.mark.anyio
+async def test_local_status_preserves_policy_when_socket_directory_is_unreadable(monkeypatch, tmp_path):
+    """A socket enumeration race cannot replace local status with one error."""
+
+    runner = _patch_connection(monkeypatch, tmp_path, master=False, locked=True)
+    socket_root = tmp_path / "test-home" / ".ssh" / "controlmasters"
+    socket_root.mkdir(parents=True)
+    original_iterdir = Path.iterdir
+
+    def selective_iterdir(path):
+        """Model permission loss only at the ControlMaster directory."""
+
+        if path == socket_root:
+            raise PermissionError("socket directory became unreadable")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", selective_iterdir)
+    payload = await _call("o2_local_status", {})
+
+    assert payload["ok"] is True
+    assert payload["policy"]["effective_mode"] == "disabled"
+    assert payload["control_sockets"] == []
     assert runner.calls == []
 
 

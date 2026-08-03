@@ -336,26 +336,26 @@ class O2PolicyStore:
         """
 
         with self._locked():
-            state = self._read_valid_state()
-            if state["mode"] != "reuse_only":
-                raise O2PolicyDeniedError("O2 became disabled before the login grant could be consumed.")
-            grant = self._require_matching_grant(state, grant_id, target)
-            now = self._clock()
-            state["login_grant"] = None
-            state["login_attempt"] = {
-                "grant_id": grant.id,
-                "client_id": grant.client_id,
-                "target": grant.target,
-                "allow_offvpn": grant.allow_offvpn,
-                "started_at": now,
-                "finished_at": None,
-                "outcome": "active",
-                "returncode": None,
-                "blocked_until": now + DEFAULT_LOGIN_COOLDOWN_SECONDS,
-            }
-            self._append_event(state, "login_grant_consumed", grant_id=grant.id, target=target)
-            self._write_next_revision(state)
-            return grant
+            return self._consume_login_grant_locked(grant_id, target)
+
+    @contextmanager
+    def consume_login_grant_for_launch(self, grant_id: str, target: LoginTarget) -> Iterator[LoginGrant]:
+        """Consume a grant and hold the policy mutex through process launch.
+
+        The caller must enter this context immediately around the single
+        authentication-capable runner invocation.  Holding the mutex makes the
+        launch linearizable with :meth:`disable`: a disable either persists
+        before consumption and prevents launch, or waits until the already
+        authorized runner call has returned.  It can therefore never report a
+        completed safety stop and then have this call spawn SSH afterward.
+
+        The context deliberately covers no route/config preparation.  Those
+        local-only operations happen before grant consumption so an unrelated
+        local error does not destroy the one-shot authorization.
+        """
+
+        with self._locked():
+            yield self._consume_login_grant_locked(grant_id, target)
 
     def finish_login_attempt(self, grant_id: str, *, outcome: str, returncode: int | None) -> None:
         """Record one login attempt's terminal outcome without changing mode.
@@ -392,6 +392,30 @@ class O2PolicyStore:
                 returncode=returncode,
             )
             self._write_next_revision(state)
+
+    def _consume_login_grant_locked(self, grant_id: str, target: LoginTarget) -> LoginGrant:
+        """Persist one active attempt while the caller owns ``self._locked``."""
+
+        state = self._read_valid_state()
+        if state["mode"] != "reuse_only":
+            raise O2PolicyDeniedError("O2 became disabled before the login grant could be consumed.")
+        grant = self._require_matching_grant(state, grant_id, target)
+        now = self._clock()
+        state["login_grant"] = None
+        state["login_attempt"] = {
+            "grant_id": grant.id,
+            "client_id": grant.client_id,
+            "target": grant.target,
+            "allow_offvpn": grant.allow_offvpn,
+            "started_at": now,
+            "finished_at": None,
+            "outcome": "active",
+            "returncode": None,
+            "blocked_until": now + DEFAULT_LOGIN_COOLDOWN_SECONDS,
+        }
+        self._append_event(state, "login_grant_consumed", grant_id=grant.id, target=target)
+        self._write_next_revision(state)
+        return grant
 
     # -- validation and persistence ------------------------------------------
     def _read_valid_state(self) -> dict[str, Any]:
@@ -583,9 +607,19 @@ class O2PolicyStore:
             metadata = os.fstat(handle.fileno())
             self._validate_file_metadata(self.mutex_path, metadata)
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            yield
+        except O2PolicyInvalidError:
+            handle.close()
+            raise
         except OSError as exc:
+            handle.close()
             raise O2PolicyInvalidError(f"Cannot lock O2 policy mutex at {self.mutex_path}: {exc}") from exc
+
+        try:
+            # Preserve exceptions from the protected operation. In particular,
+            # the launch context may surface a subprocess OSError; mislabeling
+            # it as a mutex error would hide the real failure after consuming
+            # the one-shot authorization.
+            yield
         finally:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
