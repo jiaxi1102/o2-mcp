@@ -29,7 +29,9 @@ from o2mcp.broker import (
     BrokerExecutionResult,
     BrokerServer,
     O2BrokerError,
+    O2BrokerStartupError,
     O2BrokerUnavailableError,
+    _consume_launch,
     prepare_broker_directory,
 )
 from o2mcp.broker_protocol import (
@@ -497,6 +499,32 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
+def test_launch_capability_is_canonical_and_one_shot(broker_root):
+    """A retained or copied launch recipe cannot be consumed a second time."""
+
+    paths = prepare_broker_directory(broker_root)
+    payload = {
+        "schema_version": 1,
+        "broker_dir": str(paths.root),
+        "policy_file": str(paths.root / "policy.json"),
+        "alias": "offline-o2",
+        "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+        "grant_id": "one-shot-grant",
+        "login_target": "login",
+        "launcher_client_id": "test-client",
+        "launcher_pid": 123,
+        "startup_timeout": 5.0,
+        "transport_argv": [sys.executable, "-c", "pass"],
+    }
+    paths.launch.write_text(json.dumps(payload))
+    paths.launch.chmod(0o600)
+
+    assert _consume_launch(paths.launch)["grant_id"] == "one-shot-grant"
+    assert not paths.launch.exists()
+    with pytest.raises(O2BrokerStartupError, match="absent or already consumed"):
+        _consume_launch(paths.launch)
+
+
 @pytest.mark.parametrize(
     ("receipt", "mode"),
     [
@@ -843,6 +871,7 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
         started = connection.start_broker(grant_id=grant.id, transfer=transfer)
         first_pid = started["daemon"]["pid"]
         assert set(started["destination"]) == {"hostname", "user", "port"}
+        assert not client.paths.launch.exists(), "the authentication-capable launch recipe must be one-shot"
         alias = config.transfer_alias if transfer else config.host_alias
         assert connection.run("printf launched", alias=alias, timeout=5).stdout == "launched"
 

@@ -383,7 +383,7 @@ class O2PolicyStore:
         """
 
         with self._locked():
-            return self._consume_login_grant_locked(grant_id, target)
+            return self._consume_login_grant_locked(grant_id, target, launcher_pid=os.getpid())
 
     @contextmanager
     def consume_login_grant_for_launch(self, grant_id: str, target: LoginTarget) -> Iterator[LoginGrant]:
@@ -402,7 +402,47 @@ class O2PolicyStore:
         """
 
         with self._locked():
-            yield self._consume_login_grant_locked(grant_id, target)
+            yield self._consume_login_grant_locked(grant_id, target, launcher_pid=os.getpid())
+
+    @contextmanager
+    def authorize_consumed_broker_launch(
+        self,
+        grant_id: str,
+        target: LoginTarget,
+        *,
+        client_id: str,
+        launcher_pid: int,
+    ) -> Iterator[None]:
+        """Validate one consumed grant while serializing the broker SSH spawn.
+
+        The MCP parent first consumes the one-shot grant and starts a local
+        daemon. The daemon then enters this gate immediately around its sole SSH
+        ``Popen``. A concurrent disable therefore either wins first and blocks
+        SSH, or waits until the already-authorized process exists.
+
+        Binding the attempt to both the originating process identity and its PID
+        prevents a retained or copied launch artifact from being replayed by a
+        later process while an unrelated attempt happens to be active.
+        """
+
+        if type(launcher_pid) is not int or launcher_pid <= 0:
+            raise O2LoginGrantError("broker launcher_pid must be a positive integer")
+        with self._locked():
+            state = self._read_valid_state()
+            if state["mode"] != "reuse_only":
+                raise O2PolicyDeniedError("O2 became disabled before the authorized broker could spawn SSH.")
+            attempt = state.get("login_attempt")
+            valid_attempt = (
+                isinstance(attempt, dict)
+                and attempt.get("outcome") == "active"
+                and attempt.get("grant_id") == grant_id
+                and attempt.get("target") == target
+                and attempt.get("client_id") == client_id
+                and attempt.get("launcher_pid") == launcher_pid
+            )
+            if not valid_attempt:
+                raise O2LoginGrantError("The broker launch is not bound to the current active, consumed login attempt.")
+            yield
 
     def finish_login_attempt(self, grant_id: str, *, outcome: str, returncode: int | None) -> None:
         """Record one login attempt's terminal outcome without changing mode.
@@ -440,7 +480,13 @@ class O2PolicyStore:
             )
             self._write_next_revision(state)
 
-    def _consume_login_grant_locked(self, grant_id: str, target: LoginTarget) -> LoginGrant:
+    def _consume_login_grant_locked(
+        self,
+        grant_id: str,
+        target: LoginTarget,
+        *,
+        launcher_pid: int,
+    ) -> LoginGrant:
         """Persist one active attempt while the caller owns ``self._locked``."""
 
         state = self._read_valid_state()
@@ -452,6 +498,10 @@ class O2PolicyStore:
         state["login_attempt"] = {
             "grant_id": grant.id,
             "client_id": grant.client_id,
+            # The broker daemon must be a direct child of the process that
+            # consumed this grant. This field is also useful incident evidence
+            # for identifying which MCP process initiated the attempt.
+            "launcher_pid": launcher_pid,
             "target": grant.target,
             "allow_offvpn": grant.allow_offvpn,
             "started_at": now,
@@ -605,6 +655,12 @@ class O2PolicyStore:
             raise O2PolicyInvalidError("login_attempt.outcome is unsupported")
         if type(attempt.get("allow_offvpn")) is not bool:
             raise O2PolicyInvalidError("login_attempt.allow_offvpn must be a boolean")
+        launcher_pid = attempt.get("launcher_pid")
+        # Receipts created before the persistent-broker rollout did not record a
+        # launcher PID. They remain valid cooldown evidence, but the new daemon
+        # authorization gate never accepts a missing value for an SSH spawn.
+        if launcher_pid is not None and (type(launcher_pid) is not int or launcher_pid <= 0):
+            raise O2PolicyInvalidError("login_attempt.launcher_pid must be a positive integer when present")
         for field in ("started_at", "blocked_until"):
             value = attempt.get(field)
             if type(value) not in {int, float} or not math.isfinite(value):

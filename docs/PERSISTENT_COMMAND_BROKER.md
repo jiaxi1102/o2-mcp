@@ -33,11 +33,16 @@ scope, and launches exactly one direct SSH transport. It deliberately sets
 an older mux master would reintroduce the disappearance and channel-lifetime
 problem the broker is meant to solve.
 
-The grant-consuming parent holds the global policy mutex until the detached
-daemon acknowledges that it has spawned SSH. A policy disable therefore either
-precedes grant consumption and prevents launch, or follows an already-started
-operation. The daemon records the login attempt as successful only after the
-remote helper sends the expected protocol hello.
+The grant-consuming parent holds the global policy mutex while it starts only
+the local detached daemon, then releases it so the daemon can perform its own
+authorization gate. Immediately around SSH creation, the daemon reacquires the
+mutex and verifies that the grant id, role, originating client, and parent PID
+still match the active consumed attempt. A policy disable therefore either wins
+the handoff and prevents SSH or follows an already-started operation. The
+canonical launch file is atomically claimed and erased before this check, so a
+stale recipe cannot be replayed after the broker stops. The daemon records the
+login attempt as successful only after the remote helper sends the expected
+protocol hello.
 
 There is no automatic retry or reconnect. The remote protocol hello has the same
 finite startup deadline as the launcher, so a silent child cannot retain the
@@ -93,8 +98,9 @@ automatic retry.
   `~/.agent_locks/o2-transfer-broker` default to distinct physical owner-only
   mode-0700 directories. `O2_BROKER_DIR` and `O2_TRANSFER_BROKER_DIR` may
   override them only with distinct absolute paths.
-- `command.sock`, state, launch, config snapshot, lock, and log are owner-only.
-  Symlinked or permissive authority files fail closed.
+- `command.sock`, state, one-shot launch capability, config snapshot, lock, and
+  log are owner-only. Symlinked or permissive authority files fail closed. The
+  daemon atomically removes the launch capability before any SSH spawn.
 - A client connects only when a physical mode-0600 state receipt positively
   reports `ready` under the exact protocol version; missing, malformed, or
   stale-version receipts are not treated as compatible defaults.
@@ -129,7 +135,8 @@ should not be described as Duo-free. The transfer command broker eliminates raw
 SSH only for commands; replacing rsync's distinct session boundary remains
 future work. New rsync operations default to the dedicated transfer alias because
 that role retains an explicit grant-gated master startup. Login-alias rsync can
-reuse a legacy master but cannot create one.
+reuse a legacy master but cannot create one through either the MCP wrapper or
+the public connection API.
 
 ## Offline validation
 

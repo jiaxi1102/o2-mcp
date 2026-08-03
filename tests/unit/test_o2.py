@@ -452,7 +452,7 @@ def test_run_rejects_cold_connection_opt_out(tmp_path):
     assert runner.calls == []
 
 
-def _authorize(conn: O2Connection, *, target="login", allow_offvpn=False):
+def _authorize(conn: O2Connection, *, target="transfer", allow_offvpn=False):
     """Issue one deterministic test grant against the currently observed revision."""
 
     snapshot = conn.policy.snapshot()
@@ -465,14 +465,24 @@ def _authorize(conn: O2Connection, *, target="login", allow_offvpn=False):
     )
 
 
-def test_start_master_requires_one_shot_grant(tmp_path):
+def _start_transfer_master(conn: O2Connection, *, grant_id=None):
+    """Exercise the sole retained ControlMaster start path explicitly."""
+
+    return conn.start_master(
+        grant_id=grant_id,
+        alias=conn.config.transfer_alias,
+        login_target="transfer",
+    )
+
+
+def test_transfer_master_requires_one_shot_grant(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     with pytest.raises(O2MasterUnavailableError):
-        conn.start_master()
+        _start_transfer_master(conn)
 
     grant = _authorize(conn)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok
     starts = [call["argv"] for call in runner.calls if "-MNf" in call["argv"]]
@@ -523,7 +533,7 @@ def test_policy_disable_cannot_complete_between_consumption_and_launch(tmp_path)
     conn = O2Connection(config, runner=runner, policy=bootstrap.policy)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert runner.disable_thread is not None
     runner.disable_thread.join(timeout=2)
@@ -540,14 +550,14 @@ def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path)
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok is False and result.returncode == 255
     assert "post-start control-socket check failed" in result.stderr
     attempt = conn.policy.snapshot().state["login_attempt"]
     assert attempt["outcome"] == "failed" and attempt["returncode"] == 255
     with pytest.raises(O2LoginGrantError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
 
 
@@ -565,7 +575,7 @@ def test_start_master_records_post_start_verification_timeout(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok is False and result.returncode == 255
     assert "TimeoutExpired" in result.stderr
@@ -574,7 +584,7 @@ def test_start_master_records_post_start_verification_timeout(tmp_path):
 
 def test_start_master_noop_when_running_does_not_need_grant(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
-    result = conn.start_master()
+    result = _start_transfer_master(conn)
     assert result.ok and "already running" in result.stdout
     assert conn.policy.snapshot().state["login_grant"] is None
 
@@ -584,15 +594,15 @@ def test_start_master_can_open_the_transfer_alias_with_transfer_grant(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, target="transfer")
 
-    result = conn.start_master(grant_id=grant.id, alias=conn.config.transfer_alias)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok
     starts = [call for call in runner.calls if "-MNf" in call["argv"]]
     assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
 
 
-def test_default_start_uses_login_scope_when_aliases_are_identical(tmp_path):
-    """The default role is login even when both roles share one SSH alias."""
+def test_default_master_start_is_retired_even_when_aliases_are_identical(tmp_path):
+    """Alias equality cannot turn the unsafe default login role into transfer."""
 
     config = _config(tmp_path)
     config.transfer_alias = config.host_alias
@@ -600,11 +610,9 @@ def test_default_start_uses_login_scope_when_aliases_are_identical(tmp_path):
     conn = O2Connection(config, runner=runner)
     grant = _authorize(conn, target="login")
 
-    result = conn.start_master(grant_id=grant.id)
-
-    assert result.ok
-    starts = [call for call in runner.calls if "-MNf" in call["argv"]]
-    assert len(starts) == 1 and starts[0]["argv"][-1] == "o2"
+    with pytest.raises(O2UnsafeTransportError, match="Login ControlMaster startup is retired"):
+        conn.start_master(grant_id=grant.id)
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_explicit_role_disambiguates_one_shared_alias(tmp_path):
@@ -638,7 +646,7 @@ def test_login_grant_cannot_cross_host_scope(tmp_path):
     grant = _authorize(conn, target="login", allow_offvpn=True)
 
     with pytest.raises(O2LoginGrantError, match="scoped to 'login'"):
-        conn.start_master(grant_id=grant.id, alias=conn.config.transfer_alias)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -657,9 +665,9 @@ def test_timed_out_login_consumes_grant_and_leaves_attempt_receipt(tmp_path):
     grant = _authorize(conn)
 
     with pytest.raises(subprocess.TimeoutExpired):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     with pytest.raises(O2LoginGrantError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
 
     state = conn.policy.snapshot().state
     assert state["login_grant"] is None
@@ -690,7 +698,7 @@ def test_start_master_refuses_off_vpn(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
     with pytest.raises(O2OffVpnError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -699,7 +707,7 @@ def test_start_master_allows_on_vpn(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -708,7 +716,7 @@ def test_start_master_offvpn_override(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, allow_offvpn=True)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -719,7 +727,7 @@ def test_start_master_fails_closed_when_iface_undetermined(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
     with pytest.raises(O2OffVpnError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -736,7 +744,7 @@ def test_start_master_route_binary_missing_needs_offvpn_grant(tmp_path):
     runner = RecordingRunner(master=False, responder=responder)
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, allow_offvpn=True)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 

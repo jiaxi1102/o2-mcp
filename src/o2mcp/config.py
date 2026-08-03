@@ -167,8 +167,9 @@ class O2Config:
         """Return baseline SSH options shared by login and reuse operations.
 
         These options make subprocesses non-interactive, but they intentionally do
-        not disable public-key authentication: :meth:`O2Connection.start_master`
-        needs public-key authentication for the one explicitly authorized login.
+        not disable public-key authentication: the legacy transfer-only
+        :meth:`O2Connection.start_master` path needs it for one explicitly
+        authorized transfer-host login.
         Ordinary commands and transfers must use :meth:`reuse_only_ssh_opts`
         instead so a missing ControlMaster cannot fall back to a fresh connection.
         """

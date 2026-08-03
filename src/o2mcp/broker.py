@@ -41,7 +41,7 @@ from o2mcp.broker_protocol import (
     read_frame,
     write_frame,
 )
-from o2mcp.policy import O2PolicyDeniedError, O2PolicyError, O2PolicyStore
+from o2mcp.policy import LoginTarget, O2PolicyDeniedError, O2PolicyError, O2PolicyStore
 
 
 class O2BrokerError(RuntimeError):
@@ -575,6 +575,9 @@ class BrokerServer:
         transport_argv: list[str],
         alias: str,
         destination: dict[str, str],
+        login_target: LoginTarget | None = None,
+        launcher_client_id: str | None = None,
+        launcher_pid: int | None = None,
         grant_id: str | None = None,
         ack_fd: int | None = None,
         startup_timeout: float = 90.0,
@@ -590,6 +593,16 @@ class BrokerServer:
         ):
             raise ValueError("broker destination must contain non-empty hostname, user, and port strings")
         self.destination = {key: destination[key] for key in ("hostname", "user", "port")}
+        if grant_id is not None:
+            if login_target not in {"login", "transfer"}:
+                raise ValueError("authorized broker launch must identify the login or transfer role")
+            if not isinstance(launcher_client_id, str) or not launcher_client_id:
+                raise ValueError("authorized broker launch must identify its originating client")
+            if type(launcher_pid) is not int or launcher_pid <= 0:
+                raise ValueError("authorized broker launch must identify its positive launcher PID")
+        self.login_target = login_target
+        self.launcher_client_id = launcher_client_id
+        self.launcher_pid = launcher_pid
         self.grant_id = grant_id
         self.ack_fd = ack_fd
         valid_startup_timeout = (
@@ -674,13 +687,30 @@ class BrokerServer:
 
         self._write_state("starting", started_at=self.clock())
         try:
-            self.transport = subprocess.Popen(
-                self.transport_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
+            if self.grant_id is None:
+                # Offline integration tests may construct a local broker without
+                # a login attempt. Production daemon launches always carry a
+                # consumed grant and take the guarded branch below.
+                self.transport = self._spawn_transport_process()
+            else:
+                assert self.login_target is not None
+                assert self.launcher_client_id is not None
+                assert self.launcher_pid is not None
+                if os.getppid() != self.launcher_pid:
+                    raise O2BrokerStartupError(
+                        "broker daemon is not a direct child of the process that consumed the login grant"
+                    )
+                # Validate the exact active attempt immediately around the only
+                # authentication-capable spawn. This is intentionally daemon-
+                # side: replaying launch metadata cannot bypass policy merely by
+                # invoking the private entry point directly.
+                with self.policy.authorize_consumed_broker_launch(
+                    self.grant_id,
+                    self.login_target,
+                    client_id=self.launcher_client_id,
+                    launcher_pid=self.launcher_pid,
+                ):
+                    self.transport = self._spawn_transport_process()
         except Exception as exc:
             self._ack(f"ERROR transport spawn failed: {exc}")
             raise O2BrokerStartupError(f"persistent transport could not be spawned: {exc}") from exc
@@ -723,6 +753,17 @@ class BrokerServer:
         if self.grant_id is not None:
             self.policy.finish_login_attempt(self.grant_id, outcome="success", returncode=0)
         return self.transport.stdin, self.transport.stdout
+
+    def _spawn_transport_process(self) -> subprocess.Popen[bytes]:
+        """Create the broker's sole persistent transport subprocess."""
+
+        return subprocess.Popen(
+            self.transport_argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
 
     def _bind_listener(self) -> None:
         """Publish the local endpoint only after the remote helper is ready."""
@@ -915,7 +956,7 @@ class BrokerServer:
 
 
 def _load_launch(path: Path) -> dict[str, Any]:
-    """Load and validate the private launch file written by the MCP parent."""
+    """Load and validate a privately claimed launch file."""
 
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
@@ -923,9 +964,21 @@ def _load_launch(path: Path) -> dict[str, Any]:
     if stat.S_IMODE(metadata.st_mode) != 0o600:
         raise O2BrokerStartupError("broker launch file must have mode 0600")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    required_strings = ("broker_dir", "policy_file", "alias", "grant_id")
+    required_strings = (
+        "broker_dir",
+        "policy_file",
+        "alias",
+        "grant_id",
+        "login_target",
+        "launcher_client_id",
+    )
     if not isinstance(payload, dict) or any(not isinstance(payload.get(key), str) for key in required_strings):
         raise O2BrokerStartupError("broker launch file is missing required string fields")
+    if payload["login_target"] not in {"login", "transfer"}:
+        raise O2BrokerStartupError("broker launch login_target must be 'login' or 'transfer'")
+    launcher_pid = payload.get("launcher_pid")
+    if type(launcher_pid) is not int or launcher_pid <= 0:
+        raise O2BrokerStartupError("broker launch launcher_pid must be a positive integer")
     argv = payload.get("transport_argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
         raise O2BrokerStartupError("broker launch transport_argv must be a non-empty string list")
@@ -943,6 +996,34 @@ def _load_launch(path: Path) -> dict[str, Any]:
     ):
         raise O2BrokerStartupError("broker launch startup_timeout must be finite and positive")
     return payload
+
+
+def _consume_launch(path: Path) -> dict[str, Any]:
+    """Atomically claim, validate, and erase one launch capability.
+
+    ``launch.json`` contains authentication-capable transport arguments. It is
+    never a durable recipe: exactly one daemon may rename it away, and the
+    claimed copy is removed before policy authorization or SSH spawning. The
+    canonical-path check also rejects copied launch data supplied through an
+    arbitrary mode-0600 file.
+    """
+
+    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError as exc:
+        raise O2BrokerStartupError("broker launch capability is absent or already consumed") from exc
+    except OSError as exc:
+        raise O2BrokerStartupError(f"cannot atomically claim broker launch capability: {exc}") from exc
+    try:
+        payload = _load_launch(claimed)
+        canonical = BrokerPaths(Path(payload["broker_dir"]).expanduser()).launch
+        if path.absolute() != canonical.absolute():
+            raise O2BrokerStartupError(f"broker launch capability must use its canonical private path {canonical}")
+        return payload
+    finally:
+        with suppress(FileNotFoundError):
+            claimed.unlink()
 
 
 def _install_signal_handlers(server: BrokerServer) -> None:
@@ -967,13 +1048,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--serve is required")
 
     try:
-        payload = _load_launch(args.launch_file)
+        payload = _consume_launch(args.launch_file)
         server = BrokerServer(
             paths=BrokerPaths(Path(payload["broker_dir"])),
             policy_file=Path(payload["policy_file"]),
             transport_argv=payload["transport_argv"],
             alias=payload["alias"],
             destination=payload["destination"],
+            login_target=payload["login_target"],
+            launcher_client_id=payload["launcher_client_id"],
+            launcher_pid=payload["launcher_pid"],
             grant_id=payload["grant_id"],
             ack_fd=args.ack_fd,
             startup_timeout=float(payload["startup_timeout"]),

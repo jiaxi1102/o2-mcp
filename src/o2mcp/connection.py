@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -454,10 +454,12 @@ class O2Connection:
         """Start exactly one role-specific persistent session after a grant.
 
         The child daemon acknowledges only after it has spawned the sole SSH
-        process. The policy mutex remains held through that acknowledgement, so
-        a concurrent disable either prevents launch or observes an already
-        running operation. Authentication and the remote protocol hello may
-        finish later; waiting for them is local-only and never retries.
+        process. The parent consumes the grant and starts that local daemon
+        under the policy mutex; the daemon then independently validates the
+        active attempt and holds the same mutex around SSH creation. A concurrent
+        disable therefore either prevents launch or observes an already-running
+        operation. Authentication and the remote protocol hello may finish
+        later; waiting for them is local-only and never retries.
         """
 
         self.policy.require_reuse_allowed()
@@ -497,6 +499,9 @@ class O2Connection:
             "alias": target,
             "destination": destination,
             "grant_id": grant_id,
+            "login_target": logical_target,
+            "launcher_client_id": grant.client_id,
+            "launcher_pid": os.getpid(),
             "startup_timeout": self.config.broker_start_timeout,
             "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
         }
@@ -527,17 +532,33 @@ class O2Connection:
                     )
                     os.close(write_fd)
                     write_fd = -1
-                    ready, _, _ = select.select([read_fd], [], [], 5.0)
-                    if not ready:
-                        raise O2BrokerStartupError(
-                            "Broker daemon did not acknowledge its SSH spawn within 5 seconds; do not retry."
-                        )
-                    acknowledgement = os.read(read_fd, 4096).decode("utf-8", errors="replace").strip()
-                    if not acknowledgement.startswith("SPAWNED "):
-                        raise O2BrokerStartupError(
-                            f"Broker daemon rejected the authorized launch: {acknowledgement or 'no detail'}"
-                        )
+            # Waiting while still holding the policy mutex would deadlock the
+            # daemon's own active-attempt verification. It is safe to release
+            # here: the daemon acquires the mutex immediately around SSH Popen,
+            # and its policy check fails if a disable wins the handoff race.
+            ready, _, _ = select.select([read_fd], [], [], 5.0)
+            if not ready:
+                assert daemon is not None
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait(timeout=2)
+                raise O2BrokerStartupError(
+                    "Broker daemon did not acknowledge its SSH spawn within 5 seconds; it was stopped. Do not retry."
+                )
+            acknowledgement = os.read(read_fd, 4096).decode("utf-8", errors="replace").strip()
+            if not acknowledgement.startswith("SPAWNED "):
+                raise O2BrokerStartupError(
+                    f"Broker daemon rejected the authorized launch: {acknowledgement or 'no detail'}"
+                )
         except Exception:
+            # If the daemon never atomically claimed the launch capability,
+            # remove it here. A failed local handoff must not leave an
+            # authentication-capable recipe for later inspection or replay.
+            with suppress(FileNotFoundError):
+                paths.launch.unlink()
             if consumed is not None and (daemon is None or daemon.poll() is not None):
                 self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
             raise
@@ -650,12 +671,15 @@ class O2Connection:
         alias: str | None = None,
         login_target: LoginTarget | None = None,
     ) -> CommandResult:
-        """Open one ControlMaster only after consuming a matching policy grant.
+        """Open the legacy transfer ControlMaster after a matching policy grant.
 
         An already-running exact master is a local no-op and does not consume a
         grant.  Otherwise the grant is route-checked, atomically consumed, and
         converted to an active attempt receipt before the sole authentication-
-        capable SSH subprocess is launched.  No failure path retries SSH.
+        capable SSH subprocess is launched. Login-role masters are rejected at
+        this public API boundary because new command execution uses the broker
+        and opening per-command channels on a login master can still trigger
+        Duo. No failure path retries SSH.
         """
 
         self.policy.require_reuse_allowed()
@@ -672,6 +696,11 @@ class O2Connection:
             )
         else:
             logical_target = login_target
+        if logical_target != "transfer":
+            raise O2UnsafeTransportError(
+                "Login ControlMaster startup is retired because each new session channel can still trigger Duo. "
+                "Use the persistent login command broker; only the legacy transfer rsync master may be started."
+            )
         if target not in {self.config.host_alias, self.config.transfer_alias}:
             raise O2LoginGrantError(f"A new master may target only configured O2 aliases, not '{target}'.")
         expected_alias = self.config.transfer_alias if logical_target == "transfer" else self.config.host_alias

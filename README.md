@@ -49,8 +49,9 @@ profile banners and startup latency.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:
-the MCP rejects login `o2_start_master` calls and raw SSH, directing callers to
-the broker instead. See [the broker design](docs/PERSISTENT_COMMAND_BROKER.md).
+both the MCP wrapper and public `O2Connection.start_master()` API reject login
+master starts and raw SSH, directing callers to the broker instead. See
+[the broker design](docs/PERSISTENT_COMMAND_BROKER.md).
 
 OpenSSH evaluates `Match exec` shell predicates even for its nominally local `ssh -G` config
 dump. The MCP therefore reads the configured SSH file and recursively flattens `Include`
@@ -181,8 +182,11 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   `0700`; aliased or foreign-owned directories remain invalid.
 - Only `o2_start_broker` (role-specific command transport) or the transfer rsync
   compatibility start can authenticate, and only after atomically consuming a
-  matching client/host/off-VPN-scoped grant. Each broker launch holds the policy
-  mutex until its daemon acknowledges that the sole SSH child exists.
+  matching client/host/off-VPN-scoped grant. The parent starts only a local
+  daemon under the policy mutex; that daemon revalidates the exact active
+  attempt and holds the mutex around its sole SSH spawn. Its canonical
+  `launch.json` is atomically claimed and erased before SSH, so it cannot be
+  replayed as a durable authentication recipe.
 - Login and transfer-host commands never invoke SSH directly and never open a
   new ControlMaster session channel. Raw SSH through `run_raw` is rejected in
   production. Rsync remains the explicitly isolated compatibility boundary.
