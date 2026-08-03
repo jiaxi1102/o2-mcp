@@ -91,6 +91,7 @@ def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
         json.dumps(
             {
                 "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
                 "revision": 1,
                 "mode": "disabled" if locked else "reuse_only",
                 "login_grant": None,
@@ -376,9 +377,10 @@ def test_run_rejects_cold_connection_opt_out(tmp_path):
 def _authorize(conn: O2Connection, *, target="login", allow_offvpn=False):
     """Issue one deterministic test grant against the currently observed revision."""
 
-    revision = conn.policy.snapshot().revision
+    snapshot = conn.policy.snapshot()
     return conn.policy.authorize_login(
-        expected_revision=revision,
+        expected_revision=snapshot.revision,
+        expected_generation=snapshot.generation,
         target=target,
         allow_offvpn=allow_offvpn,
         approval_reference="explicit test approval",

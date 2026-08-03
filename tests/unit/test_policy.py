@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from o2mcp.policy import (
+    DEFAULT_GRANT_TTL_SECONDS,
     O2LoginGrantError,
     O2PolicyConflictError,
     O2PolicyDeniedError,
@@ -27,7 +28,11 @@ def _reuse_store(tmp_path, *, client_id="client-a", clock=lambda: 1000.0) -> O2P
 
     store = O2PolicyStore(tmp_path / "O2_POLICY.json", client_id=client_id, clock=clock)
     disabled = store.disable(reason="initialize test policy")
-    store.enable_reuse(expected_revision=disabled["revision"], approval_reference="explicit test approval")
+    store.enable_reuse(
+        expected_revision=disabled["revision"],
+        expected_generation=disabled["generation"],
+        approval_reference="explicit test approval",
+    )
     return store
 
 
@@ -60,14 +65,39 @@ def test_reuse_enable_uses_compare_and_swap_revision(tmp_path):
     state = store.disable(reason="initialize")
 
     with pytest.raises(O2PolicyConflictError):
-        store.enable_reuse(expected_revision=state["revision"] - 1, approval_reference="stale approval")
+        store.enable_reuse(
+            expected_revision=state["revision"] - 1,
+            expected_generation=state["generation"],
+            approval_reference="stale approval",
+        )
 
     enabled = store.enable_reuse(
         expected_revision=state["revision"],
+        expected_generation=state["generation"],
         approval_reference="explicit global re-enable",
     )
     assert enabled["mode"] == "reuse_only"
     assert enabled["revision"] == state["revision"] + 1
+
+
+def test_repair_changes_generation_even_when_revision_repeats(tmp_path):
+    """Malformed-state repair cannot create an ABA match for stale approval."""
+
+    store = O2PolicyStore(tmp_path / "O2_POLICY.json", client_id="client-a")
+    original = store.disable(reason="initial disabled state")
+    store.path.write_text("{truncated")
+    store.path.chmod(0o600)
+
+    repaired = store.disable(reason="repair malformed policy")
+
+    assert repaired["revision"] == original["revision"]
+    assert repaired["generation"] != original["generation"]
+    with pytest.raises(O2PolicyConflictError, match="generation/revision"):
+        store.enable_reuse(
+            expected_revision=original["revision"],
+            expected_generation=original["generation"],
+            approval_reference="stale pre-repair approval",
+        )
 
 
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "permissions", "malformed"])
@@ -117,6 +147,7 @@ def test_login_grant_is_client_target_and_time_scoped(tmp_path):
     revision = owner.snapshot().revision
     grant = owner.authorize_login(
         expected_revision=revision,
+        expected_generation=owner.snapshot().generation,
         target="login",
         allow_offvpn=True,
         approval_reference="start login master off VPN",
@@ -134,12 +165,34 @@ def test_login_grant_is_client_target_and_time_scoped(tmp_path):
         owner.preview_login_grant(grant.id, "login")
 
 
+def test_persisted_login_grant_cannot_exceed_maximum_ttl(tmp_path):
+    """A corrupted receipt cannot extend one approval beyond five minutes."""
+
+    store = _reuse_store(tmp_path, client_id="client-a")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="bounded approval",
+    )
+    payload = json.loads(store.path.read_text())
+    payload["login_grant"]["expires_at"] = grant.created_at + DEFAULT_GRANT_TTL_SECONDS + 1.0
+    store.path.write_text(json.dumps(payload))
+    store.path.chmod(0o600)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is False
+    assert snapshot.effective_mode == "disabled"
+
+
 def test_grant_consumption_is_atomic_across_contenders(tmp_path):
     """Two callers sharing one grant can persist exactly one active attempt."""
 
     store = _reuse_store(tmp_path, client_id="same-client")
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="one approved attempt",
@@ -168,6 +221,7 @@ def test_active_attempt_blocks_new_authorization_until_cooldown(tmp_path):
     store = _reuse_store(tmp_path, client_id="client-a", clock=lambda: now[0])
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="first attempt",
@@ -177,6 +231,7 @@ def test_active_attempt_blocks_new_authorization_until_cooldown(tmp_path):
     with pytest.raises(O2LoginGrantError, match="cooling down"):
         store.authorize_login(
             expected_revision=store.snapshot().revision,
+            expected_generation=store.snapshot().generation,
             target="login",
             allow_offvpn=False,
             approval_reference="unsafe immediate retry",
@@ -185,6 +240,7 @@ def test_active_attempt_blocks_new_authorization_until_cooldown(tmp_path):
     now[0] += 301.0
     replacement = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="fresh explicit approval after cooldown",
@@ -200,6 +256,7 @@ def test_failed_attempt_remains_blocked_until_global_cooldown(tmp_path, outcome)
     store = _reuse_store(tmp_path, client_id="client-a", clock=lambda: now[0])
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="first attempt",
@@ -210,6 +267,7 @@ def test_failed_attempt_remains_blocked_until_global_cooldown(tmp_path, outcome)
     with pytest.raises(O2LoginGrantError, match="cooling down"):
         store.authorize_login(
             expected_revision=store.snapshot().revision,
+            expected_generation=store.snapshot().generation,
             target="login",
             allow_offvpn=False,
             approval_reference="unsafe immediate retry",
@@ -218,6 +276,7 @@ def test_failed_attempt_remains_blocked_until_global_cooldown(tmp_path, outcome)
     now[0] += 301.0
     replacement = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="fresh approval after cooldown",
@@ -241,6 +300,7 @@ def test_malformed_login_attempt_receipt_fails_closed(tmp_path, field, value):
     store = _reuse_store(tmp_path, client_id="client-a")
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="first attempt",
@@ -260,6 +320,7 @@ def test_malformed_login_attempt_receipt_fails_closed(tmp_path, field, value):
     with pytest.raises(O2PolicyInvalidError):
         store.authorize_login(
             expected_revision=payload["revision"],
+            expected_generation=payload["generation"],
             target="login",
             allow_offvpn=False,
             approval_reference="must fail closed",
@@ -272,6 +333,7 @@ def test_truncated_non_success_cooldown_receipt_fails_closed(tmp_path):
     store = _reuse_store(tmp_path, client_id="client-a")
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=False,
         approval_reference="first attempt",
@@ -293,6 +355,7 @@ def test_concurrent_disable_revokes_grant_and_preserves_attempt_result(tmp_path)
     store = _reuse_store(tmp_path, client_id="client-a")
     grant = store.authorize_login(
         expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
         target="login",
         allow_offvpn=True,
         approval_reference="approved attempt",

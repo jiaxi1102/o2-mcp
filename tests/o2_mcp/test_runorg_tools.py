@@ -45,6 +45,7 @@ def _build(tmp_path) -> FastMCP:
         json.dumps(
             {
                 "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
                 "revision": 1,
                 "mode": "reuse_only",
                 "login_grant": None,

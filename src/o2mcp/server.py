@@ -141,6 +141,11 @@ class EnableReuseInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
     approval_reference: str = Field(..., min_length=1, max_length=240)
     acknowledge_global: bool = Field(
         ...,
@@ -156,6 +161,11 @@ class AuthorizeLoginInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
     target: Literal["login", "transfer"]
     allow_offvpn: bool = Field(
         default=False,
@@ -304,7 +314,17 @@ def _local_status_payload() -> dict[str, Any]:
         # issuing process's client_id.  Exposing it helps the authorized task
         # recover from an MCP response-display failure without enabling theft.
         grant = {**grant, "owned_by_this_client": grant.get("client_id") == conn.policy.client_id}
-    transfers = O2AsyncTransfer(conn).status()
+    try:
+        transfers = O2AsyncTransfer(conn).status()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Policy recovery must remain visible even when the transfer directory
+        # itself is unreadable. Individual malformed receipts are normally
+        # isolated by O2AsyncTransfer.status; this is the directory-level guard.
+        transfers = {
+            "ok": False,
+            "error": "transfer_status_unavailable",
+            "message": str(exc),
+        }
     return {
         "ok": True,
         "local_only": True,
@@ -312,6 +332,7 @@ def _local_status_payload() -> dict[str, Any]:
             "path": str(snapshot.path),
             "valid": snapshot.valid,
             "effective_mode": snapshot.effective_mode,
+            "generation": snapshot.generation,
             "revision": snapshot.revision,
             "error": snapshot.error,
             "login_grant": grant,
@@ -378,6 +399,7 @@ async def o2_policy_enable_reuse(params: EnableReuseInput) -> str:
             }
         state = _connection().policy.enable_reuse(
             expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
             approval_reference=params.approval_reference,
         )
         return {"ok": True, "policy": state}
@@ -395,6 +417,7 @@ async def o2_authorize_login(params: AuthorizeLoginInput) -> str:
     def work() -> dict[str, Any]:
         grant = _connection().policy.authorize_login(
             expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
             target=params.target,
             allow_offvpn=params.allow_offvpn,
             approval_reference=params.approval_reference,

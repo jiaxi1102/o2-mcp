@@ -263,11 +263,25 @@ class O2AsyncTransfer:
         """One transfer's status (``transfer_id`` given) or a list of all known transfers."""
         if transfer_id is None:
             metas = sorted(self.state_dir.glob("*.json")) if self.state_dir.exists() else []
-            return [self._status_from_meta(p, log_tail=log_tail) for p in metas]
+            return [self._safe_status_from_meta(p, log_tail=log_tail) for p in metas]
         meta_path = self._meta_path(transfer_id)
         if meta_path is None or not meta_path.exists():
             return {"ok": False, "error": "unknown_transfer", "transfer_id": transfer_id}
-        return self._status_from_meta(meta_path, log_tail=log_tail)
+        return self._safe_status_from_meta(meta_path, log_tail=log_tail)
+
+    def _safe_status_from_meta(self, meta_path: Path, *, log_tail: int) -> dict[str, Any]:
+        """Isolate one corrupt receipt so other local diagnostics remain usable."""
+
+        try:
+            return self._status_from_meta(meta_path, log_tail=log_tail)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {
+                "ok": False,
+                "error": "invalid_transfer_metadata",
+                "transfer_id": meta_path.stem,
+                "meta_path": str(meta_path),
+                "message": str(exc),
+            }
 
     def _status_from_meta(self, meta_path: Path, *, log_tail: int) -> dict[str, Any]:
         meta = json.loads(meta_path.read_text())

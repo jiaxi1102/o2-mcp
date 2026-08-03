@@ -68,6 +68,7 @@ def _patch_connection(
         json.dumps(
             {
                 "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
                 "revision": 1,
                 "mode": "disabled" if locked else "reuse_only",
                 "login_grant": None,
@@ -235,6 +236,25 @@ async def test_local_status_reports_disabled_policy_without_ssh(monkeypatch, tmp
 
 
 @pytest.mark.anyio
+async def test_local_status_preserves_policy_when_transfer_metadata_is_corrupt(monkeypatch, tmp_path):
+    """A truncated detached-transfer receipt cannot hide policy recovery data."""
+
+    runner = _patch_connection(monkeypatch, tmp_path, master=False, locked=True)
+    transfer_dir = tmp_path / "test-home" / ".cache" / "o2mcp" / "transfers"
+    transfer_dir.mkdir(parents=True)
+    corrupt = transfer_dir / "push-20260617-001234-99-0001.json"
+    corrupt.write_text("{truncated")
+
+    payload = await _call("o2_local_status", {})
+
+    assert payload["ok"] is True
+    assert payload["policy"]["effective_mode"] == "disabled"
+    assert payload["policy"]["generation"]
+    assert payload["transfers"][0]["error"] == "invalid_transfer_metadata"
+    assert runner.calls == []
+
+
+@pytest.mark.anyio
 async def test_run_without_master_is_actionable(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=False)
     payload = await _call("o2_exec", {"params": {"command": "squeue"}})
@@ -261,6 +281,7 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
         {
             "params": {
                 "expected_revision": status["policy"]["revision"],
+                "expected_generation": status["policy"]["generation"],
                 "target": "login",
                 "allow_offvpn": True,
                 "approval_reference": "explicit test approval",
@@ -293,6 +314,7 @@ async def test_policy_disable_and_explicit_global_reenable(monkeypatch, tmp_path
         {
             "params": {
                 "expected_revision": disabled["policy"]["revision"],
+                "expected_generation": disabled["policy"]["generation"],
                 "approval_reference": "explicit global re-enable",
                 "acknowledge_global": True,
             }
@@ -370,6 +392,7 @@ async def test_start_master_can_open_transfer_alias(monkeypatch, tmp_path):
         {
             "params": {
                 "expected_revision": status["policy"]["revision"],
+                "expected_generation": status["policy"]["generation"],
                 "target": "transfer",
                 "allow_offvpn": True,
                 "approval_reference": "explicit transfer login approval",

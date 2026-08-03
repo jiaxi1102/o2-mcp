@@ -69,6 +69,7 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
         json.dumps(
             {
                 "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
                 "revision": 1,
                 "mode": "disabled" if locked else "reuse_only",
                 "login_grant": None,
@@ -255,6 +256,23 @@ def test_status_lists_all(tmp_path):
     listed = mgr.status()
     assert isinstance(listed, list) and len(listed) == 2
     assert {row["remote"] for row in listed} == {"/ra", "/rb"}
+
+
+def test_status_isolates_corrupt_metadata_when_listing(tmp_path):
+    """One truncated receipt must not suppress healthy detached transfers."""
+
+    mgr = _mgr(tmp_path, FakeSpawner())
+    healthy = mgr.push_async("/a", "/remote-a")
+    corrupt = mgr.state_dir / "push-20260617-001234-99-0001.json"
+    corrupt.write_text("{truncated")
+
+    listed = mgr.status()
+
+    assert len(listed) == 2
+    assert any(row.get("transfer_id") == healthy.id and row["ok"] for row in listed)
+    invalid = next(row for row in listed if row.get("meta_path") == str(corrupt))
+    assert invalid["ok"] is False
+    assert invalid["error"] == "invalid_transfer_metadata"
 
 
 def test_progress_parsing_rsync_tochk():

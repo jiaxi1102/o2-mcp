@@ -50,8 +50,10 @@ file has two durable modes: `disabled` blocks new remote operations, while
 `reuse_only` permits only existing exact sockets. There is deliberately no durable
 `normal` mode. The one-shot grant is atomically removed and converted to an active
 attempt receipt before SSH, so a failure, timeout, or crash cannot leave reusable
-authorization for a queued task. Policy revisions and a stable internal mutex
-serialize every transition across MCP processes.
+authorization for a queued task. Policy generation/revision pairs and a stable
+internal mutex serialize every transition across MCP processes. Callers pass
+both values from one `o2_local_status` snapshot; repair creates a new generation,
+so a repeated numeric revision cannot revive stale approval.
 
 **Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
@@ -101,7 +103,7 @@ Requires `Host o2` (and optionally `Host o2-transfer`) blocks in `~/.ssh/config`
 | `o2_local_status` | Local policy, sockets, processes, receipts, and transfer logs; never SSH | read-only/local |
 | `o2_status` | Deprecated local-only compatibility alias | read-only/local |
 | `o2_policy_disable` | Block every new remote O2 operation without killing existing processes | write/local |
-| `o2_policy_enable_reuse` | Explicitly enable existing-master reuse at an observed revision | write/local |
+| `o2_policy_enable_reuse` | Explicitly enable existing-master reuse at an observed generation/revision | write/local |
 | `o2_authorize_login` | Issue one short-lived login or transfer-host grant | write/local |
 | `o2_start_master` | Consume one matching grant and attempt exactly one master start | write |
 | `o2_probe` | One explicit fixed remote probe through an existing master; never retried | read-only |

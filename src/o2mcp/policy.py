@@ -97,6 +97,15 @@ class PolicySnapshot:
         revision = self.state.get("revision", 0)
         return revision if type(revision) is int else 0
 
+    @property
+    def generation(self) -> str | None:
+        """Return the durable state generation used to prevent revision ABA."""
+
+        if self.state is None:
+            return None
+        generation = self.state.get("generation")
+        return generation if isinstance(generation, str) else None
+
 
 @dataclass(frozen=True)
 class LoginGrant:
@@ -129,6 +138,8 @@ class LoginGrant:
                 raise O2PolicyInvalidError(f"login_grant.{key} must be a timestamp")
         if payload["expires_at"] <= payload["created_at"]:
             raise O2PolicyInvalidError("login_grant.expires_at must be later than created_at")
+        if payload["expires_at"] - payload["created_at"] > DEFAULT_GRANT_TTL_SECONDS:
+            raise O2PolicyInvalidError("login_grant lifetime exceeds the maximum authorization TTL")
         return cls(
             id=payload["id"],
             client_id=payload["client_id"],
@@ -227,13 +238,19 @@ class O2PolicyStore:
             self._append_event(state, "policy_disabled", reason=clean_reason)
             return self._write_next_revision(state)
 
-    def enable_reuse(self, *, expected_revision: int, approval_reference: str) -> dict[str, Any]:
+    def enable_reuse(
+        self,
+        *,
+        expected_revision: int,
+        expected_generation: str,
+        approval_reference: str,
+    ) -> dict[str, Any]:
         """Transition from ``disabled`` to ``reuse_only`` after explicit approval."""
 
         reference = self._clean_reference(approval_reference, field="approval_reference")
         with self._locked():
             state = self._read_valid_state()
-            self._require_revision(state, expected_revision)
+            self._require_revision(state, expected_revision, expected_generation)
             state["mode"] = "reuse_only"
             self._append_event(state, "policy_reuse_enabled", approval_reference=reference)
             return self._write_next_revision(state)
@@ -242,6 +259,7 @@ class O2PolicyStore:
         self,
         *,
         expected_revision: int,
+        expected_generation: str,
         target: LoginTarget,
         allow_offvpn: bool,
         approval_reference: str,
@@ -261,7 +279,7 @@ class O2PolicyStore:
 
         with self._locked():
             state = self._read_valid_state()
-            self._require_revision(state, expected_revision)
+            self._require_revision(state, expected_revision, expected_generation)
             if state["mode"] != "reuse_only":
                 raise O2PolicyDeniedError("Enable reuse_only mode before authorizing a new O2 login.")
 
@@ -428,6 +446,13 @@ class O2PolicyStore:
         revision = payload.get("revision")
         if type(revision) is not int or revision < 0:
             raise O2PolicyInvalidError("O2 policy revision must be a non-negative integer")
+        generation = payload.get("generation")
+        if not isinstance(generation, str) or not generation:
+            raise O2PolicyInvalidError("O2 policy generation must be a non-empty UUID")
+        try:
+            uuid.UUID(generation)
+        except ValueError as exc:
+            raise O2PolicyInvalidError("O2 policy generation must be a valid UUID") from exc
         if payload.get("mode") not in {"disabled", "reuse_only"}:
             raise O2PolicyInvalidError("O2 policy mode must be 'disabled' or 'reuse_only'")
         if payload.get("login_grant") is not None:
@@ -611,6 +636,10 @@ class O2PolicyStore:
 
         return {
             "schema_version": SCHEMA_VERSION,
+            # A fresh generation makes repair distinguishable from every state a
+            # client could have observed before malformed JSON was replaced. The
+            # numeric revision may restart, but the compare-and-swap pair cannot.
+            "generation": str(uuid.uuid4()),
             "revision": 0,
             "mode": "disabled",
             "updated_at": self._clock(),
@@ -620,14 +649,23 @@ class O2PolicyStore:
             "events": [],
         }
 
-    def _require_revision(self, state: dict[str, Any], expected_revision: int) -> None:
-        """Reject a mutation whose approval was based on stale local state."""
+    def _require_revision(
+        self,
+        state: dict[str, Any],
+        expected_revision: int,
+        expected_generation: str,
+    ) -> None:
+        """Reject a mutation whose approval predates any write or repair."""
 
         if type(expected_revision) is not int or expected_revision < 0:
             raise O2PolicyConflictError("expected_revision must be a non-negative integer")
-        if state["revision"] != expected_revision:
+        if not isinstance(expected_generation, str) or not expected_generation:
+            raise O2PolicyConflictError("expected_generation must be a non-empty UUID")
+        if state["revision"] != expected_revision or state["generation"] != expected_generation:
             raise O2PolicyConflictError(
-                f"O2 policy changed from expected revision {expected_revision} to {state['revision']}; "
+                "O2 policy changed from expected generation/revision "
+                f"{expected_generation}/{expected_revision} to "
+                f"{state['generation']}/{state['revision']}; "
                 "reread o2_local_status before requesting another transition."
             )
 
