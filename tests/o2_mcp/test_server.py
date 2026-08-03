@@ -63,6 +63,20 @@ class FakeRunner:
 def _patch_connection(
     monkeypatch, tmp_path, *, master=True, responder=None, locked=False, start_persists=True
 ) -> FakeRunner:
+    policy_file = tmp_path / "O2_POLICY.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "revision": 1,
+                "mode": "disabled" if locked else "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+            }
+        )
+    )
+    policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
         "Host o2\n"
@@ -78,13 +92,13 @@ def _patch_connection(
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
-        lock_file=tmp_path / "O2_DISABLED",
+        policy_file=policy_file,
         ssh_config_file=ssh_config,
     )
-    if locked:
-        cfg.lock_file.write_text("disabled")
     runner = FakeRunner(master=master, responder=responder, start_persists=start_persists)
-    monkeypatch.setattr(o2server, "_connection", lambda: O2Connection(cfg, runner=runner))
+    connection = O2Connection(cfg, runner=runner)
+    runner.connection = connection
+    monkeypatch.setattr(o2server, "_connection", lambda: connection)
     return runner
 
 
@@ -102,6 +116,11 @@ async def test_tool_registry_and_annotations():
     tools = {t.name: t for t in await o2server.mcp.list_tools()}
     assert set(tools) == {
         "o2_status",
+        "o2_local_status",
+        "o2_probe",
+        "o2_policy_disable",
+        "o2_policy_enable_reuse",
+        "o2_authorize_login",
         "o2_start_master",
         "o2_exec",
         "o2_submit_job",
@@ -122,6 +141,9 @@ async def test_tool_registry_and_annotations():
         "o2_place",
     }
     assert tools["o2_status"].annotations.readOnlyHint is True
+    assert tools["o2_status"].annotations.openWorldHint is False
+    assert tools["o2_local_status"].annotations.openWorldHint is False
+    assert tools["o2_probe"].annotations.openWorldHint is True
     assert tools["o2_submit_job"].annotations.readOnlyHint is False
     assert tools["o2_cancel_job"].annotations.destructiveHint is True
     assert tools["o2_workspace_gc"].annotations.destructiveHint is True
@@ -188,26 +210,28 @@ async def test_workspace_gc_dry_run_returns_script(monkeypatch, tmp_path):
     assert "/home/jiz947/.cache" in payload["script"] and "/home/jiz947/envs" not in payload["script"]
 
 
-# --- safety paths ------------------------------------------------------------
+# --- policy and authentication paths ----------------------------------------
 @pytest.mark.anyio
-async def test_status_reports_not_connected(monkeypatch, tmp_path):
-    _patch_connection(monkeypatch, tmp_path, master=False)
+async def test_status_is_local_only_and_does_not_probe(monkeypatch, tmp_path):
+    runner = _patch_connection(monkeypatch, tmp_path, master=False)
     payload = await _call("o2_status", {})
-    assert payload == {"ok": True, "locked": False, "lock_file": None, "master_running": False, "probe": None}
+
+    assert payload["ok"] is True and payload["local_only"] is True
+    assert payload["policy"]["effective_mode"] == "reuse_only"
+    assert runner.calls == []
 
 
 @pytest.mark.anyio
-async def test_status_identifies_the_active_safety_lock(monkeypatch, tmp_path):
-    """Diagnostics should name the exact lock that is preventing O2 access."""
+async def test_local_status_reports_disabled_policy_without_ssh(monkeypatch, tmp_path):
+    """Diagnostics name the policy state while making no SSH runner call."""
 
-    _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
-    payload = await _call("o2_status", {})
+    runner = _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
+    payload = await _call("o2_local_status", {})
 
     assert payload["ok"] is True
-    assert payload["locked"] is True
-    assert payload["lock_file"] == str(tmp_path / "O2_DISABLED")
-    assert payload["master_running"] is False
-    assert payload["probe"] is None
+    assert payload["policy"]["effective_mode"] == "disabled"
+    assert payload["policy"]["path"] == str(tmp_path / "O2_POLICY.json")
+    assert runner.calls == []
 
 
 @pytest.mark.anyio
@@ -220,9 +244,9 @@ async def test_run_without_master_is_actionable(monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_start_master_refused_without_optin(monkeypatch, tmp_path):
+async def test_start_master_refused_without_grant(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=False)
-    payload = await _call("o2_start_master", {"params": {"allow_new_login": False}})
+    payload = await _call("o2_start_master", {"params": {}})
     assert payload["ok"] is False and payload["error"] == "no_master"
 
 
@@ -231,8 +255,20 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
     """The MCP response must not call a vanished background master successful."""
 
     _patch_connection(monkeypatch, tmp_path, master=False, start_persists=False)
+    status = await _call("o2_local_status", {})
+    authorization = await _call(
+        "o2_authorize_login",
+        {
+            "params": {
+                "expected_revision": status["policy"]["revision"],
+                "target": "login",
+                "allow_offvpn": True,
+                "approval_reference": "explicit test approval",
+            }
+        },
+    )
 
-    payload = await _call("o2_start_master", {"params": {"allow_new_login": True}})
+    payload = await _call("o2_start_master", {"params": {"grant_id": authorization["grant_id"]}})
 
     assert payload["ok"] is False
     assert payload["returncode"] == 255
@@ -240,10 +276,29 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
 
 
 @pytest.mark.anyio
-async def test_lock_blocks_tool(monkeypatch, tmp_path):
+async def test_disabled_policy_blocks_tool(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
     payload = await _call("o2_exec", {"params": {"command": "hostname"}})
-    assert payload["ok"] is False and payload["error"] == "o2_locked"
+    assert payload["ok"] is False and payload["error"] == "policy_disabled"
+
+
+@pytest.mark.anyio
+async def test_policy_disable_and_explicit_global_reenable(monkeypatch, tmp_path):
+    _patch_connection(monkeypatch, tmp_path)
+    disabled = await _call("o2_policy_disable", {"params": {"reason": "Duo incident"}})
+    assert disabled["policy"]["mode"] == "disabled"
+
+    enabled = await _call(
+        "o2_policy_enable_reuse",
+        {
+            "params": {
+                "expected_revision": disabled["policy"]["revision"],
+                "approval_reference": "explicit global re-enable",
+                "acknowledge_global": True,
+            }
+        },
+    )
+    assert enabled["ok"] is True and enabled["policy"]["mode"] == "reuse_only"
 
 
 # --- submit / monitor (mocked runner) ----------------------------------------
@@ -309,7 +364,22 @@ async def test_start_master_can_open_transfer_alias(monkeypatch, tmp_path):
     # moves (o2_run_promote/archive, o2_push/pull use_transfer_node) have a master
     # to reuse instead of hitting the transfer-master guard with no way to satisfy it.
     runner = _patch_connection(monkeypatch, tmp_path, master=False)
-    res = await _call("o2_start_master", {"params": {"allow_new_login": True, "transfer": True}})
+    status = await _call("o2_local_status", {})
+    authorization = await _call(
+        "o2_authorize_login",
+        {
+            "params": {
+                "expected_revision": status["policy"]["revision"],
+                "target": "transfer",
+                "allow_offvpn": True,
+                "approval_reference": "explicit transfer login approval",
+            }
+        },
+    )
+    res = await _call(
+        "o2_start_master",
+        {"params": {"grant_id": authorization["grant_id"], "transfer": True}},
+    )
     assert res["ok"] is True and res["alias"] == "o2-transfer"
     mnf = [c for c in runner.calls if "-MNf" in c["argv"]]
     assert mnf and mnf[-1]["argv"][-1] == "o2-transfer"

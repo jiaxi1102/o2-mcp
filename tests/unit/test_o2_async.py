@@ -2,7 +2,7 @@
 
 The subprocess spawner and clock are injected, so these never spawn a real
 process or touch the network: they assert the wrapped command is built correctly
-(incl. remote-path quoting), the safety lock + ControlMaster guards fire before
+(incl. remote-path quoting), the policy + ControlMaster guards fire before
 any launch, and status/cancel report the right state from a faked process +
 on-disk exit-code files (incl. the post-restart fallback when the Popen is gone).
 """
@@ -64,9 +64,20 @@ class FakeSpawner:
 
 
 def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Connection:
-    lock = tmp_path / "O2_DISABLED"
-    if locked:
-        lock.write_text("disabled")
+    policy_file = tmp_path / "O2_POLICY.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "revision": 1,
+                "mode": "disabled" if locked else "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+            }
+        )
+    )
+    policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
         "Host o2 o2-transfer\n"
@@ -78,7 +89,7 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
-        lock_file=lock,
+        policy_file=policy_file,
         ssh_config_file=ssh_config,
     )
 

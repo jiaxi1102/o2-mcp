@@ -6,6 +6,8 @@ an injected runner (no network). Everything is parameterized by a synthetic RunP
 
 from __future__ import annotations
 
+import json
+
 from o2mcp import CommandResult, O2Config, O2Connection
 from o2mcp.runorg import (
     RETENTION_KEEP,
@@ -57,6 +59,20 @@ class _Runner:
 
 
 def _cfg(tmp_path):
+    policy_file = tmp_path / "O2_POLICY.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "revision": 1,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+            }
+        )
+    )
+    policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
         "Host o2 o2-transfer\n"
@@ -68,7 +84,7 @@ def _cfg(tmp_path):
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
-        lock_file=tmp_path / "O2_DISABLED",
+        policy_file=policy_file,
         ssh_config_file=ssh_config,
     )
 

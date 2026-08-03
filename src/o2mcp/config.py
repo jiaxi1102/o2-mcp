@@ -13,19 +13,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def _default_lock_file() -> Path:
-    """Return the process-independent O2 safety lock path.
+def _default_policy_file() -> Path:
+    """Return the single workstation-wide O2 policy-state path.
 
-    MCP servers are started once per Codex task, and those task processes may
-    have different working directories. A lock beneath ``Path.cwd()`` therefore
-    cannot reliably stop every task. The user-level default gives all O2 clients
-    on this workstation one authoritative emergency stop while keeping
-    ``O2_SSH_LOCK_FILE`` available for an explicit deployment-specific path.
+    ``O2_POLICY_FILE`` supports isolated deployments and offline tests without
+    reviving the former project-local lock model. Every cooperating MCP process
+    must resolve this setting to the same file.
     """
-    env = os.environ.get("O2_SSH_LOCK_FILE")
+
+    env = os.environ.get("O2_POLICY_FILE")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".agent_locks" / "O2_DISABLED"
+    return Path.home() / ".agent_locks" / "O2_POLICY.json"
 
 
 def _default_ssh_config_file() -> Path:
@@ -45,12 +44,9 @@ class O2Config:
         host_alias: SSH alias for login/compute commands (the ControlMaster host).
         transfer_alias: SSH alias for bulk rsync transfers (the O2 transfer node).
         connect_timeout: SSH ``ConnectTimeout`` in seconds.
-        lock_file: If this path exists, every O2 operation refuses to run. The
-            default is the workstation-wide ``~/.agent_locks/O2_DISABLED`` so
-            independently launched MCP processes share the same emergency stop.
-            The legacy current-working-directory lock remains an additional stop
-            in :class:`o2mcp.connection.O2Connection` for upgrade compatibility.
-        ignore_lock: Mirror of ``O2_IGNORE_LOCAL_LOCK=1`` to bypass the lock.
+        policy_file: Workstation-wide JSON state controlling disabled,
+            reuse-only, and one-shot login authorization behavior. There is no
+            environment variable that bypasses a valid disabled policy.
         default_user: Username for ``squeue -u`` etc.; ``None`` resolves to ``$USER`` remotely.
         default_log_dir: Remote directory pattern where Slurm logs land.
         ssh_config_file: User SSH config containing the O2 alias definitions.
@@ -61,8 +57,7 @@ class O2Config:
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
     transfer_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_TRANSFER_ALIAS", "o2-transfer"))
     connect_timeout: int = field(default_factory=lambda: int(os.environ.get("O2_SSH_CONNECT_TIMEOUT_SECONDS", "20")))
-    lock_file: Path = field(default_factory=_default_lock_file)
-    ignore_lock: bool = field(default_factory=lambda: os.environ.get("O2_IGNORE_LOCAL_LOCK", "0") == "1")
+    policy_file: Path = field(default_factory=_default_policy_file)
     default_user: str | None = field(default_factory=lambda: os.environ.get("O2_USER") or None)
     default_log_dir: str = field(default_factory=lambda: os.environ.get("O2_LOG_DIR", "~/logs/o2"))
 
@@ -103,9 +98,9 @@ class O2Config:
     # to be appended below for the same compatibility reason.
     # Refuse to open a NEW O2 login unless the route to O2 egresses via a VPN tunnel interface
     # (prefix below): O2 autopushes Duo to any non-HMS source IP, so a login leaving via a
-    # physical interface (en0) instead of the HMS VPN triggers a phone prompt. O2_REQUIRE_VPN=0
-    # disables the guard; O2_VPN_IFACE_PREFIX overrides the expected tunnel-interface prefix.
-    require_vpn: bool = field(default_factory=lambda: os.environ.get("O2_REQUIRE_VPN", "1") != "0")
+    # physical interface (en0) instead of the HMS VPN triggers a phone prompt.
+    # Off-VPN access is never enabled durably by configuration; it must be scoped
+    # into the one-shot login grant issued after explicit user approval.
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
     ssh_config_file: Path = field(default_factory=_default_ssh_config_file)
 

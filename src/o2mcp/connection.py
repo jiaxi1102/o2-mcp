@@ -3,8 +3,7 @@
 A Python port of ``scripts/o2_ssh_master.sh`` that preserves its safety contract
 exactly, but is testable and composable:
 
-- The user-level ``~/.agent_locks/O2_DISABLED`` lock and legacy project lock are
-  hard stops on every operation.
+- The workstation-wide ``O2_POLICY.json`` state governs every remote operation.
 - Only ``start_master`` can authenticate. Every other SSH/rsync subprocess has
   all authentication methods disabled and uses an inspected, pinned socket with
   live SSH config disabled, so OpenSSH cannot silently replace a missing
@@ -18,26 +17,28 @@ tested offline without ever touching the network.
 
 from __future__ import annotations
 
-import fcntl
 import glob
-import json
-import math
-import os
 import shlex
 import subprocess
 import tempfile
-import time
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from o2mcp.config import O2Config
+from o2mcp.policy import (
+    LoginTarget,
+    O2LoginGrantError,
+    O2PolicyDeniedError,
+    O2PolicyStore,
+)
 
-
-class O2LockedError(RuntimeError):
-    """Raised when the local O2 safety lock forbids any cluster operation."""
+# Compatibility alias for downstream clients during the 0.3 rollout.  The name
+# no longer represents a filesystem lock; all behavior is delegated to the
+# authoritative policy-state machine.
+O2LockedError = O2PolicyDeniedError
 
 
 class O2MasterUnavailableError(RuntimeError):
@@ -48,8 +49,8 @@ class O2OffVpnError(RuntimeError):
     """Raised when opening a new login would egress off the HMS VPN (→ a Duo push)."""
 
 
-class O2LoginCoordinationError(RuntimeError):
-    """Raised when a new O2 login cannot be serialized safely across processes."""
+class O2LoginCoordinationError(O2LoginGrantError):
+    """Compatibility error for callers that previously handled login mutex failures."""
 
 
 class O2UnsafeTransportError(RuntimeError):
@@ -101,15 +102,7 @@ def default_runner(argv: list[str], timeout: float | None, input_text: str | Non
 
 
 class O2Connection:
-    """Manage and use the persistent O2 SSH ControlMaster connection.
-
-    ``LOGIN_RETRY_COOLDOWN_SECONDS`` is deliberately process-independent and
-    non-configurable. Different Codex tasks must agree on the same retry window;
-    a per-process environment override would recreate the coordination gap this
-    class exists to close.
-    """
-
-    LOGIN_RETRY_COOLDOWN_SECONDS = 300.0
+    """Manage persistent O2 ControlMasters under one global policy state."""
 
     # Never let PATH lookup or an arbitrary executable whose basename is `ssh`
     # or `rsync` bypass the transport guards. O2 MCP targets macOS and the Linux
@@ -242,202 +235,29 @@ class O2Connection:
         }
     )
 
-    def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
+    def __init__(
+        self,
+        config: O2Config | None = None,
+        runner: Runner = default_runner,
+        *,
+        policy: O2PolicyStore | None = None,
+    ) -> None:
+        """Create a connection bound to the global policy and injected runner.
+
+        A caller may inject ``policy`` for deterministic offline tests.  Normal
+        MCP processes construct stores from :class:`O2Config`, whose process-wide
+        client identity ensures an authorization issued by one tool call can be
+        consumed by a later call in the same task but not by another task.
+        """
+
         self.config = config or O2Config()
         self._runner = runner
+        self.policy = policy or O2PolicyStore(self.config.policy_file)
         # A connection may build an rsync argv and then validate/run it. Cache the
         # safely expanded config for each target so those two steps cannot drift
         # and do not repeatedly parse the same local files.
         self._resolved_ssh_configs: dict[str, dict[str, str]] = {}
         self._safe_ssh_config_text_cache: str | None = None
-
-    # -- safety -----------------------------------------------------------------
-    def active_lock_file(self) -> Path | None:
-        """Return the safety lock currently blocking O2, if any.
-
-        The configured/user-level lock is authoritative for new installations.
-        The working-directory lock preserves the pre-0.2 safety contract during
-        migration: an upgrade must never silently bypass an already-engaged
-        project emergency stop. Duplicate paths are harmless and are collapsed
-        to keep the check and any error message deterministic.
-        """
-
-        if self.config.ignore_lock:
-            return None
-        configured = self.config.lock_file
-        legacy = Path.cwd() / ".agent_locks" / "O2_DISABLED"
-        for candidate in dict.fromkeys((configured, legacy)):
-            if candidate.exists():
-                return candidate
-        return None
-
-    def is_locked(self) -> bool:
-        """Whether the local O2 safety lock is engaged."""
-        return self.active_lock_file() is not None
-
-    def _require_unlocked(self) -> None:
-        active_lock = self.active_lock_file()
-        if active_lock is not None:
-            raise O2LockedError(
-                f"O2 access is locally disabled by {active_lock}. "
-                "Refusing every O2 SSH/rsync command to prevent repeated Duo/MFA prompts. "
-                "Remove that file (or set O2_IGNORE_LOCAL_LOCK=1) only after confirming O2 access is safe."
-            )
-
-    def _master_start_lock_file(self) -> Path:
-        """Return the interprocess mutex used for every new O2 master login.
-
-        The mutex is deliberately shared by the login and transfer aliases.
-        Those aliases use different SSH sockets, but both can trigger Duo; one
-        workstation must never attempt both authentications concurrently. Its
-        path is deliberately independent of ``O2_SSH_LOCK_FILE``: upgraded MCP
-        registrations may still name different legacy project locks, but every
-        process for this user must converge on one login-coordination boundary.
-        """
-
-        return Path.home() / ".agent_locks" / "O2_LOGIN_START.lock"
-
-    def _master_start_attempt_file(self) -> Path:
-        """Return the shared receipt that suppresses retries after a failed start."""
-
-        return Path.home() / ".agent_locks" / "O2_LOGIN_START_ATTEMPT.json"
-
-    def _record_master_start_attempt(self, target: str, *, returncode: int | None = None) -> None:
-        """Persist a start receipt before SSH so queued callers cannot retry it.
-
-        The file is intentionally written directly and fsynced while the login
-        mutex is held. If the process crashes mid-write, the recent file's mtime
-        still activates the cooldown; a partially written receipt therefore
-        fails safe rather than allowing the next queued process to call SSH.
-        """
-
-        receipt_path = self._master_start_attempt_file()
-        payload = {
-            "started_at": time.time(),
-            "pid": os.getpid(),
-            "target": target,
-            "returncode": returncode,
-        }
-        try:
-            receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            with receipt_path.open("w") as handle:
-                json.dump(payload, handle, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-        except OSError as exc:
-            raise O2LoginCoordinationError(
-                f"Cannot persist the O2 login-attempt receipt at {receipt_path}; "
-                f"refusing to start SSH because queued callers could repeat Duo. OS error: {exc}"
-            ) from exc
-
-    def _clear_master_start_attempt(self) -> None:
-        """Remove the retry-suppression receipt after a confirmed successful start."""
-
-        receipt_path = self._master_start_attempt_file()
-        # A live master is authoritative and all callers will reuse it. Keep a
-        # receipt that cannot be removed as a conservative guard if the master
-        # immediately disappears; never turn a good login into a reported
-        # failure merely because local cleanup was unavailable.
-        with suppress(OSError):
-            receipt_path.unlink(missing_ok=True)
-
-    def _require_login_retry_ready(self) -> None:
-        """Refuse a fresh login while a recent process-wide attempt is cooling down.
-
-        The receipt is created *before* ``ssh -MNf``. It therefore covers a
-        normal nonzero result, a timeout/exception, or a process crash. Corrupt
-        receipts use their filesystem mtime, preserving the safety window even
-        when the writer died before completing JSON serialization.
-        """
-
-        receipt_path = self._master_start_attempt_file()
-        try:
-            stat = receipt_path.stat()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise O2LoginCoordinationError(
-                f"Cannot inspect the O2 login-attempt receipt at {receipt_path}; "
-                f"refusing an uncoordinated retry. OS error: {exc}"
-            ) from exc
-
-        started_at = stat.st_mtime
-        try:
-            payload = json.loads(receipt_path.read_text())
-            candidate = payload.get("started_at") if isinstance(payload, dict) else None
-            # ``bool`` is an ``int`` subclass and JSON also permits non-finite
-            # floats in Python's permissive decoder. Neither is a trustworthy
-            # timestamp; retain the fail-safe mtime for those values.
-            if type(candidate) in (int, float) and math.isfinite(float(candidate)):
-                started_at = float(candidate)
-        except (OSError, ValueError, TypeError):
-            # A recent malformed receipt most likely means its owner crashed
-            # during the login attempt. The mtime is the safest fallback.
-            pass
-
-        age = max(0.0, time.time() - started_at)
-        remaining = self.LOGIN_RETRY_COOLDOWN_SECONDS - age
-        if remaining > 0:
-            raise O2LoginCoordinationError(
-                f"A workstation-wide O2 login attempt occurred {age:.1f}s ago; refusing another Duo-pushing "
-                f"login for {remaining:.1f}s. Receipt: {receipt_path}"
-            )
-
-        try:
-            receipt_path.unlink()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise O2LoginCoordinationError(
-                f"Cannot clear the expired O2 login-attempt receipt at {receipt_path}; "
-                f"refusing an uncoordinated retry. OS error: {exc}"
-            ) from exc
-
-    @contextmanager
-    def _serialized_master_start(self) -> Iterator[None]:
-        """Hold a workstation-wide mutex while deciding whether to log in.
-
-        ``master_running()`` followed by ``ssh -MNf`` is otherwise a classic
-        check-then-act race: two Codex task processes can both observe no socket
-        and each initiate a Duo-pushing login. ``flock`` is released by the OS
-        if a process exits, so a crashed MCP server cannot leave a stale lock.
-
-        Coordination failures fail closed. Opening an uncoordinated O2 login is
-        more harmful than asking the caller to repair local lock permissions.
-        """
-
-        lock_path = self._master_start_lock_file()
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_handle = lock_path.open("a+")
-        except OSError as exc:
-            raise O2LoginCoordinationError(
-                f"Cannot create the O2 login coordination lock at {lock_path}; "
-                f"refusing to risk concurrent Duo prompts. OS error: {exc}"
-            ) from exc
-
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        except OSError as exc:
-            # The file was opened but never locked. Close it directly rather than
-            # running the normal unlock path and potentially masking the useful
-            # coordination failure with a second OS error.
-            lock_handle.close()
-            raise O2LoginCoordinationError(
-                f"Cannot acquire the O2 login coordination lock at {lock_path}; "
-                f"refusing to risk concurrent Duo prompts. OS error: {exc}"
-            ) from exc
-
-        try:
-            yield
-        finally:
-            # Closing the descriptor releases flock even if the guarded SSH call
-            # raises. The explicit unlock keeps the lifetime obvious in review.
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            finally:
-                lock_handle.close()
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def _master_check_argv(self, alias: str) -> list[str]:
@@ -471,8 +291,6 @@ class O2Connection:
         unavailable: this boolean guard must fail closed rather than crash its
         callers or allow them to infer that reuse is safe.
         """
-        if self.is_locked():
-            return False
         target = alias or self.config.host_alias
         try:
             result = self._runner(
@@ -491,10 +309,9 @@ class O2Connection:
 
         Resolves the alias's ``HostName`` from the safely flattened SSH config and
         asks the OS routing table (``route get``). Returns the interface name (e.g.
-        ``"utun6"``, ``"en0"``) or ``None`` when it can't be determined (e.g. the
-        ``route`` tool is unavailable), so the caller can fail OPEN instead of
-        locking out. Unsafe SSH config is not an indeterminate route and therefore
-        propagates as a hard failure.
+        ``"utun6"`` or ``"en0"``) or ``None`` when it cannot be determined. The
+        caller treats an indeterminate route as off-VPN unless the consumed grant
+        explicitly permits off-VPN authentication.
         """
         try:
             host = self._resolved_ssh_config(alias).get("hostname")
@@ -509,73 +326,58 @@ class O2Connection:
                     return stripped.split(":", 1)[1].strip()
             return None
         except (OSError, subprocess.TimeoutExpired):
-            # Best-effort probe: a missing `route`/`ssh` binary (FileNotFoundError) or a probe
-            # timeout must fail OPEN (return None) — matching this method's contract — never
-            # propagate and block an otherwise-legitimate login.
+            # Route inspection is local-only. Returning None lets the caller emit
+            # one actionable authorization error rather than confusing a missing
+            # local utility with a remote connection failure.
             return None
 
     def _require_on_vpn(self, target: str) -> None:
         """Refuse a new login that would leave via a non-VPN (physical) interface.
 
-        O2 autopushes Duo to non-HMS source IPs, so a login egressing via ``en0``
-        instead of the HMS VPN tunnel triggers a phone prompt. Only refuse when the
-        interface is KNOWN and is not a VPN tunnel; if it can't be determined, proceed
-        (fail open) so an unusual setup is never locked out.
+        O2 autopushes Duo to non-HMS source IPs. Unknown routing now fails closed:
+        the user may authorize the same one-shot login with ``allow_offvpn`` when
+        VPN routing is intentionally unavailable.
         """
         iface = self._egress_interface(target)
-        if iface and not iface.startswith(self.config.vpn_iface_prefix):
+        if iface is None or not iface.startswith(self.config.vpn_iface_prefix):
+            route_detail = "could not be determined" if iface is None else f"uses '{iface}'"
             raise O2OffVpnError(
-                f"O2 ('{target}') currently routes via '{iface}', not the HMS VPN tunnel "
-                f"('{self.config.vpn_iface_prefix}*'). A fresh login from a non-HMS IP triggers a Duo "
-                "push. Connect the HMS VPN (GlobalProtect) so `route get` shows a VPN interface, then "
-                "retry — or pass allow_offvpn=True (or set O2_REQUIRE_VPN=0) to override and accept the push."
+                f"The local route for O2 target '{target}' {route_detail}, not a proven HMS VPN tunnel "
+                f"('{self.config.vpn_iface_prefix}*'). Connect GlobalProtect or issue a new one-shot login "
+                "grant with allow_offvpn=true after explicit user approval."
             )
 
-    def start_master(
-        self, *, allow_new_login: bool = False, alias: str | None = None, allow_offvpn: bool = False
-    ) -> CommandResult:
-        """Open the persistent ControlMaster for ``alias`` (default the login host).
+    def start_master(self, *, grant_id: str | None = None, alias: str | None = None) -> CommandResult:
+        """Open one ControlMaster only after consuming a matching policy grant.
 
-        O2 autopushes Duo on every new connection, so opening a master costs one
-        approved push; every later command reuses that socket for free (~8h). Refused
-        unless ``allow_new_login=True`` so it is always a deliberate, once-per-session
-        action — never something a loop can do. Pass ``alias=config.transfer_alias``
-        to open the transfer node's own master (a separate host/socket) so a
-        transfer-node rsync/ssh has a master to reuse instead of opening a fresh
-        Duo-pushing login. Unless ``allow_offvpn=True`` (or ``O2_REQUIRE_VPN=0``), a new
-        login is refused with :class:`O2OffVpnError` when the route to ``target`` does not
-        egress via a VPN tunnel interface — opening from a non-HMS IP would trigger a Duo push.
+        An already-running exact master is a local no-op and does not consume a
+        grant.  Otherwise the grant is route-checked, atomically consumed, and
+        converted to an active attempt receipt before the sole authentication-
+        capable SSH subprocess is launched.  No failure path retries SSH.
         """
-        self._require_unlocked()
+
+        self.policy.require_reuse_allowed()
         target = alias or self.config.host_alias
+        logical_target: LoginTarget = "transfer" if target == self.config.transfer_alias else "login"
+        if target not in {self.config.host_alias, self.config.transfer_alias}:
+            raise O2LoginGrantError(f"A new master may target only configured O2 aliases, not '{target}'.")
         if self.master_running(target):
             return CommandResult(self._master_check_argv(target), 0, "master already running", "")
-        if not allow_new_login:
+        if not grant_id:
             raise O2MasterUnavailableError(
-                f"No O2 ControlMaster is running for '{target}' and allow_new_login is False. "
-                "O2 autopushes Duo on a new connection; call again with allow_new_login=True to perform "
-                "exactly one approved login, then reuse it for the rest of the session."
+                f"No O2 ControlMaster is running for '{target}'. A short-lived one-shot login grant scoped to "
+                f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
             )
-        with self._serialized_master_start():
-            # Another Codex task may have opened the requested master while this
-            # process waited for the mutex. Recheck both the emergency stop and
-            # the socket *inside* the critical section; only the first contender
-            # is then allowed to execute the Duo-pushing command.
-            self._require_unlocked()
-            if self.master_running(target):
-                self._clear_master_start_attempt()
-                return CommandResult(self._master_check_argv(target), 0, "master already running", "")
-            self._require_login_retry_ready()
-            if self.config.require_vpn and not allow_offvpn:
-                self._require_on_vpn(target)
-            # Persist before invoking SSH. A nonzero result, exception, or
-            # process crash leaves the receipt in place so every process that was
-            # already queued behind this mutex fails closed during the cooldown.
-            self._record_master_start_attempt(target)
-            # Run the one authentication-capable operation against a flattened
-            # copy of the user's SSH config that has been inspected for Match
-            # directives. The exact resolved socket is pinned explicitly so the
-            # post-start check and all reuse-only clients address the same master.
+
+        grant = self.policy.preview_login_grant(grant_id, logical_target)
+        if not grant.allow_offvpn:
+            self._require_on_vpn(target)
+        # Consumption is the cross-process serialization point. Another client
+        # can neither consume this grant nor issue a second one while its attempt
+        # receipt is active.
+        consumed = self.policy.consume_login_grant(grant_id, logical_target)
+
+        try:
             with self._safe_ssh_config_path() as safe_config:
                 result = self._runner(
                     [
@@ -591,63 +393,47 @@ class O2Connection:
                     self.config.connect_timeout + 30,
                     None,
                 )
-            if result.ok:
-                # ``ssh -f`` can return zero after authentication and then lose
-                # its backgrounded connection immediately. Treating the parent
-                # process's exit code as the whole startup contract created a
-                # dangerous false positive: callers believed they had a reusable
-                # master, the retry receipt was removed, and a later command could
-                # initiate another user-approved login attempt. Verify the actual
-                # control socket before reporting success or clearing the receipt.
-                try:
-                    verification = self._runner(
-                        self._master_check_argv(target),
-                        self.config.connect_timeout + 5,
-                        None,
-                    )
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    # The pre-start receipt deliberately remains in place. A
-                    # local verification failure is ambiguous, so the safest
-                    # behavior is to suppress automatic retries for the normal
-                    # cooldown window rather than risk another Duo prompt.
-                    with suppress(O2LoginCoordinationError):
-                        self._record_master_start_attempt(target, returncode=255)
-                    detail = f"{type(exc).__name__}: {exc}"
-                    return CommandResult(
-                        # Report the step that failed. Keeping the verification
-                        # command paired with its synthetic SSH failure code
-                        # makes CommandResult internally consistent while the
-                        # diagnostic below preserves output from the start step.
-                        argv=self._master_check_argv(target),
-                        returncode=255,
-                        # No verification subprocess completed, so there is no
-                        # stdout belonging to the reported command outcome.
-                        stdout="",
-                        stderr=self._master_verification_error(target, detail, result.stderr),
-                    )
+        except subprocess.TimeoutExpired:
+            self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
+            raise
+        except Exception:
+            self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            raise
 
-                if verification.ok:
-                    self._clear_master_start_attempt()
-                else:
-                    # Record the failed control-socket check rather than the
-                    # misleading zero returned by ``ssh -MNf``. This receipt is
-                    # the cross-process evidence that a fresh login was already
-                    # attempted and must not be retried immediately.
-                    with suppress(O2LoginCoordinationError):
-                        self._record_master_start_attempt(target, returncode=verification.returncode)
-                    detail = verification.stderr.strip() or verification.stdout.strip() or "no SSH diagnostics"
-                    return CommandResult(
-                        argv=verification.argv,
-                        returncode=verification.returncode or 255,
-                        stdout=verification.stdout,
-                        stderr=self._master_verification_error(target, detail, result.stderr),
-                    )
-            else:
-                # Best-effort enrichment makes local incident diagnosis easier;
-                # the pre-SSH receipt already provides the fail-closed guarantee.
-                with suppress(O2LoginCoordinationError):
-                    self._record_master_start_attempt(target, returncode=result.returncode)
+        if not result.ok:
+            self.policy.finish_login_attempt(consumed.id, outcome="failed", returncode=result.returncode)
             return result
+
+        # ``ssh -f`` can return zero before the backgrounded master disappears.
+        # Only an exact socket control check is accepted as the postcondition.
+        try:
+            verification = self._runner(
+                self._master_check_argv(target),
+                self.config.connect_timeout + 5,
+                None,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.policy.finish_login_attempt(consumed.id, outcome="failed", returncode=255)
+            detail = f"{type(exc).__name__}: {exc}"
+            return CommandResult(
+                argv=self._master_check_argv(target),
+                returncode=255,
+                stdout="",
+                stderr=self._master_verification_error(target, detail, result.stderr),
+            )
+
+        if verification.ok:
+            self.policy.finish_login_attempt(consumed.id, outcome="success", returncode=0)
+            return result
+
+        self.policy.finish_login_attempt(consumed.id, outcome="failed", returncode=verification.returncode)
+        detail = verification.stderr.strip() or verification.stdout.strip() or "no SSH diagnostics"
+        return CommandResult(
+            argv=verification.argv,
+            returncode=verification.returncode or 255,
+            stdout=verification.stdout,
+            stderr=self._master_verification_error(target, detail, result.stderr),
+        )
 
     def _master_verification_error(self, target: str, detail: str, start_stderr: str) -> str:
         """Describe a zero-exit SSH start whose reusable socket did not survive.
@@ -709,7 +495,7 @@ class O2Connection:
         closed without generating a Duo request. ``input_text`` is piped to the
         remote command's stdin when staging scripts or other small payloads.
         """
-        self._require_unlocked()
+        self.policy.require_reuse_allowed()
         if not require_master:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH execution is disabled. Start one explicitly authorized ControlMaster, then retry."
@@ -963,10 +749,6 @@ class O2Connection:
     def _resolved_ssh_config(self, target: str) -> dict[str, str]:
         """Expand one target through an inspected config without ``Match exec``."""
 
-        # Even local config expansion is forbidden under the incident lock. This
-        # protects argv-only builders such as async rsync, which resolve their
-        # socket before the eventual subprocess launch.
-        self._require_unlocked()
         cached = self._resolved_ssh_configs.get(target)
         if cached is not None:
             return cached
@@ -1287,7 +1069,7 @@ class O2Connection:
         require_master: bool = True,
         master_alias: str | None = None,
     ) -> CommandResult:
-        """Run a fail-closed SSH/rsync transport after lock and master checks.
+        """Run a fail-closed SSH/rsync transport after policy and master checks.
 
         rsync opens its own ssh via ``-e`` and is meant to reuse the existing
         ControlMaster socket from the SSH config. By default this refuses unless a
@@ -1300,11 +1082,11 @@ class O2Connection:
         explicit ``master_alias`` must exactly match an inferred endpoint because
         the pinned socket determines the actual host and user. Thus neither a
         transfer-node alias nor a user-qualified socket can disagree with the
-        command text silently. Like :meth:`run`, the local lock is honored first.
+        command text silently. Like :meth:`run`, global policy is checked first.
         ``require_master=False`` is retained only to give existing callers an
         actionable error; cold transports are no longer supported.
         """
-        self._require_unlocked()
+        self.policy.require_reuse_allowed()
         if not require_master:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
@@ -1338,8 +1120,7 @@ class O2Connection:
         if not self.master_running(effective_target):
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{effective_target or self.config.host_alias}'; refusing a raw "
-                "transport (rsync/ssh) that would open a fresh Duo-pushing login. Start one first (start_master "
-                "with allow_new_login=True, or the local Terminal/tmux bridge) so transfers reuse the single "
-                "authenticated connection."
+                "transport (rsync/ssh) that would open a fresh Duo-pushing login. Authorize and consume one "
+                "host-scoped login grant through o2_start_master, then reuse that exact connection."
             )
         return self._runner(hardened, timeout, None)

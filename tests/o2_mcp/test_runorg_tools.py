@@ -40,6 +40,20 @@ async def _run_tool(work):
 
 
 def _build(tmp_path) -> FastMCP:
+    policy_file = tmp_path / "O2_POLICY.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "revision": 1,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+            }
+        )
+    )
+    policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
         "Host o2 o2-transfer\n"
@@ -50,7 +64,7 @@ def _build(tmp_path) -> FastMCP:
     cfg = O2Config(
         host_alias="o2",
         transfer_alias="o2-transfer",
-        lock_file=tmp_path / "O2_DISABLED",
+        policy_file=policy_file,
         ssh_config_file=ssh_config,
     )
     factory = lambda: O2Runs(O2Connection(cfg, runner=_Runner()), POLICY)  # noqa: E731

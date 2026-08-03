@@ -25,6 +25,16 @@ from o2mcp.connection import (
     O2UnsafeTransportError,
     default_runner,
 )
+from o2mcp.policy import (
+    LoginGrant,
+    O2LoginGrantError,
+    O2PolicyConflictError,
+    O2PolicyDeniedError,
+    O2PolicyError,
+    O2PolicyInvalidError,
+    O2PolicyStore,
+    PolicySnapshot,
+)
 from o2mcp.slurm import O2Slurm, SubmitResult
 from o2mcp.sync import O2Sync
 from o2mcp.workspace import WorkspaceLayout, classify_entry, plan_prune, summarize_report
@@ -39,6 +49,14 @@ __all__ = [
     "O2MasterUnavailableError",
     "O2OffVpnError",
     "O2UnsafeTransportError",
+    "O2PolicyStore",
+    "PolicySnapshot",
+    "LoginGrant",
+    "O2PolicyError",
+    "O2PolicyDeniedError",
+    "O2PolicyInvalidError",
+    "O2PolicyConflictError",
+    "O2LoginGrantError",
     "default_runner",
     "O2Slurm",
     "SubmitResult",

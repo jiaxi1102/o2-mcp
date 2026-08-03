@@ -12,13 +12,11 @@ package rather than living in it.
 
 ## Duo model (read this first)
 
-HMS O2 uses Duo **autopush**: every *new* SSH connection fires a Duo push, even key-only /
-BatchMode. The tools are built so ordinary login-node work costs exactly **one push per
-ControlMaster session**:
-
-1. Call `o2_start_master` **once** (one push you approve) to open a persistent SSH
-   **ControlMaster** (stays up ~8h via `ControlPersist`).
-2. Every other tool reuses that master and costs **no** additional push.
+HMS O2 uses Duo **autopush**: every *new* SSH connection can fire a Duo push, even
+key-only / BatchMode. The workstation-wide `~/.agent_locks/O2_POLICY.json` state
+therefore defaults fail-closed. Ordinary work may reuse an existing persistent
+ControlMaster; a new authentication requires a short-lived, client-bound,
+host-scoped, one-attempt grant returned by `o2_authorize_login`.
 
 Ordinary commands and transfers are authentication-disabled on purpose. OpenSSH normally
 falls back to a standalone connection when a configured control socket disappears; on O2,
@@ -43,35 +41,28 @@ directives itself, rejects any `Match` block before launching OpenSSH, and runs 
 against that private inspected snapshot. If your normal SSH config contains `Match`, put the
 O2 `Host` blocks in a separate Match-free file and set `O2_SSH_CONFIG_FILE` to it.
 
-The optional `o2-transfer` alias is a different host and therefore needs its own separately
-approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
-but it does not pretend those two distinct O2 authentications are one session.
+The optional `o2-transfer` alias is a different host and therefore needs its own
+separately approved grant and ControlMaster. A login grant cannot be used for the
+transfer host or consumed by another MCP task.
 
-Never open the master in a loop or run these tools on a short timer — a periodic reconnect
-is what causes "a Duo call every minute". The workstation-wide
-`~/.agent_locks/O2_DISABLED` lock file is a hard stop honored by every operation. New master
-starts are also serialized across MCP processes, so concurrent Codex tasks cannot both pass
-the no-master check and initiate overlapping Duo authentications.
-
-If a serialized master start fails, times out, crashes, or returns zero without leaving a live
-control socket, a shared attempt receipt suppresses all queued retries for five minutes. This
-converts a burst of simultaneous requests into one authorization attempt instead of a sequence
-of repeated Duo calls. A start clears the receipt only after a post-start `ssh -O check` confirms
-that the requested login or transfer master is reusable.
-
-For upgrade safety, the historical project-local
-`<current-working-directory>/.agent_locks/O2_DISABLED` path is also honored. This prevents an
-engaged older lock from becoming ineffective merely because the package was updated.
+Never open the master in a loop or run authentication tools on a timer. The policy
+file has two durable modes: `disabled` blocks new remote operations, while
+`reuse_only` permits only existing exact sockets. There is deliberately no durable
+`normal` mode. The one-shot grant is atomically removed and converted to an active
+attempt receipt before SSH, so a failure, timeout, or crash cannot leave reusable
+authorization for a queued task. Policy revisions and a stable internal mutex
+serialize every transition across MCP processes.
 
 **Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), even the one
 `o2_start_master` login comes from a non-HMS IP and Duo-pushes, and so does every reconnect
 after the master drops. To make this failure impossible, `o2_start_master` **refuses to open a
-new login unless the route to O2 egresses via a VPN tunnel interface** (it checks `route get`
-locally — no connection, no Duo). Override with `allow_offvpn: true` on the tool, or disable the
-guard with `O2_REQUIRE_VPN=0`; tune the expected interface prefix with `O2_VPN_IFACE_PREFIX`
-(default `utun`).
+new login unless the route to O2 egresses via a VPN tunnel interface** (it checks
+`route get` locally — no connection, no Duo). An explicitly approved grant may
+scope `allow_offvpn: true` to that one attempt. There is no durable environment
+bypass. Tune the expected interface prefix with `O2_VPN_IFACE_PREFIX` (default
+`utun`).
 
 ## Install
 
@@ -93,7 +84,7 @@ pip install -e ".[o2]"     # on a 3.10+ env
         "O2_SSH_HOST_ALIAS": "o2",
         "O2_SSH_TRANSFER_ALIAS": "o2-transfer",
         "O2_SSH_CONFIG_FILE": "/Users/you/.ssh/config",
-        "O2_SSH_LOCK_FILE": "/Users/you/.agent_locks/O2_DISABLED"
+        "O2_POLICY_FILE": "/Users/you/.agent_locks/O2_POLICY.json"
       }
     }
   }
@@ -107,8 +98,13 @@ Requires `Host o2` (and optionally `Host o2-transfer`) blocks in `~/.ssh/config`
 
 | Tool | Purpose | Hint |
 |------|---------|------|
-| `o2_status` | Lock state, ControlMaster state, `hostname; whoami; date` probe | read-only |
-| `o2_start_master` | Open the persistent SSH master (needs `allow_new_login`) | write |
+| `o2_local_status` | Local policy, sockets, processes, receipts, and transfer logs; never SSH | read-only/local |
+| `o2_status` | Deprecated local-only compatibility alias | read-only/local |
+| `o2_policy_disable` | Block every new remote O2 operation without killing existing processes | write/local |
+| `o2_policy_enable_reuse` | Explicitly enable existing-master reuse at an observed revision | write/local |
+| `o2_authorize_login` | Issue one short-lived login or transfer-host grant | write/local |
+| `o2_start_master` | Consume one matching grant and attempt exactly one master start | write |
+| `o2_probe` | One explicit fixed remote probe through an existing master; never retried | read-only |
 | `o2_exec` | Run an arbitrary command on a login node | write |
 | `o2_submit_job` | `sbatch` a script (existing path or staged `script_text`); returns the job id | write |
 | `o2_squeue` | `squeue -u <user>` as structured rows | read-only |
@@ -135,24 +131,22 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 
 ## Safety contract
 
-- Only `o2_start_master` is permitted to authenticate, and it requires explicit opt-in
-  (`allow_new_login`). Remote commands, synchronous transfers, detached transfers, and
-  transfer-node lifecycle launches disable every SSH authentication method, so OpenSSH's
-  normal missing-socket fallback cannot generate a new Duo request. Reuse-only operations
-  also disable SSH proxy/local command subprocesses, isolate themselves from live SSH config,
-  and remove caller socket/config overrides.
+- `O2_POLICY.json` is the sole policy state. Missing, malformed, symlinked,
+  wrong-owner, or permissively readable state is effectively `disabled`; no
+  project/ancestor lock files or bypass environment variables are consulted.
+- Only `o2_start_master` may authenticate, and only after atomically consuming a
+  matching client/host/off-VPN-scoped grant. Remote commands, transfers, and
+  lifecycle launches disable every SSH authentication method, so OpenSSH's normal
+  missing-socket fallback cannot generate a new Duo request.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
-- The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;
-  the legacy current-project lock remains an additional hard stop for safe upgrades.
-- A fixed user-level file mutex serializes new login and transfer-master starts across MCP
-  processes, even when upgraded configurations retain different legacy safety-lock paths;
-  after waiting, each contender rechecks the socket and becomes a no-op when another task
-  already established it.
-- A pre-SSH attempt receipt applies a five-minute, workstation-wide cooldown after a failed,
-  timed-out, crashed, or postcondition-failing start, preventing already-queued callers from
-  retrying sequentially. A zero exit from `ssh -MNf` is successful only when an immediate
-  control-socket check confirms that the background master survived.
+- `o2_local_status` and the deprecated `o2_status` alias never invoke SSH.
+  `o2_probe` is the only status-like remote operation and runs exactly once.
+- The policy JSON contains the login-attempt receipt and five-minute cooldown.
+  A zero exit from `ssh -MNf` is successful only when an immediate exact-socket
+  control check confirms that the background master survived.
+- `disabled` does not automatically stop a master or detached transfer. Local
+  inspection and separately approved local transfer cancellation remain available.
 - Destructive/transfer-node operations default to dry-run where applicable and verify before
   freeing scratch.
 
