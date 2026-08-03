@@ -186,6 +186,60 @@ def test_persisted_login_grant_cannot_exceed_maximum_ttl(tmp_path):
     assert snapshot.effective_mode == "disabled"
 
 
+def test_future_dated_login_grant_fails_closed(tmp_path):
+    """Clock rollback cannot extend a five-minute grant until a future date."""
+
+    now = [1000.0]
+    store = _reuse_store(tmp_path, client_id="client-a", clock=lambda: now[0])
+    store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="bounded approval",
+    )
+    payload = json.loads(store.path.read_text())
+    payload["login_grant"]["created_at"] = 2000.0
+    payload["login_grant"]["expires_at"] = 2300.0
+    store.path.write_text(json.dumps(payload))
+    store.path.chmod(0o600)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is False
+    assert snapshot.effective_mode == "disabled"
+
+
+def test_reuse_enable_revokes_residual_disabled_grant(tmp_path):
+    """Global reuse approval never revives an older login authorization."""
+
+    store = _reuse_store(tmp_path, client_id="client-a")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="older login approval",
+    )
+    payload = json.loads(store.path.read_text())
+    payload["mode"] = "disabled"
+    store.path.write_text(json.dumps(payload))
+    store.path.chmod(0o600)
+    observed = store.snapshot()
+
+    enabled = store.enable_reuse(
+        expected_revision=observed.revision,
+        expected_generation=observed.generation,
+        approval_reference="global reuse only",
+    )
+
+    assert enabled["mode"] == "reuse_only"
+    assert enabled["login_grant"] is None
+    assert any(
+        event["event"] == "login_grant_revoked_on_reuse_enable" and event["grant_id"] == grant.id
+        for event in enabled["events"]
+    )
+
+
 def test_grant_consumption_is_atomic_across_contenders(tmp_path):
     """Two callers sharing one grant can persist exactly one active attempt."""
 

@@ -121,8 +121,15 @@ class LoginGrant:
     approval_reference: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> LoginGrant:
-        """Validate and construct a grant from persisted JSON data."""
+    def from_dict(cls, payload: dict[str, Any], *, now: float | None = None) -> LoginGrant:
+        """Validate and construct a grant from persisted JSON data.
+
+        Args:
+            payload: Serialized one-shot authorization.
+            now: Current policy clock for detecting future-dated grants. The
+                optional form keeps the dataclass parser usable in isolated
+                helpers, while durable state validation always supplies it.
+        """
 
         required_strings = ("id", "client_id", "target", "approval_reference")
         if any(not isinstance(payload.get(key), str) or not payload[key] for key in required_strings):
@@ -140,6 +147,11 @@ class LoginGrant:
             raise O2PolicyInvalidError("login_grant.expires_at must be later than created_at")
         if payload["expires_at"] - payload["created_at"] > DEFAULT_GRANT_TTL_SECONDS:
             raise O2PolicyInvalidError("login_grant lifetime exceeds the maximum authorization TTL")
+        if now is not None and payload["created_at"] > now:
+            # A clock rollback or tampered future timestamp must not stretch a
+            # nominal five-minute approval into an authorization valid for
+            # months or years before its future expiry is finally reached.
+            raise O2PolicyInvalidError("login_grant.created_at cannot be later than the current policy clock")
         return cls(
             id=payload["id"],
             client_id=payload["client_id"],
@@ -251,6 +263,17 @@ class O2PolicyStore:
         with self._locked():
             state = self._read_valid_state()
             self._require_revision(state, expected_revision, expected_generation)
+            residual_grant = state.get("login_grant")
+            if isinstance(residual_grant, dict):
+                self._append_event(
+                    state,
+                    "login_grant_revoked_on_reuse_enable",
+                    grant_id=residual_grant.get("id"),
+                )
+            # Global reuse approval is not login approval. Clear any residual
+            # grant from an externally materialized disabled state so a prior
+            # authorization cannot cross this policy transition.
+            state["login_grant"] = None
             state["mode"] = "reuse_only"
             self._append_event(state, "policy_reuse_enabled", approval_reference=reference)
             return self._write_next_revision(state)
@@ -482,7 +505,7 @@ class O2PolicyStore:
         if payload.get("login_grant") is not None:
             if not isinstance(payload["login_grant"], dict):
                 raise O2PolicyInvalidError("login_grant must be null or an object")
-            LoginGrant.from_dict(payload["login_grant"])
+            LoginGrant.from_dict(payload["login_grant"], now=self._clock())
         if payload.get("login_attempt") is not None:
             if not isinstance(payload["login_attempt"], dict):
                 raise O2PolicyInvalidError("login_attempt must be null or an object")
