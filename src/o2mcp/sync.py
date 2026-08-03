@@ -107,6 +107,10 @@ class O2Sync:
         timeout: float | None = 3600.0,
     ) -> CommandResult:
         """Upload ``local_path`` to ``<alias>:remote_path`` on O2."""
+        # Check policy before argv construction because resolving the configured
+        # ControlPath uses a local ``ssh -G`` subprocess. Disabled mode promises
+        # that status/inspection stays local and no SSH executable is launched.
+        self.conn.policy.require_reuse_allowed()
         argv = self.push_argv(local_path, remote_path, transfer=transfer, extra_args=extra_args)
         return self.conn.run_raw(argv, timeout=timeout, master_alias=self._alias(transfer))
 
@@ -120,6 +124,7 @@ class O2Sync:
         timeout: float | None = 3600.0,
     ) -> CommandResult:
         """Download ``<alias>:remote_path`` from O2 into ``local_path``."""
+        self.conn.policy.require_reuse_allowed()
         argv = self.pull_argv(remote_path, local_path, transfer=transfer, extra_args=extra_args)
         return self.conn.run_raw(argv, timeout=timeout, master_alias=self._alias(transfer))
 

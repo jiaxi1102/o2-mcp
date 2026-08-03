@@ -13,8 +13,8 @@ done/failed by reading files on disk even though the in-memory ``Popen`` handle
 is gone. State (one ``.json`` + ``.log`` + ``.rc`` per transfer) lives under
 ``~/.cache/o2mcp/transfers`` (override with ``O2_ASYNC_STATE_DIR``).
 
-The same safety contract as the blocking path is enforced *before* launching: the
-local ``O2_DISABLED`` lock is honored, and a transfer refuses unless the
+The same safety contract as the blocking path is enforced *before* launching:
+the global policy must permit reuse, and a transfer refuses unless the
 ControlMaster for its alias is already up. The detached rsync also disables all
 SSH authentication methods, closing the race in which a master could disappear
 after the check and OpenSSH would otherwise fall back to a fresh Duo-pushing
@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from o2mcp.connection import O2Connection, O2LockedError, O2MasterUnavailableError
+from o2mcp.connection import O2Connection, O2MasterUnavailableError
 from o2mcp.sync import O2Sync
 
 
@@ -193,17 +193,15 @@ class O2AsyncTransfer:
         return self._launch("pull", local=local_path, remote=remote_path, transfer=transfer)
 
     def _launch(self, direction: str, *, local: str, remote: str, transfer: bool) -> TransferHandle:
-        active_lock = self.conn.active_lock_file()
-        if active_lock is not None:
-            raise O2LockedError(
-                f"O2 access is locally disabled by {active_lock}. " "Refusing to launch a background transfer."
-            )
+        # Gate before building or spawning transport argv. Status and explicit
+        # cancellation remain local-only and therefore do not call this path.
+        self.conn.policy.require_reuse_allowed()
         alias = self.sync._alias(transfer)
         if not self.conn.master_running(alias):
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{alias}'; refusing to launch a background rsync "
-                "that would open a fresh Duo-pushing login. Start one first (o2_start_master with "
-                "allow_new_login=True), then retry."
+                "that would open a fresh Duo-pushing login. Authorize one host-scoped login grant, "
+                "consume it through o2_start_master, then retry."
             )
         if direction == "push":
             argv = self.sync.push_argv(local, remote, transfer=transfer)
@@ -228,7 +226,12 @@ class O2AsyncTransfer:
             str(rc_path),
             *argv,
         ]
-        proc = self._spawn(wrapped, log_path)
+        # Recheck mode under the same workstation mutex used by disable and
+        # hold it only through child creation.  The detached process is then an
+        # existing transfer, which a later disabled transition deliberately
+        # preserves rather than terminating automatically.
+        with self.conn.policy.serialize_reuse_launch():
+            proc = self._spawn(wrapped, log_path)
         _LIVE[tid] = proc
         handle = TransferHandle(
             id=tid,
@@ -265,11 +268,25 @@ class O2AsyncTransfer:
         """One transfer's status (``transfer_id`` given) or a list of all known transfers."""
         if transfer_id is None:
             metas = sorted(self.state_dir.glob("*.json")) if self.state_dir.exists() else []
-            return [self._status_from_meta(p, log_tail=log_tail) for p in metas]
+            return [self._safe_status_from_meta(p, log_tail=log_tail) for p in metas]
         meta_path = self._meta_path(transfer_id)
         if meta_path is None or not meta_path.exists():
             return {"ok": False, "error": "unknown_transfer", "transfer_id": transfer_id}
-        return self._status_from_meta(meta_path, log_tail=log_tail)
+        return self._safe_status_from_meta(meta_path, log_tail=log_tail)
+
+    def _safe_status_from_meta(self, meta_path: Path, *, log_tail: int) -> dict[str, Any]:
+        """Isolate one corrupt receipt so other local diagnostics remain usable."""
+
+        try:
+            return self._status_from_meta(meta_path, log_tail=log_tail)
+        except (OSError, ValueError, OverflowError, KeyError, TypeError) as exc:
+            return {
+                "ok": False,
+                "error": "invalid_transfer_metadata",
+                "transfer_id": meta_path.stem,
+                "meta_path": str(meta_path),
+                "message": str(exc),
+            }
 
     def _status_from_meta(self, meta_path: Path, *, log_tail: int) -> dict[str, Any]:
         meta = json.loads(meta_path.read_text())

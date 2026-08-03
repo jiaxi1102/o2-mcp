@@ -14,9 +14,9 @@ effect: at most one push per stale event, not one per cycle. Still: do not run
 this off-network. On-network (VPN), connections are stable and Duo-free, so it is
 safe and useful there.
 
-Safety invariants (enforced via ``O2Connection``): honors the
-``~/.agent_locks/O2_DISABLED`` lock, and never opens a master itself — a dead
-master means "skip", not "reconnect".
+Safety invariants (enforced via ``O2Connection``): the global policy must permit
+reuse, and this command never opens a master itself — a dead master means
+"skip", not "reconnect".
 """
 
 from __future__ import annotations
@@ -27,15 +27,15 @@ import subprocess
 from typing import Any
 
 from o2mcp.config import O2Config
-from o2mcp.connection import O2Connection, O2LockedError, O2MasterUnavailableError
+from o2mcp.connection import O2Connection, O2MasterUnavailableError
+from o2mcp.policy import O2PolicyDeniedError, O2PolicyInvalidError
 
 
 def keepalive(config: O2Config | None = None) -> dict[str, Any]:
     """Ping an already-open O2 master; skip/clean up rather than reconnect."""
     conn = O2Connection(config)
     try:
-        if conn.is_locked():
-            return {"action": "skipped", "reason": "locked"}
+        conn.policy.require_reuse_allowed()
         if not conn.master_running():
             return {"action": "skipped", "reason": "no_master"}
         result = conn.run("true", timeout=8.0)
@@ -47,7 +47,7 @@ def keepalive(config: O2Config | None = None) -> dict[str, Any]:
         with contextlib.suppress(Exception):
             conn.stop_master()
         return {"action": "stale_master_cleared", "reason": "ping_timed_out"}
-    except (O2LockedError, O2MasterUnavailableError) as exc:
+    except (O2PolicyDeniedError, O2PolicyInvalidError, O2MasterUnavailableError) as exc:
         return {"action": "skipped", "reason": type(exc).__name__}
 
 

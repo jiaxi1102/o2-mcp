@@ -6,15 +6,10 @@ directly submit Slurm work, debug with arbitrary remote commands, monitor jobs,
 tail logs, and move files.
 
 DUO MODEL — read this before using the tools. HMS O2 uses Duo *autopush*: EVERY
-new SSH connection fires a Duo push, even key-only/BatchMode (this is not
-keyboard-interactive, so it cannot be disabled client-side). The tools are built
-to make this cost exactly ONE push per session:
-
-  1. Call ``o2_start_master`` ONCE (one push you approve) to open a persistent
-     ControlMaster. It stays up for ~8h (ControlPersist).
-  2. Every other tool (run/submit/squeue/status/tail/cancel/push/pull and the
-     non-blocking push_async/pull_async) REUSES that master and costs NO additional
-     push. (o2_transfer_status/o2_transfer_cancel read local state only — no SSH.)
+new SSH connection can fire a Duo push. The persistent global policy therefore
+defaults fail-closed, allows ordinary tools to reuse only an existing exact
+ControlMaster, and requires a short-lived, client-bound, one-attempt grant before
+``o2_start_master`` may authenticate.
 
 NEVER open the master in a loop, and never run these tools on a short timer — a
 periodic poller that reconnects each cycle is what causes a "Duo call every
@@ -22,7 +17,7 @@ minute". To completely avoid Duo, don't poll O2 from here at all (have O2 push
 results out via Globus/OnDemand) or ask HMS RC for SSH-certificate access; see
 ``docs/O2_MCP.md``.
 
-The user-level ``~/.agent_locks/O2_DISABLED`` lock is honored as a hard stop on every tool.
+``~/.agent_locks/O2_POLICY.json`` is the sole authoritative policy state.
 
 Run as a local stdio server:
 
@@ -36,8 +31,11 @@ unit-tested without it.
 from __future__ import annotations
 
 import json
+import stat
+import subprocess
 import sys
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Literal
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -45,16 +43,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from o2mcp import (
     CommandResult,
+    O2AsyncTransfer,
     O2Connection,
-    O2LockedError,
-    O2LoginCoordinationError,
+    O2LoginGrantError,
     O2MasterUnavailableError,
     O2OffVpnError,
+    O2PolicyConflictError,
+    O2PolicyDeniedError,
+    O2PolicyInvalidError,
     O2Slurm,
     O2UnsafeTransportError,
     O2Workspace,
     transfer_tools,
 )
+from o2mcp.policy import LoginTarget
 
 mcp = FastMCP("o2_mcp")
 
@@ -77,21 +79,27 @@ def _command_payload(result: CommandResult) -> dict[str, Any]:
 async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
     """Run a blocking O2 operation off the event loop and JSON-encode the result.
 
-    Lock and master-availability errors are turned into actionable, non-fatal
+    Policy and master-availability errors are turned into actionable, non-fatal
     payloads instead of crashing the tool call.
     """
     try:
         payload = await anyio.to_thread.run_sync(fn)
-    except O2LockedError as exc:
-        payload = {"ok": False, "error": "o2_locked", "message": str(exc)}
+    except O2PolicyDeniedError as exc:
+        payload = {"ok": False, "error": "policy_disabled", "message": str(exc)}
+    except O2PolicyInvalidError as exc:
+        payload = {"ok": False, "error": "policy_invalid", "message": str(exc)}
+    except O2PolicyConflictError as exc:
+        payload = {"ok": False, "error": "policy_conflict", "message": str(exc)}
+    except O2LoginGrantError as exc:
+        payload = {"ok": False, "error": "login_grant_invalid", "message": str(exc)}
     except O2MasterUnavailableError as exc:
         payload = {"ok": False, "error": "no_master", "message": str(exc)}
     except O2OffVpnError as exc:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
-    except O2LoginCoordinationError as exc:
-        payload = {"ok": False, "error": "login_coordination_failed", "message": str(exc)}
     except O2UnsafeTransportError as exc:
         payload = {"ok": False, "error": "unsafe_transport", "message": str(exc)}
+    except subprocess.TimeoutExpired as exc:
+        payload = {"ok": False, "error": "operation_timeout", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
         payload = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
     return json.dumps(payload, indent=2)
@@ -99,13 +107,15 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
 
 # --- input models ------------------------------------------------------------
 class StartMasterInput(BaseModel):
+    """Consume a previously issued one-shot authorization for one O2 host."""
+
     model_config = ConfigDict(extra="forbid")
-    allow_new_login: bool = Field(
-        default=False,
+    grant_id: str | None = Field(
+        default=None,
         description=(
-            "Must be true to open a NEW O2 login. O2 autopushes Duo on every new "
-            "connection, so this costs exactly one push; all later tools reuse the "
-            "master for free. Do this once per session — never in a loop."
+            "One-shot grant returned by o2_authorize_login. It is unnecessary when "
+            "the exact requested ControlMaster is already running, but mandatory "
+            "before any new authentication-capable SSH process."
         ),
     )
     transfer: bool = Field(
@@ -118,15 +128,58 @@ class StartMasterInput(BaseModel):
             "in addition to the login master."
         ),
     )
-    allow_offvpn: bool = Field(
-        default=False,
+
+
+class DisablePolicyInput(BaseModel):
+    """Local-only reason for engaging the global O2 safety stop."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    reason: str = Field(..., min_length=1, max_length=240)
+
+
+class EnableReuseInput(BaseModel):
+    """Explicit global transition from disabled to reuse-only operation."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
+    approval_reference: str = Field(..., min_length=1, max_length=240)
+    acknowledge_global: bool = Field(
+        ...,
         description=(
-            "Override the HMS-VPN egress guard. By default opening a master is refused "
-            "when the route to O2 does NOT go through a VPN tunnel interface, because a "
-            "login from a non-HMS IP triggers a Duo push. Set true only if you intend to "
-            "connect off-VPN and accept that push (or set O2_REQUIRE_VPN=0 to disable)."
+            "Must be true to confirm the user approved a workstation-global transition, "
+            "not merely continuation of one project task."
         ),
     )
+
+
+class AuthorizeLoginInput(BaseModel):
+    """Scope one explicit user authorization into a one-attempt grant."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
+    target: Literal["login", "transfer"]
+    allow_offvpn: bool = Field(
+        default=False,
+        description="Whether this exact one-shot login may proceed without a proven HMS VPN route.",
+    )
+    approval_reference: str = Field(..., min_length=1, max_length=240)
+
+
+class ProbeInput(BaseModel):
+    """Select the already-authenticated host for one explicit remote probe."""
+
+    model_config = ConfigDict(extra="forbid")
+    transfer: bool = Field(default=False, description="Probe the transfer master instead of the login master.")
 
 
 class RunInput(BaseModel):
@@ -190,33 +243,217 @@ class PlaceInput(BaseModel):
 
 
 # --- tools -------------------------------------------------------------------
+def _local_socket_inventory() -> list[dict[str, Any]]:
+    """Inspect conventional ControlMaster sockets without invoking SSH.
+
+    ``o2_local_status`` must remain visibly different from a remote probe.  A
+    filesystem inventory can report socket presence but intentionally does not
+    claim the socket is remotely responsive; only ``o2_probe`` establishes that.
+    """
+
+    sockets: list[dict[str, Any]] = []
+    roots = [Path.home() / ".ssh" / "controlmasters"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            candidates = sorted(root.iterdir())
+        except OSError:
+            # Socket inventory is only one local diagnostic facet. A directory
+            # permission race or removal must not hide the independently useful
+            # policy generation/revision, process list, and transfer receipts.
+            continue
+        for candidate in candidates:
+            try:
+                metadata = candidate.lstat()
+            except OSError:
+                continue
+            if stat.S_ISSOCK(metadata.st_mode):
+                sockets.append(
+                    {
+                        "path": str(candidate),
+                        "owner_uid": metadata.st_uid,
+                        "modified_at": metadata.st_mtime,
+                    }
+                )
+    return sockets
+
+
+def _local_o2_processes() -> list[dict[str, Any]]:
+    """Return O2-related local process rows using ``ps`` only.
+
+    This is diagnostic text matching, not an authorization decision.  The
+    connection layer still proves exact socket reuse before every remote call.
+    """
+
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3:
+            continue
+        pid, ppid, command = fields
+        lowered = command.lower()
+        if not any(marker in lowered for marker in ("o2-mcp", "clock-runs-mcp", "o2.hms", "o2.rc.hms", "o2-transfer")):
+            continue
+        rows.append({"pid": int(pid), "ppid": int(ppid), "command": command})
+    return rows
+
+
+def _local_status_payload() -> dict[str, Any]:
+    """Build the shared local-only payload for canonical and compatibility tools."""
+
+    conn = _connection()
+    snapshot = conn.policy.snapshot()
+    state = snapshot.state or {}
+    grant = state.get("login_grant") if isinstance(state, dict) else None
+    if isinstance(grant, dict):
+        # The id is safe to display because consumption is also bound to the
+        # issuing process's client_id.  Exposing it helps the authorized task
+        # recover from an MCP response-display failure without enabling theft.
+        grant = {**grant, "owned_by_this_client": grant.get("client_id") == conn.policy.client_id}
+    try:
+        transfers = O2AsyncTransfer(conn).status()
+    except (OSError, ValueError, OverflowError, KeyError, TypeError) as exc:
+        # Policy recovery must remain visible even when the transfer directory
+        # itself is unreadable. Individual malformed receipts are normally
+        # isolated by O2AsyncTransfer.status; this is the directory-level guard.
+        transfers = {
+            "ok": False,
+            "error": "transfer_status_unavailable",
+            "message": str(exc),
+        }
+    return {
+        "ok": True,
+        "local_only": True,
+        "policy": {
+            "path": str(snapshot.path),
+            "valid": snapshot.valid,
+            "effective_mode": snapshot.effective_mode,
+            "generation": snapshot.generation,
+            "revision": snapshot.revision,
+            "error": snapshot.error,
+            "login_grant": grant,
+            "login_attempt": state.get("login_attempt") if isinstance(state, dict) else None,
+            "recent_events": state.get("events", [])[-10:] if isinstance(state, dict) else [],
+        },
+        "control_sockets": _local_socket_inventory(),
+        "processes": _local_o2_processes(),
+        "transfers": transfers,
+    }
+
+
+@mcp.tool(
+    name="o2_local_status",
+    annotations={"title": "Local O2 policy and process status", "readOnlyHint": True, "openWorldHint": False},
+)
+async def o2_local_status() -> str:
+    """Inspect policy, sockets, processes, receipts, and transfer logs locally.
+
+    This tool never invokes SSH or a remote command and never retries, starts, or
+    stops a ControlMaster.
+    """
+
+    return await _run_tool(_local_status_payload)
+
+
 @mcp.tool(
     name="o2_status",
-    annotations={"title": "O2 connection status", "readOnlyHint": True, "openWorldHint": True},
+    annotations={"title": "Deprecated local O2 status", "readOnlyHint": True, "openWorldHint": False},
 )
 async def o2_status() -> str:
-    """Report O2 access state: safety lock, ControlMaster, and a connectivity probe.
+    """Compatibility alias for :func:`o2_local_status`; never probes remotely."""
 
-    Returns JSON with the lock state and exact active lock path, the ControlMaster
-    state, and an optional connectivity probe. If locked or disconnected, no
-    remote command is attempted.
-    When no master is running, probe is null and you must start one
-    (o2_start_master) before running commands or submitting jobs.
-    """
+    return await _run_tool(_local_status_payload)
+
+
+@mcp.tool(
+    name="o2_policy_disable",
+    annotations={"title": "Disable all new O2 remote operations", "readOnlyHint": False, "openWorldHint": False},
+)
+async def o2_policy_disable(params: DisablePolicyInput) -> str:
+    """Engage the workstation-global safety stop without terminating processes."""
+
+    def work() -> dict[str, Any]:
+        state = _connection().policy.disable(reason=params.reason)
+        return {"ok": True, "policy": state}
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
+    name="o2_policy_enable_reuse",
+    annotations={"title": "Enable reuse-only O2 access", "readOnlyHint": False, "openWorldHint": False},
+)
+async def o2_policy_enable_reuse(params: EnableReuseInput) -> str:
+    """Enable existing-master reuse after explicit global user authorization."""
+
+    def work() -> dict[str, Any]:
+        if not params.acknowledge_global:
+            return {
+                "ok": False,
+                "error": "global_acknowledgement_required",
+                "message": "acknowledge_global must be true for a workstation-wide O2 transition.",
+            }
+        state = _connection().policy.enable_reuse(
+            expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
+            approval_reference=params.approval_reference,
+        )
+        return {"ok": True, "policy": state}
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
+    name="o2_authorize_login",
+    annotations={"title": "Issue one O2 login grant", "readOnlyHint": False, "openWorldHint": False},
+)
+async def o2_authorize_login(params: AuthorizeLoginInput) -> str:
+    """Translate explicit user approval into one short-lived host-scoped grant."""
+
+    def work() -> dict[str, Any]:
+        grant = _connection().policy.authorize_login(
+            expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
+            target=params.target,
+            allow_offvpn=params.allow_offvpn,
+            approval_reference=params.approval_reference,
+        )
+        return {
+            "ok": True,
+            "grant_id": grant.id,
+            "target": grant.target,
+            "allow_offvpn": grant.allow_offvpn,
+            "expires_at": grant.expires_at,
+            "remaining_attempts": grant.remaining_attempts,
+        }
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
+    name="o2_probe",
+    annotations={"title": "Explicit reuse-only O2 probe", "readOnlyHint": True, "openWorldHint": True},
+)
+async def o2_probe(params: ProbeInput) -> str:
+    """Run exactly one fixed remote probe through an existing pinned master."""
 
     def work() -> dict[str, Any]:
         conn = _connection()
-        active_lock = conn.active_lock_file()
-        locked = active_lock is not None
-        master = (not locked) and conn.master_running()
-        probe = _command_payload(conn.probe()) if master else None
-        return {
-            "ok": True,
-            "locked": locked,
-            "lock_file": str(active_lock) if active_lock is not None else None,
-            "master_running": master,
-            "probe": probe,
-        }
+        alias = conn.config.transfer_alias if params.transfer else conn.config.host_alias
+        result = conn.run("hostname; whoami; date", timeout=conn.config.connect_timeout + 5, alias=alias)
+        return {"ok": result.ok, "alias": alias, **_command_payload(result)}
 
     return await _run_tool(work)
 
@@ -228,18 +465,22 @@ async def o2_status() -> str:
 async def o2_start_master(params: StartMasterInput) -> str:
     """Open the persistent O2 SSH ControlMaster so later tools reuse one login.
 
-    HMS O2 autopushes Duo on every new connection, so opening the master costs
-    exactly ONE push (which you approve); after that every tool reuses the master
-    with no further push for ~8h. Refused unless allow_new_login is true. If a
-    master is already running this is a no-op (and costs nothing). Call this once
-    per session — never on a timer or in a loop.
+    An existing exact master is a no-op. Otherwise ``grant_id`` must identify a
+    short-lived grant previously returned by ``o2_authorize_login`` for this MCP
+    client and host. The grant is consumed before the sole SSH attempt.
     """
 
     def work() -> dict[str, Any]:
         conn = _connection()
         alias = conn.config.transfer_alias if params.transfer else None
+        # Pass the requested role separately from its configured alias.  Some
+        # installations deliberately use one alias/socket for both roles, so
+        # comparing alias strings cannot reliably recover grant scope.
+        login_target: LoginTarget = "transfer" if params.transfer else "login"
         result = conn.start_master(
-            allow_new_login=params.allow_new_login, alias=alias, allow_offvpn=params.allow_offvpn
+            grant_id=params.grant_id,
+            alias=alias,
+            login_target=login_target,
         )
         return {"ok": result.ok, "alias": alias or conn.config.host_alias, **_command_payload(result)}
 

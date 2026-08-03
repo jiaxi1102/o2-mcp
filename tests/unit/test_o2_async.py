@@ -2,7 +2,7 @@
 
 The subprocess spawner and clock are injected, so these never spawn a real
 process or touch the network: they assert the wrapped command is built correctly
-(incl. remote-path quoting), the safety lock + ControlMaster guards fire before
+(incl. remote-path quoting), the policy + ControlMaster guards fire before
 any launch, and status/cancel report the right state from a faked process +
 on-disk exit-code files (incl. the post-restart fallback when the Popen is gone).
 """
@@ -10,6 +10,7 @@ on-disk exit-code files (incl. the post-restart fallback when the Popen is gone)
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -64,9 +65,21 @@ class FakeSpawner:
 
 
 def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Connection:
-    lock = tmp_path / "O2_DISABLED"
-    if locked:
-        lock.write_text("disabled")
+    policy_file = tmp_path / "O2_POLICY.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
+                "revision": 1,
+                "mode": "disabled" if locked else "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+            }
+        )
+    )
+    policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
         "Host o2 o2-transfer\n"
@@ -78,7 +91,7 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
-        lock_file=lock,
+        policy_file=policy_file,
         ssh_config_file=ssh_config,
     )
 
@@ -143,6 +156,45 @@ def test_push_async_blocked_by_lock(tmp_path):
     with pytest.raises(O2LockedError):
         mgr.push_async("/local/x", "/remote/x")
     assert spawner.calls == []
+
+
+def test_disable_cannot_complete_between_async_check_and_spawn(tmp_path):
+    """A detached rsync spawn shares disable's workstation mutex."""
+
+    class DisableDuringSpawn(FakeSpawner):
+        """Start a competing policy disable from inside the spawn seam."""
+
+        def __init__(self):
+            super().__init__()
+            self.policy = None
+            self.disable_started = threading.Event()
+            self.disable_finished = threading.Event()
+            self.disable_thread = None
+
+        def __call__(self, argv, log_path) -> FakeProc:
+            assert self.policy is not None
+
+            def disable() -> None:
+                self.disable_started.set()
+                self.policy.disable(reason="concurrent detached-transfer stop")
+                self.disable_finished.set()
+
+            self.disable_thread = threading.Thread(target=disable)
+            self.disable_thread.start()
+            assert self.disable_started.wait(timeout=1)
+            assert not self.disable_finished.wait(timeout=0.1)
+            return super().__call__(argv, log_path)
+
+    spawner = DisableDuringSpawn()
+    mgr = _mgr(tmp_path, spawner)
+    spawner.policy = mgr.conn.policy
+
+    handle = mgr.push_async("/local/x", "/remote/x")
+
+    assert spawner.disable_thread is not None
+    spawner.disable_thread.join(timeout=2)
+    assert handle.pid == 4321 and spawner.disable_finished.is_set()
+    assert mgr.conn.policy.snapshot().effective_mode == "disabled"
 
 
 def test_pull_async_builds_pull_argv(tmp_path):
@@ -244,6 +296,37 @@ def test_status_lists_all(tmp_path):
     listed = mgr.status()
     assert isinstance(listed, list) and len(listed) == 2
     assert {row["remote"] for row in listed} == {"/ra", "/rb"}
+
+
+def test_status_isolates_corrupt_metadata_when_listing(tmp_path):
+    """One truncated receipt must not suppress healthy detached transfers."""
+
+    mgr = _mgr(tmp_path, FakeSpawner())
+    healthy = mgr.push_async("/a", "/remote-a")
+    corrupt = mgr.state_dir / "push-20260617-001234-99-0001.json"
+    corrupt.write_text("{truncated")
+
+    listed = mgr.status()
+
+    assert len(listed) == 2
+    assert any(row.get("transfer_id") == healthy.id and row["ok"] for row in listed)
+    invalid = next(row for row in listed if row.get("meta_path") == str(corrupt))
+    assert invalid["ok"] is False
+    assert invalid["error"] == "invalid_transfer_metadata"
+
+
+def test_status_isolates_non_finite_numeric_metadata(tmp_path):
+    """JSON infinity cannot escape the corrupt-receipt diagnostic boundary."""
+
+    mgr = _mgr(tmp_path, FakeSpawner())
+    corrupt = mgr.state_dir / "push-20260617-001234-99-0001.json"
+    mgr.state_dir.mkdir(parents=True)
+    corrupt.write_text('{"id":"push-20260617-001234-99-0001","pid":1e999}')
+
+    result = mgr.status("push-20260617-001234-99-0001")
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_transfer_metadata"
 
 
 def test_progress_parsing_rsync_tochk():
