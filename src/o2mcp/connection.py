@@ -449,24 +449,25 @@ class O2Connection:
             # persist disabled in the gap between those two actions. Contexts
             # enter left-to-right so safe config preparation still happens
             # before the one-shot grant is consumed.
-            with (
-                self._safe_ssh_config_path() as safe_config,
-                self.policy.consume_login_grant_for_launch(grant_id, logical_target) as consumed,
-            ):
-                result = self._runner(
-                    [
-                        self.SSH_EXECUTABLE,
-                        "-F",
-                        safe_config,
-                        "-S",
-                        self._resolved_control_path(target),
-                        *self.config.base_ssh_opts(),
-                        "-MNf",
-                        target,
-                    ],
-                    self.config.connect_timeout + 30,
-                    None,
-                )
+            # Nested contexts preserve the required entry order while keeping
+            # the core package importable on the advertised Python 3.9 floor;
+            # parenthesized multi-context syntax was introduced in Python 3.10.
+            with self._safe_ssh_config_path() as safe_config:  # noqa: SIM117
+                with self.policy.consume_login_grant_for_launch(grant_id, logical_target) as consumed:
+                    result = self._runner(
+                        [
+                            self.SSH_EXECUTABLE,
+                            "-F",
+                            safe_config,
+                            "-S",
+                            self._resolved_control_path(target),
+                            *self.config.base_ssh_opts(),
+                            "-MNf",
+                            target,
+                        ],
+                        self.config.connect_timeout + 30,
+                        None,
+                    )
         except subprocess.TimeoutExpired:
             if consumed is not None:
                 self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
