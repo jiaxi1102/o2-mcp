@@ -91,7 +91,13 @@ def broker_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _start_local_broker(tmp_path, broker_root, *, local_request_timeout=5.0):
+def _start_local_broker(
+    tmp_path,
+    broker_root,
+    *,
+    local_request_timeout=5.0,
+    remote_response_grace=5.0,
+):
     """Start BrokerServer around the production remote helper on a local pipe."""
 
     policy = _reuse_policy(tmp_path)
@@ -103,6 +109,7 @@ def _start_local_broker(tmp_path, broker_root, *, local_request_timeout=5.0):
         alias="offline-o2",
         destination={"hostname": "offline.example", "user": "offline", "port": "22"},
         local_request_timeout=local_request_timeout,
+        remote_response_grace=remote_response_grace,
     )
     thread = threading.Thread(target=server.serve_forever, name="offline-o2-broker", daemon=True)
     thread.start()
@@ -796,6 +803,34 @@ def test_stalled_remote_write_releases_policy_after_stopping_transport(tmp_path,
             server.transport.wait(timeout=2)
         remote_writer.close()
         os.close(read_fd)
+
+
+def test_stalled_remote_response_stops_transport_and_unpublishes_broker(tmp_path, broker_root):
+    """An alive SSH process with a silent helper must not remain reusable."""
+
+    _policy, server, thread, client = _start_local_broker(
+        tmp_path,
+        broker_root,
+        remote_response_grace=0.05,
+    )
+    try:
+        # The command suspends its parent, which is the exact embedded remote
+        # helper running locally for this test. Its transport process remains
+        # alive but cannot emit a result until the daemon-side deadline kills
+        # it, reproducing the SSH-alive/helper-silent failure mode offline.
+        with pytest.raises(O2BrokerError, match="dispatched but its result was lost"):
+            client.execute("kill -STOP $PPID", timeout=0.05)
+
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert server.transport is not None and server.transport.poll() is not None
+        assert not client.paths.socket.exists()
+        state = client.local_status()
+        assert state["status"] == "failed"
+        assert "response exceeded" in state["error"]
+    finally:
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
 
 
 def test_slow_progressing_remote_write_uses_size_scaled_deadline(tmp_path, broker_root):

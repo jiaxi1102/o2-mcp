@@ -51,7 +51,10 @@ non-login Bash that inherits the one session environment, avoiding repeated
 profile banners and startup latency. Full escaped requests are size-checked
 before dispatch, stdin is capped at 1 MiB, and transport writes use inactivity
 plus frame-size-scaled deadlines so a slow progressing link survives while a
-stall cannot retain the global policy mutex indefinitely.
+stall cannot retain the global policy mutex indefinitely. For finite commands,
+the daemon also bounds the result-frame wait by the command timeout plus cleanup
+grace; a silent helper terminates and unpublishes the one transport instead of
+leaving a falsely reusable broker wedged.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:

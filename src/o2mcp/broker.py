@@ -84,6 +84,11 @@ MAX_LAUNCH_BYTES = 1024 * 1024
 # global incident stop responsive when the remote side no longer drains input.
 DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS = 5.0
 MIN_REMOTE_WRITE_BYTES_PER_SECOND = 128 * 1024
+# The remote helper normally needs only its command deadline plus bounded drain
+# cleanup to return a frame. Give it a small grace window, still shorter than
+# the client's ten-second post-timeout allowance, so a silent helper is torn
+# down by the daemon before every caller becomes wedged behind it.
+DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS = 5.0
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -597,6 +602,7 @@ class BrokerServer:
         startup_timeout: float = 90.0,
         local_request_timeout: float = 5.0,
         remote_write_timeout: float = DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS,
+        remote_response_grace: float = DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.paths = paths
@@ -629,6 +635,9 @@ class BrokerServer:
         if not _is_bounded_positive_timeout(remote_write_timeout):
             raise ValueError("broker remote write timeout must be finite and positive")
         self.remote_write_timeout = remote_write_timeout
+        if not _is_bounded_positive_timeout(remote_response_grace):
+            raise ValueError("broker remote response grace must be finite and positive")
+        self.remote_response_grace = remote_response_grace
         self.clock = clock
         self.transport: subprocess.Popen[bytes] | None = None
         self.listener: socket.socket | None = None
@@ -837,6 +846,56 @@ class BrokerServer:
             with suppress(OSError, ValueError):
                 os.set_blocking(descriptor, was_blocking)
 
+    def _read_remote_frame_with_deadline(
+        self,
+        remote_out: BinaryIO,
+        command_timeout: float | None,
+    ) -> dict[str, Any]:
+        """Read one result without leaving a finite command wedged forever.
+
+        The remote helper owns command timeout enforcement, but an alive SSH
+        process is not proof that the helper can still reply. For finite
+        commands, bound this protocol read by the command timeout plus cleanup
+        grace. A miss is fatal to the channel: after dispatch, no automatic
+        retry is safe, and retaining the socket would falsely advertise reuse.
+        Explicit no-deadline requests intentionally preserve their unbounded
+        contract and therefore read synchronously.
+        """
+
+        if command_timeout is None:
+            return read_frame(remote_out)
+
+        response_result: dict[str, Any] = {}
+
+        def receive_response() -> None:
+            """Capture the blocking read so the daemon can enforce its deadline."""
+
+            try:
+                response_result["payload"] = read_frame(remote_out)
+            except Exception as exc:  # pragma: no cover - surfaced by parent thread
+                response_result["error"] = exc
+
+        reader = threading.Thread(target=receive_response, name="o2-broker-response", daemon=True)
+        reader.start()
+        response_deadline = float(command_timeout) + self.remote_response_grace
+        reader.join(timeout=response_deadline)
+        if reader.is_alive():
+            # Killing the sole transport closes its stdout pipe and releases the
+            # reader. The outer broker loop then removes its socket and lifetime
+            # lock, making the unknown outcome visible rather than reusable.
+            self._terminate_transport(timeout=1.0)
+            reader.join(timeout=1.0)
+            raise _O2BrokerTransportError(
+                "persistent remote response exceeded the command deadline plus cleanup grace; transport stopped"
+            )
+        if "error" in response_result:
+            exc = response_result["error"]
+            raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
+        response = response_result.get("payload")
+        if not isinstance(response, dict):  # Defensive guard for the thread handoff.
+            raise _O2BrokerTransportError("persistent remote stream returned no response frame")
+        return response
+
     def _bind_listener(self) -> None:
         """Publish the local endpoint only after the remote helper is ready."""
 
@@ -982,10 +1041,7 @@ class BrokerServer:
                 return
             except (OSError, BrokerProtocolError) as exc:
                 raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
-            try:
-                response = read_frame(remote_out)
-            except (OSError, BrokerProtocolError) as exc:
-                raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
+            response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
             if response.get("id") != request.get("id"):
                 raise _O2BrokerTransportError("remote response id does not match the serialized request")
             self._commands_completed += 1

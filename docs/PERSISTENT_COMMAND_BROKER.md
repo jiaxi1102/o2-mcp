@@ -94,6 +94,10 @@ be reordered.
 The frame limit is 16 MiB. Stdout and stderr retain at most 1 MiB each; later
 bytes are drained and discarded rather than accumulated in memory. A remote
 timeout returns code 124 and the helper remains available for the next frame.
+For finite commands, the daemon separately bounds its result-frame wait by the
+command timeout plus cleanup grace. If SSH remains alive but the helper stops
+responding, that deadline terminates and unpublishes the sole transport; the
+dispatched outcome remains unknown and is never retried automatically.
 
 The local client first waits for a `dispatched` acknowledgement, which the daemon
 writes only when the request reaches the serialized execution boundary and the
