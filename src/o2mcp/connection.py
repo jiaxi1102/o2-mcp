@@ -633,15 +633,16 @@ class O2Connection:
         return self.run("hostname; whoami; date", timeout=self.config.connect_timeout + 5)
 
     def _target_alias_from_argv(self, argv: list[str]) -> str | None:
-        """Infer which configured host alias a raw rsync/ssh argv connects to.
+        """Infer the configured O2 target a raw rsync/SSH argv connects to.
 
         Rsync targets appear as ``[user@]<alias>:<path>`` and raw SSH hosts as a
-        bare ``[user@]<alias>`` token. Strip only the optional user qualifier and
-        remote path before comparing the host; otherwise a standard destination
-        such as ``jzhao@o2-transfer:/path`` would be pinned to the login socket.
-        The transfer alias is checked first so a transfer-node command is never
-        validated against the (different) login master. Returns ``None`` when no
-        configured alias appears, leaving the login alias as the default.
+        bare ``[user@]<alias>`` token. Strip the optional user qualifier only for
+        host comparison, then return the full ``[user@]alias`` endpoint. Keeping
+        that user is essential because ``%r``-based ControlPath templates resolve
+        different sockets for different SSH users. The transfer alias is checked
+        first so a transfer-node command is never validated against the (different)
+        login master. Returns ``None`` when no configured alias appears, leaving
+        the login alias as the default.
         """
         for alias in (self.config.transfer_alias, self.config.host_alias):
             if not alias:
@@ -653,7 +654,7 @@ class O2Connection:
                 endpoint = token.split(":", 1)[0]
                 host = endpoint.rsplit("@", 1)[-1]
                 if host == alias:
-                    return alias
+                    return endpoint
         return None
 
     def _resolved_control_path(self, alias: str) -> str:
@@ -839,24 +840,25 @@ class O2Connection:
         dying socket could otherwise make OpenSSH fall back to a brand-new MFA
         login. The guard verifies the master for
         the alias the command actually targets: ``master_alias`` if given, else the
-        alias inferred from ``argv`` (an ``<alias>:path`` rsync target or a bare
-        ``<alias>`` ssh host), else the login alias. So a transfer-node transfer
-        (``o2-transfer``) is never validated against the login master even when the
-        caller forgets to pass ``master_alias``. Like :meth:`run`, the local lock is
-        honored first. ``require_master=False`` is retained only to give existing
-        callers an actionable error; cold transports are no longer supported.
+        endpoint inferred from ``argv`` (a ``[user@]<alias>:path`` rsync target or
+        a bare ``[user@]<alias>`` SSH host), else the login alias. So a transfer-node
+        transfer (``o2-transfer``) is never validated against the login master even
+        when the caller forgets to pass ``master_alias``. Like :meth:`run`, the
+        local lock is honored first. ``require_master=False`` is retained only to
+        give existing callers an actionable error; cold transports are no longer
+        supported.
         """
         self._require_unlocked()
         if not require_master:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
             )
-        effective_alias = master_alias if master_alias is not None else self._target_alias_from_argv(argv)
-        target = effective_alias or self.config.host_alias
+        effective_target = master_alias if master_alias is not None else self._target_alias_from_argv(argv)
+        target = effective_target or self.config.host_alias
         hardened = self._harden_raw_transport_argv(argv, target)
-        if not self.master_running(effective_alias):
+        if not self.master_running(effective_target):
             raise O2MasterUnavailableError(
-                f"No O2 ControlMaster is running for '{effective_alias or self.config.host_alias}'; refusing a raw "
+                f"No O2 ControlMaster is running for '{effective_target or self.config.host_alias}'; refusing a raw "
                 "transport (rsync/ssh) that would open a fresh Duo-pushing login. Start one first (start_master "
                 "with allow_new_login=True, or the local Terminal/tmux bridge) so transfers reuse the single "
                 "authenticated connection."

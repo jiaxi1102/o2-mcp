@@ -8,6 +8,7 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import threading
 import time
@@ -877,7 +878,7 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
 
 def test_run_raw_infers_target_alias_from_argv(tmp_path):
     # Even without master_alias, run_raw must check the alias the command targets
-    # (inferred from an <alias>:path rsync target), not always the login alias.
+    # (inferred from a [user@]<alias>:path rsync target), not always the login alias.
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
@@ -898,6 +899,17 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
         conn.run_raw(["rsync", "-e", "ssh", "x", "alice@o2-transfer:/p"])
     with pytest.raises(O2MasterUnavailableError):
         conn.run_raw(["ssh", "alice@o2-transfer", "ls"])
+
+    # When a user-qualified master does exist, both the local socket lookup and
+    # the control check retain that user. This matters for ControlPath templates
+    # containing %r, which must not silently select the alias's default user.
+    recording_runner = RecordingRunner(master=True)
+    recording_conn = O2Connection(_config(tmp_path), runner=recording_runner)
+    recording_conn.run_raw(["rsync", "-e", "ssh", "x", "alice@o2-transfer:/p"])
+    raw_rsync = recording_runner.calls[-1]["argv"]
+    transport = shlex.split(raw_rsync[raw_rsync.index("-e") + 1])
+    assert transport[transport.index("-S") + 1] == "/tmp/alice@o2-transfer-control.sock"
+    assert any(call["argv"][-1] == "alice@o2-transfer" and "-O" in call["argv"] for call in recording_runner.calls)
 
 
 def test_rsync_blocked_by_lock(tmp_path):
