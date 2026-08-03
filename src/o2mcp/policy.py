@@ -226,6 +226,26 @@ class O2PolicyStore:
             )
         return state
 
+    @contextmanager
+    def serialize_reuse_launch(self) -> Iterator[None]:
+        """Recheck reuse policy and hold its mutex through one process spawn.
+
+        Callers must enter this context immediately around creation of the
+        remote-capable child, not around unrelated preparation or the child's
+        full lifetime.  A concurrent :meth:`disable` therefore linearizes
+        either before the check (and denies the launch) or after the child
+        exists (where it is preserved as an already-running operation).
+        """
+
+        with self._locked():
+            state = self._read_valid_state()
+            if state["mode"] != "reuse_only":
+                raise O2PolicyDeniedError(
+                    f"O2 policy mode is '{state['mode']}'. Remote O2 operations are disabled; "
+                    "local policy, socket, process, receipt, and transfer-log inspection remains available."
+                )
+            yield
+
     def preview_login_grant(self, grant_id: str, target: LoginTarget) -> LoginGrant:
         """Validate a grant without consuming it for local route preflight.
 

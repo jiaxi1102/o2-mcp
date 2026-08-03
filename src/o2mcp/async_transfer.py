@@ -226,7 +226,12 @@ class O2AsyncTransfer:
             str(rc_path),
             *argv,
         ]
-        proc = self._spawn(wrapped, log_path)
+        # Recheck mode under the same workstation mutex used by disable and
+        # hold it only through child creation.  The detached process is then an
+        # existing transfer, which a later disabled transition deliberately
+        # preserves rather than terminating automatically.
+        with self.conn.policy.serialize_reuse_launch():
+            proc = self._spawn(wrapped, log_path)
         _LIVE[tid] = proc
         handle = TransferHandle(
             id=tid,

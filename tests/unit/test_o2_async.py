@@ -10,6 +10,7 @@ on-disk exit-code files (incl. the post-restart fallback when the Popen is gone)
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,45 @@ def test_push_async_blocked_by_lock(tmp_path):
     with pytest.raises(O2LockedError):
         mgr.push_async("/local/x", "/remote/x")
     assert spawner.calls == []
+
+
+def test_disable_cannot_complete_between_async_check_and_spawn(tmp_path):
+    """A detached rsync spawn shares disable's workstation mutex."""
+
+    class DisableDuringSpawn(FakeSpawner):
+        """Start a competing policy disable from inside the spawn seam."""
+
+        def __init__(self):
+            super().__init__()
+            self.policy = None
+            self.disable_started = threading.Event()
+            self.disable_finished = threading.Event()
+            self.disable_thread = None
+
+        def __call__(self, argv, log_path) -> FakeProc:
+            assert self.policy is not None
+
+            def disable() -> None:
+                self.disable_started.set()
+                self.policy.disable(reason="concurrent detached-transfer stop")
+                self.disable_finished.set()
+
+            self.disable_thread = threading.Thread(target=disable)
+            self.disable_thread.start()
+            assert self.disable_started.wait(timeout=1)
+            assert not self.disable_finished.wait(timeout=0.1)
+            return super().__call__(argv, log_path)
+
+    spawner = DisableDuringSpawn()
+    mgr = _mgr(tmp_path, spawner)
+    spawner.policy = mgr.conn.policy
+
+    handle = mgr.push_async("/local/x", "/remote/x")
+
+    assert spawner.disable_thread is not None
+    spawner.disable_thread.join(timeout=2)
+    assert handle.pid == 4321 and spawner.disable_finished.is_set()
+    assert mgr.conn.policy.snapshot().effective_mode == "disabled"
 
 
 def test_pull_async_builds_pull_argv(tmp_path):

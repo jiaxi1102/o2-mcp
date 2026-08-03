@@ -104,6 +104,50 @@ def default_runner(argv: list[str], timeout: float | None, input_text: str | Non
     return CommandResult(argv=list(argv), returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def _guarded_default_runner(
+    argv: list[str],
+    timeout: float | None,
+    input_text: str | None,
+    *,
+    policy: O2PolicyStore,
+) -> CommandResult:
+    """Spawn the production child under policy serialization, then wait unlocked.
+
+    ``subprocess.run`` does not expose the instant at which its child exists.
+    Use ``Popen`` here so the workstation mutex covers only that instant; a
+    safety disable must not wait for a long-running remote command to finish.
+    Injected test runners retain the legacy callable seam and are serialized for
+    their (normally immediate) invocation by :meth:`_run_reuse_transport`.
+    """
+
+    stdin = subprocess.PIPE if input_text is not None else subprocess.DEVNULL
+    with policy.serialize_reuse_launch():
+        proc = subprocess.Popen(
+            argv,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    return CommandResult(
+        argv=list(argv),
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 class O2Connection:
     """Manage persistent O2 ControlMasters under one global policy state."""
 
@@ -504,6 +548,28 @@ class O2Connection:
         )
 
     # -- remote execution -------------------------------------------------------
+    def _run_reuse_transport(
+        self,
+        argv: list[str],
+        timeout: float | None,
+        input_text: str | None,
+    ) -> CommandResult:
+        """Launch one remote-capable child atomically with the global mode."""
+
+        if self._runner is default_runner:
+            return _guarded_default_runner(
+                argv,
+                timeout,
+                input_text,
+                policy=self.policy,
+            )
+        # Offline/injected runners do not expose a separate spawn primitive.
+        # Serialize their invocation so concurrency tests retain the same
+        # check-and-launch boundary as production without changing the public
+        # runner protocol.
+        with self.policy.serialize_reuse_launch():
+            return self._runner(argv, timeout, input_text)
+
     def run(
         self,
         command: str,
@@ -538,7 +604,7 @@ class O2Connection:
                 f"No O2 ControlMaster is running for '{target}'. Start one explicitly, then retry; ordinary "
                 "commands cannot fall back to a new Duo-triggering SSH connection."
             )
-        return self._runner(
+        return self._run_reuse_transport(
             [*self._reuse_only_ssh_prefix(target), target, command],
             timeout,
             input_text,
@@ -1155,4 +1221,4 @@ class O2Connection:
                 "transport (rsync/ssh) that would open a fresh Duo-pushing login. Authorize and consume one "
                 "host-scoped login grant through o2_start_master, then reuse that exact connection."
             )
-        return self._runner(hardened, timeout, None)
+        return self._run_reuse_transport(hardened, timeout, None)

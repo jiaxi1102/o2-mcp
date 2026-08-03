@@ -298,6 +298,50 @@ def test_run_uses_reuse_only_authentication_and_alias(tmp_path):
     assert last[-1] == "hostname; whoami"
 
 
+def test_policy_disable_cannot_complete_between_reuse_check_and_launch(tmp_path):
+    """A remote child launch linearizes before or after the global stop."""
+
+    class DisableDuringRemoteRunner(RecordingRunner):
+        """Attempt the safety stop while the guarded runner is being invoked."""
+
+        def __init__(self, policy):
+            super().__init__(master=True)
+            self._policy = policy
+            self.disable_started = threading.Event()
+            self.disable_finished = threading.Event()
+            self.disable_thread = None
+
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            result = super().__call__(argv, timeout, input_text)
+            if not argv or argv[-1] != "hostname":
+                return result
+
+            def disable() -> None:
+                self.disable_started.set()
+                self._policy.disable(reason="concurrent reuse stop")
+                self.disable_finished.set()
+
+            self.disable_thread = threading.Thread(target=disable)
+            self.disable_thread.start()
+            assert self.disable_started.wait(timeout=1)
+            # The child-launch seam still owns the policy mutex, so disabled
+            # cannot become durable until this launch has linearized.
+            assert not self.disable_finished.wait(timeout=0.1)
+            return result
+
+    config = _config(tmp_path)
+    bootstrap = O2Connection(config, runner=RecordingRunner(master=True))
+    runner = DisableDuringRemoteRunner(bootstrap.policy)
+    conn = O2Connection(config, runner=runner, policy=bootstrap.policy)
+
+    result = conn.run("hostname")
+
+    assert runner.disable_thread is not None
+    runner.disable_thread.join(timeout=2)
+    assert result.ok and runner.disable_finished.is_set()
+    assert conn.policy.snapshot().effective_mode == "disabled"
+
+
 def test_run_pins_proxy_derived_control_path_before_disabling_proxy(tmp_path):
     """ProxyJump-dependent ``%C`` sockets retain their original identity."""
 
