@@ -39,6 +39,7 @@ from o2mcp.broker_protocol import (
     MAX_COMMAND_BYTES,
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
+    MAX_TIMEOUT_SECONDS,
     PROTOCOL_VERSION,
     BrokerProtocolError,
     command_within_exec_limit,
@@ -79,19 +80,20 @@ MAX_UNIX_SOCKET_PATH_BYTES = 100
 MAX_LAUNCH_BYTES = 1024 * 1024
 
 
-def _is_finite_positive_number(value: Any) -> bool:
-    """Validate timeouts without allowing huge JSON integers to escape.
+def _is_bounded_positive_timeout(value: Any) -> bool:
+    """Validate finite deadlines without numeric or socket timeout overflow.
 
     ``math.isfinite`` converts integers to a C double and can raise
     ``OverflowError`` for a protocol-valid but extremely large integer. Direct
     same-user socket requests must be rejected, not allowed to unwind the
-    daemon and terminate its sole authenticated transport.
+    daemon and terminate its sole authenticated transport. A separate upper
+    bound also keeps ``socket.settimeout`` inside portable platform ranges.
     """
 
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
     try:
-        return math.isfinite(value) and value > 0
+        return math.isfinite(value) and 0 < value <= MAX_TIMEOUT_SECONDS
     except OverflowError:
         return False
 
@@ -357,7 +359,7 @@ class BrokerClient:
         self,
         payload: dict[str, Any],
         *,
-        timeout: float,
+        timeout: float | None,
         require_expected_alias: bool = True,
         require_current_protocol: bool = True,
     ) -> dict[str, Any]:
@@ -390,8 +392,10 @@ class BrokerClient:
             raise ValueError("broker command must be a non-empty string")
         if not command_within_exec_limit(command):
             raise ValueError(f"broker command exceeds the {MAX_COMMAND_BYTES}-byte maximum")
-        if not _is_finite_positive_number(timeout):
-            raise ValueError("broker timeout must be one finite positive number")
+        if timeout is not None and not _is_bounded_positive_timeout(timeout):
+            raise ValueError(
+                f"broker timeout must be None or a finite positive number no greater than {MAX_TIMEOUT_SECONDS}"
+            )
         if input_text is not None and not isinstance(input_text, str):
             raise ValueError("broker stdin must be text or None")
         if input_text is not None and not utf8_text_within_limit(
@@ -428,7 +432,7 @@ class BrokerClient:
                         f"{response!r}. Do not retry automatically; inspect broker state first."
                     )
                 dispatched = True
-                client.settimeout(timeout + 10.0)
+                client.settimeout(None if timeout is None else timeout + 10.0)
                 response = read_frame(stream)
         except O2PolicyDeniedError:
             raise
@@ -598,10 +602,10 @@ class BrokerServer:
         self.launcher_pid = launcher_pid
         self.grant_id = grant_id
         self.ack_fd = ack_fd
-        if not _is_finite_positive_number(startup_timeout):
+        if not _is_bounded_positive_timeout(startup_timeout):
             raise ValueError("broker startup timeout must be finite and positive")
         self.startup_timeout = startup_timeout
-        if not _is_finite_positive_number(local_request_timeout):
+        if not _is_bounded_positive_timeout(local_request_timeout):
             raise ValueError("broker local request timeout must be finite and positive")
         self.local_request_timeout = local_request_timeout
         self.clock = clock
@@ -838,7 +842,7 @@ class BrokerServer:
                     write_frame(local, {"type": "error", "error": "invalid_request"})
                 return
             request_timeout = request.get("timeout_seconds")
-            valid_timeout = _is_finite_positive_number(request_timeout)
+            valid_timeout = request_timeout is None or _is_bounded_positive_timeout(request_timeout)
             request_id = request.get("id")
             valid_request_id = utf8_text_within_limit(request_id, MAX_REQUEST_ID_BYTES)
             stdin_text = request.get("stdin")
@@ -994,7 +998,7 @@ def _validate_launch_payload(payload: Any) -> dict[str, Any]:
     ):
         raise O2BrokerStartupError("broker launch destination must contain hostname, user, and port strings")
     startup_timeout = payload.get("startup_timeout")
-    if not _is_finite_positive_number(startup_timeout):
+    if not _is_bounded_positive_timeout(startup_timeout):
         raise O2BrokerStartupError("broker launch startup_timeout must be finite and positive")
     return payload
 

@@ -45,8 +45,10 @@ without bound and newlines or JSON-looking output cannot corrupt the next
 command. Frames are limited to 16 MiB, while command text is capped at 64 KiB
 so `bash -c` stays below the remote `execve` argument limit. One command timeout
 returns code 124 without reconnecting or replacing the persistent channel.
-Logical commands use a non-login Bash that inherits the one session environment,
-avoiding repeated profile banners and startup latency.
+Finite deadlines are capped at seven days to avoid platform socket overflow;
+an explicit `None` retains indefinite execution. Logical commands use a
+non-login Bash that inherits the one session environment, avoiding repeated
+profile banners and startup latency.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:

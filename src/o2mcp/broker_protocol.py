@@ -34,6 +34,10 @@ MAX_COMMAND_BYTES = 64 * 1024
 # small request from expanding a response beyond the frame limit after output is
 # added; production ids are UUIDs and need only 36 bytes.
 MAX_REQUEST_ID_BYTES = 128
+# Finite deadlines are capped below platform socket/select overflow ranges. A
+# caller that truly needs no deadline must send JSON null / Python ``None``
+# explicitly rather than approximating infinity with a huge number.
+MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 # JSON escaping can expand arbitrary command bytes substantially (for example,
 # every NUL becomes six ASCII characters). A one-MiB per-stream source bound
 # therefore keeps even worst-case escaped stdout+stderr below the 16-MiB frame.
@@ -195,6 +199,7 @@ def remote_helper_source() -> str:
         MAX_FRAME_BYTES = {MAX_FRAME_BYTES}
         MAX_COMMAND_BYTES = {MAX_COMMAND_BYTES}
         MAX_REQUEST_ID_BYTES = {MAX_REQUEST_ID_BYTES}
+        MAX_TIMEOUT_SECONDS = {MAX_TIMEOUT_SECONDS}
         MAX_OUTPUT_BYTES = {MAX_OUTPUT_BYTES}
 
         def read_exact(size):
@@ -250,7 +255,7 @@ def remote_helper_source() -> str:
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 return False
             try:
-                return math.isfinite(value) and value > 0
+                return math.isfinite(value) and 0 < value <= MAX_TIMEOUT_SECONDS
             except OverflowError:
                 return False
 
@@ -382,7 +387,7 @@ def remote_helper_source() -> str:
             command = request.get(\"command\")
             timeout = request.get(\"timeout_seconds\")
             stdin_text = request.get(\"stdin\")
-            valid_timeout = finite_positive_number(timeout)
+            valid_timeout = timeout is None or finite_positive_number(timeout)
             valid_command = command_within_exec_limit(command)
             valid_stdin = (
                 stdin_text is None
@@ -393,7 +398,7 @@ def remote_helper_source() -> str:
                 continue
             started = time.monotonic()
             returncode, stdout, stderr, timed_out, stdout_truncated, stderr_truncated = run_bounded(
-                command, stdin_text, float(timeout)
+                command, stdin_text, None if timeout is None else float(timeout)
             )
             response = {{
                 "type": "result",

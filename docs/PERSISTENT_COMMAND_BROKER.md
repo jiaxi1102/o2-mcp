@@ -76,9 +76,12 @@ The remote helper first emits:
 ```
 
 A logical command request contains protocol version 2, a random request id,
-command, timeout, and optional stdin text. Explicit versioning prevents either
-side of an in-place client/daemon upgrade from misinterpreting acknowledgement
-semantics and executing an apparently failed request. The helper executes
+command, timeout, and optional stdin text. A JSON `null` timeout preserves the
+public API's explicit no-deadline behavior; finite deadlines must be positive
+and no longer than seven days so local socket timeouts stay platform-safe.
+Explicit versioning prevents either side of an in-place client/daemon upgrade
+from misinterpreting acknowledgement semantics and executing an apparently
+failed request. The helper executes
 `/bin/bash --noprofile --norc -c <command>` in the environment inherited from
 the one SSH session, so per-command login profiles cannot add banners or consume
 timeouts. It concurrently drains both output streams while retaining bounded

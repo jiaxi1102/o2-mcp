@@ -999,7 +999,10 @@ class O2Connection:
                 raise O2UnsafeTransportError(
                     f"Persistent brokers may target only configured O2 aliases, not '{target}'."
                 )
-            remote_timeout = float(timeout) if timeout is not None else 86400.0
+            # Preserve the public runner contract: ``None`` means no deadline.
+            # The broker protocol carries JSON null explicitly rather than
+            # silently converting it into an arbitrary long finite timeout.
+            remote_timeout = float(timeout) if timeout is not None else None
             result = broker.execute(command, timeout=remote_timeout, input_text=input_text)
             truncation_notes: list[str] = []
             if result.stdout_truncated:

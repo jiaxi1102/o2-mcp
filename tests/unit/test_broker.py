@@ -41,6 +41,7 @@ from o2mcp.broker_protocol import (
     MAX_COMMAND_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_REQUEST_ID_BYTES,
+    MAX_TIMEOUT_SECONDS,
     PROTOCOL_VERSION,
     BrokerProtocolError,
     encode_frame,
@@ -212,6 +213,21 @@ def test_remote_timeout_returns_result_without_restarting_channel(tmp_path, brok
         assert timed_out.returncode == 124 and timed_out.timed_out is True
         assert "timed out" in timed_out.stderr
         assert after.stdout == "alive"
+        assert server.transport.pid == ssh_pid
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_none_timeout_preserves_indefinite_execution_contract(tmp_path, broker_root):
+    """An explicit absent deadline stays JSON null rather than becoming 24 hours."""
+
+    _policy, server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        ssh_pid = server.transport.pid
+        result = client.execute("printf no-deadline", timeout=None)
+
+        assert result.stdout == "no-deadline"
+        assert result.timed_out is False
         assert server.transport.pid == ssh_pid
     finally:
         _stop_local_broker(thread, client)
@@ -571,7 +587,10 @@ def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_
         _stop_local_broker(thread, client)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), True, 10**1000])
+@pytest.mark.parametrize(
+    "timeout",
+    [0, -1, float("nan"), float("inf"), True, 10**1000, MAX_TIMEOUT_SECONDS + 1, 1e20],
+)
 def test_client_rejects_invalid_timeout_before_socket_access(tmp_path, timeout):
     """Malformed core callers fail locally before inspecting or creating paths."""
 
@@ -927,6 +946,20 @@ def test_connection_routes_login_commands_to_broker_not_controlmaster(tmp_path, 
     assert result.stdout == "brokered\n"
     assert result.argv == ["o2-broker", config.host_alias, "hostname"]
     assert fake.calls == [{"command": "hostname", "timeout": 17.0, "input_text": "payload"}]
+
+
+def test_connection_preserves_explicit_none_timeout_for_broker(tmp_path):
+    """The public no-deadline sentinel must reach the framed protocol unchanged."""
+
+    policy = _reuse_policy(tmp_path)
+    fake = _FakeBroker()
+    config = O2Config(policy_file=policy.path, broker_dir=tmp_path / "broker-client")
+    connection = O2Connection(config, policy=policy, broker_client=fake)
+
+    result = connection.run("printf indefinite", timeout=None)
+
+    assert result.stdout == "brokered\n"
+    assert fake.calls == [{"command": "printf indefinite", "timeout": None, "input_text": None}]
 
 
 def test_private_legacy_test_transport_rejects_real_subprocess_runner(tmp_path):
