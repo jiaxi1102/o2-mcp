@@ -13,21 +13,25 @@ fallback, but it is not sufficient to suppress per-session challenges.
 
 ```mermaid
 flowchart LR
-    A["MCP task A"] --> U["mode-0600 Unix socket"]
-    B["MCP task B"] --> U
-    C["MCP task C"] --> U
-    U --> D["one local broker daemon"]
-    D -->|"length-prefixed JSON"| S["one SSH process and one session"]
-    S --> R["embedded remote Python helper"]
-    R --> X["serialized bash -lc commands"]
+    A["MCP task A"] --> L["login broker socket"]
+    B["MCP task B"] --> L
+    C["MCP task C"] --> T["transfer broker socket"]
+    L --> LD["login broker daemon"]
+    T --> TD["transfer broker daemon"]
+    LD -->|"framed JSON"| LS["one login-host SSH session"]
+    TD -->|"framed JSON"| TS["one transfer-host SSH session"]
+    LS --> LR["embedded remote helper"]
+    TS --> TR["embedded remote helper"]
+    LR --> LX["serialized bash -lc commands"]
+    TR --> TX["serialized bash -lc commands"]
 ```
 
-Starting the broker is the authentication boundary. It consumes the existing
-login-scoped one-shot grant, including the off-VPN scope, and launches exactly
-one direct SSH transport. It deliberately sets `-S none`, `ControlMaster=no`,
-and `ControlPath=none`: binding the broker lifetime to an older mux master would
-reintroduce the disappearance and channel-lifetime problem the broker is meant
-to solve.
+Starting either role-specific broker is an authentication boundary. It consumes
+the matching login- or transfer-scoped one-shot grant, including the off-VPN
+scope, and launches exactly one direct SSH transport. It deliberately sets
+`-S none`, `ControlMaster=no`, and `ControlPath=none`: binding broker lifetime to
+an older mux master would reintroduce the disappearance and channel-lifetime
+problem the broker is meant to solve.
 
 The grant-consuming parent holds the global policy mutex until the detached
 daemon acknowledges that it has spawned SSH. A policy disable therefore either
@@ -35,9 +39,11 @@ precedes grant consumption and prevents launch, or follows an already-started
 operation. The daemon records the login attempt as successful only after the
 remote helper sends the expected protocol hello.
 
-There is no automatic retry or reconnect. A startup timeout leaves one attempt
-receipt for inspection. A later task must not infer that it may start another
-channel from the absence of a ready socket.
+There is no automatic retry or reconnect. The remote protocol hello has the same
+finite startup deadline as the launcher, so a silent child cannot retain the
+lifetime lock indefinitely. A startup timeout leaves one attempt receipt for
+inspection. A later task must not infer that it may start another channel from
+the absence of a ready socket.
 
 ## Protocol
 
@@ -55,25 +61,39 @@ remote hello, accommodating a login-shell banner. Every later frame is strict.
 The remote helper first emits:
 
 ```json
-{"type":"hello","protocol":1}
+{"type":"hello","protocol":2}
 ```
 
-A logical command request contains a random request id, command, timeout, and
-optional stdin text. The helper executes `/bin/bash -lc <command>`, captures both
-output streams, and returns the same id, return code, duration, timeout flag,
-and truncation flags. Commands are serialized so responses cannot be reordered.
+A logical command request contains protocol version 2, a random request id,
+command, timeout, and optional stdin text. Explicit versioning prevents either
+side of an in-place client/daemon upgrade from misinterpreting acknowledgement
+semantics and executing an apparently failed request. The helper executes
+`/bin/bash -lc <command>`, concurrently drains both output streams while
+retaining bounded prefixes, and returns the same id, return code, duration,
+timeout flag, and truncation flags. Commands are serialized within each broker
+so responses cannot be reordered.
 
-The frame limit is 16 MiB. Stdout and stderr are each truncated at 1 MiB before
-encoding. A remote timeout returns code 124 and the helper remains available for
-the next frame.
+The frame limit is 16 MiB. Stdout and stderr retain at most 1 MiB each; later
+bytes are drained and discarded rather than accumulated in memory. A remote
+timeout returns code 124 and the helper remains available for the next frame.
+
+The local client first waits for a `dispatched` acknowledgement, which the daemon
+writes only when the request reaches the serialized execution boundary and the
+policy still permits it. Queue delay does not consume the command's remote
+timeout. A caller that disconnects before acknowledgement is cancelled locally;
+if the result stream is lost after acknowledgement, the MCP reports
+`broker_outcome_unknown` with `retry_safe=false` instead of inviting an unsafe
+automatic retry.
 
 ## Local authority and failure behavior
 
-- `~/.agent_locks/o2-broker` defaults to a physical owner-only mode-0700
-  directory. `O2_BROKER_DIR` may override it only with an absolute path.
+- `~/.agent_locks/o2-broker` and
+  `~/.agent_locks/o2-transfer-broker` default to distinct physical owner-only
+  mode-0700 directories. `O2_BROKER_DIR` and `O2_TRANSFER_BROKER_DIR` may
+  override them only with distinct absolute paths.
 - `command.sock`, state, launch, config snapshot, lock, and log are owner-only.
   Symlinked or permissive authority files fail closed.
-- One lifetime `flock` prevents two daemons from owning the endpoint.
+- One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.
 - Disabling policy does not kill an already-running command or broker. It blocks
@@ -85,20 +105,25 @@ the next frame.
 
 ## MVP boundaries
 
-This first broker is login-host command transport only. `o2_exec`, Slurm tools,
-workspace tools, keepalive, and run-organization commands all reach it through
-`O2Connection.run`. Login-node raw SSH is rejected.
+`o2_exec`, Slurm tools, workspace tools, and keepalive reach the login broker
+through `O2Connection.run`. Run-organization reads normally use that broker;
+promotion and archive launches that must run on the transfer host use its
+separate persistent broker. Raw SSH commands are rejected for both roles.
 
 Existing detached rsync transfers are not terminated or migrated. Transfer
-commands still use the separately governed compatibility path and should not be
-described as Duo-free: a future transfer broker or non-SSH transfer mechanism is
-needed to eliminate that distinct session boundary.
+data still uses the separately governed ControlMaster compatibility path and
+should not be described as Duo-free. The transfer command broker eliminates raw
+SSH only for commands; replacing rsync's distinct session boundary remains
+future work.
 
 ## Offline validation
 
 `tests/unit/test_broker.py` runs the exact embedded remote helper as a local
 Python child. It proves that multiple clients and dynamically different commands
-share one process, command stdin and multiline output survive framing, timeouts
-do not reconnect, policy disable blocks forwarding, an absent broker stays
-local-only, and the detached launcher consumes one grant then reuses one daemon.
-No test in this PR contacts O2 or starts SSH.
+share one process, command stdin and multiline output survive framing, noisy
+output stays bounded, queue time is separated from command time, an abandoned
+queued request is not dispatched, protocol-hello timeout releases the lock,
+policy disable blocks forwarding, and detached role-specific launchers consume
+one matching grant then reuse one daemon. Run-organization tests prove transfer
+commands select the transfer broker. No test in this PR contacts O2 or starts
+SSH.

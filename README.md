@@ -17,17 +17,19 @@ only for a new SSH transport, but also when a new **session channel** is opened
 inside an existing OpenSSH ControlMaster. A normal `ssh o2 command` invocation
 therefore is not Duo-safe merely because it reaches the expected mux socket.
 
-Version 0.4 replaces that login-node command pattern with one workstation-wide
-broker:
+Version 0.4 replaces that command pattern with one workstation-wide broker per
+configured host role. Login-node work normally needs only the login broker; a
+separate transfer broker exists for commands that must execute on the transfer
+host:
 
-1. `o2_start_broker` consumes a short-lived, client-bound, one-attempt login
-   grant and starts exactly one SSH process.
+1. `o2_start_broker` consumes a short-lived, client-bound, one-attempt
+   role-matched grant and starts exactly one SSH process for that broker.
 2. That SSH process opens exactly one remote session running a small embedded
    Python helper.
 3. Every later `o2_exec`, Slurm, workspace, keepalive, and run-organization
    command is length-prefixed JSON sent through the same session's stdin/stdout.
-4. Independently launched MCP tasks share the broker through a mode-0600 Unix
-   socket. Commands are serialized in the MVP.
+4. Independently launched MCP tasks share the applicable broker through a
+   mode-0600 Unix socket. Commands are serialized within each role in the MVP.
 5. The daemon never reconnects. If the channel dies, its socket disappears and
    later commands fail locally; another login requires another explicit grant.
 
@@ -37,10 +39,11 @@ so a concurrent `disabled` transition wins even against a hand-crafted local
 socket request. Disabling does not terminate a command already in progress.
 
 The broker uses an `O2B1` magic marker, four-byte network-order lengths, and
-UTF-8 JSON rather than newline framing. Remote stdout/stderr is captured inside the helper, so
-newlines or JSON-looking command output cannot corrupt the next command. Frames
-are limited to 16 MiB and each output stream to 1 MiB. One command timeout returns
-code 124 without reconnecting or replacing the persistent channel.
+UTF-8 JSON rather than newline framing. Remote stdout/stderr is drained while
+retaining at most 1 MiB per stream, so noisy commands cannot grow broker memory
+without bound and newlines or JSON-looking output cannot corrupt the next
+command. Frames are limited to 16 MiB. One command timeout returns code 124
+without reconnecting or replacing the persistent channel.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:
@@ -53,10 +56,12 @@ directives itself, rejects any `Match` block before launching OpenSSH, and runs 
 against that private inspected snapshot. If your normal SSH config contains `Match`, put the
 O2 `Host` blocks in a separate Match-free file and set `O2_SSH_CONFIG_FILE` to it.
 
-The optional `o2-transfer` alias remains a different host with its own grant and
-ControlMaster in this MVP. Existing detached transfers are preserved. Transfer
-traffic is not yet carried by the command broker; do not infer that a transfer
-session is Duo-free merely because its ControlMaster exists.
+The optional `o2-transfer` alias remains a different host with its own grant,
+command broker, and rsync-compatibility ControlMaster. Run transitions and
+explicit transfer-host probes use the framed transfer broker. Existing detached
+rsync transfers remain on their pinned ControlMaster path and are preserved;
+that compatibility path must not be described as Duo-free merely because its
+ControlMaster exists.
 
 Never open the broker/master in a loop or run authentication tools on a timer. The policy
 file has two durable modes: `disabled` blocks new remote operations, while
@@ -82,7 +87,7 @@ grant remain MCP-only operations with explicit global or target-scoped approval.
 **Be on the HMS VPN.** O2 normally skips Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), the one
-`o2_start_broker` login may Duo-push. To make accidental off-VPN launch impossible,
+`o2_start_broker` login or transfer-host startup may Duo-push. To make accidental off-VPN launch impossible,
 `o2_start_broker` **refuses to open a new login unless the route to O2 egresses via a VPN
 tunnel interface** (it checks
 `route get` locally — no connection, no Duo). An explicitly approved grant may
@@ -111,7 +116,8 @@ pip install -e ".[o2]"     # on a 3.10+ env
         "O2_SSH_TRANSFER_ALIAS": "o2-transfer",
         "O2_SSH_CONFIG_FILE": "/Users/you/.ssh/config",
         "O2_POLICY_FILE": "/Users/you/.agent_locks/O2_POLICY.json",
-        "O2_BROKER_DIR": "/Users/you/.agent_locks/o2-broker"
+        "O2_BROKER_DIR": "/Users/you/.agent_locks/o2-broker",
+        "O2_TRANSFER_BROKER_DIR": "/Users/you/.agent_locks/o2-transfer-broker"
       }
     }
   }
@@ -123,6 +129,8 @@ SSH config. The broker snapshots that Match-free config before consuming the
 grant and explicitly disables mux reuse, proxies, and local command hooks for
 its one transport. `O2_BROKER_DIR` must be absolute, private, and short enough
 for a macOS Unix socket; the default satisfies those constraints.
+`O2_TRANSFER_BROKER_DIR` has the same requirements and must be distinct from
+`O2_BROKER_DIR`.
 
 ## Tools
 
@@ -133,8 +141,8 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_policy_disable` | Block every new remote O2 operation without killing existing processes | write/local |
 | `o2_policy_enable_reuse` | Explicitly enable existing broker/transport reuse at an observed generation/revision | write/local |
 | `o2_authorize_login` | Issue one short-lived login or transfer-host grant | write/local |
-| `o2_start_broker` | Consume one login grant and open the sole persistent command channel | write |
-| `o2_stop_broker` | Locally close the broker and its SSH process; no policy change | **destructive/local** |
+| `o2_start_broker` | Consume one role-matched grant and open that host role's persistent command channel (`transfer=true` for the transfer host) | write |
+| `o2_stop_broker` | Locally close one role-specific broker and its SSH process; no policy change | **destructive/local** |
 | `o2_start_master` | Transfer compatibility only; login-master starts are rejected | write |
 | `o2_probe` | One explicit fixed command through the existing broker; never retried | read-only |
 | `o2_exec` | Run an arbitrary command on a login node | write |
@@ -169,21 +177,23 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   `O2_POLICY_FILE` must be absolute. The first explicit policy mutation safely
   tightens an owned physical legacy `~/.agent_locks` directory from `0755` to
   `0700`; aliased or foreign-owned directories remain invalid.
-- Only `o2_start_broker` (login commands) or the transfer compatibility start
-  can authenticate, and only after atomically consuming a matching
-  client/host/off-VPN-scoped grant. The broker launch holds the policy mutex
-  until its daemon acknowledges that the sole SSH child exists.
-- Login commands never invoke SSH directly and never open a new ControlMaster
-  session channel. Raw SSH through `run_raw` is rejected in production.
-- The broker socket directory is physical, caller-owned, and mode 0700; its
-  socket and files are mode 0600. One lifetime `flock` prevents overlapping
-  daemons. An unbindably long socket path fails before grant consumption.
+- Only `o2_start_broker` (role-specific command transport) or the transfer rsync
+  compatibility start can authenticate, and only after atomically consuming a
+  matching client/host/off-VPN-scoped grant. Each broker launch holds the policy
+  mutex until its daemon acknowledges that the sole SSH child exists.
+- Login and transfer-host commands never invoke SSH directly and never open a
+  new ControlMaster session channel. Raw SSH through `run_raw` is rejected in
+  production. Rsync remains the explicitly isolated compatibility boundary.
+- Each broker socket directory is physical, caller-owned, and mode 0700; its
+  socket and files are mode 0600. One lifetime `flock` per role prevents
+  overlapping daemons. An unbindably long socket path fails before grant
+  consumption.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - `o2_local_status` and the deprecated `o2_status` alias inspect broker receipts,
   Unix sockets, processes, policy, and transfer logs locally; neither invokes SSH.
   `o2_probe` is the only status-like remote operation and runs exactly once
-  through the broker.
+  through the selected role-specific broker.
 - The policy JSON contains the login-attempt receipt and five-minute cooldown.
   A zero exit from `ssh -MNf` is successful only when an immediate exact-socket
   control check confirms that the background master survived.

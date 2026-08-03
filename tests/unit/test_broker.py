@@ -34,6 +34,8 @@ from o2mcp.broker import (
 )
 from o2mcp.broker_protocol import (
     FRAME_MAGIC,
+    MAX_OUTPUT_BYTES,
+    PROTOCOL_VERSION,
     BrokerProtocolError,
     encode_frame,
     read_frame,
@@ -122,7 +124,7 @@ def test_frame_rejects_oversized_and_truncated_payloads():
 def test_first_remote_frame_can_resynchronize_after_login_banner():
     """Bounded shell startup text cannot corrupt the remote hello frame."""
 
-    hello = {"type": "hello", "protocol": 1}
+    hello = {"type": "hello", "protocol": PROTOCOL_VERSION}
     stream = io.BytesIO(b"Authorized users only\n" + encode_frame(hello))
 
     assert read_frame(stream, resynchronize=True) == hello
@@ -165,6 +167,51 @@ def test_remote_timeout_returns_result_without_restarting_channel(tmp_path, brok
         _stop_local_broker(thread, client)
 
 
+def test_remote_output_is_truncated_while_channel_remains_usable(tmp_path, broker_root):
+    """Noisy commands are drained but retain only the bounded response prefix."""
+
+    _policy, server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        ssh_pid = server.transport.pid
+        noisy = client.execute(
+            'python3 -c \'import os; os.write(1, b"x" * 2097152); os.write(2, b"y" * 2097152)\'',
+            timeout=10,
+        )
+
+        assert len(noisy.stdout.encode()) == MAX_OUTPUT_BYTES
+        assert len(noisy.stderr.encode()) == MAX_OUTPUT_BYTES
+        assert noisy.stdout_truncated is True and noisy.stderr_truncated is True
+        assert client.execute("printf after-noise", timeout=5).stdout == "after-noise"
+        assert server.transport.pid == ssh_pid
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_remote_hello_timeout_releases_lifetime_lock(tmp_path, broker_root):
+    """A live transport that never speaks protocol cannot wedge all later starts."""
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", "import time; time.sleep(30)"],
+        alias="silent-o2",
+        startup_timeout=0.1,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    status = BrokerClient(paths.root).local_status()
+    assert status["status"] == "failed"
+    assert "no protocol hello" in status["error"]
+    assert BrokerClient(paths.root).launch_in_progress() is False
+    assert not paths.socket.exists()
+
+
 def test_disconnected_local_caller_does_not_kill_shared_channel(tmp_path, broker_root):
     """An MCP timeout may lose one reply but must not force a new SSH login."""
 
@@ -178,12 +225,14 @@ def test_disconnected_local_caller_does_not_kill_shared_channel(tmp_path, broker
                 stream,
                 {
                     "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
                     "id": "abandoned-request",
                     "command": "sleep 0.1; printf abandoned",
                     "timeout_seconds": 5,
                     "stdin": None,
                 },
             )
+            assert read_frame(stream) == {"type": "dispatched", "id": "abandoned-request"}
         abandoned.close()
 
         # The daemon must first drain the abandoned command, then it can serve a
@@ -193,6 +242,93 @@ def test_disconnected_local_caller_does_not_kill_shared_channel(tmp_path, broker
         assert server.transport.pid == ssh_pid
         assert client.ping()["commands_completed"] == 2
     finally:
+        _stop_local_broker(thread, client)
+
+
+def test_caller_that_disconnects_in_queue_is_never_dispatched(tmp_path, broker_root):
+    """A request abandoned before its dispatch acknowledgement is cancelled."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        first.connect(str(client.paths.socket))
+        first_stream = first.makefile("rwb", buffering=0)
+        write_frame(
+            first_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "first-blocking-request",
+                "command": "sleep 0.3; printf first",
+                "timeout_seconds": 5,
+                "stdin": None,
+            },
+        )
+        assert read_frame(first_stream) == {"type": "dispatched", "id": "first-blocking-request"}
+
+        abandoned = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        abandoned.connect(str(client.paths.socket))
+        with abandoned.makefile("rwb", buffering=0) as stream:
+            write_frame(
+                stream,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "closed-while-queued",
+                    "command": "printf must-not-run",
+                    "timeout_seconds": 5,
+                    "stdin": None,
+                },
+            )
+        abandoned.close()
+        first_response = read_frame(first_stream)
+        first_stream.close()
+        first.close()
+
+        # Give the daemon time to accept the closed socket and reject it at the
+        # dispatch acknowledgement boundary.
+        time.sleep(0.1)
+        assert first_response["stdout"] == "first"
+        assert client.ping()["commands_completed"] == 1
+        assert client.execute("printf after", timeout=5).stdout == "after"
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_command_timeout_starts_only_after_dispatch(tmp_path, broker_root):
+    """A short command timeout must not expire while another client owns the queue."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    first_stream = None
+    try:
+        first.connect(str(client.paths.socket))
+        first_stream = first.makefile("rwb", buffering=0)
+        write_frame(
+            first_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "queue-occupant",
+                "command": "sleep 0.3; printf first",
+                "timeout_seconds": 5,
+                "stdin": None,
+            },
+        )
+        assert read_frame(first_stream) == {"type": "dispatched", "id": "queue-occupant"}
+
+        # The second command's 100 ms limit is shorter than its roughly 300 ms
+        # queue wait, but it begins only after the daemon acknowledges dispatch.
+        queued = client.execute("printf second", timeout=0.1)
+        first_response = read_frame(first_stream)
+
+        assert first_response["stdout"] == "first"
+        assert queued.stdout == "second"
+        assert queued.timed_out is False
+    finally:
+        if first_stream is not None:
+            first_stream.close()
+        first.close()
         _stop_local_broker(thread, client)
 
 
@@ -208,6 +344,7 @@ def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_
                 stream,
                 {
                     "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
                     "id": "invalid-timeout",
                     "command": "printf must-not-run",
                     "timeout_seconds": float("inf"),
@@ -333,15 +470,60 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
+def test_protocol_mismatch_fails_before_connecting_to_stale_daemon(broker_root):
+    """A post-upgrade client must not send commands under obsolete queue semantics."""
+
+    paths = prepare_broker_directory(broker_root)
+    paths.state.write_text('{"status":"ready","protocol":1}\n')
+    paths.state.chmod(0o600)
+    stale_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_socket.bind(str(paths.socket))
+    paths.socket.chmod(0o600)
+    try:
+        with pytest.raises(O2BrokerUnavailableError, match="requires protocol"):
+            BrokerClient(paths.root).execute("printf unsafe", timeout=1)
+    finally:
+        stale_socket.close()
+        paths.socket.unlink()
+
+
+def test_new_daemon_rejects_pre_acknowledgement_client_protocol(tmp_path, broker_root):
+    """An old client cannot execute a command it would misreport as failed."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    old_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        old_client.connect(str(client.paths.socket))
+        with old_client.makefile("rwb", buffering=0) as stream:
+            write_frame(
+                stream,
+                {
+                    "type": "exec",
+                    # Protocol 1 did not send this version field and expected a
+                    # result immediately instead of a dispatch acknowledgement.
+                    "id": "obsolete-client",
+                    "command": "printf must-not-run",
+                    "timeout_seconds": 5,
+                    "stdin": None,
+                },
+            )
+            assert read_frame(stream) == {"type": "error", "error": "invalid_request"}
+        assert client.ping()["commands_completed"] == 0
+    finally:
+        old_client.close()
+        _stop_local_broker(thread, client)
+
+
 class _FakeBroker:
     """Record production connection routing without a socket or subprocess."""
 
-    def __init__(self) -> None:
+    def __init__(self, stdout: str = "brokered\n") -> None:
         self.calls = []
+        self.stdout = stdout
 
     def execute(self, command, *, timeout, input_text=None):
         self.calls.append({"command": command, "timeout": timeout, "input_text": input_text})
-        return BrokerExecutionResult(0, "brokered\n", "", False, 0.01, False, False)
+        return BrokerExecutionResult(0, self.stdout, "", False, 0.01, False, False)
 
 
 def test_connection_routes_login_commands_to_broker_not_controlmaster(tmp_path, monkeypatch):
@@ -417,25 +599,88 @@ def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path
     assert "python3 -u -c" in argv[-1]
 
 
-def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, broker_root, monkeypatch):
-    """One grant launches the daemon; later commands and starts stay local-only."""
+def test_transfer_host_commands_use_separate_persistent_broker(tmp_path):
+    """Run transitions retain transfer-host execution without raw SSH channels."""
+
+    policy = _reuse_policy(tmp_path)
+    login = _FakeBroker(stdout="login\n")
+    transfer = _FakeBroker(stdout="transfer\n")
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "login-broker",
+        transfer_broker_dir=tmp_path / "transfer-broker",
+    )
+    connection = O2Connection(
+        config,
+        policy=policy,
+        broker_client=login,
+        transfer_broker_client=transfer,
+    )
+
+    result = connection.run("nohup transition &", alias=config.transfer_alias, timeout=60)
+
+    assert result.stdout == "transfer\n"
+    assert login.calls == []
+    assert transfer.calls == [{"command": "nohup transition &", "timeout": 60.0, "input_text": None}]
+
+
+def test_explicit_role_disambiguates_a_shared_ssh_alias(tmp_path):
+    """Role identity, rather than alias text, selects the governed broker."""
+
+    policy = _reuse_policy(tmp_path)
+    login = _FakeBroker(stdout="login\n")
+    transfer = _FakeBroker(stdout="transfer\n")
+    config = O2Config(
+        host_alias="shared-o2",
+        transfer_alias="shared-o2",
+        policy_file=policy.path,
+        broker_dir=tmp_path / "login-broker",
+        transfer_broker_dir=tmp_path / "transfer-broker",
+    )
+    connection = O2Connection(
+        config,
+        policy=policy,
+        broker_client=login,
+        transfer_broker_client=transfer,
+    )
+
+    result = connection.run(
+        "printf transfer",
+        alias="shared-o2",
+        broker_role="transfer",
+        timeout=5,
+    )
+
+    assert result.stdout == "transfer\n"
+    assert login.calls == []
+    assert transfer.calls[0]["command"] == "printf transfer"
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, broker_root, monkeypatch, transfer):
+    """One role-matched grant launches a daemon that later calls reuse locally."""
 
     policy = _reuse_policy(tmp_path)
     config = O2Config(
         policy_file=policy.path,
-        broker_dir=broker_root,
+        broker_dir=tmp_path / "unused-login-broker" if transfer else broker_root,
+        transfer_broker_dir=broker_root if transfer else tmp_path / "unused-transfer-broker",
         ssh_config_file=tmp_path / "ssh_config",
         broker_start_timeout=5,
     )
-    config.ssh_config_file.write_text("Host o2\n  HostName example.invalid\n")
+    config.ssh_config_file.write_text(
+        "Host o2\n  HostName example.invalid\nHost o2-transfer\n  HostName transfer.example.invalid\n"
+    )
     client = BrokerClient(broker_root)
-    connection = O2Connection(config, policy=policy, broker_client=client)
+    connection_kwargs = {"transfer_broker_client": client} if transfer else {"broker_client": client}
+    connection = O2Connection(config, policy=policy, **connection_kwargs)
+    target = "transfer" if transfer else "login"
     grant = policy.authorize_login(
         expected_revision=policy.snapshot().revision,
         expected_generation=policy.snapshot().generation,
-        target="login",
+        target=target,
         allow_offvpn=True,
-        approval_reference="offline broker launch",
+        approval_reference=f"offline {target} broker launch",
     )
     monkeypatch.setattr(
         connection,
@@ -444,17 +689,18 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
     )
 
     try:
-        started = connection.start_broker(grant_id=grant.id)
+        started = connection.start_broker(grant_id=grant.id, transfer=transfer)
         first_pid = started["daemon"]["pid"]
-        assert connection.run("printf launched", timeout=5).stdout == "launched"
+        alias = config.transfer_alias if transfer else config.host_alias
+        assert connection.run("printf launched", alias=alias, timeout=5).stdout == "launched"
 
         # An already-ready broker is a no-op and must not need or consume a
         # second authorization.
-        again = connection.start_broker()
+        again = connection.start_broker(transfer=transfer)
         assert again["daemon"]["pid"] == first_pid
         assert policy.snapshot().state["login_attempt"]["outcome"] == "success"
     finally:
-        connection.stop_broker(reason="offline launcher test complete")
+        connection.stop_broker(reason="offline launcher test complete", transfer=transfer)
         deadline = time.monotonic() + 5
         while client.launch_in_progress() and time.monotonic() < deadline:
             time.sleep(0.05)

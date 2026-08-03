@@ -162,6 +162,17 @@ def test_relative_policy_paths_are_rejected(monkeypatch):
         O2Config(policy_file=Path("another-relative-policy.json"))
 
 
+def test_role_specific_broker_directories_are_absolute_and_distinct(tmp_path):
+    """Separate host roles cannot accidentally contend for one socket authority."""
+
+    with pytest.raises(ValueError, match="transfer broker directory must be.*absolute"):
+        O2Config(transfer_broker_dir=Path("relative-transfer-broker"))
+
+    shared = tmp_path / "shared-broker"
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(broker_dir=shared, transfer_broker_dir=shared)
+
+
 def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
     """Ordinary commands must be unable to authenticate if multiplexing fails."""
 

@@ -9,9 +9,9 @@ exactly, but is testable and composable:
   all authentication methods disabled and uses an inspected, pinned socket with
   live SSH config disabled, so OpenSSH cannot silently replace a missing
   multiplexed connection with a Duo-triggering standalone login.
-- Remote commands run through one workstation-wide broker session rather than
-  opening a new SSH session channel for every command. Transfers retain an
-  inspected ControlMaster socket during the MVP transition.
+- Remote commands run through one workstation-wide broker session per host role
+  rather than opening a new SSH session channel for every command. Rsync
+  transfers retain an inspected ControlMaster socket during the MVP transition.
 
 The actual subprocess call is injected (``runner``) so the whole class is unit
 tested offline without ever touching the network.
@@ -168,7 +168,7 @@ def _guarded_default_runner(
 
 
 class O2Connection:
-    """Manage persistent O2 ControlMasters under one global policy state."""
+    """Manage role-specific command brokers and rsync masters under one policy."""
 
     # Never let PATH lookup or an arbitrary executable whose basename is `ssh`
     # or `rsync` bypass the transport guards. O2 MCP targets macOS and the Linux
@@ -308,6 +308,7 @@ class O2Connection:
         *,
         policy: O2PolicyStore | None = None,
         broker_client: BrokerClient | None | object = _DEFAULT_BROKER_CLIENT,
+        transfer_broker_client: BrokerClient | None | object = _DEFAULT_BROKER_CLIENT,
         _legacy_test_transport: bool = False,
     ) -> None:
         """Create a connection bound to the global policy and injected runner.
@@ -327,16 +328,25 @@ class O2Connection:
         self.config = config or O2Config()
         self._runner = runner
         self.policy = policy or O2PolicyStore(self.config.policy_file)
+        self._uses_legacy_test_transport = _legacy_test_transport
         if _legacy_test_transport and runner is default_runner:
             raise ValueError("_legacy_test_transport requires an injected non-production runner")
-        if _legacy_test_transport and broker_client is not _DEFAULT_BROKER_CLIENT:
-            raise ValueError("_legacy_test_transport cannot be combined with a broker_client")
+        if _legacy_test_transport and (
+            broker_client is not _DEFAULT_BROKER_CLIENT or transfer_broker_client is not _DEFAULT_BROKER_CLIENT
+        ):
+            raise ValueError("_legacy_test_transport cannot be combined with broker clients")
         if _legacy_test_transport:
             self._broker = None
+            self._transfer_broker = None
         elif broker_client is _DEFAULT_BROKER_CLIENT:
             self._broker = BrokerClient(self.config.broker_dir)
         else:
             self._broker = broker_client
+        if not _legacy_test_transport:
+            if transfer_broker_client is _DEFAULT_BROKER_CLIENT:
+                self._transfer_broker = BrokerClient(self.config.transfer_broker_dir)
+            else:
+                self._transfer_broker = transfer_broker_client
         # A connection may build an rsync argv and then validate/run it. Cache the
         # safely expanded config for each target so those two steps cannot drift
         # and do not repeatedly parse the same local files.
@@ -344,10 +354,17 @@ class O2Connection:
         self._safe_ssh_config_text_cache: str | None = None
 
     # -- persistent command broker ---------------------------------------------
-    def broker_local_status(self) -> dict[str, object]:
-        """Inspect the workstation broker locally without invoking SSH."""
+    def _broker_client(self, *, transfer: bool) -> BrokerClient:
+        """Return the configured role-specific client, including test fallback."""
 
-        client = self._broker or BrokerClient(self.config.broker_dir)
+        configured = self._transfer_broker if transfer else self._broker
+        root = self.config.transfer_broker_dir if transfer else self.config.broker_dir
+        return configured or BrokerClient(root)
+
+    def broker_local_status(self, *, transfer: bool = False) -> dict[str, object]:
+        """Inspect one role-specific broker locally without invoking SSH."""
+
+        client = self._broker_client(transfer=transfer)
         return client.local_status()
 
     def _broker_transport_argv(self, target: str, ssh_config_path: Path) -> list[str]:
@@ -397,8 +414,8 @@ class O2Connection:
             remote_command,
         ]
 
-    def start_broker(self, *, grant_id: str | None = None) -> dict[str, object]:
-        """Start exactly one persistent login session after consuming a grant.
+    def start_broker(self, *, grant_id: str | None = None, transfer: bool = False) -> dict[str, object]:
+        """Start exactly one role-specific persistent session after a grant.
 
         The child daemon acknowledges only after it has spawned the sole SSH
         process. The policy mutex remains held through that acknowledgement, so
@@ -408,7 +425,8 @@ class O2Connection:
         """
 
         self.policy.require_reuse_allowed()
-        client = self._broker or BrokerClient(self.config.broker_dir)
+        logical_target: LoginTarget = "transfer" if transfer else "login"
+        client = self._broker_client(transfer=transfer)
         status = client.local_status()
         if status.get("responsive") is True:
             return status
@@ -420,19 +438,20 @@ class O2Connection:
             )
         if not grant_id:
             raise O2BrokerStartupError(
-                "No persistent O2 command broker is running. A short-lived one-shot login grant is required "
-                "before starting its single SSH session."
+                f"No persistent O2 {logical_target} command broker is running. A short-lived one-shot "
+                f"{logical_target} grant is required before starting its single SSH session."
             )
 
-        target = self.config.host_alias
-        grant = self.policy.preview_login_grant(grant_id, "login")
+        target = self.config.transfer_alias if transfer else self.config.host_alias
+        broker_dir = self.config.transfer_broker_dir if transfer else self.config.broker_dir
+        grant = self.policy.preview_login_grant(grant_id, logical_target)
         if not grant.allow_offvpn:
             self._require_on_vpn(target)
 
         # Config parsing and artifact writes are local-only and intentionally
         # happen before grant consumption. A typo or unsafe Match block must not
         # waste the user's one authorized authentication attempt.
-        paths = prepare_broker_directory(self.config.broker_dir)
+        paths = prepare_broker_directory(broker_dir)
         self._resolved_ssh_config(target)
         atomic_private_text_write(paths.ssh_config, self._safe_ssh_config_text())
         launch_payload = {
@@ -441,6 +460,7 @@ class O2Connection:
             "policy_file": str(self.config.policy_file),
             "alias": target,
             "grant_id": grant_id,
+            "startup_timeout": self.config.broker_start_timeout,
             "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
         }
         atomic_private_text_write(paths.launch, json.dumps(launch_payload, indent=2, sort_keys=True) + "\n")
@@ -458,7 +478,7 @@ class O2Connection:
         daemon: subprocess.Popen[bytes] | None = None
         try:
             with open_private_append(paths.log) as log:  # noqa: SIM117 - fd must outlive Popen only
-                with self.policy.consume_login_grant_for_launch(grant_id, "login") as consumed:
+                with self.policy.consume_login_grant_for_launch(grant_id, logical_target) as consumed:
                     daemon = subprocess.Popen(
                         [*daemon_argv, "--ack-fd", str(write_fd)],
                         stdin=subprocess.DEVNULL,
@@ -492,10 +512,10 @@ class O2Connection:
         client.wait_until_ready(timeout=self.config.broker_start_timeout)
         return client.local_status()
 
-    def stop_broker(self, *, reason: str) -> dict[str, object]:
-        """Stop only the local broker session; allowed even while policy is disabled."""
+    def stop_broker(self, *, reason: str, transfer: bool = False) -> dict[str, object]:
+        """Stop one local broker session; allowed even while policy is disabled."""
 
-        client = self._broker or BrokerClient(self.config.broker_dir)
+        client = self._broker_client(transfer=transfer)
         return client.stop(reason=reason)
 
     # -- ControlMaster lifecycle ------------------------------------------------
@@ -771,14 +791,17 @@ class O2Connection:
         require_master: bool = True,
         input_text: str | None = None,
         alias: str | None = None,
+        broker_role: LoginTarget | None = None,
     ) -> CommandResult:
         """Run one logical command over the existing persistent broker channel.
 
-        Production MCP construction routes every login-node command through the
-        workstation broker, which opens no new SSH process or SSH session
-        channel per call. ``alias`` may only be the login alias in broker mode;
-        transfer-host commands remain fail-closed until a separately framed
-        transfer broker exists.
+        Production MCP construction routes login- and transfer-node commands
+        through their distinct workstation brokers, each of which opens no new
+        SSH process or SSH session channel per call. ``alias`` must identify one
+        of those two configured roles. Bulk rsync remains on the separately
+        governed transfer ControlMaster compatibility path. ``broker_role``
+        disambiguates installations that intentionally map both roles to the
+        same SSH alias; ordinary callers may omit it when aliases are distinct.
 
         The historical injected-runner path remains solely for deterministic
         unit tests of legacy SSH/rsync argv hardening. It still requires an exact
@@ -790,15 +813,30 @@ class O2Connection:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH execution is disabled. Start one explicitly authorized persistent broker, then retry."
             )
-        target = alias or self.config.host_alias
-        if self._broker is not None:
-            if target != self.config.host_alias:
+        if broker_role not in {None, "login", "transfer"}:
+            raise ValueError("broker_role must be 'login', 'transfer', or None")
+        expected_target = self.config.transfer_alias if broker_role == "transfer" else self.config.host_alias
+        if broker_role is not None and alias is not None and alias != expected_target:
+            raise O2UnsafeTransportError(
+                f"Broker role '{broker_role}' is configured for alias '{expected_target}', not '{alias}'."
+            )
+        target = expected_target if broker_role is not None else alias or self.config.host_alias
+        if not self._uses_legacy_test_transport:
+            selected_role = broker_role
+            if selected_role is None and target == self.config.host_alias:
+                selected_role = "login"
+            elif selected_role is None and target == self.config.transfer_alias:
+                selected_role = "transfer"
+            if selected_role == "login":
+                broker = self._broker_client(transfer=False)
+            elif selected_role == "transfer":
+                broker = self._broker_client(transfer=True)
+            else:
                 raise O2UnsafeTransportError(
-                    f"Persistent broker MVP is scoped to login alias '{self.config.host_alias}', not '{target}'. "
-                    "Do not fall back to a one-off transfer-host SSH session."
+                    f"Persistent brokers may target only configured O2 aliases, not '{target}'."
                 )
             remote_timeout = float(timeout) if timeout is not None else 86400.0
-            result = self._broker.execute(command, timeout=remote_timeout, input_text=input_text)
+            result = broker.execute(command, timeout=remote_timeout, input_text=input_text)
             truncation_notes: list[str] = []
             if result.stdout_truncated:
                 truncation_notes.append("stdout truncated by persistent broker")
@@ -1402,7 +1440,7 @@ class O2Connection:
         actionable error; cold transports are no longer supported.
         """
         self.policy.require_reuse_allowed()
-        if self._broker is not None and argv and argv[0] in {"ssh", self.SSH_EXECUTABLE}:
+        if not self._uses_legacy_test_transport and argv and argv[0] in {"ssh", self.SSH_EXECUTABLE}:
             # Even authentication-disabled SSH over a live ControlMaster opens a
             # new server-side session channel, which O2 may challenge with Duo.
             # Raw SSH cannot express the broker protocol and is therefore not a

@@ -21,6 +21,7 @@ import fcntl
 import json
 import math
 import os
+import select
 import signal
 import socket
 import stat
@@ -53,6 +54,10 @@ class O2BrokerUnavailableError(O2BrokerError):
 
 class O2BrokerStartupError(O2BrokerError):
     """Raised when the one authorized broker launch cannot become ready."""
+
+
+class O2BrokerCommandOutcomeUnknownError(O2BrokerError):
+    """Raised when a dispatched command loses its result and must not be retried."""
 
 
 class _O2BrokerTransportError(O2BrokerError):
@@ -171,7 +176,7 @@ def prepare_broker_directory(path: Path) -> BrokerPaths:
     if socket_bytes > MAX_UNIX_SOCKET_PATH_BYTES:
         raise O2BrokerError(
             f"broker socket path needs {socket_bytes} bytes; portable maximum is {MAX_UNIX_SOCKET_PATH_BYTES}. "
-            "Set O2_BROKER_DIR to a shorter private absolute path."
+            "Set the applicable O2_BROKER_DIR or O2_TRANSFER_BROKER_DIR to a shorter private absolute path."
         )
     _validate_private_directory(paths.root, create=True)
     return paths
@@ -275,8 +280,8 @@ class BrokerClient:
     def __init__(self, root: str | Path) -> None:
         self.paths = BrokerPaths(Path(root).expanduser())
 
-    def _request(self, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-        """Send one framed local request after validating the socket boundary."""
+    def _connect(self, *, timeout: float | None) -> socket.socket:
+        """Connect to the validated private endpoint without sending a frame."""
 
         _validate_private_directory(self.paths.root, create=False)
         try:
@@ -290,11 +295,27 @@ class BrokerClient:
             raise O2BrokerUnavailableError("The O2 broker endpoint is not a caller-owned Unix socket.")
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise O2BrokerUnavailableError("The O2 broker socket is accessible outside its owner.")
+        state = _read_state(self.paths)
+        if state.get("protocol") != PROTOCOL_VERSION:
+            raise O2BrokerUnavailableError(
+                f"The O2 broker receipt uses protocol {state.get('protocol')!r}, but this client requires "
+                f"protocol {PROTOCOL_VERSION}. Stop the old broker locally before any explicitly authorized restart."
+            )
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(timeout)
         try:
             client.connect(str(self.paths.socket))
+            return client
+        except OSError as exc:
+            client.close()
+            raise O2BrokerUnavailableError(f"The persistent O2 broker did not answer locally: {exc}") from exc
+
+    def _request(self, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+        """Send one bounded local control request and read its sole response."""
+
+        client = self._connect(timeout=timeout)
+        try:
             with client.makefile("rwb", buffering=0) as stream:
                 write_frame(stream, payload)
                 return read_frame(stream)
@@ -325,22 +346,51 @@ class BrokerClient:
         if input_text is not None and not isinstance(input_text, str):
             raise ValueError("broker stdin must be text or None")
         request_id = str(uuid.uuid4())
-        response = self._request(
-            {
-                "type": "exec",
-                "id": request_id,
-                "command": command,
-                "timeout_seconds": timeout,
-                "stdin": input_text,
-            },
-            # The remote timeout is authoritative. The small local allowance
-            # covers framing and process teardown without encouraging retries.
-            timeout=timeout + 10.0,
-        )
-        if response.get("type") == "error" and response.get("error") == "policy_denied":
-            raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+        request = {
+            "type": "exec",
+            "protocol": PROTOCOL_VERSION,
+            "id": request_id,
+            "command": command,
+            "timeout_seconds": timeout,
+            "stdin": input_text,
+        }
+        client = self._connect(timeout=5.0)
+        dispatched = False
+        try:
+            with client.makefile("rwb", buffering=0) as stream:
+                write_frame(stream, request)
+                # Queue time is intentionally not command time. The daemon
+                # writes `dispatched` only after this request reaches the front
+                # and policy still permits its remote frame. If this caller
+                # disconnects first, the daemon cancels the queued request.
+                client.settimeout(None)
+                response = read_frame(stream)
+                if response.get("type") == "error" and response.get("error") == "policy_denied":
+                    raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+                if response != {"type": "dispatched", "id": request_id}:
+                    raise O2BrokerCommandOutcomeUnknownError(
+                        f"O2 broker request {request_id} was sent but returned an unexpected dispatch response: "
+                        f"{response!r}. Do not retry automatically; inspect broker state first."
+                    )
+                dispatched = True
+                client.settimeout(timeout + 10.0)
+                response = read_frame(stream)
+        except O2PolicyDeniedError:
+            raise
+        except (OSError, BrokerProtocolError) as exc:
+            if dispatched:
+                raise O2BrokerCommandOutcomeUnknownError(
+                    f"O2 broker command {request_id} was dispatched but its result was lost: {exc}. "
+                    "Do not retry automatically; inspect remote receipts or state first."
+                ) from exc
+            raise O2BrokerUnavailableError(f"The O2 broker did not dispatch the command: {exc}") from exc
+        finally:
+            client.close()
         if response.get("type") != "result" or response.get("id") != request_id:
-            raise O2BrokerError(f"unexpected broker response for request {request_id}: {response!r}")
+            raise O2BrokerCommandOutcomeUnknownError(
+                f"O2 broker command {request_id} was dispatched but returned an unexpected response: "
+                f"{response!r}. Do not retry automatically; inspect remote receipts or state first."
+            )
         try:
             return BrokerExecutionResult(
                 returncode=int(response["returncode"]),
@@ -352,7 +402,10 @@ class BrokerClient:
                 stderr_truncated=bool(response.get("stderr_truncated", False)),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise O2BrokerError(f"malformed broker result for request {request_id}: {response!r}") from exc
+            raise O2BrokerCommandOutcomeUnknownError(
+                f"O2 broker command {request_id} was dispatched but returned a malformed result: "
+                f"{response!r}. Do not retry automatically; inspect remote receipts or state first."
+            ) from exc
 
     def ping(self, *, timeout: float = 1.0) -> dict[str, Any]:
         """Verify the local daemon only; this never sends a remote frame."""
@@ -433,6 +486,7 @@ class BrokerServer:
         alias: str,
         grant_id: str | None = None,
         ack_fd: int | None = None,
+        startup_timeout: float = 90.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.paths = paths
@@ -441,6 +495,9 @@ class BrokerServer:
         self.alias = alias
         self.grant_id = grant_id
         self.ack_fd = ack_fd
+        if not math.isfinite(startup_timeout) or startup_timeout <= 0:
+            raise ValueError("broker startup timeout must be finite and positive")
+        self.startup_timeout = startup_timeout
         self.clock = clock
         self.transport: subprocess.Popen[bytes] | None = None
         self.listener: socket.socket | None = None
@@ -524,13 +581,30 @@ class BrokerServer:
             name="o2-broker-stderr",
             daemon=True,
         ).start()
-        try:
-            # A remote login shell may emit a bounded site/user banner on
-            # stdout before execing Python. The protocol magic permits this one
-            # initial resynchronization; all command responses remain strict.
-            hello = read_frame(self.transport.stdout, resynchronize=True)
-        except Exception as exc:
+        hello_result: dict[str, Any] = {}
+
+        def receive_hello() -> None:
+            """Read the first frame in a daemon thread bounded by startup_timeout."""
+
+            try:
+                # A remote login shell may emit a bounded site/user banner on
+                # stdout before execing Python. The protocol magic permits this
+                # one initial resynchronization; command responses stay strict.
+                hello_result["payload"] = read_frame(self.transport.stdout, resynchronize=True)
+            except Exception as exc:  # pragma: no cover - surfaced by parent thread
+                hello_result["error"] = exc
+
+        hello_thread = threading.Thread(target=receive_hello, name="o2-broker-hello", daemon=True)
+        hello_thread.start()
+        hello_thread.join(timeout=self.startup_timeout)
+        if hello_thread.is_alive():
+            raise O2BrokerStartupError(
+                f"persistent transport emitted no protocol hello within {self.startup_timeout:.1f}s"
+            )
+        if "error" in hello_result:
+            exc = hello_result["error"]
             raise O2BrokerStartupError(f"persistent transport ended before protocol hello: {exc}") from exc
+        hello = hello_result.get("payload")
         if hello != {"type": "hello", "protocol": PROTOCOL_VERSION}:
             raise O2BrokerStartupError(f"unexpected remote broker hello: {hello!r}")
         if self.grant_id is not None:
@@ -600,7 +674,8 @@ class BrokerServer:
                 and request_timeout > 0
             )
             valid_request = (
-                isinstance(request.get("id"), str)
+                request.get("protocol") == PROTOCOL_VERSION
+                and isinstance(request.get("id"), str)
                 and bool(request["id"])
                 and isinstance(request.get("command"), str)
                 and bool(request["command"])
@@ -619,6 +694,22 @@ class BrokerServer:
             # command or observes a command that was already launched.
             try:
                 with self.policy.serialize_reuse_launch():
+                    # This acknowledgement is the execution boundary. If a
+                    # queued caller has disconnected, do not forward its frame;
+                    # otherwise it could perform a mutation after reporting a
+                    # local timeout and invite a dangerous retry.
+                    readable, _, _ = select.select([client], [], [], 0)
+                    if readable:
+                        try:
+                            pending = client.recv(1, socket.MSG_PEEK)
+                        except OSError:
+                            return
+                        if not pending:
+                            return
+                    try:
+                        write_frame(local, {"type": "dispatched", "id": request["id"]})
+                    except (OSError, BrokerProtocolError):
+                        return
                     write_frame(remote_in, request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
@@ -716,6 +807,14 @@ def _load_launch(path: Path) -> dict[str, Any]:
     argv = payload.get("transport_argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
         raise O2BrokerStartupError("broker launch transport_argv must be a non-empty string list")
+    startup_timeout = payload.get("startup_timeout")
+    if (
+        not isinstance(startup_timeout, (int, float))
+        or isinstance(startup_timeout, bool)
+        or not math.isfinite(startup_timeout)
+        or startup_timeout <= 0
+    ):
+        raise O2BrokerStartupError("broker launch startup_timeout must be finite and positive")
     return payload
 
 
@@ -749,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
             alias=payload["alias"],
             grant_id=payload["grant_id"],
             ack_fd=args.ack_fd,
+            startup_timeout=float(payload["startup_timeout"]),
         )
         _install_signal_handlers(server)
         return server.serve_forever()

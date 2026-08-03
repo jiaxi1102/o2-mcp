@@ -46,6 +46,15 @@ def _default_broker_dir() -> Path:
     return Path.home() / ".agent_locks" / "o2-broker"
 
 
+def _default_transfer_broker_dir() -> Path:
+    """Return the private persistent-command directory for the transfer host."""
+
+    configured = os.environ.get("O2_TRANSFER_BROKER_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".agent_locks" / "o2-transfer-broker"
+
+
 @dataclass
 class O2Config:
     """Connection settings for HMS O2.
@@ -67,6 +76,9 @@ class O2Config:
         broker_start_timeout: Maximum time to wait for the authorized persistent
             channel to complete authentication and emit its protocol hello. A
             timeout is reported without starting a second attempt.
+        transfer_broker_dir: Separate private broker directory for commands that
+            must execute on the O2 transfer host. Login and transfer grants and
+            channels remain distinct even when aliases happen to match.
     """
 
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
@@ -122,6 +134,7 @@ class O2Config:
     broker_start_timeout: float = field(
         default_factory=lambda: float(os.environ.get("O2_BROKER_START_TIMEOUT_SECONDS", "90"))
     )
+    transfer_broker_dir: Path = field(default_factory=_default_transfer_broker_dir)
 
     def __post_init__(self) -> None:
         """Normalize and validate process-independent local authority paths.
@@ -142,6 +155,11 @@ class O2Config:
         self.broker_dir = Path(self.broker_dir).expanduser()
         if not self.broker_dir.is_absolute():
             raise ValueError("O2 broker directory must be one workstation-wide absolute path")
+        self.transfer_broker_dir = Path(self.transfer_broker_dir).expanduser()
+        if not self.transfer_broker_dir.is_absolute():
+            raise ValueError("O2 transfer broker directory must be one workstation-wide absolute path")
+        if self.transfer_broker_dir == self.broker_dir:
+            raise ValueError("O2 login and transfer brokers must use different authority directories")
         if not math.isfinite(self.broker_start_timeout) or self.broker_start_timeout <= 0:
             raise ValueError("O2 broker start timeout must be greater than zero")
 

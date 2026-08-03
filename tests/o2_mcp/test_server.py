@@ -20,6 +20,7 @@ from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
+    O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
     async_transfer,  # noqa: E402
     transfer_tools,  # noqa: E402
@@ -246,6 +247,7 @@ async def test_local_status_reports_disabled_policy_without_ssh(monkeypatch, tmp
     assert payload["ok"] is True
     assert payload["policy"]["effective_mode"] == "disabled"
     assert payload["policy"]["path"] == str(tmp_path / "O2_POLICY.json")
+    assert set(payload["command_brokers"]) == {"login", "transfer"}
     assert runner.calls == []
 
 
@@ -339,6 +341,72 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
     assert payload["ok"] is False
     assert payload["returncode"] == 255
     assert "post-start control-socket check failed" in payload["stderr"]
+
+
+@pytest.mark.anyio
+async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
+    """MCP input must carry transfer intent through start, probe, and stop."""
+
+    class _Config:
+        host_alias = "o2"
+        transfer_alias = "o2-transfer"
+        connect_timeout = 20
+
+    class _Connection:
+        config = _Config()
+
+        def __init__(self):
+            self.calls = []
+
+        def start_broker(self, *, grant_id=None, transfer=False):
+            self.calls.append(("start", grant_id, transfer))
+            return {"responsive": True}
+
+        def run(self, command, *, timeout, alias, broker_role=None):
+            self.calls.append(("run", command, timeout, alias, broker_role))
+            return CommandResult(["broker", alias, command], 0, "transfer-ok\n", "")
+
+        def stop_broker(self, *, reason, transfer=False):
+            self.calls.append(("stop", reason, transfer))
+            return {"type": "stopping"}
+
+    connection = _Connection()
+    monkeypatch.setattr(o2server, "_connection", lambda: connection)
+
+    started = await _call("o2_start_broker", {"params": {"grant_id": "grant-1", "transfer": True}})
+    probed = await _call("o2_probe", {"params": {"transfer": True}})
+    stopped = await _call(
+        "o2_stop_broker",
+        {"params": {"reason": "offline role-routing test", "transfer": True}},
+    )
+
+    assert started["ok"] is True and started["target"] == "transfer"
+    assert probed["ok"] is True and probed["alias"] == "o2-transfer"
+    assert stopped["ok"] is True and stopped["target"] == "transfer"
+    assert connection.calls == [
+        ("start", "grant-1", True),
+        ("run", "hostname; whoami; date", 25, "o2-transfer", "transfer"),
+        ("stop", "offline role-routing test", True),
+    ]
+
+
+@pytest.mark.anyio
+async def test_dispatched_result_loss_is_explicitly_not_retry_safe(monkeypatch):
+    """The MCP response must discourage duplicating an uncertain remote action."""
+
+    class _Connection:
+        def run(self, *_args, **_kwargs):
+            raise O2BrokerCommandOutcomeUnknownError("dispatched result was lost")
+
+    monkeypatch.setattr(o2server, "_connection", _Connection)
+    payload = await _call("o2_exec", {"params": {"command": "sbatch job.sh"}})
+
+    assert payload == {
+        "ok": False,
+        "error": "broker_outcome_unknown",
+        "message": "dispatched result was lost",
+        "retry_safe": False,
+    }
 
 
 @pytest.mark.anyio

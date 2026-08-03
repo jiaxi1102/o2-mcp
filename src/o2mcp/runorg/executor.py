@@ -439,7 +439,14 @@ class O2Runs:
         # as ordinary commands. Centralizing argv construction in O2Connection
         # prevents this detached lifecycle operation from becoming an accidental
         # cold-login escape hatch.
-        res = self.conn.run(launch, timeout=60, alias=self.conn.config.transfer_alias)
+        # The explicit role keeps transfer launches on their separately granted
+        # broker even when an installation maps both roles to the same SSH alias.
+        res = self.conn.run(
+            launch,
+            timeout=60,
+            alias=self.conn.config.transfer_alias,
+            broker_role="transfer",
+        )
         pid = ""
         for token in res.stdout.split():
             if token.isdigit():

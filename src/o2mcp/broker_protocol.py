@@ -18,7 +18,10 @@ import textwrap
 from collections.abc import Mapping
 from typing import Any, BinaryIO
 
-PROTOCOL_VERSION = 1
+# Version 2 adds the local dispatch acknowledgement. A client must never send a
+# command to a version-1 daemon because that older server could execute it while
+# the newer client mistakes the direct result for a pre-dispatch failure.
+PROTOCOL_VERSION = 2
 FRAME_MAGIC = b"O2B1"
 HEADER_SIZE = len(FRAME_MAGIC) + 4
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -142,10 +145,14 @@ def remote_helper_source() -> str:
         f"""\
         import json
         import math
+        import os
+        import signal
         import struct
         import subprocess
         import sys
+        import threading
         import time
+        from contextlib import suppress
 
         PROTOCOL_VERSION = {PROTOCOL_VERSION}
         FRAME_MAGIC = b"O2B1"
@@ -182,12 +189,101 @@ def remote_helper_source() -> str:
             sys.stdout.buffer.write(FRAME_MAGIC + struct.pack(\"!I\", len(body)) + body)
             sys.stdout.buffer.flush()
 
-        def bounded_text(value):
-            raw = value or b\"\"
-            truncated = len(raw) > MAX_OUTPUT_BYTES
-            if truncated:
-                raw = raw[:MAX_OUTPUT_BYTES]
-            return raw.decode(\"utf-8\", errors=\"replace\"), truncated
+        def drain_bounded(stream, captures, key):
+            parts = []
+            retained = 0
+            truncated = False
+            try:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    room = max(0, MAX_OUTPUT_BYTES - retained)
+                    if room:
+                        kept = chunk[:room]
+                        parts.append(kept)
+                        retained += len(kept)
+                    if len(chunk) > room:
+                        truncated = True
+            except OSError:
+                pass
+            finally:
+                with suppress(OSError):
+                    stream.close()
+                captures[key] = (b\"\".join(parts), truncated)
+
+        def feed_stdin(stream, value):
+            try:
+                if value is not None:
+                    stream.write(value.encode(\"utf-8\"))
+                    stream.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                with suppress(OSError):
+                    stream.close()
+
+        def kill_process_group(process):
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            if process.poll() is None:
+                process.kill()
+
+        def run_bounded(command, stdin_text, timeout):
+            process = subprocess.Popen(
+                [\"/bin/bash\", \"-lc\", command],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captures = {{}}
+            stdout_thread = threading.Thread(
+                target=drain_bounded, args=(process.stdout, captures, \"stdout\"), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=drain_bounded, args=(process.stderr, captures, \"stderr\"), daemon=True
+            )
+            stdin_thread = threading.Thread(target=feed_stdin, args=(process.stdin, stdin_text), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+            stdin_thread.start()
+            timed_out = False
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                kill_process_group(process)
+                process.wait()
+
+            # Correctly detached children redirect these descriptors and let the
+            # drains end immediately. A child that accidentally inherits them
+            # must not keep the broker hung or make output accumulation unbounded.
+            for thread in (stdout_thread, stderr_thread):
+                thread.join(timeout=0.5)
+            if stdout_thread.is_alive() or stderr_thread.is_alive():
+                kill_process_group(process)
+                for stream in (process.stdout, process.stderr):
+                    with suppress(OSError):
+                        os.close(stream.fileno())
+                stdout_thread.join(timeout=0.5)
+                stderr_thread.join(timeout=0.5)
+            stdin_thread.join(timeout=0.5)
+
+            stdout_raw, stdout_truncated = captures.get(\"stdout\", (b\"\", False))
+            stderr_raw, stderr_truncated = captures.get(\"stderr\", (b\"\", False))
+            stdout = stdout_raw.decode(\"utf-8\", errors=\"replace\")
+            stderr = stderr_raw.decode(\"utf-8\", errors=\"replace\")
+            if timed_out:
+                stderr += (\"\\n\" if stderr else \"\") + \"command timed out inside persistent O2 broker\"
+            return (
+                124 if timed_out else process.returncode,
+                stdout,
+                stderr,
+                timed_out,
+                stdout_truncated,
+                stderr_truncated,
+            )
 
         write_frame({{"type": "hello", "protocol": PROTOCOL_VERSION}})
         while True:
@@ -211,42 +307,20 @@ def remote_helper_source() -> str:
                 write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})
                 continue
             started = time.monotonic()
-            try:
-                completed = subprocess.run(
-                    [\"/bin/bash\", \"-lc\", command],
-                    input=stdin_text.encode(\"utf-8\") if stdin_text is not None else None,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=float(timeout),
-                    check=False,
-                )
-                stdout, stdout_truncated = bounded_text(completed.stdout)
-                stderr, stderr_truncated = bounded_text(completed.stderr)
-                response = {{
-                    "type": "result",
-                    "id": request_id,
-                    "returncode": completed.returncode,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "timed_out": False,
-                    "duration_seconds": time.monotonic() - started,
-                    "stdout_truncated": stdout_truncated,
-                    "stderr_truncated": stderr_truncated,
-                }}
-            except subprocess.TimeoutExpired as exc:
-                stdout, stdout_truncated = bounded_text(exc.stdout)
-                stderr, stderr_truncated = bounded_text(exc.stderr)
-                response = {{
-                    "type": "result",
-                    "id": request_id,
-                    "returncode": 124,
-                    "stdout": stdout,
-                    "stderr": stderr + ("\\n" if stderr else "") + "command timed out inside persistent O2 broker",
-                    "timed_out": True,
-                    "duration_seconds": time.monotonic() - started,
-                    "stdout_truncated": stdout_truncated,
-                    "stderr_truncated": stderr_truncated,
-                }}
+            returncode, stdout, stderr, timed_out, stdout_truncated, stderr_truncated = run_bounded(
+                command, stdin_text, float(timeout)
+            )
+            response = {{
+                "type": "result",
+                "id": request_id,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timed_out": timed_out,
+                "duration_seconds": time.monotonic() - started,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }}
             write_frame(response)
         """
     )

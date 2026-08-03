@@ -10,6 +10,7 @@ import json
 
 from o2mcp import CommandResult, O2Config
 from o2mcp import O2Connection as _ProductionO2Connection
+from o2mcp.broker import BrokerExecutionResult
 from o2mcp.runorg import (
     RETENTION_KEEP,
     RETENTION_SWEEP,
@@ -214,40 +215,48 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
 
 
-def test_live_transition_uses_reuse_only_transfer_master(tmp_path):
-    """A detached promotion launch cannot cold-connect to the transfer node."""
+def test_live_transition_uses_persistent_transfer_broker(tmp_path):
+    """A detached promotion is framed through the role-specific transfer session."""
 
     manifest_json = (
         '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
         '"created_utc":"20260101T000000Z","status":"active","datasets":["d"]}'
     )
 
-    def responder(argv, _inp):
-        command = argv[-1]
-        if command.startswith("cat ") and "run.json" in command:
-            return (manifest_json, "", 0)
-        if command.startswith("nohup bash "):
-            return ("PID 4321\n", "", 0)
-        return ("", "", 0)
+    class _Broker:
+        def __init__(self, *, transfer=False):
+            self.transfer = transfer
+            self.calls = []
 
-    runner = _Runner(responder)
+        def execute(self, command, *, timeout, input_text=None):
+            self.calls.append({"command": command, "timeout": timeout, "input": input_text})
+            if command.startswith("cat ") and "run.json" in command:
+                stdout = manifest_json
+            elif self.transfer and command.startswith("nohup bash "):
+                stdout = "PID 4321\n"
+            else:
+                stdout = ""
+            return BrokerExecutionResult(0, stdout, "", False, 0.01, False, False)
+
+    login_broker = _Broker()
+    transfer_broker = _Broker(transfer=True)
     config = _cfg(tmp_path)
-    runs = O2Runs(O2Connection(config, runner=runner), TEST_POLICY)
+    runs = O2Runs(
+        _ProductionO2Connection(
+            config,
+            broker_client=login_broker,
+            transfer_broker_client=transfer_broker,
+        ),
+        TEST_POLICY,
+    )
     run_dir = "/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"
 
     plan = runs.promote(run_dir, dry_run=False)
 
     assert plan.started is True and plan.pid == "4321"
-    transfer_launch = next(call["argv"] for call in runner.calls if call["argv"][-1].startswith("nohup bash "))
-    assert transfer_launch[-2] == "o2-transfer"
-    assert transfer_launch[:5] == [
-        O2Connection.SSH_EXECUTABLE,
-        "-F",
-        "/dev/null",
-        "-S",
-        "/tmp/o2-transfer-control.sock",
-    ]
-    assert transfer_launch[5 : 5 + len(config.reuse_only_ssh_opts())] == config.reuse_only_ssh_opts()
+    assert not any(call["command"].startswith("nohup bash ") for call in login_broker.calls)
+    launch = next(call for call in transfer_broker.calls if call["command"].startswith("nohup bash "))
+    assert launch["timeout"] == 60.0
 
 
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
