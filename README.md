@@ -136,6 +136,9 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 - `O2_POLICY.json` is the sole policy state. Missing, malformed, symlinked,
   wrong-owner, or permissively readable state is effectively `disabled`; no
   project/ancestor lock files or bypass environment variables are consulted.
+  `O2_POLICY_FILE` must be absolute. The first explicit policy mutation safely
+  tightens an owned physical legacy `~/.agent_locks` directory from `0755` to
+  `0700`; aliased or foreign-owned directories remain invalid.
 - Only `o2_start_master` may authenticate, and only after atomically consuming a
   matching client/host/off-VPN-scoped grant. Remote commands, transfers, and
   lifecycle launches disable every SSH authentication method, so OpenSSH's normal

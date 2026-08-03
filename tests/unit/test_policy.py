@@ -122,23 +122,34 @@ def test_unsafe_or_malformed_policy_fails_closed(tmp_path, unsafe_kind):
         store.require_reuse_allowed()
 
 
-@pytest.mark.parametrize("unsafe_kind", ["permissions", "symlink"])
-def test_unsafe_policy_directory_fails_closed_for_reads_and_mutations(tmp_path, unsafe_kind):
+def test_unsafe_policy_directory_fails_closed_for_reads_and_mutations(tmp_path):
     """A secure file cannot compensate for an replaceable parent directory."""
 
     policy_directory = tmp_path / "policy"
-    if unsafe_kind == "permissions":
-        policy_directory.mkdir(mode=0o755)
-        policy_directory.chmod(0o755)
-    else:
-        real_directory = tmp_path / "real-policy"
-        real_directory.mkdir(mode=0o700)
-        policy_directory.symlink_to(real_directory, target_is_directory=True)
+    real_directory = tmp_path / "real-policy"
+    real_directory.mkdir(mode=0o700)
+    policy_directory.symlink_to(real_directory, target_is_directory=True)
     store = O2PolicyStore(policy_directory / "O2_POLICY.json", client_id="client-a")
 
     assert store.snapshot().effective_mode == "disabled"
     with pytest.raises(O2PolicyInvalidError):
         store.disable(reason="must not repair an unsafe parent")
+
+
+def test_owned_legacy_policy_directory_is_tightened_on_disable(tmp_path):
+    """An upgrade can initialize policy in the 0755 directory made by 0.2."""
+
+    policy_directory = tmp_path / "policy"
+    policy_directory.mkdir(mode=0o755)
+    policy_directory.chmod(0o755)
+    store = O2PolicyStore(policy_directory / "O2_POLICY.json", client_id="client-a")
+
+    # Reads remain fail-closed until an explicit mutation performs migration.
+    assert store.snapshot().effective_mode == "disabled"
+    state = store.disable(reason="initialize upgraded global policy")
+
+    assert state["mode"] == "disabled"
+    assert os.stat(policy_directory).st_mode & 0o777 == 0o700
 
 
 def test_login_grant_is_client_target_and_time_scoped(tmp_path):

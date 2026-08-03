@@ -140,6 +140,16 @@ def test_explicit_policy_path_overrides_global_default(monkeypatch, tmp_path):
     assert O2Config().policy_file == explicit
 
 
+def test_relative_policy_paths_are_rejected(monkeypatch):
+    """Working-directory-dependent state cannot coordinate MCP processes."""
+
+    monkeypatch.setenv("O2_POLICY_FILE", "relative/O2_POLICY.json")
+    with pytest.raises(ValueError, match="must be absolute"):
+        O2Config()
+    with pytest.raises(ValueError, match="must be absolute"):
+        O2Config(policy_file=Path("another-relative-policy.json"))
+
+
 def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
     """Ordinary commands must be unable to authenticate if multiplexing fails."""
 

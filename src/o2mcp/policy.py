@@ -584,9 +584,10 @@ class O2PolicyStore:
 
         File mode ``0600`` is insufficient when the containing directory is
         accessible by group or other users: a writable directory permits file
-        replacement, and a readable directory discloses policy metadata.  Both
-        read and mutation paths call this check so unsafe permissions fail
-        closed rather than being silently repaired.
+        replacement, and a readable directory discloses policy metadata. Read
+        paths call this check and fail closed. Mutation paths first use the
+        descriptor-anchored legacy permission migration below, then reach this
+        same validation while reading policy state.
         """
 
         try:
@@ -604,16 +605,56 @@ class O2PolicyStore:
                 "O2 policy directory must not be accessible by group or other users: " f"{self.path.parent}"
             )
 
+    def _prepare_policy_directory(self) -> None:
+        """Create or safely tighten the owned physical policy directory.
+
+        o2-mcp 0.2 created ``~/.agent_locks`` under the caller's ordinary umask,
+        which commonly left an otherwise owned directory at mode ``0755``.
+        Mutations migrate that exact legacy shape to ``0700`` through a
+        descriptor opened with ``O_NOFOLLOW``. Symlinks, non-directories, and
+        foreign-owned objects remain hard failures; only permissions on the
+        user's own physical directory are tightened automatically.
+        """
+
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            directory_fd = os.open(self.path.parent, flags)
+        except OSError as exc:
+            raise O2PolicyInvalidError(f"Cannot prepare O2 policy directory {self.path.parent}: {exc}") from exc
+
+        try:
+            metadata = os.fstat(directory_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise O2PolicyInvalidError(f"O2 policy directory must be a physical directory: {self.path.parent}")
+            if metadata.st_uid != os.getuid():
+                raise O2PolicyInvalidError(f"O2 policy directory is not owned by uid {os.getuid()}: {self.path.parent}")
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                os.fchmod(directory_fd, 0o700)
+                metadata = os.fstat(directory_fd)
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise O2PolicyInvalidError(
+                    "O2 policy directory permission migration did not produce mode 0700: " f"{self.path.parent}"
+                )
+        except O2PolicyInvalidError:
+            raise
+        except OSError as exc:
+            raise O2PolicyInvalidError(f"Cannot secure O2 policy directory {self.path.parent}: {exc}") from exc
+        finally:
+            os.close(directory_fd)
+
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Hold the stable workstation-wide mutex around one JSON mutation."""
 
         try:
-            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            # An existing permissive or aliased directory is a policy-integrity
-            # error.  Do not chmod it automatically: mutation must fail closed
-            # until the human repairs the unsafe filesystem boundary explicitly.
-            self._validate_parent_directory()
+            self._prepare_policy_directory()
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC

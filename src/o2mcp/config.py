@@ -104,6 +104,23 @@ class O2Config:
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
     ssh_config_file: Path = field(default_factory=_default_ssh_config_file)
 
+    def __post_init__(self) -> None:
+        """Normalize and validate process-independent local authority paths.
+
+        The policy file coordinates independently launched MCP processes. A
+        relative path would resolve against each process's current directory
+        and silently create multiple workstation safety states, so both
+        environment-derived and explicitly constructed configurations must use
+        one absolute path.
+        """
+
+        self.policy_file = Path(self.policy_file).expanduser()
+        if not self.policy_file.is_absolute():
+            raise ValueError(
+                "O2 policy path must be absolute; set O2_POLICY_FILE to one " "workstation-wide absolute path"
+            )
+        self.ssh_config_file = Path(self.ssh_config_file).expanduser()
+
     def base_ssh_opts(self) -> list[str]:
         """Return baseline SSH options shared by login and reuse operations.
 
