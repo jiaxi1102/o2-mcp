@@ -100,7 +100,8 @@ automatic retry.
   stale-version receipts are not treated as compatible defaults.
 - Command reuse also requires the receipt's SSH alias to match that role's
   current configuration. A local stop remains available after an alias change
-  so the stale daemon can be retired safely.
+  or protocol upgrade so the stale daemon can be retired safely without sending
+  a remote command.
 - One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.

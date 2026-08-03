@@ -591,6 +591,31 @@ def test_configured_alias_mismatch_blocks_commands_but_allows_local_stop(tmp_pat
             _stop_local_broker(thread, client)
 
 
+def test_trusted_stale_protocol_receipt_still_allows_local_stop(tmp_path, broker_root):
+    """A package upgrade cannot strand the old daemon behind command checks."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    state = json.loads(client.paths.state.read_text())
+    state["protocol"] = 1
+    client.paths.state.write_text(json.dumps(state))
+    client.paths.state.chmod(0o600)
+    try:
+        with pytest.raises(O2BrokerUnavailableError, match="no trusted ready receipt"):
+            client.execute("printf obsolete", timeout=2)
+
+        stopped = client.stop(reason="retire stale protocol")
+        assert stopped["type"] == "stopping"
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        if thread.is_alive():
+            # Restore the current receipt only for emergency test cleanup.
+            state["protocol"] = PROTOCOL_VERSION
+            client.paths.state.write_text(json.dumps(state))
+            client.paths.state.chmod(0o600)
+            _stop_local_broker(thread, client)
+
+
 def test_commands_do_not_source_login_profiles_per_frame(tmp_path, broker_root, monkeypatch):
     """The helper inherits one session environment without per-command banners."""
 

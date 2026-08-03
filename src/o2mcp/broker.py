@@ -293,7 +293,13 @@ class BrokerClient:
         self.paths = BrokerPaths(Path(root).expanduser())
         self.expected_alias = expected_alias
 
-    def _connect(self, *, timeout: float | None, require_expected_alias: bool = True) -> socket.socket:
+    def _connect(
+        self,
+        *,
+        timeout: float | None,
+        require_expected_alias: bool = True,
+        require_current_protocol: bool = True,
+    ) -> socket.socket:
         """Connect to the validated private endpoint without sending a frame."""
 
         _validate_private_directory(self.paths.root, create=False)
@@ -309,7 +315,7 @@ class BrokerClient:
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise O2BrokerUnavailableError("The O2 broker socket is accessible outside its owner.")
         state = _read_state(self.paths)
-        if state.get("status") != "ready" or state.get("protocol") != PROTOCOL_VERSION:
+        if state.get("status") != "ready" or (require_current_protocol and state.get("protocol") != PROTOCOL_VERSION):
             raise O2BrokerUnavailableError(
                 f"The O2 broker has no trusted ready receipt for protocol {PROTOCOL_VERSION} "
                 f"(status={state.get('status')!r}, protocol={state.get('protocol')!r}). "
@@ -336,10 +342,15 @@ class BrokerClient:
         *,
         timeout: float,
         require_expected_alias: bool = True,
+        require_current_protocol: bool = True,
     ) -> dict[str, Any]:
         """Send one bounded local control request and read its sole response."""
 
-        client = self._connect(timeout=timeout, require_expected_alias=require_expected_alias)
+        client = self._connect(
+            timeout=timeout,
+            require_expected_alias=require_expected_alias,
+            require_current_protocol=require_current_protocol,
+        )
         try:
             with client.makefile("rwb", buffering=0) as stream:
                 write_frame(stream, payload)
@@ -494,8 +505,11 @@ class BrokerClient:
             {"type": "stop", "id": str(uuid.uuid4()), "reason": reason},
             timeout=timeout,
             # A local stop must remain possible after the configured SSH alias
-            # changes; only command reuse is bound to the expected destination.
+            # or package protocol changes; only command reuse requires the
+            # current destination and dispatch semantics. Protocols 1 and 2 use
+            # the same framing and local stop request.
             require_expected_alias=False,
+            require_current_protocol=False,
         )
         if response.get("type") != "stopping":
             raise O2BrokerError(f"unexpected broker stop response: {response!r}")
