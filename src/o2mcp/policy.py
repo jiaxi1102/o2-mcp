@@ -491,9 +491,9 @@ class O2PolicyStore:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(self.mutex_path, flags, 0o600)
-        except (OSError, O2PolicyInvalidError) as exc:
-            if isinstance(exc, O2PolicyInvalidError):
-                raise
+        except O2PolicyInvalidError:
+            raise
+        except OSError as exc:
             raise O2PolicyInvalidError(f"Cannot create O2 policy mutex at {self.mutex_path}: {exc}") from exc
 
         handle = os.fdopen(fd, "r+")
@@ -639,8 +639,8 @@ class O2PolicyStore:
         """Validate short audit metadata without storing an entire chat transcript."""
 
         if not isinstance(value, str) or not value.strip():
-            raise O2PolicyError(f"{field} must be a non-empty string")
+            raise O2PolicyInvalidError(f"{field} must be a non-empty string")
         cleaned = " ".join(value.split())
         if len(cleaned) > 240:
-            raise O2PolicyError(f"{field} must be at most 240 characters")
+            raise O2PolicyInvalidError(f"{field} must be at most 240 characters")
         return cleaned
