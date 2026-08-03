@@ -182,7 +182,11 @@ class O2PolicyStore:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.path = Path(path).expanduser()
-        self.mutex_path = self.path.with_suffix(".mutex")
+        # Append rather than replace the policy suffix. A configured policy
+        # already ending in ``.mutex`` must never alias the flock inode: policy
+        # rewrites use os.replace(), and replacing the locked inode would let a
+        # second process lock the new file inside the first critical section.
+        self.mutex_path = self.path.with_name(f"{self.path.name}.mutex")
         self.client_id = client_id or _PROCESS_CLIENT_ID
         self._clock = clock
 

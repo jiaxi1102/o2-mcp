@@ -60,6 +60,19 @@ def test_disable_initializes_secure_atomic_state(tmp_path):
     assert os.stat(store.path.parent).st_mode & 0o777 == 0o700
 
 
+def test_policy_path_cannot_alias_appended_mutex(tmp_path):
+    """A policy named ``*.mutex`` still locks a separate stable inode."""
+
+    store = O2PolicyStore(tmp_path / "custom-policy.mutex", client_id="client-a")
+
+    state = store.disable(reason="initialize unusual absolute policy name")
+
+    assert state["mode"] == "disabled"
+    assert store.mutex_path == tmp_path / "custom-policy.mutex.mutex"
+    assert store.mutex_path != store.path
+    assert store.path.is_file() and store.mutex_path.is_file()
+
+
 def test_reuse_enable_uses_compare_and_swap_revision(tmp_path):
     store = O2PolicyStore(tmp_path / "O2_POLICY.json", client_id="client-a")
     state = store.disable(reason="initialize")
