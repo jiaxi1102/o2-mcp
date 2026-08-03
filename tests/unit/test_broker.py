@@ -498,11 +498,11 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
 @pytest.mark.parametrize(
     ("receipt", "mode"),
     [
-        ('{"schema_version":1,"status":"ready","protocol":1}\n', 0o600),
+        ('{"schema_version":1,"status":"ready","protocol":1,"alias":"offline-o2"}\n', 0o600),
         (None, None),
         ("{malformed", 0o600),
-        ('{"schema_version":1,"status":"ready","protocol":2}\n', 0o644),
-        ('{"schema_version":1,"status":"starting","protocol":2}\n', 0o600),
+        ('{"schema_version":1,"status":"ready","protocol":2,"alias":"offline-o2"}\n', 0o644),
+        ('{"schema_version":1,"status":"starting","protocol":2,"alias":"offline-o2"}\n', 0o600),
     ],
 )
 def test_unverified_receipt_fails_before_connecting_to_daemon(broker_root, receipt, mode):
@@ -569,6 +569,47 @@ def test_incomplete_local_frame_times_out_without_wedging_broker(tmp_path, broke
         assert client.execute("printf recovered", timeout=2).stdout == "recovered"
     finally:
         stalled.close()
+        _stop_local_broker(thread, client)
+
+
+def test_configured_alias_mismatch_blocks_commands_but_allows_local_stop(tmp_path, broker_root):
+    """Changing an alias cannot silently reuse the old host or trap its daemon."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    mismatched = BrokerClient(client.paths.root, expected_alias="different-o2")
+    try:
+        with pytest.raises(O2BrokerUnavailableError, match="targets alias 'offline-o2'"):
+            mismatched.execute("printf wrong-host", timeout=2)
+        assert client.ping()["commands_completed"] == 0
+
+        stopped = mismatched.stop(reason="configured alias changed")
+        assert stopped["type"] == "stopping"
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_commands_do_not_source_login_profiles_per_frame(tmp_path, broker_root, monkeypatch):
+    """The helper inherits one session environment without per-command banners."""
+
+    home = tmp_path / "remote-home"
+    home.mkdir()
+    (home / ".bash_profile").write_text("echo unexpected-login-profile\n")
+    (home / ".bashrc").write_text("echo unexpected-bashrc\n")
+    bash_env = home / "bash-env"
+    bash_env.write_text("echo unexpected-bash-env\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BASH_ENV", str(bash_env))
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        result = client.execute("printf clean", timeout=2)
+
+        assert result.stdout == "clean"
+        assert result.stderr == ""
+    finally:
         _stop_local_broker(thread, client)
 
 

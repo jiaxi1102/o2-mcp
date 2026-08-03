@@ -273,6 +273,8 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
             raise O2BrokerError("broker state receipt has no valid protocol version")
         if not isinstance(payload.get("status"), str):
             raise O2BrokerError("broker state receipt has no valid lifecycle status")
+        if not isinstance(payload.get("alias"), str) or not payload["alias"]:
+            raise O2BrokerError("broker state receipt has no valid SSH alias")
         return payload
     except FileNotFoundError:
         return {"status": "absent"}
@@ -285,10 +287,13 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
 class BrokerClient:
     """Local Unix-socket client shared by independently launched MCP processes."""
 
-    def __init__(self, root: str | Path) -> None:
-        self.paths = BrokerPaths(Path(root).expanduser())
+    def __init__(self, root: str | Path, *, expected_alias: str | None = None) -> None:
+        """Bind a client to one broker directory and optional configured target."""
 
-    def _connect(self, *, timeout: float | None) -> socket.socket:
+        self.paths = BrokerPaths(Path(root).expanduser())
+        self.expected_alias = expected_alias
+
+    def _connect(self, *, timeout: float | None, require_expected_alias: bool = True) -> socket.socket:
         """Connect to the validated private endpoint without sending a frame."""
 
         _validate_private_directory(self.paths.root, create=False)
@@ -310,6 +315,11 @@ class BrokerClient:
                 f"(status={state.get('status')!r}, protocol={state.get('protocol')!r}). "
                 "Stop any old broker locally before an explicitly authorized restart."
             )
+        if require_expected_alias and self.expected_alias is not None and state.get("alias") != self.expected_alias:
+            raise O2BrokerUnavailableError(
+                f"The ready O2 broker targets alias {state.get('alias')!r}, but this client is configured for "
+                f"{self.expected_alias!r}. Stop the old broker locally before an explicitly authorized restart."
+            )
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(timeout)
@@ -320,10 +330,16 @@ class BrokerClient:
             client.close()
             raise O2BrokerUnavailableError(f"The persistent O2 broker did not answer locally: {exc}") from exc
 
-    def _request(self, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    def _request(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float,
+        require_expected_alias: bool = True,
+    ) -> dict[str, Any]:
         """Send one bounded local control request and read its sole response."""
 
-        client = self._connect(timeout=timeout)
+        client = self._connect(timeout=timeout, require_expected_alias=require_expected_alias)
         try:
             with client.makefile("rwb", buffering=0) as stream:
                 write_frame(stream, payload)
@@ -477,6 +493,9 @@ class BrokerClient:
         response = self._request(
             {"type": "stop", "id": str(uuid.uuid4()), "reason": reason},
             timeout=timeout,
+            # A local stop must remain possible after the configured SSH alias
+            # changes; only command reuse is bound to the expected destination.
+            require_expected_alias=False,
         )
         if response.get("type") != "stopping":
             raise O2BrokerError(f"unexpected broker stop response: {response!r}")

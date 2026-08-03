@@ -243,11 +243,17 @@ def remote_helper_source() -> str:
                 process.kill()
 
         def run_bounded(command, stdin_text, timeout):
+            # The one SSH session establishes the remote environment. Reusing
+            # that environment without login/profile startup prevents a banner
+            # or slow profile from contaminating every logical command.
+            command_env = os.environ.copy()
+            command_env.pop(\"BASH_ENV\", None)
             process = subprocess.Popen(
-                [\"/bin/bash\", \"-lc\", command],
+                [\"/bin/bash\", \"--noprofile\", \"--norc\", \"-c\", command],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=command_env,
                 start_new_session=True,
             )
             captures = {{}}

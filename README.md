@@ -43,7 +43,9 @@ UTF-8 JSON rather than newline framing. Remote stdout/stderr is drained while
 retaining at most 1 MiB per stream, so noisy commands cannot grow broker memory
 without bound and newlines or JSON-looking output cannot corrupt the next
 command. Frames are limited to 16 MiB. One command timeout returns code 124
-without reconnecting or replacing the persistent channel.
+without reconnecting or replacing the persistent channel. Logical commands use
+a non-login Bash that inherits the one session environment, avoiding repeated
+profile banners and startup latency.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:
@@ -188,7 +190,9 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   socket and files are mode 0600. One lifetime `flock` per role prevents
   overlapping daemons. An unbindably long socket path fails before grant
   consumption. Clients require a trusted `ready` receipt for the exact protocol
-  version, and incomplete local frames expire on a finite absolute deadline.
+  version and currently configured role alias; incomplete local frames expire on
+  a finite absolute deadline. Alias changes block command reuse but not local
+  broker stop, so the stale daemon can be retired without contacting O2.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - Blocking and detached rsync default to the transfer alias, whose master can be

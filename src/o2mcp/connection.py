@@ -339,12 +339,15 @@ class O2Connection:
             self._broker = None
             self._transfer_broker = None
         elif broker_client is _DEFAULT_BROKER_CLIENT:
-            self._broker = BrokerClient(self.config.broker_dir)
+            self._broker = BrokerClient(self.config.broker_dir, expected_alias=self.config.host_alias)
         else:
             self._broker = broker_client
         if not _legacy_test_transport:
             if transfer_broker_client is _DEFAULT_BROKER_CLIENT:
-                self._transfer_broker = BrokerClient(self.config.transfer_broker_dir)
+                self._transfer_broker = BrokerClient(
+                    self.config.transfer_broker_dir,
+                    expected_alias=self.config.transfer_alias,
+                )
             else:
                 self._transfer_broker = transfer_broker_client
         # A connection may build an rsync argv and then validate/run it. Cache the
@@ -359,7 +362,8 @@ class O2Connection:
 
         configured = self._transfer_broker if transfer else self._broker
         root = self.config.transfer_broker_dir if transfer else self.config.broker_dir
-        return configured or BrokerClient(root)
+        alias = self.config.transfer_alias if transfer else self.config.host_alias
+        return configured or BrokerClient(root, expected_alias=alias)
 
     def broker_local_status(self, *, transfer: bool = False) -> dict[str, object]:
         """Inspect one role-specific broker locally without invoking SSH."""

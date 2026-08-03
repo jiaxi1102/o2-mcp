@@ -22,8 +22,8 @@ flowchart LR
     TD -->|"framed JSON"| TS["one transfer-host SSH session"]
     LS --> LR["embedded remote helper"]
     TS --> TR["embedded remote helper"]
-    LR --> LX["serialized bash -lc commands"]
-    TR --> TX["serialized bash -lc commands"]
+    LR --> LX["serialized bash -c commands"]
+    TR --> TX["serialized bash -c commands"]
 ```
 
 Starting either role-specific broker is an authentication boundary. It consumes
@@ -68,10 +68,12 @@ A logical command request contains protocol version 2, a random request id,
 command, timeout, and optional stdin text. Explicit versioning prevents either
 side of an in-place client/daemon upgrade from misinterpreting acknowledgement
 semantics and executing an apparently failed request. The helper executes
-`/bin/bash -lc <command>`, concurrently drains both output streams while
-retaining bounded prefixes, and returns the same id, return code, duration,
-timeout flag, and truncation flags. Commands are serialized within each broker
-so responses cannot be reordered.
+`/bin/bash --noprofile --norc -c <command>` in the environment inherited from
+the one SSH session, so per-command login profiles cannot add banners or consume
+timeouts. It concurrently drains both output streams while retaining bounded
+prefixes, and returns the same id, return code, duration, timeout flag, and
+truncation flags. Commands are serialized within each broker so responses cannot
+be reordered.
 
 The frame limit is 16 MiB. Stdout and stderr retain at most 1 MiB each; later
 bytes are drained and discarded rather than accumulated in memory. A remote
@@ -96,6 +98,9 @@ automatic retry.
 - A client connects only when a physical mode-0600 state receipt positively
   reports `ready` under the exact protocol version; missing, malformed, or
   stale-version receipts are not treated as compatible defaults.
+- Command reuse also requires the receipt's SSH alias to match that role's
+  current configuration. A local stop remains available after an alias change
+  so the stale daemon can be retired safely.
 - One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.
