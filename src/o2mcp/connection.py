@@ -1242,22 +1242,32 @@ class O2Connection:
         master is already running. The transport is also rewritten with every SSH
         authentication method disabled; this closes the check/use race where a
         dying socket could otherwise make OpenSSH fall back to a brand-new MFA
-        login. The guard verifies the master for
-        the alias the command actually targets: ``master_alias`` if given, else the
-        endpoint inferred from ``argv`` (a ``[user@]<alias>:path`` rsync target or
-        a bare ``[user@]<alias>`` SSH host), else the login alias. So a transfer-node
-        transfer (``o2-transfer``) is never validated against the login master even
-        when the caller forgets to pass ``master_alias``. Like :meth:`run`, the
-        local lock is honored first. ``require_master=False`` is retained only to
-        give existing callers an actionable error; cold transports are no longer
-        supported.
+        login. The guard verifies the endpoint inferred from ``argv`` (a
+        ``[user@]<alias>:path`` rsync target or bare ``[user@]<alias>`` SSH host),
+        falling back to the login alias only when no endpoint is present. An
+        explicit ``master_alias`` must exactly match an inferred endpoint because
+        the pinned socket determines the actual host and user. Thus neither a
+        transfer-node alias nor a user-qualified socket can disagree with the
+        command text silently. Like :meth:`run`, the local lock is honored first.
+        ``require_master=False`` is retained only to give existing callers an
+        actionable error; cold transports are no longer supported.
         """
         self._require_unlocked()
         if not require_master:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
             )
-        effective_target = master_alias if master_alias is not None else self._target_alias_from_argv(argv)
+        inferred_target = self._target_alias_from_argv(argv)
+        if master_alias is not None and inferred_target is not None and master_alias != inferred_target:
+            # The pinned socket determines the actual multiplexed destination.
+            # Letting an explicit alias disagree with argv would silently execute
+            # on the socket's host/user rather than the destination the caller
+            # wrote, especially when `%r` gives user-qualified sockets.
+            raise O2UnsafeTransportError(
+                f"Explicit master_alias '{master_alias}' disagrees with transport destination "
+                f"'{inferred_target}'; use one identical [user@]alias or omit master_alias."
+            )
+        effective_target = master_alias if master_alias is not None else inferred_target
         target = effective_target or self.config.host_alias
         hardened = self._harden_raw_transport_argv(argv, target)
         if not self.master_running(effective_target):

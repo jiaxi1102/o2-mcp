@@ -1137,6 +1137,28 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
     assert transport[transport.index("-S") + 1] == "/tmp/o2-control.sock"
 
 
+@pytest.mark.parametrize(
+    ("argv", "master_alias"),
+    [
+        (["ssh", "o2", "hostname"], "o2-transfer"),
+        (["ssh", "alice@o2", "hostname"], "o2"),
+        (["rsync", "x", "o2-transfer:/p"], "o2"),
+    ],
+)
+def test_run_raw_rejects_master_alias_destination_mismatch(tmp_path, argv, master_alias):
+    """The explicit socket identity must equal the command's actual endpoint."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="disagrees with transport destination"):
+        conn.run_raw(argv, master_alias=master_alias)
+
+    # The mismatch is determined from argv alone, before config expansion or any
+    # local master probe has a chance to obscure the caller error.
+    assert runner.calls == []
+
+
 def test_rsync_blocked_by_lock(tmp_path):
     runner = RecordingRunner()
     sync = O2Sync(O2Connection(_config(tmp_path, locked=True), runner=runner))
