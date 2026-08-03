@@ -225,6 +225,47 @@ def test_failed_attempt_remains_blocked_until_global_cooldown(tmp_path, outcome)
     assert replacement.id != grant.id
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("blocked_until", None),
+        ("started_at", "not-a-timestamp"),
+        ("outcome", "unknown"),
+        ("grant_id", ""),
+        ("allow_offvpn", "yes"),
+    ],
+)
+def test_malformed_login_attempt_receipt_fails_closed(tmp_path, field, value):
+    """Corrupt cooldown data cannot be interpreted as authorization to retry."""
+
+    store = _reuse_store(tmp_path, client_id="client-a")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="first attempt",
+    )
+    store.consume_login_grant(grant.id, "login")
+    payload = json.loads(store.path.read_text())
+    if value is None:
+        payload["login_attempt"].pop(field)
+    else:
+        payload["login_attempt"][field] = value
+    store.path.write_text(json.dumps(payload))
+    store.path.chmod(0o600)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is False
+    assert snapshot.effective_mode == "disabled"
+    with pytest.raises(O2PolicyInvalidError):
+        store.authorize_login(
+            expected_revision=payload["revision"],
+            target="login",
+            allow_offvpn=False,
+            approval_reference="must fail closed",
+        )
+
+
 def test_concurrent_disable_revokes_grant_and_preserves_attempt_result(tmp_path):
     store = _reuse_store(tmp_path, client_id="client-a")
     grant = store.authorize_login(

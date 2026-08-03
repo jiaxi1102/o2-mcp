@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import stat
 import tempfile
@@ -124,8 +125,10 @@ class LoginGrant:
         if type(payload.get("remaining_attempts")) is not int or payload["remaining_attempts"] not in {0, 1}:
             raise O2PolicyInvalidError("login_grant.remaining_attempts must be zero or one")
         for key in ("created_at", "expires_at"):
-            if type(payload.get(key)) not in {int, float}:
+            if type(payload.get(key)) not in {int, float} or not math.isfinite(payload[key]):
                 raise O2PolicyInvalidError(f"login_grant.{key} must be a timestamp")
+        if payload["expires_at"] <= payload["created_at"]:
+            raise O2PolicyInvalidError("login_grant.expires_at must be later than created_at")
         return cls(
             id=payload["id"],
             client_id=payload["client_id"],
@@ -431,13 +434,61 @@ class O2PolicyStore:
             if not isinstance(payload["login_grant"], dict):
                 raise O2PolicyInvalidError("login_grant must be null or an object")
             LoginGrant.from_dict(payload["login_grant"])
-        if payload.get("login_attempt") is not None and not isinstance(payload["login_attempt"], dict):
-            raise O2PolicyInvalidError("login_attempt must be null or an object")
+        if payload.get("login_attempt") is not None:
+            if not isinstance(payload["login_attempt"], dict):
+                raise O2PolicyInvalidError("login_attempt must be null or an object")
+            self._validate_login_attempt(payload["login_attempt"])
         if not isinstance(payload.get("events", []), list):
             raise O2PolicyInvalidError("events must be an array")
         # Return a detached mutable copy so callers cannot accidentally mutate a
         # structure shared with an input fixture or JSON decoder cache.
         return json.loads(json.dumps(payload))
+
+    @staticmethod
+    def _validate_login_attempt(attempt: dict[str, Any]) -> None:
+        """Validate the complete cooldown receipt before any policy decision.
+
+        A partial active receipt must never default its cooldown to zero: doing
+        so would turn corrupt state into permission for another Duo-producing
+        attempt. Terminal receipts remain authoritative until their persisted
+        ``blocked_until`` time passes, so they receive the same strict checks.
+        """
+
+        required_strings = ("grant_id", "client_id", "target", "outcome")
+        if any(not isinstance(attempt.get(field), str) or not attempt[field] for field in required_strings):
+            raise O2PolicyInvalidError("login_attempt is missing a required non-empty string field")
+        if attempt["target"] not in {"login", "transfer"}:
+            raise O2PolicyInvalidError("login_attempt.target must be 'login' or 'transfer'")
+        if attempt["outcome"] not in {
+            "active",
+            "success",
+            "failed",
+            "timed_out",
+            "error",
+            "stale",
+        }:
+            raise O2PolicyInvalidError("login_attempt.outcome is unsupported")
+        if type(attempt.get("allow_offvpn")) is not bool:
+            raise O2PolicyInvalidError("login_attempt.allow_offvpn must be a boolean")
+        for field in ("started_at", "blocked_until"):
+            value = attempt.get(field)
+            if type(value) not in {int, float} or not math.isfinite(value):
+                raise O2PolicyInvalidError(f"login_attempt.{field} must be a finite timestamp")
+        if attempt["blocked_until"] < attempt["started_at"]:
+            raise O2PolicyInvalidError("login_attempt.blocked_until cannot precede started_at")
+
+        finished_at = attempt.get("finished_at")
+        returncode = attempt.get("returncode")
+        if attempt["outcome"] == "active":
+            if finished_at is not None or returncode is not None:
+                raise O2PolicyInvalidError("an active login_attempt cannot be finished")
+        else:
+            if type(finished_at) not in {int, float} or not math.isfinite(finished_at):
+                raise O2PolicyInvalidError("a terminal login_attempt requires a finite finished_at")
+            if finished_at < attempt["started_at"]:
+                raise O2PolicyInvalidError("login_attempt.finished_at cannot precede started_at")
+        if returncode is not None and type(returncode) is not int:
+            raise O2PolicyInvalidError("login_attempt.returncode must be null or an integer")
 
     @staticmethod
     def _validate_file_metadata(path: Path, metadata: os.stat_result) -> None:
