@@ -346,17 +346,19 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
 
 
 @pytest.mark.anyio
-async def test_stop_master_targets_transfer_role_and_rejects_login(monkeypatch, tmp_path):
-    """The MCP can retire its supported rsync master without raw SSH fallback."""
+async def test_stop_master_targets_transfer_and_legacy_login_roles(monkeypatch, tmp_path):
+    """The MCP can retire either known master without restoring login startup."""
 
     runner = _patch_connection(monkeypatch, tmp_path, master=True)
 
     stopped = await _call("o2_stop_master", {"params": {"transfer": True}})
-    rejected = await _call("o2_stop_master", {"params": {"transfer": False}})
+    legacy = await _call("o2_stop_master", {"params": {"transfer": False}})
 
     assert stopped["ok"] is True and stopped["alias"] == "o2-transfer"
-    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
-    assert rejected["ok"] is False and rejected["error"] == "login_master_retired"
+    assert legacy["ok"] is True and legacy["alias"] == "o2"
+    stop_calls = [call for call in runner.calls if "-O" in call["argv"]]
+    assert stop_calls[-2]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
+    assert stop_calls[-1]["argv"][-3:] == ["-O", "exit", "o2"]
 
 
 @pytest.mark.anyio

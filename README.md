@@ -52,9 +52,10 @@ profile banners and startup latency. Full escaped requests are size-checked
 before dispatch, stdin is capped at 1 MiB, and transport writes use inactivity
 plus frame-size-scaled deadlines so a slow progressing link survives while a
 stall cannot retain the global policy mutex indefinitely. For finite commands,
-the daemon also bounds the result-frame wait by the command timeout plus cleanup
-grace; a silent helper terminates and unpublishes the one transport instead of
-leaving a falsely reusable broker wedged.
+the daemon also bounds the result-frame wait with an inactivity timeout and a
+frame-size-scaled absolute budget; slow progress survives, while a silent helper
+terminates and unpublishes the one transport instead of leaving a falsely
+reusable broker wedged.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:
@@ -156,7 +157,7 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_start_broker` | Consume one role-matched grant and open that host role's persistent command channel (`transfer=true` for the transfer host) | write |
 | `o2_stop_broker` | Locally close one role-specific broker and its SSH process; no policy change | **destructive/local** |
 | `o2_start_master` | Transfer compatibility only; login-master starts are rejected | write |
-| `o2_stop_master` | Locally close the transfer rsync master through its exact socket | **destructive/local** |
+| `o2_stop_master` | Locally close the transfer master or a pre-upgrade login master through its exact socket; shutdown-only and does not restore login startup | **destructive/local** |
 | `o2_probe` | One explicit fixed command through the existing broker; never retried | read-only |
 | `o2_exec` | Run an arbitrary command on a login node | write |
 | `o2_submit_job` | `sbatch` a script (existing path or staged `script_text`); returns the job id | write |

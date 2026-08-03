@@ -37,6 +37,7 @@ from typing import Any, BinaryIO, Callable
 
 from o2mcp.broker_protocol import (
     MAX_COMMAND_BYTES,
+    MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
     MAX_STDIN_BYTES,
     MAX_TIMEOUT_SECONDS,
@@ -85,10 +86,14 @@ MAX_LAUNCH_BYTES = 1024 * 1024
 DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS = 5.0
 MIN_REMOTE_WRITE_BYTES_PER_SECOND = 128 * 1024
 # The remote helper normally needs only its command deadline plus bounded drain
-# cleanup to return a frame. Give it a small grace window, still shorter than
-# the client's ten-second post-timeout allowance, so a silent helper is torn
-# down by the daemon before every caller becomes wedged behind it.
+# cleanup to begin returning a frame. Give it a small inactivity window; the
+# client separately includes the daemon's full size-scaled transfer budget.
 DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS = 5.0
+# Result frames can legally approach the 16-MiB protocol ceiling after JSON
+# escaping. Progress resets the short inactivity timer, while this conservative
+# throughput floor supplies a separate absolute transfer budget.
+MIN_REMOTE_RESPONSE_BYTES_PER_SECOND = 64 * 1024
+MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYTES_PER_SECOND
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -454,7 +459,15 @@ class BrokerClient:
                         f"{response!r}. Do not retry automatically; inspect broker state first."
                     )
                 dispatched = True
-                client.settimeout(None if timeout is None else timeout + 10.0)
+                # Keep the local caller alive for the daemon's entire legal
+                # command-plus-result budget. Otherwise a slow but progressing
+                # large response would be preserved by the daemon yet still be
+                # misreported locally as an unknown outcome after ten seconds.
+                client.settimeout(
+                    None
+                    if timeout is None
+                    else timeout + DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS + MAX_REMOTE_RESPONSE_TRANSFER_SECONDS + 5.0
+                )
                 response = read_frame(stream)
         except O2PolicyDeniedError:
             raise
@@ -855,39 +868,84 @@ class BrokerServer:
 
         The remote helper owns command timeout enforcement, but an alive SSH
         process is not proof that the helper can still reply. For finite
-        commands, bound this protocol read by the command timeout plus cleanup
-        grace. A miss is fatal to the channel: after dispatch, no automatic
-        retry is safe, and retaining the socket would falsely advertise reuse.
-        Explicit no-deadline requests intentionally preserve their unbounded
-        contract and therefore read synchronously.
+        commands, wait through the command deadline, then require continuing
+        byte progress within a short inactivity window and a frame-size-scaled
+        absolute budget. A miss is fatal to the channel: after dispatch, no
+        automatic retry is safe, and retaining the socket would falsely
+        advertise reuse. Explicit no-deadline requests intentionally preserve
+        their unbounded contract and therefore read synchronously.
         """
 
         if command_timeout is None:
             return read_frame(remote_out)
 
         response_result: dict[str, Any] = {}
+        progress = {"first_at": None, "last_at": None, "complete": False}
+        progress_changed = threading.Condition()
+
+        class ProgressReader:
+            """Expose small reads so completed bytes refresh inactivity state."""
+
+            def read(self, size: int) -> bytes:
+                # ``BufferedReader.read(large_size)`` may wait for the complete
+                # frame and hide intermediate network progress. Four-KiB reads
+                # let the supervising thread distinguish slow transfer from a
+                # silent helper without parsing protocol bytes twice.
+                chunk = remote_out.read(min(size, 4096))
+                if chunk:
+                    now = time.monotonic()
+                    with progress_changed:
+                        if progress["first_at"] is None:
+                            progress["first_at"] = now
+                        progress["last_at"] = now
+                        progress_changed.notify_all()
+                return chunk
 
         def receive_response() -> None:
             """Capture the blocking read so the daemon can enforce its deadline."""
 
             try:
-                response_result["payload"] = read_frame(remote_out)
+                response_result["payload"] = read_frame(ProgressReader())
             except Exception as exc:  # pragma: no cover - surfaced by parent thread
                 response_result["error"] = exc
+            finally:
+                with progress_changed:
+                    progress["complete"] = True
+                    progress_changed.notify_all()
 
         reader = threading.Thread(target=receive_response, name="o2-broker-response", daemon=True)
+        started = time.monotonic()
+        command_deadline = started + float(command_timeout)
+        inactivity_deadline = command_deadline + self.remote_response_grace
+        absolute_deadline = inactivity_deadline + MAX_REMOTE_RESPONSE_TRANSFER_SECONDS
+        last_progress_seen: float | None = None
         reader.start()
-        response_deadline = float(command_timeout) + self.remote_response_grace
-        reader.join(timeout=response_deadline)
-        if reader.is_alive():
+        with progress_changed:
+            while not progress["complete"]:
+                latest_progress = progress["last_at"]
+                if isinstance(latest_progress, float) and latest_progress != last_progress_seen:
+                    inactivity_deadline = latest_progress + self.remote_response_grace
+                    last_progress_seen = latest_progress
+                first_progress = progress["first_at"]
+                if isinstance(first_progress, float):
+                    absolute_deadline = (
+                        first_progress + self.remote_response_grace + MAX_REMOTE_RESPONSE_TRANSFER_SECONDS
+                    )
+                remaining = min(inactivity_deadline, absolute_deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
+                progress_changed.wait(timeout=remaining)
+            timed_out = not progress["complete"]
+        if timed_out:
             # Killing the sole transport closes its stdout pipe and releases the
             # reader. The outer broker loop then removes its socket and lifetime
             # lock, making the unknown outcome visible rather than reusable.
             self._terminate_transport(timeout=1.0)
             reader.join(timeout=1.0)
             raise _O2BrokerTransportError(
-                "persistent remote response exceeded the command deadline plus cleanup grace; transport stopped"
+                "persistent remote response made no progress or exceeded its size-scaled deadline; " "transport stopped"
             )
+        reader.join(timeout=1.0)
         if "error" in response_result:
             exc = response_result["error"]
             raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc

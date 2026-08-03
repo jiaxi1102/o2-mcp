@@ -94,9 +94,10 @@ be reordered.
 The frame limit is 16 MiB. Stdout and stderr retain at most 1 MiB each; later
 bytes are drained and discarded rather than accumulated in memory. A remote
 timeout returns code 124 and the helper remains available for the next frame.
-For finite commands, the daemon separately bounds its result-frame wait by the
-command timeout plus cleanup grace. If SSH remains alive but the helper stops
-responding, that deadline terminates and unpublishes the sole transport; the
+For finite commands, the daemon separately bounds its result-frame wait with an
+inactivity timeout and a frame-size-scaled absolute budget. Slow response
+progress refreshes the inactivity deadline; if SSH remains alive but the helper
+stops responding, the daemon terminates and unpublishes the sole transport. The
 dispatched outcome remains unknown and is never retried automatically.
 
 The local client first waits for a `dispatched` acknowledgement, which the daemon
@@ -162,8 +163,9 @@ future work. New rsync operations default to the dedicated transfer alias becaus
 that role retains an explicit grant-gated master startup. Login-alias rsync can
 reuse a legacy master but cannot create one through either the MCP wrapper or
 the public connection API. `o2_stop_master` and
-`O2Connection.stop_master()` close the supported transfer master locally through
-its exact socket.
+`O2Connection.stop_master()` close either the supported transfer master or a
+pre-upgrade login master locally through its exact socket with authentication
+disabled. This shutdown compatibility does not restore login-master startup.
 
 ## Offline validation
 

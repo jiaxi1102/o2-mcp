@@ -894,19 +894,19 @@ class O2Connection:
         return f"{prior}\n{message}" if prior else message
 
     def stop_master(self, *, alias: str | None = None) -> CommandResult:
-        """Close the retained transfer ControlMaster through its exact socket.
+        """Close a retained transfer or pre-upgrade login ControlMaster.
 
-        Login-master startup is retired, so the corresponding public stop API
-        defaults to the only master this package can create. An explicit alias
-        remains available for callers that track role names themselves, but it
-        must resolve to the configured transfer role.
+        Login-master startup remains retired. Shutdown is intentionally broader
+        so rollout can remove a legacy login socket without raw SSH or restoring
+        any authentication-capable start path. Both roles pin their exact
+        ControlPath and disable authentication before issuing the local control
+        operation.
         """
 
         target = alias or self.config.transfer_alias
-        if target != self.config.transfer_alias:
+        if target not in {self.config.host_alias, self.config.transfer_alias}:
             raise O2UnsafeTransportError(
-                f"Only the governed transfer ControlMaster may be stopped here, not '{target}'. "
-                "Stop login command sessions through stop_broker instead."
+                f"Only the configured login or transfer ControlMaster may be stopped here, not '{target}'."
             )
         return self._runner(
             [
@@ -915,7 +915,7 @@ class O2Connection:
                 "/dev/null",
                 "-S",
                 self._resolved_control_path(target),
-                *self.config.base_ssh_opts(),
+                *self.config.reuse_only_ssh_opts(),
                 "-O",
                 "exit",
                 target,

@@ -630,8 +630,8 @@ def test_start_master_can_open_the_transfer_alias_with_transfer_grant(tmp_path):
     assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
 
 
-def test_stop_master_targets_only_the_supported_transfer_role(tmp_path):
-    """The public lifecycle API can retire the master it is allowed to create."""
+def test_stop_master_targets_transfer_and_legacy_login_roles(tmp_path):
+    """The lifecycle API can retire both supported and pre-upgrade masters."""
 
     runner = RecordingRunner(master=True)
     conn = O2Connection(_config(tmp_path), runner=runner)
@@ -641,8 +641,12 @@ def test_stop_master_targets_only_the_supported_transfer_role(tmp_path):
     assert result.ok
     assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
     assert runner.calls[-1]["argv"][-1] == conn.config.transfer_alias
-    with pytest.raises(O2UnsafeTransportError, match="Only the governed transfer ControlMaster"):
-        conn.stop_master(alias=conn.config.host_alias)
+    legacy = conn.stop_master(alias=conn.config.host_alias)
+    assert legacy.ok
+    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2"]
+    assert "PubkeyAuthentication=no" in runner.calls[-1]["argv"]
+    with pytest.raises(O2UnsafeTransportError, match="configured login or transfer ControlMaster"):
+        conn.stop_master(alias="unconfigured-o2")
 
 
 def test_default_master_start_is_retired_even_when_aliases_are_identical(tmp_path):

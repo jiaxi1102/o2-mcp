@@ -28,7 +28,9 @@ import pytest
 
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp.broker import (
+    DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_LAUNCH_BYTES,
+    MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
     MAX_UNIX_SOCKET_PATH_BYTES,
     BrokerClient,
     BrokerExecutionResult,
@@ -678,7 +680,9 @@ def test_connect_deadline_is_cleared_before_a_large_queued_request_write(broker_
     result = client.execute("cat >/dev/null", timeout=5, input_text="x" * MAX_STDIN_BYTES)
 
     assert result.returncode == 0
-    assert observed.timeout == 15.0
+    assert observed.timeout == (
+        5.0 + DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS + MAX_REMOTE_RESPONSE_TRANSFER_SECONDS + 5.0
+    )
 
 
 def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_path, broker_root):
@@ -827,10 +831,66 @@ def test_stalled_remote_response_stops_transport_and_unpublishes_broker(tmp_path
         assert not client.paths.socket.exists()
         state = client.local_status()
         assert state["status"] == "failed"
-        assert "response exceeded" in state["error"]
+        assert "response made no progress" in state["error"]
     finally:
         if thread.is_alive():
             _stop_local_broker(thread, client)
+
+
+def test_slow_progressing_remote_response_uses_size_scaled_deadline(tmp_path, broker_root):
+    """A legal large response may outlive fixed grace while bytes keep arriving."""
+
+    policy = _reuse_policy(tmp_path)
+    server = BrokerServer(
+        paths=prepare_broker_directory(broker_root),
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-c", "pass"],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        remote_response_grace=0.05,
+    )
+    server.transport = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    read_fd, write_fd = os.pipe()
+    remote_reader = os.fdopen(read_fd, "rb", buffering=0)
+    response = encode_frame(
+        {
+            "type": "result",
+            "id": "slow-result",
+            "returncode": 0,
+            "stdout": "x" * (32 * 1024),
+            "stderr": "",
+        }
+    )
+
+    def send_slowly() -> None:
+        """Take longer than grace overall while staying continuously active."""
+
+        try:
+            for offset in range(0, len(response), 4096):
+                os.write(write_fd, response[offset : offset + 4096])
+                time.sleep(0.02)
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=send_slowly, daemon=True)
+    writer.start()
+    try:
+        result = server._read_remote_frame_with_deadline(remote_reader, command_timeout=0.05)
+
+        assert result["id"] == "slow-result"
+        assert len(result["stdout"]) == 32 * 1024
+        assert server.transport.poll() is None
+    finally:
+        remote_reader.close()
+        writer.join(timeout=2)
+        if server.transport.poll() is None:
+            server.transport.kill()
+            server.transport.wait(timeout=2)
 
 
 def test_slow_progressing_remote_write_uses_size_scaled_deadline(tmp_path, broker_root):
