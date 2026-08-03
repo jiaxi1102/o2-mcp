@@ -274,6 +274,19 @@ def test_run_requires_master(tmp_path):
         conn.run("squeue")
 
 
+def test_master_running_treats_probe_timeout_as_unavailable(tmp_path):
+    """A hung local socket check must fail closed without escaping as an error."""
+
+    def runner(argv, timeout, input_text):
+        if argv[:2] == ["ssh", "-G"]:
+            return CommandResult(list(argv), 0, "controlpath /tmp/o2-control.sock\n", "")
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    assert conn.master_running() is False
+
+
 def test_run_raw_requires_master(tmp_path):
     # A raw transport (rsync/ssh) must also refuse without a master, or it would
     # open a fresh connection — a new Duo push — outside the one approved master.

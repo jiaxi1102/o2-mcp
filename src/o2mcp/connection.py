@@ -426,16 +426,24 @@ class O2Connection:
 
         Defaults to the login host alias. Pass the transfer alias to check the
         transfer node's own master — it is a separate host and a separate control
-        socket, so a live login master does not imply a live transfer master.
+        socket, so a live login master does not imply a live transfer master. A
+        local config/probe timeout or missing SSH executable is treated as
+        unavailable: this boolean guard must fail closed rather than crash its
+        callers or allow them to infer that reuse is safe.
         """
         if self.is_locked():
             return False
         target = alias or self.config.host_alias
-        result = self._runner(
-            self._master_check_argv(target),
-            self.config.connect_timeout + 5,
-            None,
-        )
+        try:
+            result = self._runner(
+                self._master_check_argv(target),
+                self.config.connect_timeout + 5,
+                None,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Both config expansion and `ssh -O check` are local-only probes.
+            # Either failure means the expected socket was not proven reusable.
+            return False
         return result.ok
 
     def _egress_interface(self, alias: str) -> str | None:
