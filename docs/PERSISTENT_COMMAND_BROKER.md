@@ -64,7 +64,8 @@ Logical command text is capped at 64 KiB because it becomes a remote
 `bash -c` argument; this keeps a valid frame below the host's `execve` argument
 limit. Larger scripts must be transferred as files and invoked with a short
 command. Process-spawn failures return an ordinary command result and do not
-terminate the persistent helper.
+terminate the persistent helper. The client validates the complete JSON-escaped
+request before connecting, so stdin expansion cannot fail after dispatch.
 
 The daemon may scan through at most 64 KiB of unframed output before the first
 remote hello, accommodating a login-shell banner. Every later frame is strict.
@@ -124,6 +125,9 @@ automatic retry.
 - One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.
+- The remote frame write has a five-second deadline while the policy mutex is
+  held. If SSH stops draining stdin, the daemon terminates that broken transport
+  and releases global policy authority instead of blocking incident disable.
 - Disabling policy does not kill an already-running command or broker. It blocks
   the next frame. `o2_stop_broker` is an explicit local process-control action.
 - If SSH exits or framing fails, the daemon removes its socket, writes a failed

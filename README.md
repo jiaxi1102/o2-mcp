@@ -48,7 +48,9 @@ returns code 124 without reconnecting or replacing the persistent channel.
 Finite deadlines are capped at seven days to avoid platform socket overflow;
 an explicit `None` retains indefinite execution. Logical commands use a
 non-login Bash that inherits the one session environment, avoiding repeated
-profile banners and startup latency.
+profile banners and startup latency. Full escaped requests are size-checked
+before dispatch, and stalled transport writes are bounded so they cannot retain
+the global policy mutex indefinitely.
 
 ControlMaster hardening remains in the library for the transfer compatibility
 layer and offline regression tests. It is **not** the login command boundary:

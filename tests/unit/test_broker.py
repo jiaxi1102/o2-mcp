@@ -13,13 +13,15 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import pytest
@@ -39,6 +41,7 @@ from o2mcp.broker import (
 from o2mcp.broker_protocol import (
     FRAME_MAGIC,
     MAX_COMMAND_BYTES,
+    MAX_FRAME_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_REQUEST_ID_BYTES,
     MAX_TIMEOUT_SECONDS,
@@ -250,6 +253,46 @@ def test_remote_output_is_truncated_while_channel_remains_usable(tmp_path, broke
         assert client.execute("printf after-noise", timeout=5).stdout == "after-noise"
         assert server.transport.pid == ssh_pid
     finally:
+        _stop_local_broker(thread, client)
+
+
+def test_blocked_stdin_feeder_kills_inheriting_descendant(tmp_path, broker_root):
+    """A non-reading stdin descendant cannot leak a feeder thread and payload."""
+
+    _policy, server, thread, client = _start_local_broker(tmp_path, broker_root)
+    descendant_pid = None
+    script = (
+        "import subprocess; "
+        "child = subprocess.Popen(['/bin/sleep', '30'], stdin=0, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print(child.pid, flush=True)"
+    )
+    try:
+        ssh_pid = server.transport.pid
+        result = client.execute(
+            "python3 -c " + shlex.quote(script),
+            timeout=5,
+            input_text="x" * (2 * 1024 * 1024),
+        )
+        descendant_pid = int(result.stdout.strip())
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("stdin-inheriting descendant survived feeder cleanup")
+
+        assert result.returncode == 0
+        assert client.execute("printf after-stdin-cleanup", timeout=5).stdout == "after-stdin-cleanup"
+        assert server.transport.pid == ssh_pid
+    finally:
+        if descendant_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(descendant_pid, signal.SIGKILL)
         _stop_local_broker(thread, client)
 
 
@@ -611,6 +654,69 @@ def test_client_rejects_unencodable_stdin_before_socket_access(tmp_path):
         client.execute("cat", timeout=1, input_text="\ud800")
 
     assert not client.paths.root.exists()
+
+
+def test_client_rejects_json_expanded_stdin_before_socket_access(tmp_path):
+    """Escaping overhead must be included in the pre-dispatch frame bound."""
+
+    client = BrokerClient(tmp_path / "absent")
+    expanding_stdin = "\0" * ((MAX_FRAME_BYTES // 6) + 1024)
+
+    with pytest.raises(ValueError, match="encoded broker request exceeds"):
+        client.execute("cat", timeout=1, input_text=expanding_stdin)
+
+    assert not client.paths.root.exists()
+
+
+def test_stalled_remote_write_releases_policy_after_stopping_transport(tmp_path, broker_root):
+    """A blocked SSH stdin write cannot retain the global policy mutex forever."""
+
+    policy = _reuse_policy(tmp_path)
+    server = BrokerServer(
+        paths=prepare_broker_directory(broker_root),
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-c", "pass"],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        remote_write_timeout=0.05,
+    )
+    server.transport = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    entered = threading.Event()
+
+    class _StalledWriter:
+        """Model a pipe write that unblocks only when SSH is terminated."""
+
+        def write(self, _value):
+            entered.set()
+            while server.transport.poll() is None:
+                time.sleep(0.005)
+            raise BrokenPipeError("transport stopped")
+
+        def flush(self):
+            return None
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(O2BrokerError, match="frame write exceeded"), policy.serialize_reuse_launch():
+            server._write_remote_frame_with_deadline(
+                _StalledWriter(),
+                {"type": "exec", "id": "stalled-write"},
+            )
+
+        assert entered.is_set()
+        assert time.monotonic() - started < 2
+        assert server.transport.poll() is not None
+        disabled = policy.disable(reason="write deadline released policy mutex")
+        assert disabled["mode"] == "disabled"
+    finally:
+        if server.transport.poll() is None:
+            server.transport.kill()
+            server.transport.wait(timeout=2)
 
 
 def test_daemon_rechecks_global_policy_before_forwarding(tmp_path, broker_root):

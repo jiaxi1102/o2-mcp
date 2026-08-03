@@ -43,6 +43,7 @@ from o2mcp.broker_protocol import (
     PROTOCOL_VERSION,
     BrokerProtocolError,
     command_within_exec_limit,
+    encode_frame,
     read_frame,
     utf8_text_within_limit,
     write_frame,
@@ -78,6 +79,10 @@ MAX_UNIX_SOCKET_PATH_BYTES = 100
 # the embedded helper source. Bound descriptor reads so a malformed parent
 # cannot make the daemon accumulate unbounded local data before policy checks.
 MAX_LAUNCH_BYTES = 1024 * 1024
+# A stalled SSH channel must not retain the workstation policy mutex forever.
+# Five seconds is ample for a <=16 MiB local pipe write while still keeping a
+# global incident stop responsive when the remote side no longer drains input.
+DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS = 5.0
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -413,6 +418,13 @@ class BrokerClient:
             "timeout_seconds": timeout,
             "stdin": input_text,
         }
+        try:
+            # Validate the complete escaped JSON body, not only raw stdin. Quotes,
+            # backslashes, and control characters can expand substantially and
+            # must fail before a broker connection or dispatch acknowledgement.
+            encode_frame(request)
+        except BrokerProtocolError as exc:
+            raise ValueError(f"encoded broker request exceeds the frame contract: {exc}") from exc
         client = self._connect(timeout=5.0)
         dispatched = False
         try:
@@ -579,6 +591,7 @@ class BrokerServer:
         ack_fd: int | None = None,
         startup_timeout: float = 90.0,
         local_request_timeout: float = 5.0,
+        remote_write_timeout: float = DEFAULT_REMOTE_WRITE_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.paths = paths
@@ -608,6 +621,9 @@ class BrokerServer:
         if not _is_bounded_positive_timeout(local_request_timeout):
             raise ValueError("broker local request timeout must be finite and positive")
         self.local_request_timeout = local_request_timeout
+        if not _is_bounded_positive_timeout(remote_write_timeout):
+            raise ValueError("broker remote write timeout must be finite and positive")
+        self.remote_write_timeout = remote_write_timeout
         self.clock = clock
         self.transport: subprocess.Popen[bytes] | None = None
         self.listener: socket.socket | None = None
@@ -748,6 +764,49 @@ class BrokerServer:
             start_new_session=True,
         )
 
+    def _terminate_transport(self, *, timeout: float) -> None:
+        """Stop the sole transport locally and wait a bounded time for cleanup."""
+
+        process = self.transport
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout)
+
+    def _write_remote_frame_with_deadline(self, remote_in: BinaryIO, request: dict[str, Any]) -> None:
+        """Write one request without indefinitely holding the policy mutex.
+
+        Python's buffered pipe writes expose no per-call deadline. Perform the
+        bounded write in a helper thread; if SSH stops draining its stdin, kill
+        the sole transport so the pipe closes, the writer unblocks, and the
+        policy mutex can be released for an incident disable.
+        """
+
+        outcome: dict[str, BaseException] = {}
+
+        def write_request() -> None:
+            try:
+                write_frame(remote_in, request)
+            except BaseException as exc:  # surfaced synchronously below
+                outcome["error"] = exc
+
+        writer = threading.Thread(target=write_request, name="o2-broker-frame-write", daemon=True)
+        writer.start()
+        writer.join(timeout=self.remote_write_timeout)
+        if writer.is_alive():
+            self._terminate_transport(timeout=1.0)
+            writer.join(timeout=1.0)
+            raise _O2BrokerTransportError(
+                f"persistent remote frame write exceeded {self.remote_write_timeout:.1f}s; transport stopped"
+            )
+        error = outcome.get("error")
+        if error is not None:
+            raise _O2BrokerTransportError(f"persistent remote stream failed: {error}") from error
+
     def _bind_listener(self) -> None:
         """Publish the local endpoint only after the remote helper is ready."""
 
@@ -880,7 +939,7 @@ class BrokerServer:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})
                     except (OSError, BrokerProtocolError):
                         return
-                    write_frame(remote_in, request)
+                    self._write_remote_frame_with_deadline(remote_in, request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
                     write_frame(local, {"type": "error", "error": "policy_denied", "message": str(exc)})
@@ -953,13 +1012,7 @@ class BrokerServer:
                 self.listener.close()
                 with suppress(FileNotFoundError):
                     self.paths.socket.unlink()
-            if self.transport is not None and self.transport.poll() is None:
-                self.transport.terminate()
-                try:
-                    self.transport.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.transport.kill()
-                    self.transport.wait(timeout=5)
+            self._terminate_transport(timeout=5.0)
             if self._lock_handle is not None:
                 self._lock_handle.close()
 

@@ -357,6 +357,15 @@ def remote_helper_source() -> str:
                 stdout_thread.join(timeout=0.5)
                 stderr_thread.join(timeout=0.5)
             stdin_thread.join(timeout=0.5)
+            if stdin_thread.is_alive():
+                # A descendant may inherit stdin after the command process
+                # exits and then never read it. Kill that process group and
+                # close the pipe so this request cannot leak one blocked feeder
+                # thread plus its full input string for the helper lifetime.
+                kill_process_group(process)
+                with suppress(OSError, ValueError):
+                    os.close(process.stdin.fileno())
+                stdin_thread.join(timeout=0.5)
 
             stdout_raw, stdout_truncated = captures.get(\"stdout\", (b\"\", False))
             stderr_raw, stderr_truncated = captures.get(\"stderr\", (b\"\", False))
