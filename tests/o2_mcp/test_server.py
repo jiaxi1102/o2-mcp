@@ -28,36 +28,62 @@ from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
 from o2mcp import server as o2server  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolate_user_level_o2_files(monkeypatch, tmp_path):
+    """Prevent protocol tests from writing login receipts into the real home."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "test-home"))
+
+
 class FakeRunner:
     """Deterministic stand-in for the subprocess runner (records calls)."""
 
-    def __init__(self, *, master: bool = True, responder=None):
+    def __init__(self, *, master: bool = True, responder=None, start_persists: bool = True):
         self.calls = []
         self.master = master
         self._responder = responder
+        self._start_persists = start_persists
 
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         self.calls.append({"argv": list(argv), "input": input_text})
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if self.master else 255, "", "")
         if "-MNf" in argv:
+            if self._start_persists:
+                self.master = True
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
             return CommandResult(list(argv), rc, out, err)
         return CommandResult(list(argv), 0, "", "")
 
 
-def _patch_connection(monkeypatch, tmp_path, *, master=True, responder=None, locked=False) -> FakeRunner:
+def _patch_connection(
+    monkeypatch, tmp_path, *, master=True, responder=None, locked=False, start_persists=True
+) -> FakeRunner:
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        "Host o2-transfer\n"
+        "  HostName transfer.rc.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-transfer-control.sock\n"
+    )
     cfg = O2Config(
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
         lock_file=tmp_path / "O2_DISABLED",
+        ssh_config_file=ssh_config,
     )
     if locked:
         cfg.lock_file.write_text("disabled")
-    runner = FakeRunner(master=master, responder=responder)
+    runner = FakeRunner(master=master, responder=responder, start_persists=start_persists)
     monkeypatch.setattr(o2server, "_connection", lambda: O2Connection(cfg, runner=runner))
     return runner
 
@@ -201,6 +227,19 @@ async def test_start_master_refused_without_optin(monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
+async def test_start_master_reports_failed_post_start_verification(monkeypatch, tmp_path):
+    """The MCP response must not call a vanished background master successful."""
+
+    _patch_connection(monkeypatch, tmp_path, master=False, start_persists=False)
+
+    payload = await _call("o2_start_master", {"params": {"allow_new_login": True}})
+
+    assert payload["ok"] is False
+    assert payload["returncode"] == 255
+    assert "post-start control-socket check failed" in payload["stderr"]
+
+
+@pytest.mark.anyio
 async def test_lock_blocks_tool(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True, locked=True)
     payload = await _call("o2_exec", {"params": {"command": "hostname"}})
@@ -326,6 +365,9 @@ async def test_push_async_returns_transfer_id_without_blocking(monkeypatch, tmp_
     assert payload["pid"] == 4321
     # launched the detached bash-wrapped rsync, with the remote path escaped.
     assert launched and launched[0][0] == "bash"
+    transport = launched[0][launched[0].index("-e") + 1]
+    assert "PreferredAuthentications=none" in transport
+    assert "PubkeyAuthentication=no" in transport
     assert launched[0][-1] == "o2:" + remote.replace(" ", "\\ ")
 
 

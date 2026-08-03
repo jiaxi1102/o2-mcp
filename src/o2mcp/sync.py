@@ -1,10 +1,11 @@
 """File transfer to/from O2 via rsync over the existing SSH connection.
 
 rsync reuses the ControlMaster configured in the SSH config (so no extra login),
-and the ``-e`` transport is pinned to BatchMode so a missing key fails fast
-instead of prompting for Duo. Large transfers can opt into the dedicated O2
-transfer node; by default we reuse the login alias to keep to a single
-authenticated connection.
+and the ``-e`` transport disables every authentication method. This is stronger
+than BatchMode alone: if the master disappears after the local socket check,
+OpenSSH cannot fall back to a fresh key-based connection that triggers Duo.
+Large transfers can opt into the dedicated O2 transfer node; by default we reuse
+the login alias to keep to a single authenticated connection.
 
 Remote paths are backslash-escaped for the remote shell. rsync hands the
 post-colon path to a *remote* shell, which otherwise word-splits a path
@@ -55,9 +56,9 @@ class O2Sync:
     def __init__(self, connection: O2Connection) -> None:
         self.conn = connection
 
-    def _rsync_e_opt(self) -> str:
-        """The ``-e`` ssh transport string enforcing batch mode."""
-        return "ssh " + " ".join(self.conn.config.base_ssh_opts())
+    def _rsync_e_opt(self, alias: str) -> str:
+        """Return the ``-e`` transport that can only reuse an existing master."""
+        return self.conn.reuse_only_ssh_transport(alias)
 
     def _alias(self, transfer: bool) -> str:
         return self.conn.config.transfer_alias if transfer else self.conn.config.host_alias
@@ -123,12 +124,36 @@ class O2Sync:
         return self.conn.run_raw(argv, timeout=timeout, master_alias=self._alias(transfer))
 
     def _build_rsync(self, *, source: str, dest: str, extra_args: list[str] | None) -> list[str]:
+        alias = self._alias_from_remote(source, dest)
         return [
-            "rsync",
+            # Pin the system client so detached transfers cannot resolve a PATH
+            # wrapper that ignores the hardened `-e` SSH transport.
+            self.conn.RSYNC_EXECUTABLE,
             *_DEFAULT_RSYNC_ARGS,
             "-e",
-            self._rsync_e_opt(),
+            self._rsync_e_opt(alias),
             *(extra_args or []),
             source,
             dest,
         ]
+
+    def _alias_from_remote(self, source: str, dest: str) -> str:
+        """Return the configured ``[user@]alias`` from an rsync endpoint.
+
+        Preserve an explicit user because the hardened SSH transport resolves
+        ``%r``-based ControlPath templates. Comparing only the host portion keeps
+        the configured login/transfer aliases authoritative while allowing the
+        standard rsync ``user@alias:path`` spelling.
+        """
+
+        for alias in (self.conn.config.transfer_alias, self.conn.config.host_alias):
+            for operand in (source, dest):
+                if ":" not in operand:
+                    continue
+                endpoint = operand.split(":", 1)[0]
+                if endpoint.rsplit("@", 1)[-1] == alias:
+                    return endpoint
+        # O2Sync always constructs one remote endpoint itself. Retain a safe
+        # login-alias default for programmatic callers that invoke this private
+        # builder directly with two local-looking paths.
+        return self.conn.config.host_alias

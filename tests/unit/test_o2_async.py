@@ -67,11 +67,26 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
-    cfg = O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2 o2-transfer\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/%n-control.sock\n"
+    )
+    cfg = O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=lock,
+        ssh_config_file=ssh_config,
+    )
 
     def runner(argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if master else 255, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     return O2Connection(cfg, runner=runner)
@@ -103,7 +118,10 @@ def test_push_async_launches_detached_with_escaped_remote(tmp_path):
     assert wrapped[3] == "bash" and wrapped[4] == handle.rc_path
     rsync_argv = wrapped[5:]
     assert rsync_argv == O2Sync(_conn(tmp_path)).push_argv("/local/Human", remote)
-    assert rsync_argv[0] == "rsync"
+    assert rsync_argv[0] == O2Connection.RSYNC_EXECUTABLE
+    transport = rsync_argv[rsync_argv.index("-e") + 1]
+    assert "PreferredAuthentications=none" in transport
+    assert "PubkeyAuthentication=no" in transport
     assert rsync_argv[-1] == "o2:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
 
     # metadata persisted (the schema status() reads); argv stored is the rsync argv, not the wrapper.

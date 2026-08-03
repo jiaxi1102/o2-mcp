@@ -20,6 +20,29 @@ ControlMaster session**:
    **ControlMaster** (stays up ~8h via `ControlPersist`).
 2. Every other tool reuses that master and costs **no** additional push.
 
+Ordinary commands and transfers are authentication-disabled on purpose. OpenSSH normally
+falls back to a standalone connection when a configured control socket disappears; on O2,
+that key-based fallback can generate an unexpected Duo request. The MCP therefore passes
+`ControlMaster=no`, `PreferredAuthentications=none`, and disables public-key, password,
+keyboard-interactive, GSSAPI, and host-based authentication for every non-start operation.
+It also disables `ProxyJump` and `ProxyCommand`, because proxy SSH subprocesses would not
+inherit the outer client's authentication restrictions, and disables local/known-host command
+hooks that could launch another process. Those options still permit reuse of an
+already-authenticated master: the MCP first resolves the alias's original `ControlPath` from
+an inspected, flattened SSH config and pins that expanded socket with `-S`, preserving `%C`
+paths whose hash includes a jump host. Every reuse command then uses `-F /dev/null`; caller
+`-F`, `-S`, and `ControlPath` overrides are removed. User overrides must use the unambiguous
+`user@alias` form, while port and hostname overrides are rejected because they would no
+longer match the pinned socket. SSH and rsync are normalized to the operating system's
+`/usr/bin` clients; executable paths or wrappers supplied by callers are rejected. A missing
+or failed socket terminates locally instead of opening a replacement login.
+
+OpenSSH evaluates `Match exec` shell predicates even for its nominally local `ssh -G` config
+dump. The MCP therefore reads the configured SSH file and recursively flattens `Include`
+directives itself, rejects any `Match` block before launching OpenSSH, and runs `ssh -G` only
+against that private inspected snapshot. If your normal SSH config contains `Match`, put the
+O2 `Host` blocks in a separate Match-free file and set `O2_SSH_CONFIG_FILE` to it.
+
 The optional `o2-transfer` alias is a different host and therefore needs its own separately
 approved ControlMaster. The cross-process guard serializes login- and transfer-master starts,
 but it does not pretend those two distinct O2 authentications are one session.
@@ -30,10 +53,11 @@ is what causes "a Duo call every minute". The workstation-wide
 starts are also serialized across MCP processes, so concurrent Codex tasks cannot both pass
 the no-master check and initiate overlapping Duo authentications.
 
-If a serialized master start fails, times out, or crashes, a shared attempt receipt suppresses
-all queued retries for five minutes. This converts a burst of simultaneous requests into one
-authorization attempt instead of a sequence of repeated Duo calls. A successful start clears
-the receipt immediately.
+If a serialized master start fails, times out, crashes, or returns zero without leaving a live
+control socket, a shared attempt receipt suppresses all queued retries for five minutes. This
+converts a burst of simultaneous requests into one authorization attempt instead of a sequence
+of repeated Duo calls. A start clears the receipt only after a post-start `ssh -O check` confirms
+that the requested login or transfer master is reusable.
 
 For upgrade safety, the historical project-local
 `<current-working-directory>/.agent_locks/O2_DISABLED` path is also honored. This prevents an
@@ -68,6 +92,7 @@ pip install -e ".[o2]"     # on a 3.10+ env
       "env": {
         "O2_SSH_HOST_ALIAS": "o2",
         "O2_SSH_TRANSFER_ALIAS": "o2-transfer",
+        "O2_SSH_CONFIG_FILE": "/Users/you/.ssh/config",
         "O2_SSH_LOCK_FILE": "/Users/you/.agent_locks/O2_DISABLED"
       }
     }
@@ -110,10 +135,14 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 
 ## Safety contract
 
-- All SSH uses `BatchMode=yes` (public key only) — a dead master or missing key fails fast
-  instead of triggering an interactive MFA prompt.
-- Remote commands run only through an already-established ControlMaster; opening a new login
-  requires explicit opt-in (`allow_new_login`).
+- Only `o2_start_master` is permitted to authenticate, and it requires explicit opt-in
+  (`allow_new_login`). Remote commands, synchronous transfers, detached transfers, and
+  transfer-node lifecycle launches disable every SSH authentication method, so OpenSSH's
+  normal missing-socket fallback cannot generate a new Duo request. Reuse-only operations
+  also disable SSH proxy/local command subprocesses, isolate themselves from live SSH config,
+  and remove caller socket/config overrides.
+- The library retains its historical `require_master` parameters for source compatibility,
+  but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - The user-level `O2_DISABLED` lock hard-stops every operation across projects and Codex tasks;
   the legacy current-project lock remains an additional hard stop for safe upgrades.
 - A fixed user-level file mutex serializes new login and transfer-master starts across MCP
@@ -121,7 +150,9 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   after waiting, each contender rechecks the socket and becomes a no-op when another task
   already established it.
 - A pre-SSH attempt receipt applies a five-minute, workstation-wide cooldown after a failed,
-  timed-out, or crashed start, preventing already-queued callers from retrying sequentially.
+  timed-out, crashed, or postcondition-failing start, preventing already-queued callers from
+  retrying sequentially. A zero exit from `ssh -MNf` is successful only when an immediate
+  control-socket check confirms that the background master survived.
 - Destructive/transfer-node operations default to dry-run where applicable and verify before
   freeing scratch.
 

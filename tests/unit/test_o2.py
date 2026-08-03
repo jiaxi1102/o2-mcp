@@ -8,6 +8,7 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import threading
 import time
@@ -26,6 +27,7 @@ from o2mcp import (
     O2OffVpnError,
     O2Slurm,
     O2Sync,
+    O2UnsafeTransportError,
     default_runner,
 )
 from o2mcp import keepalive as o2keepalive
@@ -41,17 +43,29 @@ def isolate_user_level_o2_files(monkeypatch, tmp_path):
 class RecordingRunner:
     """A fake subprocess runner: records calls, answers via a response function."""
 
-    def __init__(self, *, master: bool = True, responder=None):
+    def __init__(self, *, master: bool = True, responder=None, start_persists: bool = True):
         self.calls = []
         self.master = master
         self._responder = responder
+        self._start_persists = start_persists
 
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if self.master else 255, "", "")
         if "-MNf" in argv:
+            # A successful fake startup normally creates a reusable master so
+            # the production postcondition is exercised. Tests can disable this
+            # transition to reproduce SSH returning zero before its background
+            # connection disappears.
+            if self._start_persists:
+                self.master = True
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            # Config expansion is a local-only prerequisite, not the remote
+            # command under test. Model both values production code consumes.
+            out = f"hostname {argv[-1]}.example\ncontrolpath /tmp/{argv[-1]}-control.sock\n"
+            return CommandResult(list(argv), 0, out, "")
         if self._responder is not None:
             out, err, rc = self._responder(argv, input_text)
             return CommandResult(list(argv), rc, out, err)
@@ -63,7 +77,13 @@ class RecordingRunner:
         cmds = []
         for call in self.calls:
             argv = call["argv"]
-            if argv and argv[0] == "ssh" and "-O" not in argv and "-MNf" not in argv:
+            if (
+                argv
+                and argv[0] == O2Connection.SSH_EXECUTABLE
+                and "-O" not in argv
+                and "-MNf" not in argv
+                and "-G" not in argv
+            ):
                 cmds.append(argv[-1])
         return cmds
 
@@ -87,6 +107,9 @@ class ConcurrentStartRunner:
 
     def __call__(self, argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
         """Return deterministic SSH-check/start results for the race test."""
+
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, "controlpath /tmp/o2-control.sock\n", "")
 
         if "-O" in argv and "check" in argv:
             with self._state_lock:
@@ -113,7 +136,24 @@ def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
     lock = tmp_path / "O2_DISABLED"
     if locked:
         lock.write_text("disabled")
-    return O2Config(host_alias="o2", transfer_alias="o2-transfer", connect_timeout=20, lock_file=lock)
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        "Host o2-transfer\n"
+        "  HostName transfer.rc.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-transfer-control.sock\n"
+    )
+    return O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        connect_timeout=20,
+        lock_file=lock,
+        ssh_config_file=ssh_config,
+    )
 
 
 def test_default_lock_is_workstation_wide(monkeypatch, tmp_path):
@@ -132,6 +172,30 @@ def test_explicit_lock_path_still_overrides_global_default(monkeypatch, tmp_path
     monkeypatch.setenv("O2_SSH_LOCK_FILE", str(explicit))
 
     assert O2Config().lock_file == explicit
+
+
+def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
+    """Ordinary commands must be unable to authenticate if multiplexing fails."""
+
+    opts = _config(tmp_path).reuse_only_ssh_opts()
+    option_values = {opts[index + 1] for index, token in enumerate(opts[:-1]) if token == "-o"}
+
+    # BatchMode alone is insufficient on O2 because successful key authentication
+    # can itself trigger Duo. Disabling the key and every alternate authentication
+    # mechanism ensures a missing socket produces a local SSH failure, not a login.
+    assert {
+        "ControlMaster=no",
+        "ConnectionAttempts=1",
+        "ProxyCommand=none",
+        "ProxyJump=none",
+        "PreferredAuthentications=none",
+        "PubkeyAuthentication=no",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "GSSAPIAuthentication=no",
+        "HostbasedAuthentication=no",
+        "NumberOfPasswordPrompts=0",
+    } <= option_values
 
 
 # --- subprocess stdio isolation ---------------------------------------------
@@ -216,6 +280,19 @@ def test_run_requires_master(tmp_path):
         conn.run("squeue")
 
 
+def test_master_running_treats_probe_timeout_as_unavailable(tmp_path):
+    """A hung local socket check must fail closed without escaping as an error."""
+
+    def runner(argv, timeout, input_text):
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, "controlpath /tmp/o2-control.sock\n", "")
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    assert conn.master_running() is False
+
+
 def test_run_raw_requires_master(tmp_path):
     # A raw transport (rsync/ssh) must also refuse without a master, or it would
     # open a fresh connection — a new Duo push — outside the one approved master.
@@ -224,21 +301,117 @@ def test_run_raw_requires_master(tmp_path):
     assert conn.master_running() is False
     with pytest.raises(O2MasterUnavailableError):
         conn.run_raw(["rsync", "x", "y"])
-    # An explicit opt-out is still honored for a deliberately-cold transport.
-    conn.run_raw(["rsync", "x", "y"], require_master=False)
-    assert runner.calls[-1]["argv"][0] == "rsync"
+    # The former escape hatch is retained only as an explicit failure so an old
+    # caller cannot silently regain cold-connection behavior after upgrading.
+    calls_before_opt_out = len(runner.calls)
+    with pytest.raises(O2UnsafeTransportError, match="Cold O2 SSH/rsync execution is disabled"):
+        conn.run_raw(["rsync", "x", "y"], require_master=False)
+    assert len(runner.calls) == calls_before_opt_out
 
 
-def test_run_uses_batchmode_and_alias(tmp_path):
+def test_run_uses_reuse_only_authentication_and_alias(tmp_path):
     runner = RecordingRunner(master=True)
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.run("hostname; whoami")
     assert result.ok
     last = runner.calls[-1]["argv"]
-    assert last[0] == "ssh"
-    assert "BatchMode=yes" in last
+    assert last[0] == O2Connection.SSH_EXECUTABLE
+    assert last[:5] == [O2Connection.SSH_EXECUTABLE, "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert last[5 : 5 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+    assert "PreferredAuthentications=none" in last
+    assert "PubkeyAuthentication=no" in last
+    assert "PermitLocalCommand=no" in last
+    assert "KnownHostsCommand=none" in last
     assert last[-2] == "o2"
     assert last[-1] == "hostname; whoami"
+
+
+def test_run_pins_proxy_derived_control_path_before_disabling_proxy(tmp_path):
+    """ProxyJump-dependent ``%C`` sockets retain their original identity."""
+
+    class ProxyConfigRunner(RecordingRunner):
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                return CommandResult(
+                    list(argv),
+                    0,
+                    "proxyjump bastion.example\ncontrolpath /tmp/cm-original-jump-hash\n",
+                    "",
+                )
+            return super().__call__(argv, timeout, input_text)
+
+    runner = ProxyConfigRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.run("hostname")
+
+    assert result.ok
+    command = runner.calls[-1]["argv"]
+    assert command[:5] == [
+        O2Connection.SSH_EXECUTABLE,
+        "-F",
+        "/dev/null",
+        "-S",
+        "/tmp/cm-original-jump-hash",
+    ]
+    assert "ProxyJump=none" in command and "ProxyCommand=none" in command
+
+
+def test_match_ssh_config_is_rejected_before_openssh_runs(tmp_path):
+    """Socket expansion must never execute a Match predicate's shell command."""
+
+    config = _config(tmp_path)
+    config.ssh_config_file.write_text(
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+        'Match=exec "ssh unsafe-probe.example true"\n'
+        "  ServerAliveInterval 30\n"
+    )
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(config, runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="contains Match"):
+        conn.run("hostname")
+
+    # The rejection comes from literal file inspection. In particular, not even
+    # `ssh -G` is launched, because that command evaluates Match exec itself.
+    assert runner.calls == []
+
+
+def test_match_in_included_ssh_config_is_rejected(tmp_path):
+    """An Include cannot hide an executable Match block from the safety scan."""
+
+    config = _config(tmp_path)
+    included = tmp_path / "o2-extra.conf"
+    included.write_text('Match exec "ssh unsafe-probe.example true"\n  ServerAliveInterval 30\n')
+    config.ssh_config_file.write_text(
+        f"Include={included}\n"
+        "Host o2\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/o2-control.sock\n"
+    )
+    runner = RecordingRunner(master=True)
+
+    with pytest.raises(O2UnsafeTransportError, match="contains Match"):
+        O2Connection(config, runner=runner).run("hostname")
+
+    assert runner.calls == []
+
+
+def test_run_rejects_cold_connection_opt_out(tmp_path):
+    """No library caller may bypass the master-only contract."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="Cold O2 SSH execution is disabled"):
+        conn.run("hostname", require_master=False)
+
+    assert runner.calls == []
 
 
 def test_start_master_requires_opt_in(tmp_path):
@@ -249,14 +422,77 @@ def test_start_master_requires_opt_in(tmp_path):
     # Opt-in opens the master with -MNf.
     result = conn.start_master(allow_new_login=True)
     assert result.ok
-    assert "-MNf" in runner.calls[-1]["argv"]
+    starts = [call["argv"] for call in runner.calls if "-MNf" in call["argv"]]
+    assert len(starts) == 1
+    # The explicitly authorized start is the only path allowed to authenticate;
+    # reuse-only options would make creation of the initial master impossible.
+    assert "PubkeyAuthentication=no" not in starts[0]
+    assert "PreferredAuthentications=none" not in starts[0]
+    assert runner.calls[-1]["argv"] == conn._master_check_argv("o2")
+
+
+def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path):
+    """A zero exit from ``ssh -MNf`` is not success without a live socket."""
+
+    runner = RecordingRunner(master=False, start_persists=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok is False
+    assert result.returncode == 255
+    assert result.argv == conn._master_check_argv("o2")
+    assert result.stdout == ""
+    assert "post-start control-socket check failed" in result.stderr
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+
+    # The failed postcondition is retained as a workstation-wide cooldown
+    # receipt. A second caller must fail closed before another Duo-pushing SSH
+    # process can start.
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["target"] == "o2"
+    assert receipt["returncode"] == 255
+    with pytest.raises(O2LoginCoordinationError, match="refusing another Duo-pushing login"):
+        conn.start_master(allow_new_login=True)
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+
+
+def test_start_master_records_post_start_verification_timeout(tmp_path):
+    """A timed-out socket postcondition retains an actionable cooldown receipt."""
+
+    class VerificationTimeoutRunner(RecordingRunner):
+        def __call__(self, argv, timeout, input_text) -> CommandResult:
+            if "-O" in argv and "check" in argv and self.master:
+                self.calls.append({"argv": list(argv), "timeout": timeout, "input": input_text})
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return super().__call__(argv, timeout, input_text)
+
+    runner = VerificationTimeoutRunner(master=False)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(allow_new_login=True)
+
+    assert result.ok is False and result.returncode == 255
+    assert "TimeoutExpired" in result.stderr
+    receipt = json.loads(conn._master_start_attempt_file().read_text())
+    assert receipt["returncode"] == 255
 
 
 def test_start_master_noop_when_running(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
     result = conn.start_master(allow_new_login=False)
     assert result.ok and "already running" in result.stdout
-    assert result.argv == ["ssh", *conn.config.base_ssh_opts(), "-O", "check", "o2"]
+    assert result.argv == [
+        O2Connection.SSH_EXECUTABLE,
+        "-F",
+        "/dev/null",
+        "-S",
+        "/tmp/o2-control.sock",
+        *conn.config.base_ssh_opts(),
+        "-O",
+        "check",
+        "o2",
+    ]
 
 
 def test_start_master_can_open_the_transfer_alias(tmp_path):
@@ -267,16 +503,22 @@ def test_start_master_can_open_the_transfer_alias(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True, alias=conn.config.transfer_alias)
     assert result.ok
-    assert "-MNf" in runner.calls[-1]["argv"]
-    assert runner.calls[-1]["argv"][-1] == "o2-transfer"
+    starts = [call for call in runner.calls if "-MNf" in call["argv"]]
+    assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
+    assert runner.calls[-1]["argv"] == conn._master_check_argv("o2-transfer")
 
 
 def test_concurrent_master_starts_execute_one_login(tmp_path):
     """Even legacy project configs must share one O2/Duo login mutex."""
 
     runner = ConcurrentStartRunner()
+    ssh_config_file = _config(tmp_path).ssh_config_file
     configs = [
-        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        O2Config(
+            host_alias="o2",
+            lock_file=tmp_path / project / "O2_DISABLED",
+            ssh_config_file=ssh_config_file,
+        )
         for project in ("clock-project", "diffusion-project")
     ]
     connections = [O2Connection(config, runner=runner) for config in configs]
@@ -288,7 +530,17 @@ def test_concurrent_master_starts_execute_one_login(tmp_path):
     assert all(result.ok for result in results)
     assert sum("already running" in result.stdout for result in results) == 1
     reused = next(result for result in results if "already running" in result.stdout)
-    assert reused.argv == ["ssh", *configs[0].base_ssh_opts(), "-O", "check", "o2"]
+    assert reused.argv == [
+        O2Connection.SSH_EXECUTABLE,
+        "-F",
+        "/dev/null",
+        "-S",
+        "/tmp/o2-control.sock",
+        *configs[0].base_ssh_opts(),
+        "-O",
+        "check",
+        "o2",
+    ]
 
     mutex_paths = {conn._master_start_lock_file() for conn in connections}
     assert mutex_paths == {tmp_path / "test-home" / ".agent_locks" / "O2_LOGIN_START.lock"}
@@ -299,8 +551,13 @@ def test_concurrent_callers_do_not_retry_a_failed_login(tmp_path):
     """One failed SSH start must put every queued contender into cooldown."""
 
     runner = ConcurrentStartRunner(start_returncode=255)
+    ssh_config_file = _config(tmp_path).ssh_config_file
     configs = [
-        O2Config(host_alias="o2", lock_file=tmp_path / project / "O2_DISABLED")
+        O2Config(
+            host_alias="o2",
+            lock_file=tmp_path / project / "O2_DISABLED",
+            ssh_config_file=ssh_config_file,
+        )
         for project in ("clock-project", "diffusion-project")
     ]
     connections = [O2Connection(config, runner=runner) for config in configs]
@@ -399,7 +656,7 @@ def _vpn_responder(interface):
     """Responder answering the guard's `ssh -G` (HostName) and `route get` (interface)."""
 
     def responder(argv, input_text):
-        if argv[:2] == ["ssh", "-G"]:
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
         if argv[:2] == ["route", "get"]:
             if interface is None:
@@ -425,7 +682,7 @@ def test_start_master_allows_on_vpn(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_offvpn_override(tmp_path):
@@ -433,7 +690,7 @@ def test_start_master_offvpn_override(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True, allow_offvpn=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_failopen_when_iface_undetermined(tmp_path):
@@ -441,7 +698,7 @@ def test_start_master_failopen_when_iface_undetermined(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder(None))
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_failopen_when_route_binary_missing(tmp_path):
@@ -449,7 +706,7 @@ def test_start_master_failopen_when_route_binary_missing(tmp_path):
     # subprocess.run does) BEFORE any CommandResult.ok check — the probe must swallow it
     # and fail OPEN, not propagate the error and block an otherwise-legitimate login.
     def responder(argv, _input):
-        if argv[:2] == ["ssh", "-G"]:
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
         if argv[:2] == ["route", "get"]:
             raise FileNotFoundError(2, "No such file or directory", "route")
@@ -458,7 +715,7 @@ def test_start_master_failopen_when_route_binary_missing(tmp_path):
     runner = RecordingRunner(master=False, responder=responder)
     conn = O2Connection(_config(tmp_path), runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_guard_disabled_via_config(tmp_path):
@@ -468,19 +725,20 @@ def test_start_master_guard_disabled_via_config(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(config, runner=runner)
     result = conn.start_master(allow_new_login=True)
-    assert result.ok and "-MNf" in runner.calls[-1]["argv"]
+    assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
     # Guard disabled -> no egress probing at all.
     assert not any(call["argv"][:2] == ["route", "get"] for call in runner.calls)
 
 
-def test_o2config_vpn_fields_appended_last():
-    # The VPN fields must come AFTER the existing public fields so a positional
+def test_o2config_new_fields_are_appended_for_positional_compatibility():
+    # Safety fields must come AFTER the original public fields so a positional
     # O2Config(...) caller isn't silently shifted (e.g. default_user -> require_vpn).
     from dataclasses import fields
 
     names = [f.name for f in fields(O2Config)]
     assert names.index("require_vpn") > names.index("default_log_dir")
     assert names.index("vpn_iface_prefix") > names.index("default_user")
+    assert names.index("ssh_config_file") > names.index("vpn_iface_prefix")
 
 
 # --- Slurm submit/monitor ----------------------------------------------------
@@ -560,10 +818,12 @@ def test_push_pull_build_rsync(tmp_path):
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
     sync.push("./local/run.sbatch", "/scratch/jobs/run.sbatch")
     argv = runner.calls[-1]["argv"]
-    assert argv[0] == "rsync"
+    assert argv[0] == O2Connection.RSYNC_EXECUTABLE
     assert "-e" in argv
     e_opt = argv[argv.index("-e") + 1]
-    assert e_opt.startswith("ssh ") and "BatchMode=yes" in e_opt
+    assert e_opt.startswith(f"{O2Connection.SSH_EXECUTABLE} ") and "BatchMode=yes" in e_opt
+    assert "PreferredAuthentications=none" in e_opt
+    assert "PubkeyAuthentication=no" in e_opt
     assert argv[-2] == "./local/run.sbatch"
     assert argv[-1] == "o2:/scratch/jobs/run.sbatch"
 
@@ -571,6 +831,191 @@ def test_push_pull_build_rsync(tmp_path):
     argv = runner.calls[-1]["argv"]
     assert argv[-2] == "o2-transfer:/scratch/out/results"
     assert argv[-1] == "./local/results"
+
+    # Programmatic builder callers may use rsync's user-qualified endpoint.
+    # Preserve that user when selecting the `%r`-dependent ControlPath.
+    argv = sync._build_rsync(source="./local/results", dest="alice@o2-transfer:/scratch/results", extra_args=None)
+    transport = argv[argv.index("-e") + 1]
+    assert "-S /tmp/alice@o2-transfer-control.sock" in transport
+
+
+def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
+    """Library callers cannot smuggle an authentication-capable raw transport."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    conn.run_raw(["ssh", "o2", "hostname"])
+    direct = runner.calls[-1]["argv"]
+    assert direct[:5] == [O2Connection.SSH_EXECUTABLE, "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert direct[5 : 5 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
+
+    # Caller-selected config/socket paths are stripped, including after another
+    # option with a separate argument. The guarded /dev/null config and resolved
+    # socket remain the only effective values.
+    conn.run_raw(
+        [
+            "ssh",
+            "-c",
+            "aes128-ctr",
+            "-F",
+            "/tmp/unsafe-config",
+            "-S",
+            "/tmp/unsafe-socket",
+            "-o",
+            "ControlPath=/tmp/also-unsafe",
+            "o2",
+            "hostname",
+        ]
+    )
+    direct = runner.calls[-1]["argv"]
+    assert direct[:5] == [O2Connection.SSH_EXECUTABLE, "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
+    assert "/tmp/unsafe-config" not in direct
+    assert "/tmp/unsafe-socket" not in direct
+    assert "ControlPath=/tmp/also-unsafe" not in direct
+
+    conn.run_raw(
+        [
+            "rsync",
+            "-e",
+            "ssh -F /tmp/unsafe-config -S /tmp/unsafe-socket -o ControlPath=/tmp/also-unsafe",
+            "x",
+            "o2:/p",
+        ]
+    )
+    rsync = runner.calls[-1]["argv"]
+    transport = rsync[rsync.index("-e") + 1]
+    assert "-F /dev/null" in transport
+    assert "-S /tmp/o2-control.sock" in transport
+    assert "/tmp/unsafe-config" not in transport
+    assert "/tmp/unsafe-socket" not in transport
+    assert "/tmp/also-unsafe" not in transport
+    assert "PreferredAuthentications=none" in transport
+
+    # Every remote-shell option is normalized, not just the first. Use a benign
+    # caller option here; safety-sensitive `-o` options are rejected separately.
+    conn.run_raw(["rsync", "-e", "ssh", "-essh -o ServerAliveInterval=15", "x", "o2:/p"])
+    rsync = runner.calls[-1]["argv"]
+    transports = [
+        rsync[rsync.index("-e") + 1],
+        next(token[2:] for token in rsync if token.startswith("-e") and token != "-e"),
+    ]
+    assert all("PubkeyAuthentication=no" in transport for transport in transports)
+    assert all("PreferredAuthentications=none" in transport for transport in transports)
+    assert "ServerAliveInterval=15" in transports[1]
+
+    conn.run_raw(["rsync", "-avze", "ssh -o ServerAliveInterval=15", "x", "o2:/p"])
+    clustered = runner.calls[-1]["argv"]
+    transport = clustered[clustered.index("-avze") + 1]
+    assert "PubkeyAuthentication=no" in transport and "ServerAliveInterval=15" in transport
+
+    conn.run_raw(["rsync", "-avzessh -o ServerAliveInterval=15", "x", "o2:/p"])
+    attached = runner.calls[-1]["argv"]
+    transport = next(token[len("-avze") :] for token in attached if token.startswith("-avze"))
+    assert "PubkeyAuthentication=no" in transport and "ServerAliveInterval=15" in transport
+
+    # Rsync options that consume arguments end a short-option cluster. The
+    # letters inside those arguments are data, so an ``e`` in --fake-super or a
+    # temp path must not be mistaken for another remote-shell option.
+    conn.run_raw(["rsync", "-M--fake-super", "-T/tmp/cache", "x", "o2:/p"])
+    argument_clusters = runner.calls[-1]["argv"]
+    assert "-M--fake-super" in argument_clusters
+    assert "-T/tmp/cache" in argument_clusters
+    inserted_transport = argument_clusters[argument_clusters.index("-e") + 1]
+    assert "PreferredAuthentications=none" in inserted_transport
+
+    # The same rule applies when a non-transport option takes its argument from
+    # the next argv element. Even an argument literally named ``-e`` remains an
+    # argument to ``-M``; the guard inserts its own separate hardened transport.
+    conn.run_raw(["rsync", "-M", "-e", "x", "o2:/p"])
+    separated_argument = runner.calls[-1]["argv"]
+    assert separated_argument[separated_argument.index("-M") + 1] == "-e"
+    assert separated_argument[1] == "-e"
+    assert "PreferredAuthentications=none" in separated_argument[2]
+
+    # Long options can also consume the next argv element. A pattern named
+    # ``-e`` is valid data for --exclude, not a second remote-shell declaration.
+    conn.run_raw(["rsync", "--exclude", "-e", "x", "o2:/p"])
+    long_argument = runner.calls[-1]["argv"]
+    exclude_index = long_argument.index("--exclude")
+    assert long_argument[exclude_index + 1] == "-e"
+    assert long_argument[1] == "-e"
+    assert "PreferredAuthentications=none" in long_argument[2]
+
+    # An equals-attached long-option value stays inside its own token and does
+    # not hide the following real remote-shell option from normalization.
+    conn.run_raw(["rsync", "--exclude=-e", "-e", "ssh", "x", "o2:/p"])
+    attached_long_argument = runner.calls[-1]["argv"]
+    assert "--exclude=-e" in attached_long_argument
+    explicit_transport = attached_long_argument[attached_long_argument.index("-e") + 1]
+    assert "PreferredAuthentications=none" in explicit_transport
+
+    # Rsync also accepts ``-o=argument``. Preserve the equals sign while
+    # hardening the attached remote shell.
+    conn.run_raw(["rsync", "-avze=ssh -o ServerAliveInterval=15", "x", "o2:/p"])
+    equals_cluster = runner.calls[-1]["argv"]
+    equals_transport = next(token[len("-avze=") :] for token in equals_cluster if token.startswith("-avze="))
+    assert "PubkeyAuthentication=no" in equals_transport and "ServerAliveInterval=15" in equals_transport
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ssh", "-l", "alice", "o2", "hostname"],
+        ["ssh", "-o", "User=alice", "o2", "hostname"],
+        ["ssh", "-p", "2222", "o2", "hostname"],
+        ["ssh", "-p2222", "o2", "hostname"],
+        ["ssh", "-o", "Port=2222", "o2", "hostname"],
+        ["ssh", "-o", "HostName=other.example", "o2", "hostname"],
+        ["ssh", "-J", "proxy.example", "o2", "hostname"],
+        ["ssh", "-o", "ProxyCommand=ssh proxy.example", "o2", "hostname"],
+        ["ssh", "-o", "PubkeyAuthentication=yes", "o2", "hostname"],
+        ["ssh", "-i", "/tmp/key", "o2", "hostname"],
+        ["rsync", "-e", "ssh -l alice", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o User=alice", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -p 2222", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o Port=2222", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o ProxyCommand='ssh proxy.example'", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"],
+    ],
+)
+def test_run_raw_rejects_safety_sensitive_ssh_options(tmp_path, argv):
+    """Caller options cannot alter endpoint, proxy, or authentication safety."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="options are disabled"):
+        conn.run_raw(argv)
+
+    assert not any(
+        call["argv"]
+        and call["argv"][0] in {O2Connection.SSH_EXECUTABLE, O2Connection.RSYNC_EXECUTABLE}
+        and "-O" not in call["argv"]
+        and "-G" not in call["argv"]
+        for call in runner.calls
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["rsync", "-e", "custom-rsh", "x", "o2:/p"],
+        ["rsync", "-e", "/tmp/ssh", "x", "o2:/p"],
+        ["/tmp/ssh", "o2", "hostname"],
+        ["/tmp/rsync", "-e", "ssh", "x", "o2:/p"],
+    ],
+)
+def test_run_raw_rejects_untrusted_transport_executables(tmp_path, argv):
+    """A wrapper with a trusted-looking basename must not bypass hardening."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="trusted|arbitrary executable paths"):
+        conn.run_raw(argv)
+
+    assert runner.calls == []
 
 
 def test_remote_path_with_spaces_is_escaped(tmp_path):
@@ -616,6 +1061,8 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
@@ -626,10 +1073,12 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
 
 def test_run_raw_infers_target_alias_from_argv(tmp_path):
     # Even without master_alias, run_raw must check the alias the command targets
-    # (inferred from an <alias>:path rsync target), not always the login alias.
+    # (inferred from a [user@]<alias>:path rsync target), not always the login alias.
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
     conn = O2Connection(_config(tmp_path), runner=runner)
@@ -639,6 +1088,102 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
     # a bare ssh to the transfer node is inferred too
     with pytest.raises(O2MasterUnavailableError):
         conn.run_raw(["ssh", "o2-transfer", "ls"])
+    # Standard user-qualified rsync and SSH destinations must select the same
+    # transfer-node socket rather than falling back to the login alias.
+    with pytest.raises(O2MasterUnavailableError):
+        conn.run_raw(["rsync", "-e", "ssh", "x", "alice@o2-transfer:/p"])
+    with pytest.raises(O2MasterUnavailableError):
+        conn.run_raw(["ssh", "alice@o2-transfer", "ls"])
+
+    # When a user-qualified master does exist, both the local socket lookup and
+    # the control check retain that user. This matters for ControlPath templates
+    # containing %r, which must not silently select the alias's default user.
+    recording_runner = RecordingRunner(master=True)
+    recording_conn = O2Connection(_config(tmp_path), runner=recording_runner)
+    recording_conn.run_raw(["rsync", "-e", "ssh", "x", "alice@o2-transfer:/p"])
+    raw_rsync = recording_runner.calls[-1]["argv"]
+    transport = shlex.split(raw_rsync[raw_rsync.index("-e") + 1])
+    assert transport[transport.index("-S") + 1] == "/tmp/alice@o2-transfer-control.sock"
+    assert any(call["argv"][-1] == "alice@o2-transfer" and "-O" in call["argv"] for call in recording_runner.calls)
+
+    # Only SSH's destination operand selects a socket. An alias appearing in the
+    # remote command is ordinary data and must not override the actual `o2` host.
+    recording_conn.run_raw(["ssh", "o2", "echo", "o2-transfer"])
+    raw_ssh = recording_runner.calls[-1]["argv"]
+    assert raw_ssh[raw_ssh.index("-S") + 1] == "/tmp/o2-control.sock"
+
+    # Likewise, an rsync option argument can resemble a remote endpoint without
+    # being a source or destination. Target inference must ignore that value.
+    recording_conn.run_raw(["rsync", "--exclude", "o2-transfer:/ignored", "x", "o2:/p"])
+    raw_rsync = recording_runner.calls[-1]["argv"]
+    transport = shlex.split(raw_rsync[raw_rsync.index("-e") + 1])
+    assert transport[transport.index("-S") + 1] == "/tmp/o2-control.sock"
+
+
+@pytest.mark.parametrize(
+    ("argv", "master_alias"),
+    [
+        (["ssh", "o2", "hostname"], "o2-transfer"),
+        (["ssh", "alice@o2", "hostname"], "o2"),
+        (["rsync", "x", "o2-transfer:/p"], "o2"),
+    ],
+)
+def test_run_raw_rejects_master_alias_destination_mismatch(tmp_path, argv, master_alias):
+    """The explicit socket identity must equal the command's actual endpoint."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="disagrees with transport destination"):
+        conn.run_raw(argv, master_alias=master_alias)
+
+    # The mismatch is determined from argv alone, before config expansion or any
+    # local master probe has a chance to obscure the caller error.
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ssh", "o22", "hostname"],
+        ["rsync", "x", "other:/p"],
+        ["rsync", "o2:/p", "other:/q"],
+    ],
+)
+def test_run_raw_rejects_unrecognized_transport_destinations(tmp_path, argv):
+    """A typoed host must not be overridden by the default pinned O2 socket."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="not a configured O2 alias"):
+        conn.run_raw(argv)
+
+    assert runner.calls == []
+
+
+def test_run_raw_rejects_multiple_configured_endpoints(tmp_path):
+    """One rsync command cannot safely pin sockets for two remote endpoints."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="multiple O2 endpoints"):
+        conn.run_raw(["rsync", "o2:/source", "o2-transfer:/dest"])
+
+    assert runner.calls == []
+
+
+def test_rsync_local_colon_path_is_not_mistaken_for_remote_endpoint(tmp_path):
+    """A colon after a slash is a local rsync path, not an unrecognized host."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.run_raw(["rsync", "./sample:a", "./out"])
+
+    assert result.ok
+    assert runner.calls[-1]["argv"][0] == O2Connection.RSYNC_EXECUTABLE
 
 
 def test_rsync_blocked_by_lock(tmp_path):
@@ -707,6 +1252,8 @@ def test_keepalive_clears_stale_master_on_timeout(tmp_path, monkeypatch):
             return CommandResult(list(argv), 0, "", "")  # local master process "running"
         if "-O" in argv and "exit" in argv:
             return CommandResult(list(argv), 0, "exit sent", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         if argv[-1] == "true":
             raise sp.TimeoutExpired(argv, timeout)  # connection dead -> ping stalls
         return CommandResult(list(argv), 0, "", "")

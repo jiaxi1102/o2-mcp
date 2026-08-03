@@ -30,6 +30,8 @@ class _Runner:
     def __call__(self, argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:  # master is up
             return CommandResult(list(argv), 0, "", "")
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")  # registry read etc. -> empty/ok
 
 
@@ -38,7 +40,19 @@ async def _run_tool(work):
 
 
 def _build(tmp_path) -> FastMCP:
-    cfg = O2Config(host_alias="o2", transfer_alias="o2-transfer", lock_file=tmp_path / "O2_DISABLED")
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text(
+        "Host o2 o2-transfer\n"
+        "  HostName o2.hms.harvard.edu\n"
+        "  User jiz947\n"
+        "  ControlPath /tmp/%n-control.sock\n"
+    )
+    cfg = O2Config(
+        host_alias="o2",
+        transfer_alias="o2-transfer",
+        lock_file=tmp_path / "O2_DISABLED",
+        ssh_config_file=ssh_config,
+    )
     factory = lambda: O2Runs(O2Connection(cfg, runner=_Runner()), POLICY)  # noqa: E731
     mcp = FastMCP("probe")
     tools.register(mcp, runs_factory=factory, run_tool=_run_tool)

@@ -15,9 +15,11 @@ is gone. State (one ``.json`` + ``.log`` + ``.rc`` per transfer) lives under
 
 The same safety contract as the blocking path is enforced *before* launching: the
 local ``O2_DISABLED`` lock is honored, and a transfer refuses unless the
-ControlMaster for its alias is already up — so a background rsync can never open
-a fresh Duo-pushing login. The detached rsync reuses that master through the SSH
-config's ControlPath, exactly like :class:`O2Sync`.
+ControlMaster for its alias is already up. The detached rsync also disables all
+SSH authentication methods, closing the race in which a master could disappear
+after the check and OpenSSH would otherwise fall back to a fresh Duo-pushing
+login. Successful transfers reuse the configured ControlPath, exactly like
+:class:`O2Sync`.
 
 The subprocess seam (``spawner``) and clock are injected so the whole class is
 unit-tested offline without spawning real processes.
