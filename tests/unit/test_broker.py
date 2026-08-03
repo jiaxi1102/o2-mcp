@@ -79,6 +79,7 @@ def _start_local_broker(tmp_path, broker_root, *, local_request_timeout=5.0):
         policy_file=policy.path,
         transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
         alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
         local_request_timeout=local_request_timeout,
     )
     thread = threading.Thread(target=server.serve_forever, name="offline-o2-broker", daemon=True)
@@ -222,6 +223,7 @@ def test_remote_hello_timeout_releases_lifetime_lock(tmp_path, broker_root):
         policy_file=policy.path,
         transport_argv=[sys.executable, "-u", "-c", "import time; time.sleep(30)"],
         alias="silent-o2",
+        destination={"hostname": "silent.example", "user": "offline", "port": "22"},
         startup_timeout=0.1,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -501,8 +503,16 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
         ('{"schema_version":1,"status":"ready","protocol":1,"alias":"offline-o2"}\n', 0o600),
         (None, None),
         ("{malformed", 0o600),
-        ('{"schema_version":1,"status":"ready","protocol":2,"alias":"offline-o2"}\n', 0o644),
-        ('{"schema_version":1,"status":"starting","protocol":2,"alias":"offline-o2"}\n', 0o600),
+        (
+            '{"schema_version":1,"status":"ready","protocol":2,"alias":"offline-o2",'
+            '"destination":{"hostname":"offline.example","user":"offline","port":"22"}}\n',
+            0o644,
+        ),
+        (
+            '{"schema_version":1,"status":"starting","protocol":2,"alias":"offline-o2",'
+            '"destination":{"hostname":"offline.example","user":"offline","port":"22"}}\n',
+            0o600,
+        ),
     ],
 )
 def test_unverified_receipt_fails_before_connecting_to_daemon(broker_root, receipt, mode):
@@ -589,6 +599,23 @@ def test_configured_alias_mismatch_blocks_commands_but_allows_local_stop(tmp_pat
     finally:
         if thread.is_alive():
             _stop_local_broker(thread, client)
+
+
+def test_expanded_destination_change_blocks_stale_broker_reuse(tmp_path, broker_root):
+    """HostName, user, or port changes cannot reuse the alias's previous daemon."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    rebound = BrokerClient(
+        client.paths.root,
+        expected_alias="offline-o2",
+        expected_destination={"hostname": "new.example", "user": "offline", "port": "22"},
+    )
+    try:
+        with pytest.raises(O2BrokerUnavailableError, match="expanded destination"):
+            rebound.execute("printf wrong-destination", timeout=2)
+        assert client.ping()["commands_completed"] == 0
+    finally:
+        _stop_local_broker(thread, client)
 
 
 def test_trusted_stale_protocol_receipt_still_allows_local_stop(tmp_path, broker_root):
@@ -815,6 +842,7 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
     try:
         started = connection.start_broker(grant_id=grant.id, transfer=transfer)
         first_pid = started["daemon"]["pid"]
+        assert set(started["destination"]) == {"hostname", "user", "port"}
         alias = config.transfer_alias if transfer else config.host_alias
         assert connection.run("printf launched", alias=alias, timeout=5).stdout == "launched"
 

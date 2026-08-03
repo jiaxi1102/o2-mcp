@@ -365,6 +365,38 @@ class O2Connection:
         alias = self.config.transfer_alias if transfer else self.config.host_alias
         return configured or BrokerClient(root, expected_alias=alias)
 
+    def _broker_destination(self, target: str) -> dict[str, str]:
+        """Return the expanded endpoint identity that a broker must preserve.
+
+        Alias text alone is insufficient because editing ``HostName``, ``User``,
+        or ``Port`` under the same alias changes the authority a command reaches.
+        The values come from the same inspected SSH-config snapshot used to
+        launch the broker, so the receipt and actual transport cannot drift.
+        """
+
+        resolved = self._resolved_ssh_config(target)
+        destination = {key: resolved.get(key, "") for key in ("hostname", "user", "port")}
+        if any(not value for value in destination.values()):
+            raise O2UnsafeTransportError(
+                f"SSH target '{target}' did not resolve a complete hostname/user/port identity."
+            )
+        return destination
+
+    def _identity_bound_broker_client(self, *, transfer: bool) -> BrokerClient:
+        """Bind a real broker client to the currently expanded SSH destination."""
+
+        client = self._broker_client(transfer=transfer)
+        if not isinstance(client, BrokerClient):
+            # Focused tests inject a small duck-typed fake. Production always
+            # uses BrokerClient and therefore always performs identity binding.
+            return client
+        target = self.config.transfer_alias if transfer else self.config.host_alias
+        return BrokerClient(
+            client.paths.root,
+            expected_alias=target,
+            expected_destination=self._broker_destination(target),
+        )
+
     def broker_local_status(self, *, transfer: bool = False) -> dict[str, object]:
         """Inspect one role-specific broker locally without invoking SSH."""
 
@@ -430,7 +462,8 @@ class O2Connection:
 
         self.policy.require_reuse_allowed()
         logical_target: LoginTarget = "transfer" if transfer else "login"
-        client = self._broker_client(transfer=transfer)
+        target = self.config.transfer_alias if transfer else self.config.host_alias
+        client = self._identity_bound_broker_client(transfer=transfer)
         status = client.local_status()
         if status.get("responsive") is True:
             return status
@@ -446,7 +479,6 @@ class O2Connection:
                 f"{logical_target} grant is required before starting its single SSH session."
             )
 
-        target = self.config.transfer_alias if transfer else self.config.host_alias
         broker_dir = self.config.transfer_broker_dir if transfer else self.config.broker_dir
         grant = self.policy.preview_login_grant(grant_id, logical_target)
         if not grant.allow_offvpn:
@@ -456,13 +488,14 @@ class O2Connection:
         # happen before grant consumption. A typo or unsafe Match block must not
         # waste the user's one authorized authentication attempt.
         paths = prepare_broker_directory(broker_dir)
-        self._resolved_ssh_config(target)
+        destination = self._broker_destination(target)
         atomic_private_text_write(paths.ssh_config, self._safe_ssh_config_text())
         launch_payload = {
             "schema_version": 1,
             "broker_dir": str(paths.root),
             "policy_file": str(self.config.policy_file),
             "alias": target,
+            "destination": destination,
             "grant_id": grant_id,
             "startup_timeout": self.config.broker_start_timeout,
             "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
@@ -832,9 +865,9 @@ class O2Connection:
             elif selected_role is None and target == self.config.transfer_alias:
                 selected_role = "transfer"
             if selected_role == "login":
-                broker = self._broker_client(transfer=False)
+                broker = self._identity_bound_broker_client(transfer=False)
             elif selected_role == "transfer":
-                broker = self._broker_client(transfer=True)
+                broker = self._identity_bound_broker_client(transfer=True)
             else:
                 raise O2UnsafeTransportError(
                     f"Persistent brokers may target only configured O2 aliases, not '{target}'."

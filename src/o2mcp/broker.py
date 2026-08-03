@@ -275,6 +275,15 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
             raise O2BrokerError("broker state receipt has no valid lifecycle status")
         if not isinstance(payload.get("alias"), str) or not payload["alias"]:
             raise O2BrokerError("broker state receipt has no valid SSH alias")
+        destination = payload.get("destination")
+        valid_destination = isinstance(destination, dict) and all(
+            isinstance(destination.get(key), str) and bool(destination[key]) for key in ("hostname", "user", "port")
+        )
+        # Protocol 1 predates destination binding. Keep its otherwise trusted
+        # receipt readable only so a local stop can retire that daemon; protocol
+        # 2 command clients require the full identity below.
+        if protocol >= 2 and not valid_destination:
+            raise O2BrokerError("broker state receipt has no valid expanded SSH destination")
         return payload
     except FileNotFoundError:
         return {"status": "absent"}
@@ -287,11 +296,18 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
 class BrokerClient:
     """Local Unix-socket client shared by independently launched MCP processes."""
 
-    def __init__(self, root: str | Path, *, expected_alias: str | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        expected_alias: str | None = None,
+        expected_destination: dict[str, str] | None = None,
+    ) -> None:
         """Bind a client to one broker directory and optional configured target."""
 
         self.paths = BrokerPaths(Path(root).expanduser())
         self.expected_alias = expected_alias
+        self.expected_destination = dict(expected_destination) if expected_destination is not None else None
 
     def _connect(
         self,
@@ -325,6 +341,16 @@ class BrokerClient:
             raise O2BrokerUnavailableError(
                 f"The ready O2 broker targets alias {state.get('alias')!r}, but this client is configured for "
                 f"{self.expected_alias!r}. Stop the old broker locally before an explicitly authorized restart."
+            )
+        if (
+            require_expected_alias
+            and self.expected_destination is not None
+            and state.get("destination") != self.expected_destination
+        ):
+            raise O2BrokerUnavailableError(
+                f"The ready O2 broker targets expanded destination {state.get('destination')!r}, but the current "
+                f"SSH configuration resolves to {self.expected_destination!r}. Stop the old broker locally before "
+                "an explicitly authorized restart."
             )
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -548,6 +574,7 @@ class BrokerServer:
         policy_file: Path,
         transport_argv: list[str],
         alias: str,
+        destination: dict[str, str],
         grant_id: str | None = None,
         ack_fd: int | None = None,
         startup_timeout: float = 90.0,
@@ -558,6 +585,11 @@ class BrokerServer:
         self.policy = O2PolicyStore(policy_file)
         self.transport_argv = list(transport_argv)
         self.alias = alias
+        if not isinstance(destination, dict) or not all(
+            isinstance(destination.get(key), str) and bool(destination[key]) for key in ("hostname", "user", "port")
+        ):
+            raise ValueError("broker destination must contain non-empty hostname, user, and port strings")
+        self.destination = {key: destination[key] for key in ("hostname", "user", "port")}
         self.grant_id = grant_id
         self.ack_fd = ack_fd
         valid_startup_timeout = (
@@ -596,6 +628,7 @@ class BrokerServer:
                 "status": status,
                 "pid": os.getpid(),
                 "alias": self.alias,
+                "destination": self.destination,
                 "updated_at": self.clock(),
                 "commands_completed": self._commands_completed,
                 **details,
@@ -896,6 +929,11 @@ def _load_launch(path: Path) -> dict[str, Any]:
     argv = payload.get("transport_argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
         raise O2BrokerStartupError("broker launch transport_argv must be a non-empty string list")
+    destination = payload.get("destination")
+    if not isinstance(destination, dict) or not all(
+        isinstance(destination.get(key), str) and bool(destination[key]) for key in ("hostname", "user", "port")
+    ):
+        raise O2BrokerStartupError("broker launch destination must contain hostname, user, and port strings")
     startup_timeout = payload.get("startup_timeout")
     if (
         not isinstance(startup_timeout, (int, float))
@@ -935,6 +973,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_file=Path(payload["policy_file"]),
             transport_argv=payload["transport_argv"],
             alias=payload["alias"],
+            destination=payload["destination"],
             grant_id=payload["grant_id"],
             ack_fd=args.ack_fd,
             startup_timeout=float(payload["startup_timeout"]),
