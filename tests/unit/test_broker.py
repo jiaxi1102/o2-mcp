@@ -40,6 +40,7 @@ from o2mcp.broker_protocol import (
     FRAME_MAGIC,
     MAX_COMMAND_BYTES,
     MAX_OUTPUT_BYTES,
+    MAX_REQUEST_ID_BYTES,
     PROTOCOL_VERSION,
     BrokerProtocolError,
     encode_frame,
@@ -47,7 +48,7 @@ from o2mcp.broker_protocol import (
     remote_helper_source,
     write_frame,
 )
-from o2mcp.policy import O2PolicyDeniedError, O2PolicyStore
+from o2mcp.policy import DEFAULT_LOGIN_COOLDOWN_SECONDS, O2PolicyDeniedError, O2PolicyStore
 
 
 def _reuse_policy(tmp_path) -> O2PolicyStore:
@@ -61,6 +62,18 @@ def _reuse_policy(tmp_path) -> O2PolicyStore:
         approval_reference="offline test approval",
     )
     return store
+
+
+def _pathological_json_payloads() -> list[bytes]:
+    """Build JSON that exceeds runtime parser guards without exceeding a frame."""
+
+    payloads = [b'{"nested":' + (b"[" * 10000) + b"0" + (b"]" * 10000) + b"}"]
+    get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+    if get_digit_limit is not None:
+        digit_limit = get_digit_limit()
+        if digit_limit > 0:
+            payloads.append(b'{"integer":' + (b"9" * (digit_limit + 1)) + b"}")
+    return payloads
 
 
 @pytest.fixture
@@ -152,6 +165,10 @@ def test_frame_rejects_oversized_and_truncated_payloads():
         encode_frame({"command": "\ud800"})
     with pytest.raises(BrokerProtocolError, match="expected bytes"):
         read_frame(io.BytesIO(FRAME_MAGIC + struct.pack("!I", 10) + b"{}"))
+    for body in _pathological_json_payloads():
+        raw = FRAME_MAGIC + struct.pack("!I", len(body)) + body
+        with pytest.raises(BrokerProtocolError, match="not valid UTF-8 JSON"):
+            read_frame(io.BytesIO(raw))
 
 
 def test_first_remote_frame_can_resynchronize_after_login_banner():
@@ -250,6 +267,36 @@ def test_oversized_command_is_rejected_without_losing_persistent_channel(tmp_pat
             assert read_frame(stream) == {"type": "error", "error": "invalid_request"}
         direct.close()
 
+        unsafe_text_requests = (
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "x" * (MAX_REQUEST_ID_BYTES + 1),
+                "command": "printf must-not-run",
+                "timeout_seconds": 5,
+                "stdin": None,
+            },
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "invalid-stdin",
+                "command": "cat",
+                "timeout_seconds": 5,
+                "stdin": "\ud800",
+            },
+        )
+        for request in unsafe_text_requests:
+            # ensure_ascii deliberately models a hand-crafted peer that can put
+            # an unpaired surrogate into otherwise UTF-8 JSON. Production
+            # encode_frame rejects it before socket access.
+            body = json.dumps(request, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            unsafe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            unsafe.connect(str(client.paths.socket))
+            with unsafe.makefile("rwb", buffering=0) as stream:
+                stream.write(FRAME_MAGIC + struct.pack("!I", len(body)) + body)
+                assert read_frame(stream) == {"type": "error", "error": "invalid_request"}
+            unsafe.close()
+
         assert client.execute("printf still-alive", timeout=5).stdout == "still-alive"
         assert server.transport.pid == ssh_pid
         assert client.ping()["commands_completed"] == 1
@@ -281,6 +328,55 @@ def test_remote_hello_timeout_releases_lifetime_lock(tmp_path, broker_root):
     assert "no protocol hello" in status["error"]
     assert BrokerClient(paths.root).launch_in_progress() is False
     assert not paths.socket.exists()
+
+
+def test_listener_publication_failure_preserves_failed_attempt_cooldown(
+    tmp_path,
+    broker_root,
+    monkeypatch,
+):
+    """A remote hello is not success until the trusted local endpoint exists."""
+
+    policy = _reuse_policy(tmp_path)
+    grant = policy.authorize_login(
+        expected_revision=policy.snapshot().revision,
+        expected_generation=policy.snapshot().generation,
+        target="login",
+        allow_offvpn=True,
+        approval_reference="offline listener-publication failure test",
+    )
+    launcher_pid = os.getpid()
+    policy.consume_login_grant(grant.id, "login")
+    paths = prepare_broker_directory(broker_root)
+    paths.socket.write_text("same-user stale regular file")
+    paths.socket.chmod(0o600)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        grant_id=grant.id,
+        login_target="login",
+        launcher_client_id=grant.client_id,
+        launcher_pid=launcher_pid,
+    )
+    # Production launches the daemon as a direct child. This in-process test
+    # models that binding without forking another test harness process.
+    monkeypatch.setattr(os, "getppid", lambda: launcher_pid)
+    outcomes = []
+    thread = threading.Thread(target=lambda: outcomes.append(server.serve_forever()), daemon=True)
+
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert outcomes == [1]
+    attempt = policy.snapshot().state["login_attempt"]
+    assert attempt["outcome"] == "failed"
+    assert attempt["blocked_until"] >= attempt["started_at"] + DEFAULT_LOGIN_COOLDOWN_SECONDS
+    # Refusing an untrusted path must not then delete it during generic cleanup.
+    assert paths.socket.read_text() == "same-user stale regular file"
 
 
 def test_disconnected_local_caller_does_not_kill_shared_channel(tmp_path, broker_root):
@@ -459,6 +555,15 @@ def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_
             response = read_frame(stream)
         direct.close()
 
+        # JSON may be syntactically plausible yet exceed Python's safe integer
+        # or nesting limits. Feed bytes directly because the normal encoder
+        # correctly refuses these values before socket access.
+        for body in _pathological_json_payloads():
+            pathological = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            pathological.connect(str(client.paths.socket))
+            pathological.sendall(FRAME_MAGIC + struct.pack("!I", len(body)) + body)
+            pathological.close()
+
         assert response == {"type": "error", "error": "invalid_request"}
         assert client.execute("printf healthy", timeout=5).stdout == "healthy"
         assert client.ping()["commands_completed"] == 1
@@ -466,7 +571,7 @@ def test_malformed_direct_socket_request_is_rejected_without_remote_forward(tmp_
         _stop_local_broker(thread, client)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), True])
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), True, 10**1000])
 def test_client_rejects_invalid_timeout_before_socket_access(tmp_path, timeout):
     """Malformed core callers fail locally before inspecting or creating paths."""
 
@@ -474,6 +579,17 @@ def test_client_rejects_invalid_timeout_before_socket_access(tmp_path, timeout):
 
     with pytest.raises(ValueError, match="finite positive"):
         client.execute("true", timeout=timeout)
+
+    assert not client.paths.root.exists()
+
+
+def test_client_rejects_unencodable_stdin_before_socket_access(tmp_path):
+    """A Unicode surrogate cannot be dispatched or tear down a ready helper."""
+
+    client = BrokerClient(tmp_path / "absent")
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        client.execute("cat", timeout=1, input_text="\ud800")
 
     assert not client.paths.root.exists()
 

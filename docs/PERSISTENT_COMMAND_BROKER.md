@@ -42,7 +42,7 @@ the handoff and prevents SSH or follows an already-started operation. Launch
 data is sent only through a bounded anonymous pipe inherited by that child; no
 same-UID-replaceable path or durable recipe exists. The daemon records the login
 attempt as successful only after the remote helper sends the expected protocol
-hello.
+hello and the owner-only local socket plus trusted ready receipt are published.
 
 There is no automatic retry or reconnect. The remote protocol hello has the same
 finite startup deadline as the launcher, so a silent child cannot retain the

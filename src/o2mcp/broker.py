@@ -37,10 +37,13 @@ from typing import Any, BinaryIO, Callable
 
 from o2mcp.broker_protocol import (
     MAX_COMMAND_BYTES,
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_ID_BYTES,
     PROTOCOL_VERSION,
     BrokerProtocolError,
     command_within_exec_limit,
     read_frame,
+    utf8_text_within_limit,
     write_frame,
 )
 from o2mcp.policy import LoginTarget, O2PolicyDeniedError, O2PolicyError, O2PolicyStore
@@ -74,6 +77,23 @@ MAX_UNIX_SOCKET_PATH_BYTES = 100
 # the embedded helper source. Bound descriptor reads so a malformed parent
 # cannot make the daemon accumulate unbounded local data before policy checks.
 MAX_LAUNCH_BYTES = 1024 * 1024
+
+
+def _is_finite_positive_number(value: Any) -> bool:
+    """Validate timeouts without allowing huge JSON integers to escape.
+
+    ``math.isfinite`` converts integers to a C double and can raise
+    ``OverflowError`` for a protocol-valid but extremely large integer. Direct
+    same-user socket requests must be rejected, not allowed to unwind the
+    daemon and terminate its sole authenticated transport.
+    """
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -370,16 +390,16 @@ class BrokerClient:
             raise ValueError("broker command must be a non-empty string")
         if not command_within_exec_limit(command):
             raise ValueError(f"broker command exceeds the {MAX_COMMAND_BYTES}-byte maximum")
-        valid_timeout = (
-            isinstance(timeout, (int, float))
-            and not isinstance(timeout, bool)
-            and math.isfinite(timeout)
-            and timeout > 0
-        )
-        if not valid_timeout:
+        if not _is_finite_positive_number(timeout):
             raise ValueError("broker timeout must be one finite positive number")
         if input_text is not None and not isinstance(input_text, str):
             raise ValueError("broker stdin must be text or None")
+        if input_text is not None and not utf8_text_within_limit(
+            input_text,
+            MAX_FRAME_BYTES,
+            allow_empty=True,
+        ):
+            raise ValueError("broker stdin must be valid UTF-8 within the frame limit")
         request_id = str(uuid.uuid4())
         request = {
             "type": "exec",
@@ -578,22 +598,10 @@ class BrokerServer:
         self.launcher_pid = launcher_pid
         self.grant_id = grant_id
         self.ack_fd = ack_fd
-        valid_startup_timeout = (
-            isinstance(startup_timeout, (int, float))
-            and not isinstance(startup_timeout, bool)
-            and math.isfinite(startup_timeout)
-            and startup_timeout > 0
-        )
-        if not valid_startup_timeout:
+        if not _is_finite_positive_number(startup_timeout):
             raise ValueError("broker startup timeout must be finite and positive")
         self.startup_timeout = startup_timeout
-        valid_local_timeout = (
-            isinstance(local_request_timeout, (int, float))
-            and not isinstance(local_request_timeout, bool)
-            and math.isfinite(local_request_timeout)
-            and local_request_timeout > 0
-        )
-        if not valid_local_timeout:
+        if not _is_finite_positive_number(local_request_timeout):
             raise ValueError("broker local request timeout must be finite and positive")
         self.local_request_timeout = local_request_timeout
         self.clock = clock
@@ -723,8 +731,6 @@ class BrokerServer:
         hello = hello_result.get("payload")
         if hello != {"type": "hello", "protocol": PROTOCOL_VERSION}:
             raise O2BrokerStartupError(f"unexpected remote broker hello: {hello!r}")
-        if self.grant_id is not None:
-            self.policy.finish_login_attempt(self.grant_id, outcome="success", returncode=0)
         return self.transport.stdin, self.transport.stdout
 
     def _spawn_transport_process(self) -> subprocess.Popen[bytes]:
@@ -751,10 +757,13 @@ class BrokerServer:
             self.paths.socket.unlink()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(self.paths.socket))
+        # From this point the daemon owns both the descriptor and pathname, so
+        # outer cleanup may remove them. A refusal before bind must leave an
+        # untrusted pre-existing object untouched.
+        self.listener = listener
         os.chmod(self.paths.socket, 0o600)
         listener.listen(16)
         listener.settimeout(1.0)
-        self.listener = listener
         assert self.transport is not None
         self._write_state("ready", ssh_pid=self.transport.pid, ready_at=self.clock())
 
@@ -829,21 +838,21 @@ class BrokerServer:
                     write_frame(local, {"type": "error", "error": "invalid_request"})
                 return
             request_timeout = request.get("timeout_seconds")
-            valid_timeout = (
-                isinstance(request_timeout, (int, float))
-                and not isinstance(request_timeout, bool)
-                and math.isfinite(request_timeout)
-                and request_timeout > 0
+            valid_timeout = _is_finite_positive_number(request_timeout)
+            request_id = request.get("id")
+            valid_request_id = utf8_text_within_limit(request_id, MAX_REQUEST_ID_BYTES)
+            stdin_text = request.get("stdin")
+            valid_stdin = stdin_text is None or utf8_text_within_limit(
+                stdin_text,
+                MAX_FRAME_BYTES,
+                allow_empty=True,
             )
             valid_request = (
                 request.get("protocol") == PROTOCOL_VERSION
-                and isinstance(request.get("id"), str)
-                and bool(request["id"])
-                and isinstance(request.get("command"), str)
-                and bool(request["command"])
-                and command_within_exec_limit(request["command"])
+                and valid_request_id
+                and command_within_exec_limit(request.get("command"))
                 and valid_timeout
-                and (request.get("stdin") is None or isinstance(request.get("stdin"), str))
+                and valid_stdin
             )
             if not valid_request:
                 with suppress(OSError, BrokerProtocolError):
@@ -897,6 +906,11 @@ class BrokerServer:
             self._acquire_lifetime_lock()
             remote_in, remote_out = self._start_transport()
             self._bind_listener()
+            # A remote protocol hello alone is not reusable authority. Clear
+            # the retry cooldown only after the local socket and trusted ready
+            # receipt have both been published successfully.
+            if self.grant_id is not None:
+                self.policy.finish_login_attempt(self.grant_id, outcome="success", returncode=0)
             while not self._stop_requested:
                 assert self.listener is not None
                 assert self.transport is not None
@@ -933,8 +947,8 @@ class BrokerServer:
         finally:
             if self.listener is not None:
                 self.listener.close()
-            with suppress(FileNotFoundError):
-                self.paths.socket.unlink()
+                with suppress(FileNotFoundError):
+                    self.paths.socket.unlink()
             if self.transport is not None and self.transport.poll() is None:
                 self.transport.terminate()
                 try:
@@ -980,12 +994,7 @@ def _validate_launch_payload(payload: Any) -> dict[str, Any]:
     ):
         raise O2BrokerStartupError("broker launch destination must contain hostname, user, and port strings")
     startup_timeout = payload.get("startup_timeout")
-    if (
-        not isinstance(startup_timeout, (int, float))
-        or isinstance(startup_timeout, bool)
-        or not math.isfinite(startup_timeout)
-        or startup_timeout <= 0
-    ):
+    if not _is_finite_positive_number(startup_timeout):
         raise O2BrokerStartupError("broker launch startup_timeout must be finite and positive")
     return payload
 
@@ -1017,7 +1026,7 @@ def _read_launch_fd(fd: int) -> dict[str, Any]:
             os.close(fd)
     try:
         payload = json.loads(b"".join(chunks).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise O2BrokerStartupError(f"broker launch payload is not valid UTF-8 JSON: {exc}") from exc
     return _validate_launch_payload(payload)
 

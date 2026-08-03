@@ -463,6 +463,11 @@ class O2PolicyStore:
                 raise O2PolicyConflictError(
                     f"The active login attempt for grant {grant_id} is no longer present in policy state."
                 )
+            if attempt.get("outcome") != "active":
+                # Terminal attempts are immutable evidence. In particular, a
+                # later broker cleanup failure must not rewrite success as
+                # failure after success already cleared the retry cooldown.
+                raise O2PolicyConflictError(f"The login attempt for grant {grant_id} is already terminal.")
             attempt["finished_at"] = self._clock()
             attempt["outcome"] = outcome
             attempt["returncode"] = returncode

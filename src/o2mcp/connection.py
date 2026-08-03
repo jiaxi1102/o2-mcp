@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -44,6 +44,7 @@ from o2mcp.config import O2Config
 from o2mcp.policy import (
     LoginTarget,
     O2LoginGrantError,
+    O2PolicyConflictError,
     O2PolicyDeniedError,
     O2PolicyStore,
 )
@@ -639,7 +640,12 @@ class O2Connection:
                 )
         except Exception:
             if consumed is not None and (daemon is None or daemon.poll() is not None):
-                self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+                # The daemon may have already recorded its own specific startup
+                # failure before the parent observes its exit. Terminal attempt
+                # evidence is immutable; preserve it rather than masking the
+                # original startup error with a duplicate-finish conflict.
+                with suppress(O2PolicyConflictError):
+                    self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
             raise
         finally:
             os.close(ack_read_fd)

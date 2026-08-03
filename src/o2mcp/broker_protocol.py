@@ -30,6 +30,10 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 # protocol frame cannot kill the sole persistent channel during process spawn.
 # Large scripts should be transferred as files and invoked by a short command.
 MAX_COMMAND_BYTES = 64 * 1024
+# Request ids are echoed in dispatch and result frames. Bounding them keeps a
+# small request from expanding a response beyond the frame limit after output is
+# added; production ids are UUIDs and need only 36 bytes.
+MAX_REQUEST_ID_BYTES = 128
 # JSON escaping can expand arbitrary command bytes substantially (for example,
 # every NUL becomes six ASCII characters). A one-MiB per-stream source bound
 # therefore keeps even worst-case escaped stdout+stderr below the 16-MiB frame.
@@ -41,20 +45,26 @@ class BrokerProtocolError(RuntimeError):
     """Raised when a peer sends a malformed, oversized, or truncated frame."""
 
 
-def command_within_exec_limit(value: Any) -> bool:
-    """Return whether text is a valid, non-empty, exec-safe broker command.
+def utf8_text_within_limit(value: Any, max_bytes: int, *, allow_empty: bool = False) -> bool:
+    """Return whether a value is encodable text within one byte limit.
 
     JSON can represent unpaired Unicode surrogates that cannot become a Unix
     argv byte string. Treat those as invalid input rather than allowing an
     encoding exception to terminate the local daemon or remote helper.
     """
 
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or (not value and not allow_empty):
         return False
     try:
-        return len(value.encode("utf-8")) <= MAX_COMMAND_BYTES
+        return len(value.encode("utf-8")) <= max_bytes
     except UnicodeEncodeError:
         return False
+
+
+def command_within_exec_limit(value: Any) -> bool:
+    """Return whether text is a valid, non-empty, exec-safe broker command."""
+
+    return utf8_text_within_limit(value, MAX_COMMAND_BYTES)
 
 
 def encode_frame(payload: Mapping[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -> bytes:
@@ -135,7 +145,7 @@ def read_frame(
     raw = _read_exact(stream, length)
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise BrokerProtocolError(f"broker frame is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise BrokerProtocolError("broker frame payload must be a JSON object")
@@ -184,6 +194,7 @@ def remote_helper_source() -> str:
         FRAME_MAGIC = b"O2B1"
         MAX_FRAME_BYTES = {MAX_FRAME_BYTES}
         MAX_COMMAND_BYTES = {MAX_COMMAND_BYTES}
+        MAX_REQUEST_ID_BYTES = {MAX_REQUEST_ID_BYTES}
         MAX_OUTPUT_BYTES = {MAX_OUTPUT_BYTES}
 
         def read_exact(size):
@@ -224,12 +235,23 @@ def remote_helper_source() -> str:
             write_all(FRAME_MAGIC + struct.pack(\"!I\", len(body)) + body)
             sys.stdout.buffer.flush()
 
-        def command_within_exec_limit(value):
-            if not isinstance(value, str) or not value:
+        def utf8_text_within_limit(value, max_bytes, allow_empty=False):
+            if not isinstance(value, str) or (not value and not allow_empty):
                 return False
             try:
-                return len(value.encode(\"utf-8\")) <= MAX_COMMAND_BYTES
+                return len(value.encode(\"utf-8\")) <= max_bytes
             except UnicodeEncodeError:
+                return False
+
+        def command_within_exec_limit(value):
+            return utf8_text_within_limit(value, MAX_COMMAND_BYTES)
+
+        def finite_positive_number(value):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
+            try:
+                return math.isfinite(value) and value > 0
+            except OverflowError:
                 return False
 
         def drain_bounded(stream, captures, key):
@@ -353,19 +375,20 @@ def remote_helper_source() -> str:
             except EOFError:
                 break
             request_id = request.get(\"id\")
-            if request.get(\"type\") != \"exec\" or not isinstance(request_id, str):
-                write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})
+            valid_request_id = utf8_text_within_limit(request_id, MAX_REQUEST_ID_BYTES)
+            if request.get(\"type\") != \"exec\" or not valid_request_id:
+                write_frame({{"type": "error", "id": None, "error": "invalid_request"}})
                 continue
             command = request.get(\"command\")
             timeout = request.get(\"timeout_seconds\")
             stdin_text = request.get(\"stdin\")
-            valid_timeout = (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
-                             and math.isfinite(timeout) and timeout > 0)
+            valid_timeout = finite_positive_number(timeout)
             valid_command = command_within_exec_limit(command)
-            if not valid_command or not valid_timeout:
-                write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})
-                continue
-            if stdin_text is not None and not isinstance(stdin_text, str):
+            valid_stdin = (
+                stdin_text is None
+                or utf8_text_within_limit(stdin_text, MAX_FRAME_BYTES, allow_empty=True)
+            )
+            if not valid_command or not valid_timeout or not valid_stdin:
                 write_frame({{"type": "error", "id": request_id, "error": "invalid_request"}})
                 continue
             started = time.monotonic()

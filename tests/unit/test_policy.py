@@ -353,6 +353,28 @@ def test_broker_spawn_requires_exact_active_consumed_attempt(tmp_path):
             pass
 
 
+def test_terminal_login_attempt_cannot_be_rewritten(tmp_path):
+    """Cleanup errors must not corrupt immutable success/cooldown evidence."""
+
+    store = _reuse_store(tmp_path)
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=True,
+        approval_reference="terminal evidence test",
+    )
+    store.consume_login_grant(grant.id, "login")
+    store.finish_login_attempt(grant.id, outcome="success", returncode=0)
+
+    with pytest.raises(O2PolicyConflictError, match="already terminal"):
+        store.finish_login_attempt(grant.id, outcome="failed", returncode=255)
+
+    attempt = store.snapshot().state["login_attempt"]
+    assert attempt["outcome"] == "success"
+    assert attempt["blocked_until"] == attempt["finished_at"]
+
+
 def test_disabled_policy_wins_before_broker_transport_spawn(tmp_path):
     """A consumed grant is not enough once the global mode becomes disabled."""
 
