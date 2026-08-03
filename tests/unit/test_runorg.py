@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 
-from o2mcp import CommandResult, O2Config, O2Connection
+from o2mcp import CommandResult, O2Config
+from o2mcp import O2Connection as _ProductionO2Connection
 from o2mcp.runorg import (
     RETENTION_KEEP,
     RETENTION_SWEEP,
@@ -26,6 +27,15 @@ from o2mcp.runorg import (
     variant_of,
 )
 from o2mcp.runorg.executor import _infer_pipeline
+
+
+class O2Connection(_ProductionO2Connection):
+    """Select the offline fake-runner command path for run-organization tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", True)
+        super().__init__(*args, **kwargs)
+
 
 TEST_POLICY = RunPolicy(
     pipeline_keywords=(("ultrack", "track"), ("grid", "grid")),

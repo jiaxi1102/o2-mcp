@@ -18,7 +18,6 @@ import pytest
 from o2mcp import (
     CommandResult,
     O2Config,
-    O2Connection,
     O2LockedError,
     O2LoginCoordinationError,
     O2LoginGrantError,
@@ -29,7 +28,19 @@ from o2mcp import (
     O2UnsafeTransportError,
     default_runner,
 )
+from o2mcp import (
+    O2Connection as _ProductionO2Connection,
+)
 from o2mcp import keepalive as o2keepalive
+from o2mcp.broker import BrokerExecutionResult, O2BrokerUnavailableError
+
+
+class O2Connection(_ProductionO2Connection):
+    """Use the explicit offline legacy transport for argv regression tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", "broker_client" not in kwargs)
+        super().__init__(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -1199,9 +1210,27 @@ def test_o2_core_is_dependency_light():
     assert "OK" in proc.stdout
 
 
-# --- keepalive (must never open a new login) ---------------------------------
+# --- keepalive (must never open a new session channel) -----------------------
 def _patch_keepalive(monkeypatch, conn):
     monkeypatch.setattr(o2keepalive, "O2Connection", lambda config=None: conn)
+
+
+class _KeepaliveBroker:
+    """Minimal broker double for keepalive routing and failure behavior."""
+
+    def __init__(self, *, responsive=True, fail=False):
+        self.responsive = responsive
+        self.fail = fail
+        self.commands = []
+
+    def local_status(self):
+        return {"responsive": self.responsive}
+
+    def execute(self, command, *, timeout, input_text=None):
+        self.commands.append(command)
+        if self.fail:
+            raise O2BrokerUnavailableError("persistent channel ended")
+        return BrokerExecutionResult(0, "", "", False, 0.01, False, False)
 
 
 def test_keepalive_skips_when_policy_disabled(tmp_path, monkeypatch):
@@ -1211,42 +1240,27 @@ def test_keepalive_skips_when_policy_disabled(tmp_path, monkeypatch):
     assert runner.calls == []  # never touched ssh
 
 
-def test_keepalive_skips_when_no_master(tmp_path, monkeypatch):
-    runner = RecordingRunner(master=False)
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+def test_keepalive_skips_when_no_broker(tmp_path, monkeypatch):
+    broker = _KeepaliveBroker(responsive=False)
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
-    assert out["action"] == "skipped" and out["reason"] == "no_master"
-    # It probed the master socket but NEVER ran a remote command (no new login).
-    assert "true" not in runner.remote_commands
+    assert out["action"] == "skipped" and out["reason"] == "no_broker"
+    assert broker.commands == []
 
 
-def test_keepalive_pings_existing_master(tmp_path, monkeypatch):
-    runner = RecordingRunner(master=True)
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+def test_keepalive_pings_existing_broker(tmp_path, monkeypatch):
+    broker = _KeepaliveBroker()
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
     assert out["action"] == "pinged" and out["ok"] is True
-    assert runner.remote_commands[-1] == "true"  # harmless no-op resets the idle timer
+    assert broker.commands == ["true"]
 
 
-def test_keepalive_clears_stale_master_on_timeout(tmp_path, monkeypatch):
-    """If the ping stalls (stale master), tear it down instead of reconnecting again."""
-    import subprocess as sp
+def test_keepalive_skips_failed_broker_without_restart(tmp_path, monkeypatch):
+    """A dead channel is reported locally; keepalive never starts a replacement."""
 
-    calls = []
-
-    def runner(argv, timeout, input_text):
-        calls.append(list(argv))
-        if "-O" in argv and "check" in argv:
-            return CommandResult(list(argv), 0, "", "")  # local master process "running"
-        if "-O" in argv and "exit" in argv:
-            return CommandResult(list(argv), 0, "exit sent", "")
-        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
-            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
-        if argv[-1] == "true":
-            raise sp.TimeoutExpired(argv, timeout)  # connection dead -> ping stalls
-        return CommandResult(list(argv), 0, "", "")
-
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+    broker = _KeepaliveBroker(fail=True)
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
-    assert out["action"] == "stale_master_cleared"
-    assert any("-O" in c and "exit" in c for c in calls)  # tore the stale master down
+    assert out == {"action": "skipped", "reason": "O2BrokerUnavailableError"}
+    assert broker.commands == ["true"]

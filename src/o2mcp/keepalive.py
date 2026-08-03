@@ -1,53 +1,39 @@
-"""Keep an existing O2 ControlMaster warm so it does not idle out.
+"""Send a no-op through an existing persistent O2 command broker.
 
-A no-op ``true`` is run through the master, which resets ``ControlPersist``'s idle
-timer (a plain socket ``-O check`` does not).
+A no-op ``true`` is dynamically framed over the broker's one SSH session. It
+does not create another SSH process or session channel.
 
-IMPORTANT — only useful ON the HMS network / VPN. ``ssh -O check`` reports the
-local master *process*, not whether O2 is still reachable through it. If the
-underlying connection has been dropped (which happens within minutes from
-outside the HMS network), the ping stalls trying to reconnect — and because O2
-autopushes Duo on every new connection, that reconnect triggers a Duo push. To
-contain that, on a stalled ping this tears the stale master down (``-O exit``) so
-the NEXT cycle sees "no master" and skips instead of reconnecting again. Net
-effect: at most one push per stale event, not one per cycle. Still: do not run
-this off-network. On-network (VPN), connections are stable and Duo-free, so it is
-safe and useful there.
+The broker never reconnects, so a dead channel means "skip", not a new Duo
+attempt. OpenSSH's own ServerAlive messages monitor the transport without
+opening command channels; this command exists only for deployments that want a
+remote application-level liveness marker.
 
-Safety invariants (enforced via ``O2Connection``): the global policy must permit
-reuse, and this command never opens a master itself — a dead master means
-"skip", not "reconnect".
+Safety invariants (enforced twice by ``O2Connection`` and the daemon): the global
+policy must permit reuse, and this command never starts a broker itself.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
-import subprocess
 from typing import Any
 
+from o2mcp.broker import O2BrokerError
 from o2mcp.config import O2Config
-from o2mcp.connection import O2Connection, O2MasterUnavailableError
+from o2mcp.connection import O2Connection
 from o2mcp.policy import O2PolicyDeniedError, O2PolicyInvalidError
 
 
 def keepalive(config: O2Config | None = None) -> dict[str, Any]:
-    """Ping an already-open O2 master; skip/clean up rather than reconnect."""
+    """Ping an already-open broker and skip rather than reconnect."""
+
     conn = O2Connection(config)
     try:
         conn.policy.require_reuse_allowed()
-        if not conn.master_running():
-            return {"action": "skipped", "reason": "no_master"}
+        if conn.broker_local_status().get("responsive") is not True:
+            return {"action": "skipped", "reason": "no_broker"}
         result = conn.run("true", timeout=8.0)
         return {"action": "pinged", "ok": result.ok, "returncode": result.returncode}
-    except subprocess.TimeoutExpired:
-        # The local master socket exists but O2 is no longer reachable through it,
-        # so the ping stalled (likely re-authenticating). Tear the stale master
-        # down so the next cycle skips instead of reconnecting again.
-        with contextlib.suppress(Exception):
-            conn.stop_master()
-        return {"action": "stale_master_cleared", "reason": "ping_timed_out"}
-    except (O2PolicyDeniedError, O2PolicyInvalidError, O2MasterUnavailableError) as exc:
+    except (O2PolicyDeniedError, O2PolicyInvalidError, O2BrokerError) as exc:
         return {"action": "skipped", "reason": type(exc).__name__}
 
 

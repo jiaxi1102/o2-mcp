@@ -95,7 +95,7 @@ class O2Slurm:
     ) -> SubmitResult:
         """Stage an sbatch script's TEXT to ``remote_path`` on O2, then submit it.
 
-        The script is written via the existing ControlMaster (no extra login) and
+        The script is written via the existing framed broker session and
         made executable before submission.
         """
         quoted = _quote_remote_path(remote_path)

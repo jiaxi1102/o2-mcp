@@ -14,6 +14,7 @@ Project-specific layers (e.g. run-organization for a particular pipeline) build
 from __future__ import annotations
 
 from o2mcp.async_transfer import O2AsyncTransfer, TransferHandle, default_spawner
+from o2mcp.broker import O2BrokerError, O2BrokerStartupError, O2BrokerUnavailableError
 from o2mcp.config import O2Config
 from o2mcp.connection import (
     CommandResult,
@@ -49,6 +50,9 @@ __all__ = [
     "O2MasterUnavailableError",
     "O2OffVpnError",
     "O2UnsafeTransportError",
+    "O2BrokerError",
+    "O2BrokerUnavailableError",
+    "O2BrokerStartupError",
     "O2PolicyStore",
     "PolicySnapshot",
     "LoginGrant",

@@ -8,6 +8,7 @@ variables (the same names the shell scripts already use) or explicitly.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,12 +37,21 @@ def _default_ssh_config_file() -> Path:
     return Path.home() / ".ssh" / "config"
 
 
+def _default_broker_dir() -> Path:
+    """Return the workstation-wide persistent-command broker directory."""
+
+    configured = os.environ.get("O2_BROKER_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".agent_locks" / "o2-broker"
+
+
 @dataclass
 class O2Config:
     """Connection settings for HMS O2.
 
     Attributes:
-        host_alias: SSH alias for login/compute commands (the ControlMaster host).
+        host_alias: SSH alias used by the persistent login command broker.
         transfer_alias: SSH alias for bulk rsync transfers (the O2 transfer node).
         connect_timeout: SSH ``ConnectTimeout`` in seconds.
         policy_file: Workstation-wide JSON state controlling disabled,
@@ -52,6 +62,11 @@ class O2Config:
         ssh_config_file: User SSH config containing the O2 alias definitions.
             The connection layer reads and flattens this file without executing
             ``Match exec`` predicates before asking OpenSSH to expand a socket.
+        broker_dir: Private workstation-wide directory containing the broker's
+            Unix socket, lifecycle receipt, and inspected SSH-config snapshot.
+        broker_start_timeout: Maximum time to wait for the authorized persistent
+            channel to complete authentication and emit its protocol hello. A
+            timeout is reported without starting a second attempt.
     """
 
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
@@ -103,6 +118,10 @@ class O2Config:
     # into the one-shot login grant issued after explicit user approval.
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
     ssh_config_file: Path = field(default_factory=_default_ssh_config_file)
+    broker_dir: Path = field(default_factory=_default_broker_dir)
+    broker_start_timeout: float = field(
+        default_factory=lambda: float(os.environ.get("O2_BROKER_START_TIMEOUT_SECONDS", "90"))
+    )
 
     def __post_init__(self) -> None:
         """Normalize and validate process-independent local authority paths.
@@ -120,6 +139,11 @@ class O2Config:
                 "O2 policy path must be absolute; set O2_POLICY_FILE to one " "workstation-wide absolute path"
             )
         self.ssh_config_file = Path(self.ssh_config_file).expanduser()
+        self.broker_dir = Path(self.broker_dir).expanduser()
+        if not self.broker_dir.is_absolute():
+            raise ValueError("O2 broker directory must be one workstation-wide absolute path")
+        if not math.isfinite(self.broker_start_timeout) or self.broker_start_timeout <= 0:
+            raise ValueError("O2 broker start timeout must be greater than zero")
 
     def base_ssh_opts(self) -> list[str]:
         """Return baseline SSH options shared by login and reuse operations.

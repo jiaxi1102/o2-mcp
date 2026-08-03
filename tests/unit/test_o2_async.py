@@ -19,12 +19,22 @@ from o2mcp import (
     CommandResult,
     O2AsyncTransfer,
     O2Config,
-    O2Connection,
     O2LockedError,
     O2MasterUnavailableError,
     O2Sync,
     async_transfer,
 )
+from o2mcp import (
+    O2Connection as _ProductionO2Connection,
+)
+
+
+class O2Connection(_ProductionO2Connection):
+    """Select the fake-runner transport used by detached-transfer unit tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", True)
+        super().__init__(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)

@@ -1,15 +1,17 @@
-"""Safe, reusable SSH command channel for HMS O2.
+"""Safe, persistent command and transfer transports for HMS O2.
 
 A Python port of ``scripts/o2_ssh_master.sh`` that preserves its safety contract
 exactly, but is testable and composable:
 
 - The workstation-wide ``O2_POLICY.json`` state governs every remote operation.
-- Only ``start_master`` can authenticate. Every other SSH/rsync subprocess has
+- Only an explicitly granted broker or master start can authenticate. Every
+  other SSH/rsync subprocess has
   all authentication methods disabled and uses an inspected, pinned socket with
   live SSH config disabled, so OpenSSH cannot silently replace a missing
   multiplexed connection with a Duo-triggering standalone login.
-- Remote commands run only through an already-established ControlMaster socket;
-  opening a NEW login requires an explicit opt-in (one approved MFA verification).
+- Remote commands run through one workstation-wide broker session rather than
+  opening a new SSH session channel for every command. Transfers retain an
+  inspected ControlMaster socket during the MVP transition.
 
 The actual subprocess call is injected (``runner``) so the whole class is unit
 tested offline without ever touching the network.
@@ -18,8 +20,12 @@ tested offline without ever touching the network.
 from __future__ import annotations
 
 import glob
+import json
+import os
+import select
 import shlex
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,6 +33,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from o2mcp.broker import (
+    BrokerClient,
+    O2BrokerStartupError,
+    atomic_private_text_write,
+    open_private_append,
+    prepare_broker_directory,
+)
+from o2mcp.broker_protocol import remote_helper_source
 from o2mcp.config import O2Config
 from o2mcp.policy import (
     LoginTarget,
@@ -76,6 +90,11 @@ class CommandResult:
 
 # A runner takes (argv, timeout, input_text) and returns a CommandResult.
 Runner = Callable[[list[str], Optional[float], Optional[str]], CommandResult]
+
+# Distinguish an omitted broker client from an explicit ``None`` used by focused
+# tests. Production MCP construction never supplies this sentinel and therefore
+# always routes commands through BrokerClient.
+_DEFAULT_BROKER_CLIENT = object()
 
 
 def default_runner(argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
@@ -288,6 +307,8 @@ class O2Connection:
         runner: Runner = default_runner,
         *,
         policy: O2PolicyStore | None = None,
+        broker_client: BrokerClient | None | object = _DEFAULT_BROKER_CLIENT,
+        _legacy_test_transport: bool = False,
     ) -> None:
         """Create a connection bound to the global policy and injected runner.
 
@@ -295,16 +316,187 @@ class O2Connection:
         MCP processes construct stores from :class:`O2Config`, whose process-wide
         client identity ensures an authorization issued by one tool call can be
         consumed by a later call in the same task but not by another task.
+
+        ``_legacy_test_transport`` exists only for the offline regression suite
+        that verifies historical SSH/rsync argv hardening with an injected fake
+        runner. It is rejected with the real subprocess runner. Production and
+        ordinary injected-runner construction always create a workstation
+        :class:`BrokerClient`; focused tests can instead inject a fake broker.
         """
 
         self.config = config or O2Config()
         self._runner = runner
         self.policy = policy or O2PolicyStore(self.config.policy_file)
+        if _legacy_test_transport and runner is default_runner:
+            raise ValueError("_legacy_test_transport requires an injected non-production runner")
+        if _legacy_test_transport and broker_client is not _DEFAULT_BROKER_CLIENT:
+            raise ValueError("_legacy_test_transport cannot be combined with a broker_client")
+        if _legacy_test_transport:
+            self._broker = None
+        elif broker_client is _DEFAULT_BROKER_CLIENT:
+            self._broker = BrokerClient(self.config.broker_dir)
+        else:
+            self._broker = broker_client
         # A connection may build an rsync argv and then validate/run it. Cache the
         # safely expanded config for each target so those two steps cannot drift
         # and do not repeatedly parse the same local files.
         self._resolved_ssh_configs: dict[str, dict[str, str]] = {}
         self._safe_ssh_config_text_cache: str | None = None
+
+    # -- persistent command broker ---------------------------------------------
+    def broker_local_status(self) -> dict[str, object]:
+        """Inspect the workstation broker locally without invoking SSH."""
+
+        client = self._broker or BrokerClient(self.config.broker_dir)
+        return client.local_status()
+
+    def _broker_transport_argv(self, target: str, ssh_config_path: Path) -> list[str]:
+        """Build the sole authentication-capable persistent SSH session argv.
+
+        ``-S none`` prevents this long-lived session from attaching to an
+        existing ControlMaster and then inheriting its unstable lifetime. The
+        one-shot login grant authorizes this direct transport explicitly. Proxy
+        and local helper hooks are disabled so one launch cannot fan out into
+        additional authentication-capable processes.
+        """
+
+        remote_program = remote_helper_source()
+        remote_command = f"python3 -u -c {shlex.quote(remote_program)}"
+        return [
+            self.SSH_EXECUTABLE,
+            "-F",
+            str(ssh_config_path),
+            "-S",
+            "none",
+            *self.config.base_ssh_opts(),
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "KnownHostsCommand=none",
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            target,
+            remote_command,
+        ]
+
+    def start_broker(self, *, grant_id: str | None = None) -> dict[str, object]:
+        """Start exactly one persistent login session after consuming a grant.
+
+        The child daemon acknowledges only after it has spawned the sole SSH
+        process. The policy mutex remains held through that acknowledgement, so
+        a concurrent disable either prevents launch or observes an already
+        running operation. Authentication and the remote protocol hello may
+        finish later; waiting for them is local-only and never retries.
+        """
+
+        self.policy.require_reuse_allowed()
+        client = self._broker or BrokerClient(self.config.broker_dir)
+        status = client.local_status()
+        if status.get("responsive") is True:
+            return status
+        if client.launch_in_progress():
+            lifecycle = str(status.get("status") or "unknown")
+            raise O2BrokerStartupError(
+                f"An O2 broker daemon already owns the lifetime lock (receipt status: {lifecycle}) but did not "
+                "answer the short local ping. It may be busy, awaiting Duo, or failing; do not start a second session."
+            )
+        if not grant_id:
+            raise O2BrokerStartupError(
+                "No persistent O2 command broker is running. A short-lived one-shot login grant is required "
+                "before starting its single SSH session."
+            )
+
+        target = self.config.host_alias
+        grant = self.policy.preview_login_grant(grant_id, "login")
+        if not grant.allow_offvpn:
+            self._require_on_vpn(target)
+
+        # Config parsing and artifact writes are local-only and intentionally
+        # happen before grant consumption. A typo or unsafe Match block must not
+        # waste the user's one authorized authentication attempt.
+        paths = prepare_broker_directory(self.config.broker_dir)
+        self._resolved_ssh_config(target)
+        atomic_private_text_write(paths.ssh_config, self._safe_ssh_config_text())
+        launch_payload = {
+            "schema_version": 1,
+            "broker_dir": str(paths.root),
+            "policy_file": str(self.config.policy_file),
+            "alias": target,
+            "grant_id": grant_id,
+            "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
+        }
+        atomic_private_text_write(paths.launch, json.dumps(launch_payload, indent=2, sort_keys=True) + "\n")
+
+        daemon_argv = [
+            sys.executable,
+            "-c",
+            "from o2mcp.broker import main; raise SystemExit(main())",
+            "--serve",
+            "--launch-file",
+            str(paths.launch),
+        ]
+        read_fd, write_fd = os.pipe()
+        consumed = None
+        daemon: subprocess.Popen[bytes] | None = None
+        try:
+            with open_private_append(paths.log) as log:  # noqa: SIM117 - fd must outlive Popen only
+                with self.policy.consume_login_grant_for_launch(grant_id, "login") as consumed:
+                    daemon = subprocess.Popen(
+                        [*daemon_argv, "--ack-fd", str(write_fd)],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                        start_new_session=True,
+                        close_fds=True,
+                        pass_fds=(write_fd,),
+                    )
+                    os.close(write_fd)
+                    write_fd = -1
+                    ready, _, _ = select.select([read_fd], [], [], 5.0)
+                    if not ready:
+                        raise O2BrokerStartupError(
+                            "Broker daemon did not acknowledge its SSH spawn within 5 seconds; do not retry."
+                        )
+                    acknowledgement = os.read(read_fd, 4096).decode("utf-8", errors="replace").strip()
+                    if not acknowledgement.startswith("SPAWNED "):
+                        raise O2BrokerStartupError(
+                            f"Broker daemon rejected the authorized launch: {acknowledgement or 'no detail'}"
+                        )
+        except Exception:
+            if consumed is not None and (daemon is None or daemon.poll() is not None):
+                self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            raise
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
+        client.wait_until_ready(timeout=self.config.broker_start_timeout)
+        return client.local_status()
+
+    def stop_broker(self, *, reason: str) -> dict[str, object]:
+        """Stop only the local broker session; allowed even while policy is disabled."""
+
+        client = self._broker or BrokerClient(self.config.broker_dir)
+        return client.stop(reason=reason)
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def _master_check_argv(self, alias: str) -> list[str]:
@@ -580,26 +772,50 @@ class O2Connection:
         input_text: str | None = None,
         alias: str | None = None,
     ) -> CommandResult:
-        """Run a remote shell command over an existing ControlMaster only.
+        """Run one logical command over the existing persistent broker channel.
 
-        ``alias`` defaults to the login host and may name the separately approved
-        transfer master. The historical ``require_master`` parameter remains for
-        source compatibility, but passing ``False`` is now rejected: a cold SSH
-        connection is never a safe fallback for an O2 MCP operation.
+        Production MCP construction routes every login-node command through the
+        workstation broker, which opens no new SSH process or SSH session
+        channel per call. ``alias`` may only be the login alias in broker mode;
+        transfer-host commands remain fail-closed until a separately framed
+        transfer broker exists.
 
-        The socket check is intentionally paired with authentication-disabled SSH
-        options. A check alone has a race: the master can die before this second
-        subprocess starts, and OpenSSH would normally authenticate a new standalone
-        connection. With every authentication method disabled, that race fails
-        closed without generating a Duo request. ``input_text`` is piped to the
-        remote command's stdin when staging scripts or other small payloads.
+        The historical injected-runner path remains solely for deterministic
+        unit tests of legacy SSH/rsync argv hardening. It still requires an exact
+        ControlMaster and disables all authentication methods; the native MCP
+        factory never selects it.
         """
         self.policy.require_reuse_allowed()
         if not require_master:
             raise O2UnsafeTransportError(
-                "Cold O2 SSH execution is disabled. Start one explicitly authorized ControlMaster, then retry."
+                "Cold O2 SSH execution is disabled. Start one explicitly authorized persistent broker, then retry."
             )
         target = alias or self.config.host_alias
+        if self._broker is not None:
+            if target != self.config.host_alias:
+                raise O2UnsafeTransportError(
+                    f"Persistent broker MVP is scoped to login alias '{self.config.host_alias}', not '{target}'. "
+                    "Do not fall back to a one-off transfer-host SSH session."
+                )
+            remote_timeout = float(timeout) if timeout is not None else 86400.0
+            result = self._broker.execute(command, timeout=remote_timeout, input_text=input_text)
+            truncation_notes: list[str] = []
+            if result.stdout_truncated:
+                truncation_notes.append("stdout truncated by persistent broker")
+            if result.stderr_truncated:
+                truncation_notes.append("stderr truncated by persistent broker")
+            stderr = result.stderr
+            if truncation_notes:
+                stderr += ("\n" if stderr else "") + "; ".join(truncation_notes)
+            return CommandResult(
+                argv=["o2-broker", target, command],
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+
+        # Explicit private test path used only by offline command-construction
+        # regression tests. Production always returned above.
         if not self.master_running(target):
             raise O2MasterUnavailableError(
                 f"No O2 ControlMaster is running for '{target}'. Start one explicitly, then retry; ordinary "
@@ -612,7 +828,7 @@ class O2Connection:
         )
 
     def probe(self) -> CommandResult:
-        """Lightweight connectivity check: ``hostname; whoami; date`` on O2."""
+        """Run one explicit fixed command through the persistent broker."""
         return self.run("hostname; whoami; date", timeout=self.config.connect_timeout + 5)
 
     def _ssh_destination_from_argv(self, argv: list[str]) -> str | None:
@@ -1186,6 +1402,15 @@ class O2Connection:
         actionable error; cold transports are no longer supported.
         """
         self.policy.require_reuse_allowed()
+        if self._broker is not None and argv and argv[0] in {"ssh", self.SSH_EXECUTABLE}:
+            # Even authentication-disabled SSH over a live ControlMaster opens a
+            # new server-side session channel, which O2 may challenge with Duo.
+            # Raw SSH cannot express the broker protocol and is therefore not a
+            # compatibility fallback in production.
+            raise O2UnsafeTransportError(
+                "Raw O2 SSH commands are disabled because each invocation opens a new session channel. "
+                "Use O2Connection.run/o2_exec so the command is framed through the persistent broker."
+            )
         if not require_master:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."

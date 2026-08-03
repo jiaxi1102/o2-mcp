@@ -112,7 +112,8 @@ def register(mcp, srv) -> None:
         """Start an rsync UPLOAD in the background and return immediately (does NOT block).
 
         Prefer this over o2_push for large/slow uploads: it launches a detached rsync
-        (reusing the ControlMaster — no extra Duo) and returns a transfer_id right away,
+        (reusing the transfer compatibility transport, without authentication fallback)
+        and returns a transfer_id right away,
         so you can do other work while it runs and poll o2_transfer_status when you want.
         The transfer keeps going between tool calls and survives an MCP-server restart;
         re-running the same upload resumes it (rsync --partial). Refuses unless the

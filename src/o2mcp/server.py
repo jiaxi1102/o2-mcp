@@ -5,11 +5,11 @@ Exposes the safe, tested ``o2mcp`` primitives as MCP tools so an agent can
 directly submit Slurm work, debug with arbitrary remote commands, monitor jobs,
 tail logs, and move files.
 
-DUO MODEL — read this before using the tools. HMS O2 uses Duo *autopush*: EVERY
-new SSH connection can fire a Duo push. The persistent global policy therefore
-defaults fail-closed, allows ordinary tools to reuse only an existing exact
-ControlMaster, and requires a short-lived, client-bound, one-attempt grant before
-``o2_start_master`` may authenticate.
+DUO MODEL — read this before using the tools. HMS O2 can challenge both a new
+SSH transport and a new session channel inside a ControlMaster. The persistent
+global policy therefore defaults fail-closed. Login-node commands use one
+workstation-wide broker that keeps a single SSH session channel open; starting
+that broker requires a short-lived, client-bound, one-attempt login grant.
 
 NEVER open the master in a loop, and never run these tools on a short timer — a
 periodic poller that reconnects each cycle is what causes a "Duo call every
@@ -44,6 +44,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from o2mcp import (
     CommandResult,
     O2AsyncTransfer,
+    O2BrokerError,
+    O2BrokerStartupError,
+    O2BrokerUnavailableError,
     O2Connection,
     O2LoginGrantError,
     O2MasterUnavailableError,
@@ -98,6 +101,12 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
     except O2UnsafeTransportError as exc:
         payload = {"ok": False, "error": "unsafe_transport", "message": str(exc)}
+    except O2BrokerUnavailableError as exc:
+        payload = {"ok": False, "error": "no_broker", "message": str(exc)}
+    except O2BrokerStartupError as exc:
+        payload = {"ok": False, "error": "broker_start_failed", "message": str(exc)}
+    except O2BrokerError as exc:
+        payload = {"ok": False, "error": "broker_error", "message": str(exc)}
     except subprocess.TimeoutExpired as exc:
         payload = {"ok": False, "error": "operation_timeout", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
@@ -121,13 +130,30 @@ class StartMasterInput(BaseModel):
     transfer: bool = Field(
         default=False,
         description=(
-            "Open the dedicated transfer-node master (o2-transfer) instead of the "
-            "login master. The transfer node is a separate host with its own socket, "
-            "so a transfer-node move (o2_run_promote / o2_run_archive, or o2_push/pull "
-            "with use_transfer_node) needs this opened once (one more approved push) "
-            "in addition to the login master."
+            "Open the dedicated transfer-node master (o2-transfer). Login-node "
+            "commands now use o2_start_broker instead of a ControlMaster."
         ),
     )
+
+
+class StartBrokerInput(BaseModel):
+    """Consume one login grant to start the persistent command channel."""
+
+    model_config = ConfigDict(extra="forbid")
+    grant_id: str | None = Field(
+        default=None,
+        description=(
+            "One-shot login grant returned by o2_authorize_login. It is unnecessary "
+            "only when the workstation broker is already locally responsive."
+        ),
+    )
+
+
+class StopBrokerInput(BaseModel):
+    """Local-only reason for closing the persistent broker process."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    reason: str = Field(..., min_length=1, max_length=240)
 
 
 class DisablePolicyInput(BaseModel):
@@ -176,10 +202,13 @@ class AuthorizeLoginInput(BaseModel):
 
 
 class ProbeInput(BaseModel):
-    """Select the already-authenticated host for one explicit remote probe."""
+    """Select the brokered login host for one explicit remote probe."""
 
     model_config = ConfigDict(extra="forbid")
-    transfer: bool = Field(default=False, description="Probe the transfer master instead of the login master.")
+    transfer: bool = Field(
+        default=False,
+        description="Reserved for a future transfer broker; true currently fails closed without SSH.",
+    )
 
 
 class RunInput(BaseModel):
@@ -304,7 +333,10 @@ def _local_o2_processes() -> list[dict[str, Any]]:
             continue
         pid, ppid, command = fields
         lowered = command.lower()
-        if not any(marker in lowered for marker in ("o2-mcp", "clock-runs-mcp", "o2.hms", "o2.rc.hms", "o2-transfer")):
+        if not any(
+            marker in lowered
+            for marker in ("o2-mcp", "o2mcp.broker", "clock-runs-mcp", "o2.hms", "o2.rc.hms", "o2-transfer")
+        ):
             continue
         rows.append({"pid": int(pid), "ppid": int(ppid), "command": command})
     return rows
@@ -348,6 +380,7 @@ def _local_status_payload() -> dict[str, Any]:
             "recent_events": state.get("events", [])[-10:] if isinstance(state, dict) else [],
         },
         "control_sockets": _local_socket_inventory(),
+        "command_broker": conn.broker_local_status(),
         "processes": _local_o2_processes(),
         "transfers": transfers,
     }
@@ -447,11 +480,19 @@ async def o2_authorize_login(params: AuthorizeLoginInput) -> str:
     annotations={"title": "Explicit reuse-only O2 probe", "readOnlyHint": True, "openWorldHint": True},
 )
 async def o2_probe(params: ProbeInput) -> str:
-    """Run exactly one fixed remote probe through an existing pinned master."""
+    """Run one fixed remote probe through the existing persistent broker."""
 
     def work() -> dict[str, Any]:
         conn = _connection()
-        alias = conn.config.transfer_alias if params.transfer else conn.config.host_alias
+        if params.transfer:
+            return {
+                "ok": False,
+                "error": "transfer_broker_unavailable",
+                "message": (
+                    "The persistent broker MVP supports the login host only; " "no raw transfer-host probe is allowed."
+                ),
+            }
+        alias = conn.config.host_alias
         result = conn.run("hostname; whoami; date", timeout=conn.config.connect_timeout + 5, alias=alias)
         return {"ok": result.ok, "alias": alias, **_command_payload(result)}
 
@@ -463,14 +504,23 @@ async def o2_probe(params: ProbeInput) -> str:
     annotations={"title": "Start O2 SSH master", "readOnlyHint": False, "openWorldHint": True},
 )
 async def o2_start_master(params: StartMasterInput) -> str:
-    """Open the persistent O2 SSH ControlMaster so later tools reuse one login.
+    """Open only the legacy transfer ControlMaster after one matching grant.
 
-    An existing exact master is a no-op. Otherwise ``grant_id`` must identify a
-    short-lived grant previously returned by ``o2_authorize_login`` for this MCP
-    client and host. The grant is consumed before the sole SSH attempt.
+    Login-master requests fail locally because a ControlMaster does not prevent
+    per-session Duo. Transfer requests retain the prior one-shot grant behavior
+    during the MVP transition.
     """
 
     def work() -> dict[str, Any]:
+        if not params.transfer:
+            return {
+                "ok": False,
+                "error": "login_master_retired",
+                "message": (
+                    "A login ControlMaster does not prevent O2 from challenging each new session channel. "
+                    "Use o2_start_broker with a login-scoped grant instead."
+                ),
+            }
         conn = _connection()
         alias = conn.config.transfer_alias if params.transfer else None
         # Pass the requested role separately from its configured alias.  Some
@@ -488,14 +538,50 @@ async def o2_start_master(params: StartMasterInput) -> str:
 
 
 @mcp.tool(
+    name="o2_start_broker",
+    annotations={"title": "Start persistent O2 command broker", "readOnlyHint": False, "openWorldHint": True},
+)
+async def o2_start_broker(params: StartBrokerInput) -> str:
+    """Start one dynamic command channel after consuming a login-scoped grant.
+
+    The daemon never reconnects. An already-responsive broker is a local no-op;
+    a daemon that is still starting blocks another attempt.
+    """
+
+    def work() -> dict[str, Any]:
+        status = _connection().start_broker(grant_id=params.grant_id)
+        return {"ok": status.get("responsive") is True, "broker": status}
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
+    name="o2_stop_broker",
+    annotations={
+        "title": "Stop persistent O2 command broker",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
+)
+async def o2_stop_broker(params: StopBrokerInput) -> str:
+    """Close the local broker and its SSH process without changing policy."""
+
+    def work() -> dict[str, Any]:
+        return {"ok": True, "broker": _connection().stop_broker(reason=params.reason)}
+
+    return await _run_tool(work)
+
+
+@mcp.tool(
     name="o2_exec",
     annotations={"title": "Run a command on O2", "readOnlyHint": False, "openWorldHint": True},
 )
 async def o2_exec(params: RunInput) -> str:
     """Run an arbitrary shell command on an O2 login node (debugging / inspection).
 
-    Reuses the existing ControlMaster (no extra Duo push) and refuses if none is
-    running — start one first with o2_start_master. Returns JSON with
+    Reuses the broker's existing SSH session channel and refuses if none is
+    running — start one first with o2_start_broker. Returns JSON with
     returncode/stdout/stderr.
     """
 
