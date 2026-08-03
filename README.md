@@ -55,6 +55,17 @@ internal mutex serialize every transition across MCP processes. Callers pass
 both values from one `o2_local_status` snapshot; repair creates a new generation,
 so a repeated numeric revision cannot revive stale approval.
 
+If repeated Duo prompts begin while the native MCP tools are unavailable, use
+the package's local-only emergency command. It performs the same atomic policy
+transition as `o2_policy_disable` and never invokes SSH or any remote probe:
+
+```bash
+o2-mcp-policy-disable --reason "repeated Duo prompts"
+```
+
+This command can only reduce authority. Re-enabling reuse and issuing a login
+grant remain MCP-only operations with explicit global or target-scoped approval.
+
 **Be on the HMS VPN.** O2 only *skips* Duo for connections from HMS-trusted source IPs — i.e.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), even the one

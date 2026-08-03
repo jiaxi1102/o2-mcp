@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def _default_policy_file() -> Path:
+def default_policy_file() -> Path:
     """Return the single workstation-wide O2 policy-state path.
 
     ``O2_POLICY_FILE`` supports isolated deployments and offline tests without
@@ -57,7 +57,7 @@ class O2Config:
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
     transfer_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_TRANSFER_ALIAS", "o2-transfer"))
     connect_timeout: int = field(default_factory=lambda: int(os.environ.get("O2_SSH_CONNECT_TIMEOUT_SECONDS", "20")))
-    policy_file: Path = field(default_factory=_default_policy_file)
+    policy_file: Path = field(default_factory=default_policy_file)
     default_user: str | None = field(default_factory=lambda: os.environ.get("O2_USER") or None)
     default_log_dir: str = field(default_factory=lambda: os.environ.get("O2_LOG_DIR", "~/logs/o2"))
 
