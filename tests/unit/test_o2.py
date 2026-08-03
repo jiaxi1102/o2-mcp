@@ -20,6 +20,7 @@ from o2mcp import (
     O2Config,
     O2Connection,
     O2LockedError,
+    O2LoginCoordinationError,
     O2LoginGrantError,
     O2MasterUnavailableError,
     O2OffVpnError,
@@ -522,6 +523,47 @@ def test_start_master_can_open_the_transfer_alias_with_transfer_grant(tmp_path):
     assert result.ok
     starts = [call for call in runner.calls if "-MNf" in call["argv"]]
     assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
+
+
+def test_default_start_uses_login_scope_when_aliases_are_identical(tmp_path):
+    """The default role is login even when both roles share one SSH alias."""
+
+    config = _config(tmp_path)
+    config.transfer_alias = config.host_alias
+    runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
+    conn = O2Connection(config, runner=runner)
+    grant = _authorize(conn, target="login")
+
+    result = conn.start_master(grant_id=grant.id)
+
+    assert result.ok
+    starts = [call for call in runner.calls if "-MNf" in call["argv"]]
+    assert len(starts) == 1 and starts[0]["argv"][-1] == "o2"
+
+
+def test_explicit_role_disambiguates_one_shared_alias(tmp_path):
+    """A transfer-scoped grant remains usable through a shared master alias."""
+
+    config = _config(tmp_path)
+    config.transfer_alias = config.host_alias
+    runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
+    conn = O2Connection(config, runner=runner)
+    grant = _authorize(conn, target="transfer")
+
+    result = conn.start_master(
+        grant_id=grant.id,
+        alias=config.transfer_alias,
+        login_target="transfer",
+    )
+
+    assert result.ok
+
+
+def test_compatibility_coordination_error_catches_grant_failures():
+    """Legacy handlers must catch every replacement coordination failure."""
+
+    with pytest.raises(O2LoginCoordinationError):
+        raise O2LoginGrantError("replacement grant failure")
 
 
 def test_login_grant_cannot_cross_host_scope(tmp_path):

@@ -49,8 +49,11 @@ class O2OffVpnError(RuntimeError):
     """Raised when opening a new login would egress off the HMS VPN (→ a Duo push)."""
 
 
-class O2LoginCoordinationError(O2LoginGrantError):
-    """Compatibility error for callers that previously handled login mutex failures."""
+# Preserve the old exception name as a true alias.  A subclass would only make
+# ``O2LoginCoordinationError`` catch errors raised as that subtype; callers that
+# still use the compatibility name must catch every new grant-coordination
+# failure raised directly as ``O2LoginGrantError`` during the 0.3 transition.
+O2LoginCoordinationError = O2LoginGrantError
 
 
 class O2UnsafeTransportError(RuntimeError):
@@ -347,7 +350,13 @@ class O2Connection:
                 "grant with allow_offvpn=true after explicit user approval."
             )
 
-    def start_master(self, *, grant_id: str | None = None, alias: str | None = None) -> CommandResult:
+    def start_master(
+        self,
+        *,
+        grant_id: str | None = None,
+        alias: str | None = None,
+        login_target: LoginTarget | None = None,
+    ) -> CommandResult:
         """Open one ControlMaster only after consuming a matching policy grant.
 
         An already-running exact master is a local no-op and does not consume a
@@ -358,9 +367,25 @@ class O2Connection:
 
         self.policy.require_reuse_allowed()
         target = alias or self.config.host_alias
-        logical_target: LoginTarget = "transfer" if target == self.config.transfer_alias else "login"
+        # The MCP request carries a logical role independently from the SSH
+        # alias.  Keep that role explicit so installations that intentionally
+        # map login and transfer to one alias do not misclassify the default
+        # login call merely because both configured strings compare equal.
+        if login_target is None:
+            logical_target: LoginTarget = (
+                "transfer"
+                if alias is not None and target == self.config.transfer_alias and target != self.config.host_alias
+                else "login"
+            )
+        else:
+            logical_target = login_target
         if target not in {self.config.host_alias, self.config.transfer_alias}:
             raise O2LoginGrantError(f"A new master may target only configured O2 aliases, not '{target}'.")
+        expected_alias = self.config.transfer_alias if logical_target == "transfer" else self.config.host_alias
+        if target != expected_alias:
+            raise O2LoginGrantError(
+                f"The '{logical_target}' login role must use configured alias '{expected_alias}', not '{target}'."
+            )
         if self.master_running(target):
             return CommandResult(self._master_check_argv(target), 0, "master already running", "")
         if not grant_id:

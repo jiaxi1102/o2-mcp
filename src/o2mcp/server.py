@@ -56,6 +56,7 @@ from o2mcp import (
     O2Workspace,
     transfer_tools,
 )
+from o2mcp.policy import LoginTarget
 
 mcp = FastMCP("o2_mcp")
 
@@ -472,7 +473,15 @@ async def o2_start_master(params: StartMasterInput) -> str:
     def work() -> dict[str, Any]:
         conn = _connection()
         alias = conn.config.transfer_alias if params.transfer else None
-        result = conn.start_master(grant_id=params.grant_id, alias=alias)
+        # Pass the requested role separately from its configured alias.  Some
+        # installations deliberately use one alias/socket for both roles, so
+        # comparing alias strings cannot reliably recover grant scope.
+        login_target: LoginTarget = "transfer" if params.transfer else "login"
+        result = conn.start_master(
+            grant_id=params.grant_id,
+            alias=alias,
+            login_target=login_target,
+        )
         return {"ok": result.ok, "alias": alias or conn.config.host_alias, **_command_payload(result)}
 
     return await _run_tool(work)
