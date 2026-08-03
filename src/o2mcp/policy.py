@@ -474,9 +474,6 @@ class O2PolicyStore:
             value = attempt.get(field)
             if type(value) not in {int, float} or not math.isfinite(value):
                 raise O2PolicyInvalidError(f"login_attempt.{field} must be a finite timestamp")
-        if attempt["blocked_until"] < attempt["started_at"]:
-            raise O2PolicyInvalidError("login_attempt.blocked_until cannot precede started_at")
-
         finished_at = attempt.get("finished_at")
         returncode = attempt.get("returncode")
         if attempt["outcome"] == "active":
@@ -489,6 +486,15 @@ class O2PolicyStore:
                 raise O2PolicyInvalidError("login_attempt.finished_at cannot precede started_at")
         if returncode is not None and type(returncode) is not int:
             raise O2PolicyInvalidError("login_attempt.returncode must be null or an integer")
+        if attempt["outcome"] == "success":
+            # Successful master verification intentionally clears the retry
+            # cooldown, but the receipt must prove that exact terminal state.
+            if returncode != 0 or attempt["blocked_until"] != finished_at:
+                raise O2PolicyInvalidError(
+                    "a successful login_attempt must have returncode 0 and clear its cooldown at finished_at"
+                )
+        elif attempt["blocked_until"] < (attempt["started_at"] + DEFAULT_LOGIN_COOLDOWN_SECONDS):
+            raise O2PolicyInvalidError("a non-success login_attempt must preserve the full retry cooldown")
 
     @staticmethod
     def _validate_file_metadata(path: Path, metadata: os.stat_result) -> None:

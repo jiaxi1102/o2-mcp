@@ -266,6 +266,29 @@ def test_malformed_login_attempt_receipt_fails_closed(tmp_path, field, value):
         )
 
 
+def test_truncated_non_success_cooldown_receipt_fails_closed(tmp_path):
+    """A plausible timestamp cannot shorten the workstation-wide retry delay."""
+
+    store = _reuse_store(tmp_path, client_id="client-a")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="first attempt",
+    )
+    store.consume_login_grant(grant.id, "login")
+    payload = json.loads(store.path.read_text())
+    # Keep the receipt internally ordered so this regression specifically proves
+    # enforcement of the complete cooldown, not only the older monotonic check.
+    payload["login_attempt"]["blocked_until"] = payload["login_attempt"]["started_at"] + 1.0
+    store.path.write_text(json.dumps(payload))
+    store.path.chmod(0o600)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is False
+    assert snapshot.effective_mode == "disabled"
+
+
 def test_concurrent_disable_revokes_grant_and_preserves_attempt_result(tmp_path):
     store = _reuse_store(tmp_path, client_id="client-a")
     grant = store.authorize_login(
