@@ -184,11 +184,11 @@ class O2AsyncTransfer:
         self._clock = clock
 
     # -- launch -----------------------------------------------------------------
-    def push_async(self, local_path: str, remote_path: str, *, transfer: bool = False) -> TransferHandle:
+    def push_async(self, local_path: str, remote_path: str, *, transfer: bool = True) -> TransferHandle:
         """Start a background upload of ``local_path`` to ``remote_path`` on O2."""
         return self._launch("push", local=local_path, remote=remote_path, transfer=transfer)
 
-    def pull_async(self, remote_path: str, local_path: str, *, transfer: bool = False) -> TransferHandle:
+    def pull_async(self, remote_path: str, local_path: str, *, transfer: bool = True) -> TransferHandle:
         """Start a background download of ``remote_path`` into ``local_path``."""
         return self._launch("pull", local=local_path, remote=remote_path, transfer=transfer)
 

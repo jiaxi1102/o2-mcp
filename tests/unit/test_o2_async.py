@@ -145,7 +145,7 @@ def test_push_async_launches_detached_with_escaped_remote(tmp_path):
     transport = rsync_argv[rsync_argv.index("-e") + 1]
     assert "PreferredAuthentications=none" in transport
     assert "PubkeyAuthentication=no" in transport
-    assert rsync_argv[-1] == "o2:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
+    assert rsync_argv[-1] == "o2-transfer:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
 
     # metadata persisted (the schema status() reads); argv stored is the rsync argv, not the wrapper.
     meta = json.loads(Path(handle.meta_path).read_text())

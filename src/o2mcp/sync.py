@@ -4,8 +4,9 @@ rsync reuses the ControlMaster configured in the SSH config (so no extra login),
 and the ``-e`` transport disables every authentication method. This is stronger
 than BatchMode alone: if the master disappears after the local socket check,
 OpenSSH cannot fall back to a fresh key-based connection that triggers Duo.
-Large transfers can opt into the dedicated O2 transfer node; by default we reuse
-the login alias to keep to a single authenticated connection.
+The dedicated O2 transfer node is the default because it is the only role with a
+governed ControlMaster startup path in the broker architecture. ``transfer=False``
+can reuse a pre-existing legacy login master, but cannot authorize or start one.
 
 Remote paths are backslash-escaped for the remote shell. rsync hands the
 post-colon path to a *remote* shell, which otherwise word-splits a path
@@ -72,7 +73,7 @@ class O2Sync:
         local_path: str,
         remote_path: str,
         *,
-        transfer: bool = False,
+        transfer: bool = True,
         extra_args: list[str] | None = None,
     ) -> list[str]:
         """The exact rsync argv :meth:`push` would run (built, not executed)."""
@@ -87,7 +88,7 @@ class O2Sync:
         remote_path: str,
         local_path: str,
         *,
-        transfer: bool = False,
+        transfer: bool = True,
         extra_args: list[str] | None = None,
     ) -> list[str]:
         """The exact rsync argv :meth:`pull` would run (built, not executed)."""
@@ -102,7 +103,7 @@ class O2Sync:
         local_path: str,
         remote_path: str,
         *,
-        transfer: bool = False,
+        transfer: bool = True,
         extra_args: list[str] | None = None,
         timeout: float | None = 3600.0,
     ) -> CommandResult:
@@ -119,7 +120,7 @@ class O2Sync:
         remote_path: str,
         local_path: str,
         *,
-        transfer: bool = False,
+        transfer: bool = True,
         extra_args: list[str] | None = None,
         timeout: float | None = 3600.0,
     ) -> CommandResult:

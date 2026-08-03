@@ -835,7 +835,7 @@ def test_push_pull_build_rsync(tmp_path):
     assert "PreferredAuthentications=none" in e_opt
     assert "PubkeyAuthentication=no" in e_opt
     assert argv[-2] == "./local/run.sbatch"
-    assert argv[-1] == "o2:/scratch/jobs/run.sbatch"
+    assert argv[-1] == "o2-transfer:/scratch/jobs/run.sbatch"
 
     sync.pull("/scratch/out/results", "./local/results", transfer=True)
     argv = runner.calls[-1]["argv"]
@@ -1039,7 +1039,7 @@ def test_remote_path_with_spaces_is_escaped(tmp_path):
     argv = runner.calls[-1]["argv"]
     assert argv[-2] == "/local/Human"  # local side is an argv token: never shell-split
     # every space is backslash-escaped (so the remote shell treats it as literal, not a split)
-    assert argv[-1] == "o2:" + remote.replace(" ", "\\ ")
+    assert argv[-1] == "o2-transfer:" + remote.replace(" ", "\\ ")
     assert " " not in argv[-1].replace("\\ ", "")  # no UNescaped space remains
 
 
@@ -1047,27 +1047,29 @@ def test_remote_path_preserves_tilde_and_vars(tmp_path):
     # ~, $VAR and ${VAR} stay bare so the remote shell still expands them.
     runner = RecordingRunner(master=True)
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    assert sync.push_argv("a", "~/jobs/run.sbatch")[-1] == "o2:~/jobs/run.sbatch"
-    assert sync.push_argv("a", "$SCRATCH/out")[-1] == "o2:$SCRATCH/out"
-    assert sync.push_argv("a", "${SCRATCH}/out")[-1] == "o2:${SCRATCH}/out"  # braced var preserved
-    assert sync.push_argv("a", "$SCRATCH/my out")[-1] == "o2:$SCRATCH/my\\ out"  # spaces still escaped
-    assert sync.push_argv("a", "$(whoami)/x")[-1] == "o2:$\\(whoami\\)/x"  # () escaped -> no command substitution
+    assert sync.push_argv("a", "~/jobs/run.sbatch")[-1] == "o2-transfer:~/jobs/run.sbatch"
+    assert sync.push_argv("a", "$SCRATCH/out")[-1] == "o2-transfer:$SCRATCH/out"
+    assert sync.push_argv("a", "${SCRATCH}/out")[-1] == "o2-transfer:${SCRATCH}/out"  # braced var preserved
+    assert sync.push_argv("a", "$SCRATCH/my out")[-1] == "o2-transfer:$SCRATCH/my\\ out"  # spaces still escaped
+    assert (
+        sync.push_argv("a", "$(whoami)/x")[-1] == "o2-transfer:$\\(whoami\\)/x"
+    )  # () escaped -> no command substitution
 
 
 def test_escape_is_noop_for_plain_paths(tmp_path):
     # Space-free paths must be byte-for-byte unchanged (no behavior change, no stray escapes).
     runner = RecordingRunner(master=True)
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    assert sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")[-1] == "o2:/n/groups/tabin/jzhao/runs/foo"
+    assert sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")[-1] == "o2-transfer:/n/groups/tabin/jzhao/runs/foo"
     # push_argv builds exactly what push() runs.
     sync.push("a", "/n/groups/tabin/jzhao/runs/foo")
     assert runner.calls[-1]["argv"] == sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")
 
 
-def test_transfer_uses_the_transfer_alias_master(tmp_path):
-    # The login master is up but the transfer-node master is NOT. A normal transfer
-    # (login alias) proceeds; a transfer-node transfer must refuse rather than let
-    # rsync open a fresh Duo-pushing login to o2-transfer.
+def test_default_rsync_requires_transfer_master_but_legacy_login_reuse_remains(tmp_path):
+    # The login master is up but the transfer-node master is NOT. Default rsync
+    # must refuse on the transfer alias, while an explicit legacy-login reuse may
+    # proceed without creating a new login master.
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
@@ -1076,9 +1078,9 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
         return CommandResult(list(argv), 0, "", "")
 
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    sync.push("a", "b")  # login alias master is up -> ok
     with pytest.raises(O2MasterUnavailableError):
-        sync.push("a", "b", transfer=True)  # transfer alias master is down -> refuse
+        sync.push("a", "b")  # transfer alias master is down -> refuse
+    sync.push("a", "b", transfer=False)  # pre-existing login master may still be reused
 
 
 def test_run_raw_infers_target_alias_from_argv(tmp_path):

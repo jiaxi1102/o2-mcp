@@ -151,7 +151,7 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_job_status` | `sacct -j <id>` accounting (state, elapsed, exit code, MaxRSS) | read-only |
 | `o2_tail_log` | Tail a remote log file | read-only |
 | `o2_cancel_job` | `scancel <id>` | **destructive** |
-| `o2_push` / `o2_pull` | rsync up/down (reuses the master; `use_transfer_node` for big moves) | write |
+| `o2_push` / `o2_pull` | rsync up/down through the existing transfer master by default; `use_transfer_node=false` is legacy reuse only | write |
 | `o2_push_async` / `o2_pull_async` | Non-blocking rsync: launch detached, return a `transfer_id` immediately | write |
 | `o2_transfer_status` | Progress/state of async transfers (`running`/`done`/`failed`/`crashed`); omit id to list all | read-only |
 | `o2_transfer_cancel` | SIGTERM a running async transfer's process group | **destructive** |
@@ -191,6 +191,9 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
   version, and incomplete local frames expire on a finite absolute deadline.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
+- Blocking and detached rsync default to the transfer alias, whose master can be
+  started with a transfer-scoped one-shot grant. Login-alias rsync remains only
+  for reusing an already-existing legacy login master; the MCP cannot create one.
 - `o2_local_status` and the deprecated `o2_status` alias inspect broker receipts,
   Unix sockets, processes, policy, and transfer logs locally; neither invokes SSH.
   `o2_probe` is the only status-like remote operation and runs exactly once

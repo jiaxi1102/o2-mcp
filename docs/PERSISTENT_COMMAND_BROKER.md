@@ -120,7 +120,9 @@ Existing detached rsync transfers are not terminated or migrated. Transfer
 data still uses the separately governed ControlMaster compatibility path and
 should not be described as Duo-free. The transfer command broker eliminates raw
 SSH only for commands; replacing rsync's distinct session boundary remains
-future work.
+future work. New rsync operations default to the dedicated transfer alias because
+that role retains an explicit grant-gated master startup. Login-alias rsync can
+reuse a legacy master but cannot create one.
 
 ## Offline validation
 
