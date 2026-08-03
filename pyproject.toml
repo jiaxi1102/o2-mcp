@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "o2mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Generic HMS O2 cluster access + MCP server: Duo-frugal SSH ControlMaster, Slurm submit/monitor, rsync transfers (blocking + non-blocking), workspace/disk hygiene, and a project-parameterized run-organization engine."
 requires-python = ">=3.9"
 readme = "README.md"
@@ -42,6 +42,7 @@ dev = [
 [project.scripts]
 o2-mcp = "o2mcp.server:main"
 o2-mcp-keepalive = "o2mcp.keepalive:main"
+o2-mcp-policy-disable = "o2mcp.policy_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
