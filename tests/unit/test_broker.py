@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import shutil
 import socket
 import struct
@@ -321,6 +322,40 @@ def test_caller_that_disconnects_in_queue_is_never_dispatched(tmp_path, broker_r
         assert client.ping()["commands_completed"] == 1
         assert client.execute("printf after", timeout=5).stdout == "after"
     finally:
+        _stop_local_broker(thread, client)
+
+
+def test_timed_out_queued_stop_is_cancelled_before_shutdown(tmp_path, broker_root):
+    """A stop that reported timeout cannot terminate the shared broker later."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    marker = tmp_path / "long-command-started"
+    command_result = []
+    command = "python3 -c " + shlex.quote(
+        "from pathlib import Path; import time; " f"Path({str(marker)!r}).write_text('started'); time.sleep(0.4)"
+    )
+    command_thread = threading.Thread(
+        target=lambda: command_result.append(client.execute(command, timeout=2)),
+        daemon=True,
+    )
+    try:
+        command_thread.start()
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), "the queue occupant never reached its remote execution boundary"
+
+        with pytest.raises(O2BrokerUnavailableError, match="did not answer locally"):
+            client.stop(reason="caller deadline is intentionally shorter than queue", timeout=0.05)
+
+        command_thread.join(timeout=3)
+        assert command_result and command_result[0].returncode == 0
+        # The abandoned stop frame is accepted only after the long command, but
+        # its response write detects the closed caller before mutating lifecycle
+        # state. Later users therefore retain the same healthy channel.
+        assert client.execute("printf still-running", timeout=2).stdout == "still-running"
+    finally:
+        command_thread.join(timeout=3)
         _stop_local_broker(thread, client)
 
 

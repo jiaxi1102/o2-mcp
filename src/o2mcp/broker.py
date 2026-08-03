@@ -785,6 +785,23 @@ class BrokerServer:
         assert self.transport is not None
         self._write_state("ready", ssh_pid=self.transport.pid, ready_at=self.clock())
 
+    @staticmethod
+    def _local_caller_disconnected(client: socket.socket) -> bool:
+        """Return whether a queued local caller has closed its endpoint.
+
+        The accepted request may have waited behind a long remote command. A
+        zero-time readiness check distinguishes a closed socket (EOF) from a
+        still-waiting caller without consuming any unexpected pending bytes.
+        """
+
+        readable, _, _ = select.select([client], [], [], 0)
+        if not readable:
+            return False
+        try:
+            return not client.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return True
+
     def _handle_client(self, client: socket.socket, remote_in: BinaryIO, remote_out: BinaryIO) -> None:
         """Handle one local request, forwarding only validated exec frames."""
 
@@ -820,10 +837,19 @@ class BrokerServer:
                     )
                 return
             if request_type == "stop":
+                # A stop can wait behind a long serialized command. A caller
+                # whose local deadline expires closes its socket; acknowledge
+                # first so that queued, abandoned requests are cancelled rather
+                # than shutting down the shared broker minutes after reporting
+                # failure. Once this frame is written, stop is dispatched.
+                if self._local_caller_disconnected(client):
+                    return
+                try:
+                    write_frame(local, {"type": "stopping", "pid": os.getpid()})
+                except (OSError, BrokerProtocolError):
+                    return
                 self._stop_requested = True
                 self._write_state("stopping", stop_reason=str(request.get("reason") or "local request"))
-                with suppress(OSError, BrokerProtocolError):
-                    write_frame(local, {"type": "stopping", "pid": os.getpid()})
                 return
             if request_type != "exec":
                 with suppress(OSError, BrokerProtocolError):
@@ -861,14 +887,8 @@ class BrokerServer:
                     # queued caller has disconnected, do not forward its frame;
                     # otherwise it could perform a mutation after reporting a
                     # local timeout and invite a dangerous retry.
-                    readable, _, _ = select.select([client], [], [], 0)
-                    if readable:
-                        try:
-                            pending = client.recv(1, socket.MSG_PEEK)
-                        except OSError:
-                            return
-                        if not pending:
-                            return
+                    if self._local_caller_disconnected(client):
+                        return
                     try:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})
                     except (OSError, BrokerProtocolError):
