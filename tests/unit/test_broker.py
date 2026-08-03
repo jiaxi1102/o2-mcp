@@ -798,7 +798,13 @@ def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path
     """The sole granted SSH process seals config and cannot fan out via hooks."""
 
     policy = _reuse_policy(tmp_path)
-    config = O2Config(policy_file=policy.path, broker_dir=tmp_path / "broker-client")
+    ssh_config = tmp_path / "ssh_config"
+    ssh_config.write_text("Host o2\n  HostName example.invalid\n")
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "broker-client",
+        ssh_config_file=ssh_config,
+    )
 
     def resolve_config(argv, _timeout, _input_text):
         """Return representative ``ssh -G`` output without touching a network."""
