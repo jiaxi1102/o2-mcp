@@ -72,7 +72,9 @@ class O2Config:
             The connection layer reads and flattens this file without executing
             ``Match exec`` predicates before asking OpenSSH to expand a socket.
         broker_dir: Private workstation-wide directory containing the broker's
-            Unix socket, lifecycle receipt, and inspected SSH-config snapshot.
+            Unix socket, lifecycle receipt, lock, and diagnostic log. Expanded
+            SSH configuration is passed through the one-shot launch descriptor
+            rather than persisted here.
         broker_start_timeout: Maximum time to wait for the authorized persistent
             channel to complete authentication and emit its protocol hello. A
             timeout is reported without starting a second attempt.

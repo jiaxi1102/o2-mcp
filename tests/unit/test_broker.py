@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from o2mcp import O2Config, O2Connection, O2UnsafeTransportError
+from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp.broker import (
     MAX_LAUNCH_BYTES,
     MAX_UNIX_SOCKET_PATH_BYTES,
@@ -795,18 +795,54 @@ def test_production_raw_ssh_is_not_a_broker_fallback(tmp_path):
 
 
 def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path):
-    """The sole granted SSH process cannot attach to a mux or fan out via hooks."""
+    """The sole granted SSH process seals config and cannot fan out via hooks."""
 
     policy = _reuse_policy(tmp_path)
     config = O2Config(policy_file=policy.path, broker_dir=tmp_path / "broker-client")
-    connection = O2Connection(config, policy=policy, broker_client=_FakeBroker())
 
-    argv = connection._broker_transport_argv(config.host_alias, tmp_path / "inspected_config")
+    def resolve_config(argv, _timeout, _input_text):
+        """Return representative ``ssh -G`` output without touching a network."""
+
+        assert argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]
+        return CommandResult(
+            list(argv),
+            0,
+            "\n".join(
+                [
+                    "host o2",
+                    "hostname example.invalid",
+                    "user offline",
+                    "port 22",
+                    # Repeated identities are ordered, meaningful OpenSSH
+                    # inputs and must survive the expanded-config replay.
+                    "identityfile /tmp/id_one",
+                    "identityfile /tmp/id_two",
+                    # These unsafe values model a same-user config that must
+                    # not override the broker's hard-coded safety contract.
+                    "proxycommand unsafe-helper",
+                    "controlpath /tmp/unsafe.sock",
+                ]
+            )
+            + "\n",
+            "",
+        )
+
+    connection = O2Connection(
+        config,
+        runner=resolve_config,
+        policy=policy,
+        broker_client=_FakeBroker(),
+    )
+
+    argv = connection._broker_transport_argv(config.host_alias)
     option_values = {argv[index + 1] for index, token in enumerate(argv[:-1]) if token == "-o"}
 
-    assert argv[:3] == [O2Connection.SSH_EXECUTABLE, "-F", str(tmp_path / "inspected_config")]
+    assert argv[:3] == [O2Connection.SSH_EXECUTABLE, "-F", "/dev/null"]
     assert argv[argv.index("-S") + 1] == "none"
     assert {
+        "HostName=example.invalid",
+        "User=offline",
+        "Port=22",
         "ControlMaster=no",
         "ControlPath=none",
         "ControlPersist=no",
@@ -817,7 +853,14 @@ def test_broker_transport_is_direct_single_attempt_and_disables_helpers(tmp_path
         "KnownHostsCommand=none",
         "RemoteCommand=none",
         "ClearAllForwardings=yes",
+        "CanonicalizeHostname=no",
+        "ForkAfterAuthentication=no",
+        "PKCS11Provider=none",
+        "identityfile=/tmp/id_one",
+        "identityfile=/tmp/id_two",
     } <= option_values
+    assert "proxycommand=unsafe-helper" not in option_values
+    assert "controlpath=/tmp/unsafe.sock" not in option_values
     assert argv[-2] == config.host_alias
     assert "python3 -u -c" in argv[-1]
 
@@ -908,7 +951,7 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
     monkeypatch.setattr(
         connection,
         "_broker_transport_argv",
-        lambda _target, _config: [sys.executable, "-u", "-c", remote_helper_source()],
+        lambda _target: [sys.executable, "-u", "-c", remote_helper_source()],
     )
 
     try:

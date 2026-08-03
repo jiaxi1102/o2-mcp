@@ -98,10 +98,12 @@ automatic retry.
   `~/.agent_locks/o2-transfer-broker` default to distinct physical owner-only
   mode-0700 directories. `O2_BROKER_DIR` and `O2_TRANSFER_BROKER_DIR` may
   override them only with distinct absolute paths.
-- `command.sock`, state, config snapshot, lock, and log are owner-only.
+- `command.sock`, state, lock, and log are owner-only.
   Symlinked or permissive authority files fail closed. Authentication-capable
   launch data never enters the filesystem; it is consumed once from a bounded
-  inherited descriptor before any SSH spawn.
+  inherited descriptor before any SSH spawn. The inspected `ssh -G` expansion
+  is sealed directly into that launch argv, while SSH reads `-F /dev/null`, so
+  there is no replaceable config pathname between authorization and spawn.
 - A client connects only when a physical mode-0600 state receipt positively
   reports `ready` under the exact protocol version; missing, malformed, or
   stale-version receipts are not treated as compatible defaults.

@@ -99,12 +99,6 @@ class BrokerPaths:
         return self.root / "daemon.lock"
 
     @property
-    def ssh_config(self) -> Path:
-        """Return the inspected SSH-config snapshot used for broker startup."""
-
-        return self.root / "ssh_config"
-
-    @property
     def log(self) -> Path:
         """Return the daemon and SSH diagnostic log path."""
 
@@ -178,29 +172,6 @@ def prepare_broker_directory(path: Path) -> BrokerPaths:
         )
     _validate_private_directory(paths.root, create=True)
     return paths
-
-
-def atomic_private_text_write(path: Path, text: str) -> None:
-    """Atomically write one mode-0600 UTF-8 broker artifact.
-
-    The inspected SSH config can contain usernames and identity paths. It shares
-    the receipt writer's ownership and permission guarantees but is
-    intentionally plain text for direct OpenSSH consumption.
-    """
-
-    _validate_private_directory(path.parent, create=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary)
 
 
 @contextmanager

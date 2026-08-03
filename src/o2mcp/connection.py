@@ -36,7 +36,6 @@ from typing import Callable, Optional
 from o2mcp.broker import (
     BrokerClient,
     O2BrokerStartupError,
-    atomic_private_text_write,
     open_private_append,
     prepare_broker_directory,
 )
@@ -317,6 +316,41 @@ class O2Connection:
         }
     )
 
+    # The inspected `ssh -G` output is replayed as sealed argv rather than a
+    # mutable `-F` path. These directives are either fixed explicitly by the
+    # broker safety contract or could execute local helpers / open extra
+    # channels; omit them from the replay and supply safe values first.
+    _BROKER_OMITTED_RESOLVED_OPTIONS = frozenset(
+        {
+            "batchmode",
+            "canonicalizehostname",
+            "clearallforwardings",
+            "connecttimeout",
+            "controlmaster",
+            "controlpath",
+            "controlpersist",
+            "dynamicforward",
+            "forkafterauthentication",
+            "host",
+            "hostname",
+            "knownhostscommand",
+            "localcommand",
+            "localforward",
+            "permitlocalcommand",
+            "pkcs11provider",
+            "port",
+            "proxycommand",
+            "proxyjump",
+            "proxyusefdpass",
+            "remotecommand",
+            "remoteforward",
+            "requesttty",
+            "securitykeyprovider",
+            "sessiontype",
+            "user",
+        }
+    )
+
     def __init__(
         self,
         config: O2Config | None = None,
@@ -370,6 +404,7 @@ class O2Connection:
         # safely expanded config for each target so those two steps cannot drift
         # and do not repeatedly parse the same local files.
         self._resolved_ssh_configs: dict[str, dict[str, str]] = {}
+        self._resolved_ssh_entries: dict[str, list[tuple[str, str]]] = {}
         self._safe_ssh_config_text_cache: str | None = None
 
     # -- persistent command broker ---------------------------------------------
@@ -419,25 +454,40 @@ class O2Connection:
         client = self._broker_client(transfer=transfer)
         return client.local_status()
 
-    def _broker_transport_argv(self, target: str, ssh_config_path: Path) -> list[str]:
+    def _broker_transport_argv(self, target: str) -> list[str]:
         """Build the sole authentication-capable persistent SSH session argv.
 
         ``-S none`` prevents this long-lived session from attaching to an
         existing ControlMaster and then inheriting its unstable lifetime. The
         one-shot login grant authorizes this direct transport explicitly. Proxy
         and local helper hooks are disabled so one launch cannot fan out into
-        additional authentication-capable processes.
+        additional authentication-capable processes. The inspected expanded
+        config is replayed directly as argv behind fixed safety options; SSH
+        never opens a same-UID-replaceable config pathname after authorization.
         """
 
         remote_program = remote_helper_source()
         remote_command = f"python3 -u -c {shlex.quote(remote_program)}"
+        destination = self._broker_destination(target)
+        resolved_options = [
+            option
+            for key, value in self._resolved_ssh_entries_for_target(target)
+            if key not in self._BROKER_OMITTED_RESOLVED_OPTIONS
+            for option in ("-o", f"{key}={value}")
+        ]
         return [
             self.SSH_EXECUTABLE,
             "-F",
-            str(ssh_config_path),
+            "/dev/null",
             "-S",
             "none",
             *self.config.base_ssh_opts(),
+            "-o",
+            f"HostName={destination['hostname']}",
+            "-o",
+            f"User={destination['user']}",
+            "-o",
+            f"Port={destination['port']}",
             "-o",
             "ControlMaster=no",
             "-o",
@@ -459,9 +509,16 @@ class O2Connection:
             "-o",
             "ClearAllForwardings=yes",
             "-o",
+            "CanonicalizeHostname=no",
+            "-o",
+            "ForkAfterAuthentication=no",
+            "-o",
+            "PKCS11Provider=none",
+            "-o",
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=3",
+            *resolved_options,
             target,
             remote_command,
         ]
@@ -507,7 +564,6 @@ class O2Connection:
         # waste the user's one authorized authentication attempt.
         paths = prepare_broker_directory(broker_dir)
         destination = self._broker_destination(target)
-        atomic_private_text_write(paths.ssh_config, self._safe_ssh_config_text())
         launch_payload = {
             "schema_version": 1,
             "broker_dir": str(paths.root),
@@ -519,7 +575,7 @@ class O2Connection:
             "launcher_client_id": grant.client_id,
             "launcher_pid": os.getpid(),
             "startup_timeout": self.config.broker_start_timeout,
-            "transport_argv": self._broker_transport_argv(target, paths.ssh_config),
+            "transport_argv": self._broker_transport_argv(target),
         }
         launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
 
@@ -1198,13 +1254,18 @@ class O2Connection:
             handle.flush()
             yield handle.name
 
-    def _resolved_ssh_config(self, target: str) -> dict[str, str]:
-        """Expand one target through an inspected config without ``Match exec``."""
+    def _resolved_ssh_entries_for_target(self, target: str) -> list[tuple[str, str]]:
+        """Return every ordered ``ssh -G`` entry from the inspected snapshot.
 
-        cached = self._resolved_ssh_configs.get(target)
+        Keeping repeated keys such as ``IdentityFile`` is necessary when the
+        broker replays the expanded configuration as sealed command-line
+        options. A dictionary-only parser would silently discard all but one
+        authentication identity.
+        """
+
+        cached = self._resolved_ssh_entries.get(target)
         if cached is not None:
-            return cached
-
+            return list(cached)
         with self._safe_ssh_config_path() as safe_config:
             result = self._runner(
                 [self.SSH_EXECUTABLE, "-G", "-F", safe_config, target],
@@ -1215,11 +1276,23 @@ class O2Connection:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
             raise O2UnsafeTransportError(f"Could not safely resolve SSH config for '{target}': {detail}")
 
-        resolved: dict[str, str] = {}
+        entries: list[tuple[str, str]] = []
         for line in result.stdout.splitlines():
             key, separator, value = line.partition(" ")
             if separator:
-                resolved.setdefault(key.lower(), value.strip())
+                entries.append((key.lower(), value.strip()))
+        self._resolved_ssh_entries[target] = entries
+        return list(entries)
+
+    def _resolved_ssh_config(self, target: str) -> dict[str, str]:
+        """Expand one target through an inspected config without ``Match exec``."""
+
+        cached = self._resolved_ssh_configs.get(target)
+        if cached is not None:
+            return cached
+        resolved: dict[str, str] = {}
+        for key, value in self._resolved_ssh_entries_for_target(target):
+            resolved.setdefault(key, value)
         self._resolved_ssh_configs[target] = resolved
         return resolved
 
