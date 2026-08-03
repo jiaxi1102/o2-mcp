@@ -335,16 +335,16 @@ def test_command_timeout_starts_only_after_dispatch(tmp_path, broker_root):
                 "type": "exec",
                 "protocol": PROTOCOL_VERSION,
                 "id": "queue-occupant",
-                "command": "sleep 0.3; printf first",
+                "command": "sleep 1.5; printf first",
                 "timeout_seconds": 5,
                 "stdin": None,
             },
         )
         assert read_frame(first_stream) == {"type": "dispatched", "id": "queue-occupant"}
 
-        # The second command's 100 ms limit is shorter than its roughly 300 ms
-        # queue wait, but it begins only after the daemon acknowledges dispatch.
-        queued = client.execute("printf second", timeout=0.1)
+        # The second command's one-second limit is shorter than its 1.5-second
+        # queue wait, but comfortably covers its own tiny process after dispatch.
+        queued = client.execute("printf second", timeout=1.0)
         first_response = read_frame(first_stream)
 
         assert first_response["stdout"] == "first"
