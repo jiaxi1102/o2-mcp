@@ -210,6 +210,38 @@ class O2Connection:
         {"B", "D", "E", "F", "I", "J", "L", "O", "P", "Q", "R", "S", "W", "b", "c", "e", "i", "l", "m", "o", "p", "w"}
     )
 
+    # Caller values for these keywords could re-enable authentication, launch a
+    # proxy/local helper, or change the endpoint/socket lifecycle. Reject them
+    # explicitly instead of depending on OpenSSH's repeated-option precedence.
+    _SSH_FORBIDDEN_CALLER_O_OPTIONS = frozenset(
+        {
+            "batchmode",
+            "certificatefile",
+            "challengeresponseauthentication",
+            "controlmaster",
+            "controlpersist",
+            "gssapiauthentication",
+            "hostbasedauthentication",
+            "hostname",
+            "identityagent",
+            "identityfile",
+            "kbdinteractiveauthentication",
+            "knownhostscommand",
+            "localcommand",
+            "numberofpasswordprompts",
+            "passwordauthentication",
+            "permitlocalcommand",
+            "pkcs11provider",
+            "port",
+            "preferredauthentications",
+            "proxycommand",
+            "proxyjump",
+            "pubkeyauthentication",
+            "securitykeyprovider",
+            "user",
+        }
+    )
+
     def __init__(self, config: O2Config | None = None, runner: Runner = default_runner) -> None:
         self.config = config or O2Config()
         self._runner = runner
@@ -776,35 +808,47 @@ class O2Connection:
             index += 1
         return operands
 
-    def _target_alias_from_argv(self, argv: list[str]) -> str | None:
-        """Infer the configured O2 endpoint used by a raw rsync/SSH argv.
+    def _transport_endpoints_from_argv(self, argv: list[str]) -> list[str]:
+        """Return every SSH/rsync ``[user@]host`` endpoint present in argv.
 
-        Rsync endpoints appear as ``[user@]<alias>:<path>`` while raw SSH has one
-        destination operand. Parse each command's option structure first so an
-        alias mentioned in an option value or remote command cannot select the
-        wrong socket. Strip the optional user qualifier only for host comparison,
-        then return the full ``[user@]alias`` endpoint because ``%r``-based
-        ControlPath templates resolve different sockets for different users.
+        An empty list is distinct from an unrecognized endpoint: local-only rsync
+        has no remote host and may safely use the login default, while a typoed or
+        ungoverned host must be rejected before a pinned O2 socket overrides it.
+        Rsync treats a colon as remote-shell syntax only when it appears before
+        any slash, so local paths such as ``./sample:a`` remain local operands.
         """
 
         if not argv:
-            return None
+            return []
         executable = argv[0]
         if executable in {"ssh", self.SSH_EXECUTABLE}:
             destination = self._ssh_destination_from_argv(argv)
-            candidates = [destination] if destination is not None else []
-        elif executable in {"rsync", self.RSYNC_EXECUTABLE}:
-            # A colon distinguishes remote-shell/daemon operands from ordinary
-            # local paths, which may coincidentally equal an O2 alias.
-            candidates = [operand for operand in self._rsync_operands_from_argv(argv) if ":" in operand]
-        else:
-            candidates = []
+            return [destination] if destination is not None else []
+        if executable not in {"rsync", self.RSYNC_EXECUTABLE}:
+            return []
 
+        endpoints: list[str] = []
+        for operand in self._rsync_operands_from_argv(argv):
+            endpoint, separator, _remote_path = operand.partition(":")
+            if separator and "/" not in endpoint:
+                endpoints.append(endpoint)
+        return endpoints
+
+    def _target_alias_from_argv(self, argv: list[str]) -> str | None:
+        """Infer the configured O2 endpoint used by a raw rsync/SSH argv.
+
+        Parse each command's option structure first so an alias mentioned in an
+        option value or remote command cannot select the wrong socket. Strip the
+        optional user qualifier only for host comparison, then return the full
+        ``[user@]alias`` endpoint because ``%r``-based ControlPath templates
+        resolve different sockets for different users.
+        """
+
+        endpoints = self._transport_endpoints_from_argv(argv)
         for alias in (self.config.transfer_alias, self.config.host_alias):
             if not alias:
                 continue
-            for token in candidates:
-                endpoint = token.split(":", 1)[0]
+            for endpoint in endpoints:
                 host = endpoint.rsplit("@", 1)[-1]
                 if host == alias:
                     return endpoint
@@ -1052,27 +1096,35 @@ class O2Connection:
                     # in ``-vS/path``), but discard the unsafe option and value.
                     if kept_flags:
                         sanitized.append("-" + "".join(kept_flags))
-                elif option in {"l", "p"}:
-                    identity = "user" if option == "l" else "port"
+                elif option in {"I", "J", "O", "i", "l", "p"}:
+                    option_label = {
+                        "I": "PKCS11 provider",
+                        "J": "ProxyJump",
+                        "O": "control command",
+                        "i": "identity file",
+                        "l": "user",
+                        "p": "port",
+                    }[option]
                     raise O2UnsafeTransportError(
-                        f"SSH {identity} options are disabled for guarded O2 transports; "
+                        f"SSH {option_label} options are disabled for guarded O2 transports; "
                         "use user@o2 or user@o2-transfer for user selection and keep host/port in the inspected alias."
                     )
-                elif option == "o" and self._ssh_o_option_name(argument) in {
-                    "controlpath",
-                    "hostname",
-                    "port",
-                    "user",
-                }:
+                elif option == "o":
                     option_name = self._ssh_o_option_name(argument)
-                    if option_name != "controlpath":
+                    if option_name in self._SSH_FORBIDDEN_CALLER_O_OPTIONS:
                         raise O2UnsafeTransportError(
                             f"SSH {option_name} options are disabled for guarded O2 transports; "
-                            "use user@o2 or user@o2-transfer for user selection and keep host/port in the "
-                            "inspected alias."
+                            "authentication, proxy/helper, and endpoint settings are owned by the guarded transport."
                         )
-                    if kept_flags:
-                        sanitized.append("-" + "".join(kept_flags))
+                    if option_name == "controlpath":
+                        if kept_flags:
+                            sanitized.append("-" + "".join(kept_flags))
+                    else:
+                        # Benign caller options remain available, but only after
+                        # every safety-sensitive keyword has been denied above.
+                        sanitized.append(token)
+                        if consumes_next:
+                            sanitized.append(argument)
                 else:
                     # This argument-taking option is unrelated to socket/user
                     # identity. Preserve its exact representation and value.
@@ -1257,6 +1309,19 @@ class O2Connection:
             raise O2UnsafeTransportError(
                 "Cold O2 SSH/rsync execution is disabled. Start one explicitly authorized ControlMaster, then retry."
             )
+        endpoints = self._transport_endpoints_from_argv(argv)
+        configured_aliases = {alias for alias in (self.config.host_alias, self.config.transfer_alias) if alias}
+        unrecognized = [endpoint for endpoint in endpoints if endpoint.rsplit("@", 1)[-1] not in configured_aliases]
+        if unrecognized:
+            raise O2UnsafeTransportError(
+                f"Transport destination '{unrecognized[0]}' is not a configured O2 alias; "
+                "refusing to override it with the pinned login socket."
+            )
+        if len(set(endpoints)) > 1:
+            raise O2UnsafeTransportError(
+                "One guarded transport cannot name multiple O2 endpoints: " + ", ".join(dict.fromkeys(endpoints))
+            )
+
         inferred_target = self._target_alias_from_argv(argv)
         if master_alias is not None and inferred_target is not None and master_alias != inferred_target:
             # The pinned socket determines the actual multiplexed destination.

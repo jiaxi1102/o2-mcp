@@ -850,13 +850,6 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     assert direct[:5] == [O2Connection.SSH_EXECUTABLE, "-F", "/dev/null", "-S", "/tmp/o2-control.sock"]
     assert direct[5 : 5 + len(conn.config.reuse_only_ssh_opts())] == conn.config.reuse_only_ssh_opts()
 
-    # A later raw ProxyJump request cannot win over the earlier command-line
-    # `ProxyJump=none`. Otherwise the child proxy SSH could authenticate even
-    # though the outer O2 client has every authentication method disabled.
-    conn.run_raw(["ssh", "-J", "proxy.example", "o2", "hostname"])
-    direct = runner.calls[-1]["argv"]
-    assert direct.index("ProxyJump=none") < direct.index("-J")
-
     # Caller-selected config/socket paths are stripped, including after another
     # option with a separate argument. The guarded /dev/null config and resolved
     # socket remain the only effective values.
@@ -885,23 +878,6 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
         [
             "rsync",
             "-e",
-            "ssh -o PubkeyAuthentication=yes -o ProxyCommand='ssh proxy.example'",
-            "x",
-            "o2:/p",
-        ]
-    )
-    rsync = runner.calls[-1]["argv"]
-    transport = rsync[rsync.index("-e") + 1]
-    # The safe option is prepended, and OpenSSH honors the first command-line
-    # value, so the caller's later attempt to re-enable keys is ineffective.
-    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
-    assert "PreferredAuthentications=none" in transport
-    assert transport.index("ProxyCommand=none") < transport.index("ProxyCommand=ssh proxy.example")
-
-    conn.run_raw(
-        [
-            "rsync",
-            "-e",
             "ssh -F /tmp/unsafe-config -S /tmp/unsafe-socket -o ControlPath=/tmp/also-unsafe",
             "x",
             "o2:/p",
@@ -916,9 +892,9 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     assert "/tmp/also-unsafe" not in transport
     assert "PreferredAuthentications=none" in transport
 
-    # Every remote-shell option is normalized, not just the first. This prevents
-    # a later compact/long-form override from restoring a cold-login path.
-    conn.run_raw(["rsync", "-e", "ssh", "-essh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    # Every remote-shell option is normalized, not just the first. Use a benign
+    # caller option here; safety-sensitive `-o` options are rejected separately.
+    conn.run_raw(["rsync", "-e", "ssh", "-essh -o ServerAliveInterval=15", "x", "o2:/p"])
     rsync = runner.calls[-1]["argv"]
     transports = [
         rsync[rsync.index("-e") + 1],
@@ -926,16 +902,17 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     ]
     assert all("PubkeyAuthentication=no" in transport for transport in transports)
     assert all("PreferredAuthentications=none" in transport for transport in transports)
+    assert "ServerAliveInterval=15" in transports[1]
 
-    conn.run_raw(["rsync", "-avze", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    conn.run_raw(["rsync", "-avze", "ssh -o ServerAliveInterval=15", "x", "o2:/p"])
     clustered = runner.calls[-1]["argv"]
     transport = clustered[clustered.index("-avze") + 1]
-    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
+    assert "PubkeyAuthentication=no" in transport and "ServerAliveInterval=15" in transport
 
-    conn.run_raw(["rsync", "-avzessh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    conn.run_raw(["rsync", "-avzessh -o ServerAliveInterval=15", "x", "o2:/p"])
     attached = runner.calls[-1]["argv"]
     transport = next(token[len("-avze") :] for token in attached if token.startswith("-avze"))
-    assert transport.index("PubkeyAuthentication=no") < transport.index("PubkeyAuthentication=yes")
+    assert "PubkeyAuthentication=no" in transport and "ServerAliveInterval=15" in transport
 
     # Rsync options that consume arguments end a short-option cluster. The
     # letters inside those arguments are data, so an ``e`` in --fake-super or a
@@ -975,10 +952,10 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
 
     # Rsync also accepts ``-o=argument``. Preserve the equals sign while
     # hardening the attached remote shell.
-    conn.run_raw(["rsync", "-avze=ssh -o PubkeyAuthentication=yes", "x", "o2:/p"])
+    conn.run_raw(["rsync", "-avze=ssh -o ServerAliveInterval=15", "x", "o2:/p"])
     equals_cluster = runner.calls[-1]["argv"]
     equals_transport = next(token[len("-avze=") :] for token in equals_cluster if token.startswith("-avze="))
-    assert equals_transport.index("PubkeyAuthentication=no") < equals_transport.index("PubkeyAuthentication=yes")
+    assert "PubkeyAuthentication=no" in equals_transport and "ServerAliveInterval=15" in equals_transport
 
 
 @pytest.mark.parametrize(
@@ -990,19 +967,25 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
         ["ssh", "-p2222", "o2", "hostname"],
         ["ssh", "-o", "Port=2222", "o2", "hostname"],
         ["ssh", "-o", "HostName=other.example", "o2", "hostname"],
+        ["ssh", "-J", "proxy.example", "o2", "hostname"],
+        ["ssh", "-o", "ProxyCommand=ssh proxy.example", "o2", "hostname"],
+        ["ssh", "-o", "PubkeyAuthentication=yes", "o2", "hostname"],
+        ["ssh", "-i", "/tmp/key", "o2", "hostname"],
         ["rsync", "-e", "ssh -l alice", "x", "o2:/p"],
         ["rsync", "-e", "ssh -o User=alice", "x", "o2:/p"],
         ["rsync", "-e", "ssh -p 2222", "x", "o2:/p"],
         ["rsync", "-e", "ssh -o Port=2222", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o ProxyCommand='ssh proxy.example'", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o PubkeyAuthentication=yes", "x", "o2:/p"],
     ],
 )
-def test_run_raw_rejects_ssh_endpoint_identity_options(tmp_path, argv):
-    """Endpoint identity must not change after the exact socket is resolved."""
+def test_run_raw_rejects_safety_sensitive_ssh_options(tmp_path, argv):
+    """Caller options cannot alter endpoint, proxy, or authentication safety."""
 
     runner = RecordingRunner(master=True)
     conn = O2Connection(_config(tmp_path), runner=runner)
 
-    with pytest.raises(O2UnsafeTransportError, match="user options|port options|hostname options"):
+    with pytest.raises(O2UnsafeTransportError, match="options are disabled"):
         conn.run_raw(argv)
 
     assert not any(
@@ -1157,6 +1140,50 @@ def test_run_raw_rejects_master_alias_destination_mismatch(tmp_path, argv, maste
     # The mismatch is determined from argv alone, before config expansion or any
     # local master probe has a chance to obscure the caller error.
     assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["ssh", "o22", "hostname"],
+        ["rsync", "x", "other:/p"],
+        ["rsync", "o2:/p", "other:/q"],
+    ],
+)
+def test_run_raw_rejects_unrecognized_transport_destinations(tmp_path, argv):
+    """A typoed host must not be overridden by the default pinned O2 socket."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="not a configured O2 alias"):
+        conn.run_raw(argv)
+
+    assert runner.calls == []
+
+
+def test_run_raw_rejects_multiple_configured_endpoints(tmp_path):
+    """One rsync command cannot safely pin sockets for two remote endpoints."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2UnsafeTransportError, match="multiple O2 endpoints"):
+        conn.run_raw(["rsync", "o2:/source", "o2-transfer:/dest"])
+
+    assert runner.calls == []
+
+
+def test_rsync_local_colon_path_is_not_mistaken_for_remote_endpoint(tmp_path):
+    """A colon after a slash is a local rsync path, not an unrecognized host."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.run_raw(["rsync", "./sample:a", "./out"])
+
+    assert result.ok
+    assert runner.calls[-1]["argv"][0] == O2Connection.RSYNC_EXECUTABLE
 
 
 def test_rsync_blocked_by_lock(tmp_path):
