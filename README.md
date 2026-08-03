@@ -31,9 +31,11 @@ hooks that could launch another process. Those options still permit reuse of an
 already-authenticated master: the MCP first resolves the alias's original `ControlPath` from
 an inspected, flattened SSH config and pins that expanded socket with `-S`, preserving `%C`
 paths whose hash includes a jump host. Every reuse command then uses `-F /dev/null`; caller
-`-F`, `-S`, and `ControlPath` overrides are removed, while `-l`/`User` overrides are rejected
-in favor of the unambiguous `user@alias` form. A missing or failed socket terminates locally
-instead of opening a replacement login.
+`-F`, `-S`, and `ControlPath` overrides are removed. User overrides must use the unambiguous
+`user@alias` form, while port and hostname overrides are rejected because they would no
+longer match the pinned socket. SSH and rsync are normalized to the operating system's
+`/usr/bin` clients; executable paths or wrappers supplied by callers are rejected. A missing
+or failed socket terminates locally instead of opening a replacement login.
 
 OpenSSH evaluates `Match exec` shell predicates even for its nominally local `ssh -G` config
 dump. The MCP therefore reads the configured SSH file and recursively flattens `Include`

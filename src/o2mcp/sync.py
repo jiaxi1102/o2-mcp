@@ -126,7 +126,9 @@ class O2Sync:
     def _build_rsync(self, *, source: str, dest: str, extra_args: list[str] | None) -> list[str]:
         alias = self._alias_from_remote(source, dest)
         return [
-            "rsync",
+            # Pin the system client so detached transfers cannot resolve a PATH
+            # wrapper that ignores the hardened `-e` SSH transport.
+            self.conn.RSYNC_EXECUTABLE,
             *_DEFAULT_RSYNC_ARGS,
             "-e",
             self._rsync_e_opt(alias),

@@ -111,6 +111,14 @@ class O2Connection:
 
     LOGIN_RETRY_COOLDOWN_SECONDS = 300.0
 
+    # Never let PATH lookup or an arbitrary executable whose basename is `ssh`
+    # or `rsync` bypass the transport guards. O2 MCP targets macOS and the Linux
+    # CI/runtime layout, where the operating-system clients live at these paths.
+    # Bare caller spellings are accepted for compatibility but normalized to the
+    # absolute binaries before execution; all other paths are rejected.
+    SSH_EXECUTABLE = "/usr/bin/ssh"
+    RSYNC_EXECUTABLE = "/usr/bin/rsync"
+
     # Rsync accepts short options in clusters, but these options consume an
     # argument. Once one appears, the remainder of the token (or the following
     # argv element when there is no remainder) is data, not more option letters.
@@ -410,7 +418,7 @@ class O2Connection:
         """
 
         return [
-            "ssh",
+            self.SSH_EXECUTABLE,
             "-F",
             "/dev/null",
             "-S",
@@ -539,7 +547,7 @@ class O2Connection:
             with self._safe_ssh_config_path() as safe_config:
                 result = self._runner(
                     [
-                        "ssh",
+                        self.SSH_EXECUTABLE,
                         "-F",
                         safe_config,
                         "-S",
@@ -631,7 +639,7 @@ class O2Connection:
         target = self.config.host_alias
         return self._runner(
             [
-                "ssh",
+                self.SSH_EXECUTABLE,
                 "-F",
                 "/dev/null",
                 "-S",
@@ -781,11 +789,11 @@ class O2Connection:
 
         if not argv:
             return None
-        executable = Path(argv[0]).name
-        if executable == "ssh":
+        executable = argv[0]
+        if executable in {"ssh", self.SSH_EXECUTABLE}:
             destination = self._ssh_destination_from_argv(argv)
             candidates = [destination] if destination is not None else []
-        elif executable == "rsync":
+        elif executable in {"rsync", self.RSYNC_EXECUTABLE}:
             # A colon distinguishes remote-shell/daemon operands from ordinary
             # local paths, which may coincidentally equal an O2 alias.
             candidates = [operand for operand in self._rsync_operands_from_argv(argv) if ":" in operand]
@@ -921,7 +929,7 @@ class O2Connection:
 
         with self._safe_ssh_config_path() as safe_config:
             result = self._runner(
-                ["ssh", "-G", "-F", safe_config, target],
+                [self.SSH_EXECUTABLE, "-G", "-F", safe_config, target],
                 self.config.connect_timeout,
                 None,
             )
@@ -960,7 +968,7 @@ class O2Connection:
         """Return ``ssh`` plus a pinned socket and fail-closed client options."""
 
         return [
-            "ssh",
+            self.SSH_EXECUTABLE,
             "-F",
             "/dev/null",
             "-S",
@@ -1095,14 +1103,19 @@ class O2Connection:
             tokens = shlex.split(command)
         except ValueError as exc:
             raise O2UnsafeTransportError(f"Invalid rsync SSH transport: {exc}") from exc
-        if not tokens or Path(tokens[0]).name != "ssh":
-            raise O2UnsafeTransportError("O2 rsync transports must use ssh through the configured ControlMaster.")
+        if not tokens or tokens[0] not in {"ssh", self.SSH_EXECUTABLE}:
+            raise O2UnsafeTransportError(
+                f"O2 rsync transports must use the trusted {self.SSH_EXECUTABLE} client through the configured "
+                "ControlMaster; arbitrary SSH executable paths are disabled."
+            )
         safe = self._reuse_only_ssh_prefix(alias)[1:]
         caller_tokens = tokens[1:]
         if caller_tokens[: len(safe)] == safe:
             caller_tokens = caller_tokens[len(safe) :]
         caller_tokens = self._sanitize_caller_ssh_options(caller_tokens, stop_at_host=False)
-        return shlex.join([tokens[0], *safe, *caller_tokens])
+        # Normalize a caller's bare `ssh` spelling to the absolute system binary
+        # so subprocess/rsync cannot resolve an attacker-controlled PATH entry.
+        return shlex.join([self.SSH_EXECUTABLE, *safe, *caller_tokens])
 
     def _harden_raw_transport_argv(self, argv: list[str], alias: str) -> list[str]:
         """Return an SSH/rsync argv whose fallback path cannot authenticate.
@@ -1116,16 +1129,23 @@ class O2Connection:
             raise O2UnsafeTransportError("Refusing an empty raw O2 transport command.")
 
         hardened = list(argv)
-        executable = Path(hardened[0]).name
-        if executable == "ssh":
+        executable = hardened[0]
+        if executable in {"ssh", self.SSH_EXECUTABLE}:
             safe = self._reuse_only_ssh_prefix(alias)[1:]
             caller_tokens = hardened[1:]
             if caller_tokens[: len(safe)] == safe:
                 caller_tokens = caller_tokens[len(safe) :]
             caller_tokens = self._sanitize_caller_ssh_options(caller_tokens, stop_at_host=True)
-            return [hardened[0], *safe, *caller_tokens]
-        if executable != "rsync":
-            raise O2UnsafeTransportError("run_raw accepts only ssh or rsync O2 transports.")
+            return [self.SSH_EXECUTABLE, *safe, *caller_tokens]
+        if executable not in {"rsync", self.RSYNC_EXECUTABLE}:
+            raise O2UnsafeTransportError(
+                f"run_raw accepts only the trusted {self.SSH_EXECUTABLE} or {self.RSYNC_EXECUTABLE} O2 "
+                "transports; arbitrary executable paths are disabled."
+            )
+        # As with SSH, pin rsync itself before it interprets the guarded `-e`
+        # transport. A caller-supplied wrapper named rsync could otherwise ignore
+        # that transport and open its own authentication-capable connection.
+        hardened[0] = self.RSYNC_EXECUTABLE
 
         # An explicit rsync remote shell overrides RSYNC_RSH and the user's
         # environment. Normalize every supported spelling so detached and

@@ -85,7 +85,7 @@ def _conn(tmp_path: Path, *, master: bool = True, locked: bool = False) -> O2Con
     def runner(argv, timeout, input_text) -> CommandResult:
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if master else 255, "", "")
-        if argv[:2] == ["ssh", "-G"]:
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
         return CommandResult(list(argv), 0, "", "")
 
@@ -118,7 +118,7 @@ def test_push_async_launches_detached_with_escaped_remote(tmp_path):
     assert wrapped[3] == "bash" and wrapped[4] == handle.rc_path
     rsync_argv = wrapped[5:]
     assert rsync_argv == O2Sync(_conn(tmp_path)).push_argv("/local/Human", remote)
-    assert rsync_argv[0] == "rsync"
+    assert rsync_argv[0] == O2Connection.RSYNC_EXECUTABLE
     transport = rsync_argv[rsync_argv.index("-e") + 1]
     assert "PreferredAuthentications=none" in transport
     assert "PubkeyAuthentication=no" in transport
