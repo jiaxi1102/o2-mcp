@@ -268,7 +268,11 @@ class O2PolicyStore:
                 raise O2LoginGrantError("Another unexpired workstation-wide login grant already exists.")
 
             attempt = state.get("login_attempt")
-            if isinstance(attempt, dict) and attempt.get("outcome") == "active":
+            if isinstance(attempt, dict):
+                # ``blocked_until`` governs the global cooldown independently
+                # of whether the SSH subprocess is still active or has already
+                # reported failure.  Restricting this check to ``active`` would
+                # permit an immediate retry after a failed/timed-out Duo push.
                 blocked_until = float(attempt.get("blocked_until", 0.0))
                 if now < blocked_until:
                     remaining = blocked_until - now
@@ -276,8 +280,9 @@ class O2PolicyStore:
                         f"A prior O2 login attempt is still active or cooling down for {remaining:.1f}s. "
                         "Do not authorize another Duo-pushing attempt yet."
                     )
-                attempt["outcome"] = "stale"
-                attempt["finished_at"] = now
+                if attempt.get("outcome") == "active":
+                    attempt["outcome"] = "stale"
+                    attempt["finished_at"] = now
 
             grant = LoginGrant(
                 id=str(uuid.uuid4()),
@@ -371,6 +376,7 @@ class O2PolicyStore:
     def _read_valid_state(self) -> dict[str, Any]:
         """Read one safe, regular, owned, mode-0600 policy JSON file."""
 
+        self._validate_parent_directory()
         try:
             metadata = self.path.lstat()
         except FileNotFoundError as exc:
@@ -394,6 +400,7 @@ class O2PolicyStore:
         permissive mode) is never overwritten automatically.
         """
 
+        self._validate_parent_directory()
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
@@ -443,18 +450,41 @@ class O2PolicyStore:
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise O2PolicyInvalidError(f"O2 policy object must not be accessible by group or other users: {path}")
 
+    def _validate_parent_directory(self) -> None:
+        """Reject a policy directory that another local account can replace.
+
+        File mode ``0600`` is insufficient when the containing directory is
+        accessible by group or other users: a writable directory permits file
+        replacement, and a readable directory discloses policy metadata.  Both
+        read and mutation paths call this check so unsafe permissions fail
+        closed rather than being silently repaired.
+        """
+
+        try:
+            metadata = self.path.parent.lstat()
+        except FileNotFoundError as exc:
+            raise O2PolicyInvalidError(f"O2 policy directory does not exist: {self.path.parent}") from exc
+        except OSError as exc:
+            raise O2PolicyInvalidError(f"Cannot inspect O2 policy directory {self.path.parent}: {exc}") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise O2PolicyInvalidError(f"O2 policy directory must be a physical directory: {self.path.parent}")
+        if metadata.st_uid != os.getuid():
+            raise O2PolicyInvalidError(f"O2 policy directory is not owned by uid {os.getuid()}: {self.path.parent}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise O2PolicyInvalidError(
+                "O2 policy directory must not be accessible by group or other users: " f"{self.path.parent}"
+            )
+
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Hold the stable workstation-wide mutex around one JSON mutation."""
 
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            # Tighten a directory created under a permissive umask.  Refuse a
-            # foreign owner rather than attempting to repair someone else's path.
-            parent_stat = self.path.parent.stat()
-            if parent_stat.st_uid != os.getuid() or not stat.S_ISDIR(parent_stat.st_mode):
-                raise O2PolicyInvalidError(f"Unsafe O2 policy directory: {self.path.parent}")
-            os.chmod(self.path.parent, 0o700)
+            # An existing permissive or aliased directory is a policy-integrity
+            # error.  Do not chmod it automatically: mutation must fail closed
+            # until the human repairs the unsafe filesystem boundary explicitly.
+            self._validate_parent_directory()
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
