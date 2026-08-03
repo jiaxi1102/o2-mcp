@@ -820,6 +820,12 @@ def test_push_pull_build_rsync(tmp_path):
     assert argv[-2] == "o2-transfer:/scratch/out/results"
     assert argv[-1] == "./local/results"
 
+    # Programmatic builder callers may use rsync's user-qualified endpoint.
+    # Preserve that user when selecting the `%r`-dependent ControlPath.
+    argv = sync._build_rsync(source="./local/results", dest="alice@o2-transfer:/scratch/results", extra_args=None)
+    transport = argv[argv.index("-e") + 1]
+    assert "-S /tmp/alice@o2-transfer-control.sock" in transport
+
 
 def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     """Library callers cannot smuggle an authentication-capable raw transport."""
@@ -845,8 +851,8 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     conn.run_raw(
         [
             "ssh",
-            "-p",
-            "22",
+            "-c",
+            "aes128-ctr",
             "-F",
             "/tmp/unsafe-config",
             "-S",
@@ -968,17 +974,23 @@ def test_run_raw_hardens_direct_ssh_and_permissive_rsync(tmp_path):
     [
         ["ssh", "-l", "alice", "o2", "hostname"],
         ["ssh", "-o", "User=alice", "o2", "hostname"],
+        ["ssh", "-p", "2222", "o2", "hostname"],
+        ["ssh", "-p2222", "o2", "hostname"],
+        ["ssh", "-o", "Port=2222", "o2", "hostname"],
+        ["ssh", "-o", "HostName=other.example", "o2", "hostname"],
         ["rsync", "-e", "ssh -l alice", "x", "o2:/p"],
         ["rsync", "-e", "ssh -o User=alice", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -p 2222", "x", "o2:/p"],
+        ["rsync", "-e", "ssh -o Port=2222", "x", "o2:/p"],
     ],
 )
-def test_run_raw_rejects_ssh_user_options(tmp_path, argv):
-    """User selection must use user@alias so socket resolution retains %r."""
+def test_run_raw_rejects_ssh_endpoint_identity_options(tmp_path, argv):
+    """Endpoint identity must not change after the exact socket is resolved."""
 
     runner = RecordingRunner(master=True)
     conn = O2Connection(_config(tmp_path), runner=runner)
 
-    with pytest.raises(O2UnsafeTransportError, match="user options|User options"):
+    with pytest.raises(O2UnsafeTransportError, match="user options|port options|hostname options"):
         conn.run_raw(argv)
 
     assert not any(

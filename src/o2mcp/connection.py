@@ -981,15 +981,17 @@ class O2Connection:
         return normalized.replace("=", " ", 1).split(None, 1)[0].lower() if normalized else ""
 
     def _sanitize_caller_ssh_options(self, tokens: list[str], *, stop_at_host: bool) -> list[str]:
-        """Remove socket/config overrides and reject alternate SSH users.
+        """Remove socket/config overrides and reject endpoint identity changes.
 
         The guarded prefix owns ``-F`` and ``-S``. OpenSSH gives a later ``-S``
         precedence, so merely prepending the pinned socket is insufficient; every
         caller-supplied config-file, ControlPath, and socket override is removed.
-        ``-l`` and ``-o User=...`` are rejected because selecting a user through
-        transport options would make the already-resolved ``%r`` socket stale.
-        Callers can express the user safely as ``user@alias``, which is retained
-        during target inference and socket resolution.
+        User, port, and hostname overrides are rejected because changing those
+        values after socket resolution can make ``%r``/``%p``/``%h`` ControlPath
+        templates stale or silently route the command through a different pinned
+        master. Callers can express the user safely as ``user@alias``, which is
+        retained during target inference and socket resolution; host and port
+        remain owned by the inspected alias configuration.
 
         For a direct SSH argv, option parsing stops at the destination so a remote
         command argument named ``-S`` remains ordinary data. Rsync's ``-e`` value
@@ -1042,15 +1044,24 @@ class O2Connection:
                     # in ``-vS/path``), but discard the unsafe option and value.
                     if kept_flags:
                         sanitized.append("-" + "".join(kept_flags))
-                elif option == "l":
+                elif option in {"l", "p"}:
+                    identity = "user" if option == "l" else "port"
                     raise O2UnsafeTransportError(
-                        "SSH user options are disabled for guarded O2 transports; use user@o2 or user@o2-transfer."
+                        f"SSH {identity} options are disabled for guarded O2 transports; "
+                        "use user@o2 or user@o2-transfer for user selection and keep host/port in the inspected alias."
                     )
-                elif option == "o" and self._ssh_o_option_name(argument) in {"controlpath", "user"}:
-                    if self._ssh_o_option_name(argument) == "user":
+                elif option == "o" and self._ssh_o_option_name(argument) in {
+                    "controlpath",
+                    "hostname",
+                    "port",
+                    "user",
+                }:
+                    option_name = self._ssh_o_option_name(argument)
+                    if option_name != "controlpath":
                         raise O2UnsafeTransportError(
-                            "SSH User options are disabled for guarded O2 transports; use user@o2 or "
-                            "user@o2-transfer."
+                            f"SSH {option_name} options are disabled for guarded O2 transports; "
+                            "use user@o2 or user@o2-transfer for user selection and keep host/port in the "
+                            "inspected alias."
                         )
                     if kept_flags:
                         sanitized.append("-" + "".join(kept_flags))

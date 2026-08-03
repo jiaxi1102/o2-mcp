@@ -136,11 +136,21 @@ class O2Sync:
         ]
 
     def _alias_from_remote(self, source: str, dest: str) -> str:
-        """Return the configured alias embedded in one side of an rsync transfer."""
+        """Return the configured ``[user@]alias`` from an rsync endpoint.
+
+        Preserve an explicit user because the hardened SSH transport resolves
+        ``%r``-based ControlPath templates. Comparing only the host portion keeps
+        the configured login/transfer aliases authoritative while allowing the
+        standard rsync ``user@alias:path`` spelling.
+        """
 
         for alias in (self.conn.config.transfer_alias, self.conn.config.host_alias):
-            if source.startswith(f"{alias}:") or dest.startswith(f"{alias}:"):
-                return alias
+            for operand in (source, dest):
+                if ":" not in operand:
+                    continue
+                endpoint = operand.split(":", 1)[0]
+                if endpoint.rsplit("@", 1)[-1] == alias:
+                    return endpoint
         # O2Sync always constructs one remote endpoint itself. Retain a safe
         # login-alias default for programmatic callers that invoke this private
         # builder directly with two local-looking paths.
