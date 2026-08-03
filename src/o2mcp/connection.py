@@ -635,14 +635,25 @@ class O2Connection:
     def _target_alias_from_argv(self, argv: list[str]) -> str | None:
         """Infer which configured host alias a raw rsync/ssh argv connects to.
 
-        rsync targets appear as ``<alias>:<path>`` and raw ssh as a bare ``<alias>``
-        token. The transfer alias is checked first so a transfer-node command is
-        never validated against the (different) login master. Returns ``None`` when
-        no configured alias appears, leaving the login alias as the default.
+        Rsync targets appear as ``[user@]<alias>:<path>`` and raw SSH hosts as a
+        bare ``[user@]<alias>`` token. Strip only the optional user qualifier and
+        remote path before comparing the host; otherwise a standard destination
+        such as ``jzhao@o2-transfer:/path`` would be pinned to the login socket.
+        The transfer alias is checked first so a transfer-node command is never
+        validated against the (different) login master. Returns ``None`` when no
+        configured alias appears, leaving the login alias as the default.
         """
         for alias in (self.config.transfer_alias, self.config.host_alias):
-            if alias and any(token == alias or token.startswith(f"{alias}:") for token in argv):
-                return alias
+            if not alias:
+                continue
+            for token in argv:
+                # The first colon separates an rsync host from its remote path;
+                # the last at-sign in the host portion separates an optional
+                # user. Configured aliases themselves contain neither delimiter.
+                endpoint = token.split(":", 1)[0]
+                host = endpoint.rsplit("@", 1)[-1]
+                if host == alias:
+                    return alias
         return None
 
     def _resolved_control_path(self, alias: str) -> str:

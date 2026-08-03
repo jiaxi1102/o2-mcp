@@ -892,6 +892,12 @@ def test_run_raw_infers_target_alias_from_argv(tmp_path):
     # a bare ssh to the transfer node is inferred too
     with pytest.raises(O2MasterUnavailableError):
         conn.run_raw(["ssh", "o2-transfer", "ls"])
+    # Standard user-qualified rsync and SSH destinations must select the same
+    # transfer-node socket rather than falling back to the login alias.
+    with pytest.raises(O2MasterUnavailableError):
+        conn.run_raw(["rsync", "-e", "ssh", "x", "alice@o2-transfer:/p"])
+    with pytest.raises(O2MasterUnavailableError):
+        conn.run_raw(["ssh", "alice@o2-transfer", "ls"])
 
 
 def test_rsync_blocked_by_lock(tmp_path):
