@@ -479,7 +479,46 @@ class O2PolicyStore:
         try:
             return self._validate_state(json.loads(self.path.read_text()))
         except (OSError, ValueError, O2PolicyInvalidError):
-            return self._initial_state()
+            return self._conservative_repair_state(metadata)
+
+    def _conservative_repair_state(self, metadata: os.stat_result) -> dict[str, Any]:
+        """Replace malformed JSON while retaining a file-age retry cooldown.
+
+        Truncation destroys the exact login-attempt receipt, so repair cannot
+        prove that no Duo-producing SSH process just ran. The policy file's
+        modification time is the last remaining durable evidence: treat it as
+        the start of an unknown failed attempt, capped at the current clock for
+        future-dated metadata. A genuinely old malformed file has already aged
+        out; a recent corruption retains the remainder of the global cooldown.
+        """
+
+        now = self._clock()
+        modification_time = float(metadata.st_mtime)
+        if not math.isfinite(modification_time):
+            modification_time = now
+        started_at = max(0.0, min(modification_time, now))
+        state = self._initial_state()
+        repair_id = f"repair-{uuid.uuid4()}"
+        state["login_attempt"] = {
+            "grant_id": repair_id,
+            "client_id": self.client_id,
+            # The cooldown is workstation-global, so either concrete target is
+            # sufficient when malformed bytes erased the original target.
+            "target": "login",
+            "allow_offvpn": False,
+            "started_at": started_at,
+            "finished_at": now,
+            "outcome": "error",
+            "returncode": None,
+            "blocked_until": started_at + DEFAULT_LOGIN_COOLDOWN_SECONDS,
+        }
+        self._append_event(
+            state,
+            "policy_repaired_with_conservative_cooldown",
+            repair_id=repair_id,
+            source_modified_at=modification_time,
+        )
+        return state
 
     def _validate_state(self, payload: Any) -> dict[str, Any]:
         """Strictly validate the durable fields needed for safe decisions."""
@@ -612,8 +651,10 @@ class O2PolicyStore:
         which commonly left an otherwise owned directory at mode ``0755``.
         Mutations migrate that exact legacy shape to ``0700`` through a
         descriptor opened with ``O_NOFOLLOW``. Symlinks, non-directories, and
-        foreign-owned objects remain hard failures; only permissions on the
-        user's own physical directory are tightened automatically.
+        foreign-owned objects remain hard failures. Arbitrary absolute policy
+        paths are supported, but their parent permissions are never changed:
+        automatic migration is limited to ``~/.agent_locks`` so unrelated
+        shared/project directories cannot lose intentional access.
         """
 
         try:
@@ -636,6 +677,14 @@ class O2PolicyStore:
             if metadata.st_uid != os.getuid():
                 raise O2PolicyInvalidError(f"O2 policy directory is not owned by uid {os.getuid()}: {self.path.parent}")
             if stat.S_IMODE(metadata.st_mode) & 0o077:
+                legacy_directory = Path(os.path.abspath(Path.home() / ".agent_locks"))
+                configured_directory = Path(os.path.abspath(self.path.parent))
+                if configured_directory != legacy_directory:
+                    raise O2PolicyInvalidError(
+                        "O2 policy directory is permissive and is not the known "
+                        f"legacy directory {legacy_directory}; create a dedicated "
+                        "mode-0700 directory instead of changing unrelated contents"
+                    )
                 os.fchmod(directory_fd, 0o700)
                 metadata = os.fstat(directory_fd)
             if stat.S_IMODE(metadata.st_mode) & 0o077:

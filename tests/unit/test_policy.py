@@ -136,10 +136,11 @@ def test_unsafe_policy_directory_fails_closed_for_reads_and_mutations(tmp_path):
         store.disable(reason="must not repair an unsafe parent")
 
 
-def test_owned_legacy_policy_directory_is_tightened_on_disable(tmp_path):
+def test_owned_legacy_policy_directory_is_tightened_on_disable(monkeypatch, tmp_path):
     """An upgrade can initialize policy in the 0755 directory made by 0.2."""
 
-    policy_directory = tmp_path / "policy"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy_directory = tmp_path / ".agent_locks"
     policy_directory.mkdir(mode=0o755)
     policy_directory.chmod(0o755)
     store = O2PolicyStore(policy_directory / "O2_POLICY.json", client_id="client-a")
@@ -150,6 +151,20 @@ def test_owned_legacy_policy_directory_is_tightened_on_disable(tmp_path):
 
     assert state["mode"] == "disabled"
     assert os.stat(policy_directory).st_mode & 0o777 == 0o700
+
+
+def test_permissive_nonlegacy_policy_directory_is_not_modified(tmp_path):
+    """A custom policy path cannot chmod an unrelated shared directory."""
+
+    shared_directory = tmp_path / "shared-project"
+    shared_directory.mkdir(mode=0o755)
+    shared_directory.chmod(0o755)
+    store = O2PolicyStore(shared_directory / "O2_POLICY.json", client_id="client-a")
+
+    with pytest.raises(O2PolicyInvalidError, match="dedicated mode-0700"):
+        store.disable(reason="must not change shared directory access")
+
+    assert os.stat(shared_directory).st_mode & 0o777 == 0o755
 
 
 def test_login_grant_is_client_target_and_time_scoped(tmp_path):
@@ -449,3 +464,34 @@ def test_disable_repairs_owned_malformed_json_but_not_symlink(tmp_path):
     repaired = store.disable(reason="repair to safest state")
     assert repaired["mode"] == "disabled"
     assert json.loads(policy.read_text())["schema_version"] == 1
+
+
+def test_malformed_policy_repair_preserves_recent_retry_cooldown(tmp_path):
+    """Truncation cannot erase evidence of a just-started login attempt."""
+
+    now = [1000.0]
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text("{truncated")
+    policy.chmod(0o600)
+    os.utime(policy, (900.0, 900.0))
+    store = O2PolicyStore(policy, client_id="repair-client", clock=lambda: now[0])
+
+    repaired = store.disable(reason="repair malformed state")
+    enabled = store.enable_reuse(
+        expected_revision=repaired["revision"],
+        expected_generation=repaired["generation"],
+        approval_reference="reuse only after repair",
+    )
+
+    attempt = enabled["login_attempt"]
+    assert attempt["outcome"] == "error"
+    assert attempt["started_at"] == 900.0
+    assert attempt["blocked_until"] == 1200.0
+    with pytest.raises(O2LoginGrantError, match="cooling down for 200.0s"):
+        store.authorize_login(
+            expected_revision=enabled["revision"],
+            expected_generation=enabled["generation"],
+            target="login",
+            allow_offvpn=False,
+            approval_reference="must remain blocked",
+        )
