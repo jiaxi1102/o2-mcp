@@ -69,7 +69,7 @@ def broker_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _start_local_broker(tmp_path, broker_root):
+def _start_local_broker(tmp_path, broker_root, *, local_request_timeout=5.0):
     """Start BrokerServer around the production remote helper on a local pipe."""
 
     policy = _reuse_policy(tmp_path)
@@ -79,6 +79,7 @@ def _start_local_broker(tmp_path, broker_root):
         policy_file=policy.path,
         transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
         alias="offline-o2",
+        local_request_timeout=local_request_timeout,
     )
     thread = threading.Thread(target=server.serve_forever, name="offline-o2-broker", daemon=True)
     thread.start()
@@ -87,10 +88,11 @@ def _start_local_broker(tmp_path, broker_root):
     # in-process test has no parent launcher, so wait on the server's own listener
     # publication instead of racing a transient lock observation on a busy CI VM.
     deadline = time.monotonic() + 10
-    while server.listener is None and thread.is_alive() and time.monotonic() < deadline:
+    status = client.local_status()
+    while status.get("responsive") is not True and thread.is_alive() and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert server.listener is not None, client.local_status()
-    client.ping(timeout=1)
+        status = client.local_status()
+    assert status.get("responsive") is True, status
     return policy, server, thread, client
 
 
@@ -110,6 +112,29 @@ def test_frame_round_trip_preserves_newlines_and_unicode():
     payload = {"type": "result", "stdout": "line 1\n{not a frame}\n雪\n", "returncode": 0}
 
     assert read_frame(io.BytesIO(encode_frame(payload))) == payload
+
+
+def test_frame_writer_handles_partial_binary_writes():
+    """Unix SocketIO may accept only a prefix of a large frame per write call."""
+
+    class _PartialWriter:
+        def __init__(self):
+            self.output = bytearray()
+
+        def write(self, value):
+            accepted = min(7, len(value))
+            self.output.extend(value[:accepted])
+            return accepted
+
+        def flush(self):
+            return None
+
+    writer = _PartialWriter()
+    payload = {"type": "result", "stdout": "x" * 100}
+
+    write_frame(writer, payload)
+
+    assert read_frame(io.BytesIO(writer.output)) == payload
 
 
 def test_frame_rejects_oversized_and_truncated_payloads():
@@ -470,17 +495,28 @@ def test_launch_file_state_is_json_serializable(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
-def test_protocol_mismatch_fails_before_connecting_to_stale_daemon(broker_root):
-    """A post-upgrade client must not send commands under obsolete queue semantics."""
+@pytest.mark.parametrize(
+    ("receipt", "mode"),
+    [
+        ('{"schema_version":1,"status":"ready","protocol":1}\n', 0o600),
+        (None, None),
+        ("{malformed", 0o600),
+        ('{"schema_version":1,"status":"ready","protocol":2}\n', 0o644),
+        ('{"schema_version":1,"status":"starting","protocol":2}\n', 0o600),
+    ],
+)
+def test_unverified_receipt_fails_before_connecting_to_daemon(broker_root, receipt, mode):
+    """A client sends nothing unless a trusted receipt proves protocol compatibility."""
 
     paths = prepare_broker_directory(broker_root)
-    paths.state.write_text('{"status":"ready","protocol":1}\n')
-    paths.state.chmod(0o600)
+    if receipt is not None:
+        paths.state.write_text(receipt)
+        paths.state.chmod(mode)
     stale_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale_socket.bind(str(paths.socket))
     paths.socket.chmod(0o600)
     try:
-        with pytest.raises(O2BrokerUnavailableError, match="requires protocol"):
+        with pytest.raises(O2BrokerUnavailableError, match="no trusted ready receipt"):
             BrokerClient(paths.root).execute("printf unsafe", timeout=1)
     finally:
         stale_socket.close()
@@ -511,6 +547,28 @@ def test_new_daemon_rejects_pre_acknowledgement_client_protocol(tmp_path, broker
         assert client.ping()["commands_completed"] == 0
     finally:
         old_client.close()
+        _stop_local_broker(thread, client)
+
+
+def test_incomplete_local_frame_times_out_without_wedging_broker(tmp_path, broker_root):
+    """A stalled same-user socket cannot block later commands or local stop."""
+
+    _policy, _server, thread, client = _start_local_broker(
+        tmp_path,
+        broker_root,
+        local_request_timeout=0.1,
+    )
+    stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        stalled.connect(str(client.paths.socket))
+        stalled.sendall(FRAME_MAGIC[:2])
+        # Let the server accept this connection and expire its incomplete frame
+        # before checking that the next complete client still reaches it.
+        time.sleep(0.2)
+
+        assert client.execute("printf recovered", timeout=2).stdout == "recovered"
+    finally:
+        stalled.close()
         _stop_local_broker(thread, client)
 
 

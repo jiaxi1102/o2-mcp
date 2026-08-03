@@ -254,7 +254,7 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
     """Read a locally trustworthy broker receipt or return an absent state."""
 
     if not paths.root.exists():
-        return {"status": "absent", "protocol": PROTOCOL_VERSION}
+        return {"status": "absent"}
     try:
         _validate_private_directory(paths.root, create=False)
         metadata = paths.state.lstat()
@@ -265,13 +265,21 @@ def _read_state(paths: BrokerPaths) -> dict[str, Any]:
         payload = json.loads(paths.state.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise O2BrokerError("broker state receipt must contain a JSON object")
+        schema_version = payload.get("schema_version")
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
+            raise O2BrokerError("broker state receipt has an unsupported schema version")
+        protocol = payload.get("protocol")
+        if not isinstance(protocol, int) or isinstance(protocol, bool):
+            raise O2BrokerError("broker state receipt has no valid protocol version")
+        if not isinstance(payload.get("status"), str):
+            raise O2BrokerError("broker state receipt has no valid lifecycle status")
         return payload
     except FileNotFoundError:
-        return {"status": "absent", "protocol": PROTOCOL_VERSION}
+        return {"status": "absent"}
     except (json.JSONDecodeError, OSError) as exc:
-        return {"status": "invalid", "protocol": PROTOCOL_VERSION, "error": str(exc)}
+        return {"status": "invalid", "error": str(exc)}
     except O2BrokerError as exc:
-        return {"status": "invalid", "protocol": PROTOCOL_VERSION, "error": str(exc)}
+        return {"status": "invalid", "error": str(exc)}
 
 
 class BrokerClient:
@@ -296,10 +304,11 @@ class BrokerClient:
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise O2BrokerUnavailableError("The O2 broker socket is accessible outside its owner.")
         state = _read_state(self.paths)
-        if state.get("protocol") != PROTOCOL_VERSION:
+        if state.get("status") != "ready" or state.get("protocol") != PROTOCOL_VERSION:
             raise O2BrokerUnavailableError(
-                f"The O2 broker receipt uses protocol {state.get('protocol')!r}, but this client requires "
-                f"protocol {PROTOCOL_VERSION}. Stop the old broker locally before any explicitly authorized restart."
+                f"The O2 broker has no trusted ready receipt for protocol {PROTOCOL_VERSION} "
+                f"(status={state.get('status')!r}, protocol={state.get('protocol')!r}). "
+                "Stop any old broker locally before an explicitly authorized restart."
             )
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -474,6 +483,28 @@ class BrokerClient:
         return response
 
 
+class _DeadlineSocketReader:
+    """Expose ``read`` with one absolute deadline over an accepted socket.
+
+    ``socket.settimeout`` alone is an inactivity timeout and can be extended by a
+    peer that trickles bytes. Recomputing the remaining budget before every
+    ``recv`` ensures the entire first frame, not merely each chunk, is bounded.
+    """
+
+    def __init__(self, client: socket.socket, timeout: float) -> None:
+        self.client = client
+        self.deadline = time.monotonic() + timeout
+
+    def read(self, size: int) -> bytes:
+        """Read at most ``size`` bytes before the shared absolute deadline."""
+
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("local broker request deadline expired")
+        self.client.settimeout(remaining)
+        return self.client.recv(size)
+
+
 class BrokerServer:
     """Own one transport process and serialize local clients over its streams."""
 
@@ -487,6 +518,7 @@ class BrokerServer:
         grant_id: str | None = None,
         ack_fd: int | None = None,
         startup_timeout: float = 90.0,
+        local_request_timeout: float = 5.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.paths = paths
@@ -495,9 +527,24 @@ class BrokerServer:
         self.alias = alias
         self.grant_id = grant_id
         self.ack_fd = ack_fd
-        if not math.isfinite(startup_timeout) or startup_timeout <= 0:
+        valid_startup_timeout = (
+            isinstance(startup_timeout, (int, float))
+            and not isinstance(startup_timeout, bool)
+            and math.isfinite(startup_timeout)
+            and startup_timeout > 0
+        )
+        if not valid_startup_timeout:
             raise ValueError("broker startup timeout must be finite and positive")
         self.startup_timeout = startup_timeout
+        valid_local_timeout = (
+            isinstance(local_request_timeout, (int, float))
+            and not isinstance(local_request_timeout, bool)
+            and math.isfinite(local_request_timeout)
+            and local_request_timeout > 0
+        )
+        if not valid_local_timeout:
+            raise ValueError("broker local request timeout must be finite and positive")
+        self.local_request_timeout = local_request_timeout
         self.clock = clock
         self.transport: subprocess.Popen[bytes] | None = None
         self.listener: socket.socket | None = None
@@ -634,14 +681,23 @@ class BrokerServer:
     def _handle_client(self, client: socket.socket, remote_in: BinaryIO, remote_out: BinaryIO) -> None:
         """Handle one local request, forwarding only validated exec frames."""
 
-        with client.makefile("rwb", buffering=0) as local:
-            try:
-                request = read_frame(local)
-            except (OSError, BrokerProtocolError):
-                # A malformed or disconnected same-user local client is not
-                # evidence that the remote SSH channel failed. Drop only this
-                # request so one expired MCP call cannot force another Duo.
-                return
+        # One same-user process must not be able to monopolize the serialized
+        # broker by sending only a frame prefix. The timeout covers receipt of
+        # the first and only local request; command execution has its own remote
+        # deadline after the explicit dispatch acknowledgement.
+        try:
+            request = read_frame(_DeadlineSocketReader(client, self.local_request_timeout))
+        except (OSError, BrokerProtocolError):
+            # A malformed or disconnected same-user local client is not
+            # evidence that the remote SSH channel failed. Drop only this
+            # request so one expired MCP call cannot force another Duo.
+            return
+
+        # Local responses are also bounded so an acknowledged caller that stops
+        # reading a large result cannot wedge later clients. This deadline does
+        # not govern or interrupt the remote command itself.
+        client.settimeout(self.local_request_timeout)
+        with client.makefile("wb", buffering=0) as local:
             request_type = request.get("type")
             if request_type == "ping":
                 with suppress(OSError, BrokerProtocolError):

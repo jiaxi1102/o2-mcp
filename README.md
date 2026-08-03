@@ -187,7 +187,8 @@ resumes it (`rsync --partial`). Remote paths are escaped so spaces transfer inta
 - Each broker socket directory is physical, caller-owned, and mode 0700; its
   socket and files are mode 0600. One lifetime `flock` per role prevents
   overlapping daemons. An unbindably long socket path fails before grant
-  consumption.
+  consumption. Clients require a trusted `ready` receipt for the exact protocol
+  version, and incomplete local frames expire on a finite absolute deadline.
 - The library retains its historical `require_master` parameters for source compatibility,
   but rejects `require_master=False`; callers cannot opt back into cold SSH/rsync behavior.
 - `o2_local_status` and the deprecated `o2_status` alias inspect broker receipts,

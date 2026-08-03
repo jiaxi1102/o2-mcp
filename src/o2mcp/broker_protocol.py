@@ -122,9 +122,14 @@ def read_frame(
 
 
 def write_frame(stream: BinaryIO, payload: Mapping[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -> None:
-    """Write and flush one validated frame to a binary stream."""
+    """Write and flush one validated frame, including partial-write streams."""
 
-    stream.write(encode_frame(payload, max_bytes=max_bytes))
+    remaining = memoryview(encode_frame(payload, max_bytes=max_bytes))
+    while remaining:
+        written = stream.write(remaining)
+        if not isinstance(written, int) or written <= 0:
+            raise BrokerProtocolError("broker stream stopped during a frame write")
+        remaining = remaining[written:]
     stream.flush()
 
 
@@ -182,11 +187,19 @@ def remote_helper_source() -> str:
                 raise ValueError(\"frame payload must be an object\")
             return payload
 
+        def write_all(raw):
+            remaining = memoryview(raw)
+            while remaining:
+                written = sys.stdout.buffer.write(remaining)
+                if not isinstance(written, int) or written <= 0:
+                    raise BrokenPipeError("broker stream stopped during a frame write")
+                remaining = remaining[written:]
+
         def write_frame(payload):
             body = json.dumps(payload, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")
             if not body or len(body) > MAX_FRAME_BYTES:
                 raise ValueError(\"response frame exceeds protocol limit\")
-            sys.stdout.buffer.write(FRAME_MAGIC + struct.pack(\"!I\", len(body)) + body)
+            write_all(FRAME_MAGIC + struct.pack(\"!I\", len(body)) + body)
             sys.stdout.buffer.flush()
 
         def drain_bounded(stream, captures, key):

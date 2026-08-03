@@ -93,6 +93,9 @@ automatic retry.
   override them only with distinct absolute paths.
 - `command.sock`, state, launch, config snapshot, lock, and log are owner-only.
   Symlinked or permissive authority files fail closed.
+- A client connects only when a physical mode-0600 state receipt positively
+  reports `ready` under the exact protocol version; missing, malformed, or
+  stale-version receipts are not treated as compatible defaults.
 - One lifetime `flock` per role prevents two daemons from owning an endpoint.
 - Both `O2Connection.run` and the daemon re-read `O2_POLICY.json` before a
   command. A global disable cannot be bypassed with a direct socket client.
@@ -100,6 +103,9 @@ automatic retry.
   the next frame. `o2_stop_broker` is an explicit local process-control action.
 - If SSH exits or framing fails, the daemon removes its socket, writes a failed
   receipt, terminates the child if necessary, and exits. It never reconnects.
+- The first local frame has an absolute five-second deadline, so a same-user
+  process cannot wedge the serialized broker by sending an incomplete or
+  byte-trickled request. Local response writes are bounded by the same deadline.
 - `o2_local_status` may read the receipt and ping the Unix socket, but it never
   sends a frame to O2.
 
