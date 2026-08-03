@@ -307,6 +307,96 @@ def test_grant_consumption_is_atomic_across_contenders(tmp_path):
     assert state["login_grant"] is None
     assert state["login_attempt"]["grant_id"] == grant.id
     assert state["login_attempt"]["outcome"] == "active"
+    assert state["login_attempt"]["launcher_pid"] == os.getpid()
+
+
+def test_broker_spawn_requires_exact_active_consumed_attempt(tmp_path):
+    """A daemon cannot turn stale launch metadata into another SSH attempt."""
+
+    store = _reuse_store(tmp_path, client_id="origin-client")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=True,
+        approval_reference="authorized broker launch",
+    )
+    store.consume_login_grant(grant.id, "login")
+
+    # The exact active attempt is the only shape allowed immediately around the
+    # daemon's SSH Popen.
+    with store.authorize_consumed_broker_launch(
+        grant.id,
+        "login",
+        client_id=grant.client_id,
+        launcher_pid=os.getpid(),
+    ):
+        pass
+
+    with pytest.raises(O2LoginGrantError, match="not bound"):  # noqa: SIM117 - Python 3.9 floor
+        with store.authorize_consumed_broker_launch(
+            grant.id,
+            "transfer",
+            client_id=grant.client_id,
+            launcher_pid=os.getpid(),
+        ):
+            pass
+
+    store.finish_login_attempt(grant.id, outcome="success", returncode=0)
+    with pytest.raises(O2LoginGrantError, match="not bound"):  # noqa: SIM117 - Python 3.9 floor
+        with store.authorize_consumed_broker_launch(
+            grant.id,
+            "login",
+            client_id=grant.client_id,
+            launcher_pid=os.getpid(),
+        ):
+            pass
+
+
+def test_terminal_login_attempt_cannot_be_rewritten(tmp_path):
+    """Cleanup errors must not corrupt immutable success/cooldown evidence."""
+
+    store = _reuse_store(tmp_path)
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=True,
+        approval_reference="terminal evidence test",
+    )
+    store.consume_login_grant(grant.id, "login")
+    store.finish_login_attempt(grant.id, outcome="success", returncode=0)
+
+    with pytest.raises(O2PolicyConflictError, match="already terminal"):
+        store.finish_login_attempt(grant.id, outcome="failed", returncode=255)
+
+    attempt = store.snapshot().state["login_attempt"]
+    assert attempt["outcome"] == "success"
+    assert attempt["blocked_until"] == attempt["finished_at"]
+
+
+def test_disabled_policy_wins_before_broker_transport_spawn(tmp_path):
+    """A consumed grant is not enough once the global mode becomes disabled."""
+
+    store = _reuse_store(tmp_path, client_id="origin-client")
+    grant = store.authorize_login(
+        expected_revision=store.snapshot().revision,
+        expected_generation=store.snapshot().generation,
+        target="login",
+        allow_offvpn=True,
+        approval_reference="authorized broker launch",
+    )
+    store.consume_login_grant(grant.id, "login")
+    store.disable(reason="incident arrived during local daemon handoff")
+
+    with pytest.raises(O2PolicyDeniedError, match="disabled"):  # noqa: SIM117 - Python 3.9 floor
+        with store.authorize_consumed_broker_launch(
+            grant.id,
+            "login",
+            client_id=grant.client_id,
+            launcher_pid=os.getpid(),
+        ):
+            pass
 
 
 def test_active_attempt_blocks_new_authorization_until_cooldown(tmp_path):

@@ -29,7 +29,11 @@ class TransferInput(BaseModel):
     local_path: str = Field(..., description="Local path.", min_length=1)
     remote_path: str = Field(..., description="Remote path on O2.", min_length=1)
     use_transfer_node: bool = Field(
-        default=False, description="Use the dedicated O2 transfer node alias (for large transfers)."
+        default=True,
+        description=(
+            "Use the dedicated O2 transfer node alias. This is the safe default because its governed "
+            "rsync ControlMaster has an explicit startup path; false is legacy reuse only and cannot start a master."
+        ),
     )
 
 
@@ -79,7 +83,7 @@ def register(mcp, srv) -> None:
         annotations={"title": "Upload files to O2", "readOnlyHint": False, "openWorldHint": True},
     )
     async def o2_push(params: TransferInput) -> str:
-        """rsync a local file/directory up to O2 (reuses the ControlMaster, no extra login)."""
+        """Rsync to O2 through the existing transfer master by default."""
 
         def work() -> dict[str, Any]:
             result = O2Sync(srv._connection()).push(
@@ -112,11 +116,13 @@ def register(mcp, srv) -> None:
         """Start an rsync UPLOAD in the background and return immediately (does NOT block).
 
         Prefer this over o2_push for large/slow uploads: it launches a detached rsync
-        (reusing the ControlMaster — no extra Duo) and returns a transfer_id right away,
+        (reusing the transfer compatibility transport, without authentication fallback)
+        and returns a transfer_id right away,
         so you can do other work while it runs and poll o2_transfer_status when you want.
         The transfer keeps going between tool calls and survives an MCP-server restart;
         re-running the same upload resumes it (rsync --partial). Refuses unless the
-        ControlMaster is already up (start it once with o2_start_master).
+        transfer ControlMaster is already up (start it once with a transfer-scoped
+        grant through o2_start_master).
         """
 
         def work() -> dict[str, Any]:

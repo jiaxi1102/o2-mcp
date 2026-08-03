@@ -18,7 +18,6 @@ import pytest
 from o2mcp import (
     CommandResult,
     O2Config,
-    O2Connection,
     O2LockedError,
     O2LoginCoordinationError,
     O2LoginGrantError,
@@ -29,7 +28,20 @@ from o2mcp import (
     O2UnsafeTransportError,
     default_runner,
 )
+from o2mcp import (
+    O2Connection as _ProductionO2Connection,
+)
 from o2mcp import keepalive as o2keepalive
+from o2mcp.broker import BrokerExecutionResult, O2BrokerUnavailableError
+from o2mcp.broker_protocol import MAX_TIMEOUT_SECONDS
+
+
+class O2Connection(_ProductionO2Connection):
+    """Use the explicit offline legacy transport for argv regression tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", "broker_client" not in kwargs)
+        super().__init__(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +161,45 @@ def test_relative_policy_paths_are_rejected(monkeypatch):
         O2Config()
     with pytest.raises(ValueError, match="must be absolute"):
         O2Config(policy_file=Path("another-relative-policy.json"))
+
+
+def test_role_specific_broker_directories_are_absolute_and_distinct(tmp_path):
+    """Separate host roles cannot accidentally contend for one socket authority."""
+
+    with pytest.raises(ValueError, match="transfer broker directory must be.*absolute"):
+        O2Config(transfer_broker_dir=Path("relative-transfer-broker"))
+
+    shared = tmp_path / "shared-broker"
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(broker_dir=shared, transfer_broker_dir=shared)
+
+    root = tmp_path / "authority-root"
+    root.mkdir()
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(
+            broker_dir=root / "login",
+            transfer_broker_dir=root / "temporary" / ".." / "login",
+        )
+
+    linked_root = tmp_path / "linked-authority-root"
+    linked_root.symlink_to(root, target_is_directory=True)
+    with pytest.raises(ValueError, match="must use different authority directories"):
+        O2Config(
+            broker_dir=root / "login",
+            transfer_broker_dir=linked_root / "login",
+        )
+
+
+@pytest.mark.parametrize("invalid_timeout", [True, 0, float("inf"), MAX_TIMEOUT_SECONDS + 1])
+def test_broker_start_timeout_is_rejected_before_authorized_launch(tmp_path, invalid_timeout):
+    """Configuration cannot defer an invalid timeout until after grant use."""
+
+    with pytest.raises(ValueError, match="broker start timeout"):
+        O2Config(
+            broker_dir=tmp_path / "login-broker",
+            transfer_broker_dir=tmp_path / "transfer-broker",
+            broker_start_timeout=invalid_timeout,
+        )
 
 
 def test_reuse_only_options_disable_every_fallback_authentication_method(tmp_path):
@@ -430,7 +481,7 @@ def test_run_rejects_cold_connection_opt_out(tmp_path):
     assert runner.calls == []
 
 
-def _authorize(conn: O2Connection, *, target="login", allow_offvpn=False):
+def _authorize(conn: O2Connection, *, target="transfer", allow_offvpn=False):
     """Issue one deterministic test grant against the currently observed revision."""
 
     snapshot = conn.policy.snapshot()
@@ -443,14 +494,24 @@ def _authorize(conn: O2Connection, *, target="login", allow_offvpn=False):
     )
 
 
-def test_start_master_requires_one_shot_grant(tmp_path):
+def _start_transfer_master(conn: O2Connection, *, grant_id=None):
+    """Exercise the sole retained ControlMaster start path explicitly."""
+
+    return conn.start_master(
+        grant_id=grant_id,
+        alias=conn.config.transfer_alias,
+        login_target="transfer",
+    )
+
+
+def test_transfer_master_requires_one_shot_grant(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     with pytest.raises(O2MasterUnavailableError):
-        conn.start_master()
+        _start_transfer_master(conn)
 
     grant = _authorize(conn)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok
     starts = [call["argv"] for call in runner.calls if "-MNf" in call["argv"]]
@@ -501,7 +562,7 @@ def test_policy_disable_cannot_complete_between_consumption_and_launch(tmp_path)
     conn = O2Connection(config, runner=runner, policy=bootstrap.policy)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert runner.disable_thread is not None
     runner.disable_thread.join(timeout=2)
@@ -518,14 +579,14 @@ def test_start_master_rejects_zero_exit_when_control_socket_disappears(tmp_path)
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok is False and result.returncode == 255
     assert "post-start control-socket check failed" in result.stderr
     attempt = conn.policy.snapshot().state["login_attempt"]
     assert attempt["outcome"] == "failed" and attempt["returncode"] == 255
     with pytest.raises(O2LoginGrantError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
 
 
@@ -543,7 +604,7 @@ def test_start_master_records_post_start_verification_timeout(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
 
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok is False and result.returncode == 255
     assert "TimeoutExpired" in result.stderr
@@ -552,7 +613,7 @@ def test_start_master_records_post_start_verification_timeout(tmp_path):
 
 def test_start_master_noop_when_running_does_not_need_grant(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=RecordingRunner(master=True))
-    result = conn.start_master()
+    result = _start_transfer_master(conn)
     assert result.ok and "already running" in result.stdout
     assert conn.policy.snapshot().state["login_grant"] is None
 
@@ -562,15 +623,34 @@ def test_start_master_can_open_the_transfer_alias_with_transfer_grant(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, target="transfer")
 
-    result = conn.start_master(grant_id=grant.id, alias=conn.config.transfer_alias)
+    result = _start_transfer_master(conn, grant_id=grant.id)
 
     assert result.ok
     starts = [call for call in runner.calls if "-MNf" in call["argv"]]
     assert len(starts) == 1 and starts[0]["argv"][-1] == "o2-transfer"
 
 
-def test_default_start_uses_login_scope_when_aliases_are_identical(tmp_path):
-    """The default role is login even when both roles share one SSH alias."""
+def test_stop_master_targets_transfer_and_legacy_login_roles(tmp_path):
+    """The lifecycle API can retire both supported and pre-upgrade masters."""
+
+    runner = RecordingRunner(master=True)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.stop_master()
+
+    assert result.ok
+    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
+    assert runner.calls[-1]["argv"][-1] == conn.config.transfer_alias
+    legacy = conn.stop_master(alias=conn.config.host_alias)
+    assert legacy.ok
+    assert runner.calls[-1]["argv"][-3:] == ["-O", "exit", "o2"]
+    assert "PubkeyAuthentication=no" in runner.calls[-1]["argv"]
+    with pytest.raises(O2UnsafeTransportError, match="configured login or transfer ControlMaster"):
+        conn.stop_master(alias="unconfigured-o2")
+
+
+def test_default_master_start_is_retired_even_when_aliases_are_identical(tmp_path):
+    """Alias equality cannot turn the unsafe default login role into transfer."""
 
     config = _config(tmp_path)
     config.transfer_alias = config.host_alias
@@ -578,11 +658,9 @@ def test_default_start_uses_login_scope_when_aliases_are_identical(tmp_path):
     conn = O2Connection(config, runner=runner)
     grant = _authorize(conn, target="login")
 
-    result = conn.start_master(grant_id=grant.id)
-
-    assert result.ok
-    starts = [call for call in runner.calls if "-MNf" in call["argv"]]
-    assert len(starts) == 1 and starts[0]["argv"][-1] == "o2"
+    with pytest.raises(O2UnsafeTransportError, match="Login ControlMaster startup is retired"):
+        conn.start_master(grant_id=grant.id)
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_explicit_role_disambiguates_one_shared_alias(tmp_path):
@@ -616,7 +694,7 @@ def test_login_grant_cannot_cross_host_scope(tmp_path):
     grant = _authorize(conn, target="login", allow_offvpn=True)
 
     with pytest.raises(O2LoginGrantError, match="scoped to 'login'"):
-        conn.start_master(grant_id=grant.id, alias=conn.config.transfer_alias)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -635,9 +713,9 @@ def test_timed_out_login_consumes_grant_and_leaves_attempt_receipt(tmp_path):
     grant = _authorize(conn)
 
     with pytest.raises(subprocess.TimeoutExpired):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     with pytest.raises(O2LoginGrantError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
 
     state = conn.policy.snapshot().state
     assert state["login_grant"] is None
@@ -668,7 +746,7 @@ def test_start_master_refuses_off_vpn(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
     with pytest.raises(O2OffVpnError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -677,7 +755,7 @@ def test_start_master_allows_on_vpn(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -686,7 +764,7 @@ def test_start_master_offvpn_override(tmp_path):
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, allow_offvpn=True)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -697,7 +775,7 @@ def test_start_master_fails_closed_when_iface_undetermined(tmp_path):
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn)
     with pytest.raises(O2OffVpnError):
-        conn.start_master(grant_id=grant.id)
+        _start_transfer_master(conn, grant_id=grant.id)
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -714,7 +792,7 @@ def test_start_master_route_binary_missing_needs_offvpn_grant(tmp_path):
     runner = RecordingRunner(master=False, responder=responder)
     conn = O2Connection(_config(tmp_path), runner=runner)
     grant = _authorize(conn, allow_offvpn=True)
-    result = conn.start_master(grant_id=grant.id)
+    result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
@@ -813,7 +891,7 @@ def test_push_pull_build_rsync(tmp_path):
     assert "PreferredAuthentications=none" in e_opt
     assert "PubkeyAuthentication=no" in e_opt
     assert argv[-2] == "./local/run.sbatch"
-    assert argv[-1] == "o2:/scratch/jobs/run.sbatch"
+    assert argv[-1] == "o2-transfer:/scratch/jobs/run.sbatch"
 
     sync.pull("/scratch/out/results", "./local/results", transfer=True)
     argv = runner.calls[-1]["argv"]
@@ -1017,7 +1095,7 @@ def test_remote_path_with_spaces_is_escaped(tmp_path):
     argv = runner.calls[-1]["argv"]
     assert argv[-2] == "/local/Human"  # local side is an argv token: never shell-split
     # every space is backslash-escaped (so the remote shell treats it as literal, not a split)
-    assert argv[-1] == "o2:" + remote.replace(" ", "\\ ")
+    assert argv[-1] == "o2-transfer:" + remote.replace(" ", "\\ ")
     assert " " not in argv[-1].replace("\\ ", "")  # no UNescaped space remains
 
 
@@ -1025,27 +1103,29 @@ def test_remote_path_preserves_tilde_and_vars(tmp_path):
     # ~, $VAR and ${VAR} stay bare so the remote shell still expands them.
     runner = RecordingRunner(master=True)
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    assert sync.push_argv("a", "~/jobs/run.sbatch")[-1] == "o2:~/jobs/run.sbatch"
-    assert sync.push_argv("a", "$SCRATCH/out")[-1] == "o2:$SCRATCH/out"
-    assert sync.push_argv("a", "${SCRATCH}/out")[-1] == "o2:${SCRATCH}/out"  # braced var preserved
-    assert sync.push_argv("a", "$SCRATCH/my out")[-1] == "o2:$SCRATCH/my\\ out"  # spaces still escaped
-    assert sync.push_argv("a", "$(whoami)/x")[-1] == "o2:$\\(whoami\\)/x"  # () escaped -> no command substitution
+    assert sync.push_argv("a", "~/jobs/run.sbatch")[-1] == "o2-transfer:~/jobs/run.sbatch"
+    assert sync.push_argv("a", "$SCRATCH/out")[-1] == "o2-transfer:$SCRATCH/out"
+    assert sync.push_argv("a", "${SCRATCH}/out")[-1] == "o2-transfer:${SCRATCH}/out"  # braced var preserved
+    assert sync.push_argv("a", "$SCRATCH/my out")[-1] == "o2-transfer:$SCRATCH/my\\ out"  # spaces still escaped
+    assert (
+        sync.push_argv("a", "$(whoami)/x")[-1] == "o2-transfer:$\\(whoami\\)/x"
+    )  # () escaped -> no command substitution
 
 
 def test_escape_is_noop_for_plain_paths(tmp_path):
     # Space-free paths must be byte-for-byte unchanged (no behavior change, no stray escapes).
     runner = RecordingRunner(master=True)
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    assert sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")[-1] == "o2:/n/groups/tabin/jzhao/runs/foo"
+    assert sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")[-1] == "o2-transfer:/n/groups/tabin/jzhao/runs/foo"
     # push_argv builds exactly what push() runs.
     sync.push("a", "/n/groups/tabin/jzhao/runs/foo")
     assert runner.calls[-1]["argv"] == sync.push_argv("a", "/n/groups/tabin/jzhao/runs/foo")
 
 
-def test_transfer_uses_the_transfer_alias_master(tmp_path):
-    # The login master is up but the transfer-node master is NOT. A normal transfer
-    # (login alias) proceeds; a transfer-node transfer must refuse rather than let
-    # rsync open a fresh Duo-pushing login to o2-transfer.
+def test_default_rsync_requires_transfer_master_but_legacy_login_reuse_remains(tmp_path):
+    # The login master is up but the transfer-node master is NOT. Default rsync
+    # must refuse on the transfer alias, while an explicit legacy-login reuse may
+    # proceed without creating a new login master.
     def runner(argv, timeout, input_text):
         if "-O" in argv and "check" in argv:
             return CommandResult(list(argv), 0 if argv[-1] == "o2" else 255, "", "")
@@ -1054,9 +1134,9 @@ def test_transfer_uses_the_transfer_alias_master(tmp_path):
         return CommandResult(list(argv), 0, "", "")
 
     sync = O2Sync(O2Connection(_config(tmp_path), runner=runner))
-    sync.push("a", "b")  # login alias master is up -> ok
     with pytest.raises(O2MasterUnavailableError):
-        sync.push("a", "b", transfer=True)  # transfer alias master is down -> refuse
+        sync.push("a", "b")  # transfer alias master is down -> refuse
+    sync.push("a", "b", transfer=False)  # pre-existing login master may still be reused
 
 
 def test_run_raw_infers_target_alias_from_argv(tmp_path):
@@ -1199,9 +1279,27 @@ def test_o2_core_is_dependency_light():
     assert "OK" in proc.stdout
 
 
-# --- keepalive (must never open a new login) ---------------------------------
+# --- keepalive (must never open a new session channel) -----------------------
 def _patch_keepalive(monkeypatch, conn):
     monkeypatch.setattr(o2keepalive, "O2Connection", lambda config=None: conn)
+
+
+class _KeepaliveBroker:
+    """Minimal broker double for keepalive routing and failure behavior."""
+
+    def __init__(self, *, responsive=True, fail=False):
+        self.responsive = responsive
+        self.fail = fail
+        self.commands = []
+
+    def local_status(self):
+        return {"responsive": self.responsive}
+
+    def execute(self, command, *, timeout, input_text=None):
+        self.commands.append(command)
+        if self.fail:
+            raise O2BrokerUnavailableError("persistent channel ended")
+        return BrokerExecutionResult(0, "", "", False, 0.01, False, False)
 
 
 def test_keepalive_skips_when_policy_disabled(tmp_path, monkeypatch):
@@ -1211,42 +1309,27 @@ def test_keepalive_skips_when_policy_disabled(tmp_path, monkeypatch):
     assert runner.calls == []  # never touched ssh
 
 
-def test_keepalive_skips_when_no_master(tmp_path, monkeypatch):
-    runner = RecordingRunner(master=False)
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+def test_keepalive_skips_when_no_broker(tmp_path, monkeypatch):
+    broker = _KeepaliveBroker(responsive=False)
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
-    assert out["action"] == "skipped" and out["reason"] == "no_master"
-    # It probed the master socket but NEVER ran a remote command (no new login).
-    assert "true" not in runner.remote_commands
+    assert out["action"] == "skipped" and out["reason"] == "no_broker"
+    assert broker.commands == []
 
 
-def test_keepalive_pings_existing_master(tmp_path, monkeypatch):
-    runner = RecordingRunner(master=True)
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+def test_keepalive_pings_existing_broker(tmp_path, monkeypatch):
+    broker = _KeepaliveBroker()
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
     assert out["action"] == "pinged" and out["ok"] is True
-    assert runner.remote_commands[-1] == "true"  # harmless no-op resets the idle timer
+    assert broker.commands == ["true"]
 
 
-def test_keepalive_clears_stale_master_on_timeout(tmp_path, monkeypatch):
-    """If the ping stalls (stale master), tear it down instead of reconnecting again."""
-    import subprocess as sp
+def test_keepalive_skips_failed_broker_without_restart(tmp_path, monkeypatch):
+    """A dead channel is reported locally; keepalive never starts a replacement."""
 
-    calls = []
-
-    def runner(argv, timeout, input_text):
-        calls.append(list(argv))
-        if "-O" in argv and "check" in argv:
-            return CommandResult(list(argv), 0, "", "")  # local master process "running"
-        if "-O" in argv and "exit" in argv:
-            return CommandResult(list(argv), 0, "exit sent", "")
-        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
-            return CommandResult(list(argv), 0, f"controlpath /tmp/{argv[-1]}-control.sock\n", "")
-        if argv[-1] == "true":
-            raise sp.TimeoutExpired(argv, timeout)  # connection dead -> ping stalls
-        return CommandResult(list(argv), 0, "", "")
-
-    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), runner=runner))
+    broker = _KeepaliveBroker(fail=True)
+    _patch_keepalive(monkeypatch, O2Connection(_config(tmp_path), broker_client=broker))
     out = o2keepalive.keepalive()
-    assert out["action"] == "stale_master_cleared"
-    assert any("-O" in c and "exit" in c for c in calls)  # tore the stale master down
+    assert out == {"action": "skipped", "reason": "O2BrokerUnavailableError"}
+    assert broker.commands == ["true"]

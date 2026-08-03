@@ -8,9 +8,12 @@ variables (the same names the shell scripts already use) or explicitly.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from o2mcp.broker_protocol import MAX_TIMEOUT_SECONDS
 
 
 def default_policy_file() -> Path:
@@ -36,12 +39,30 @@ def _default_ssh_config_file() -> Path:
     return Path.home() / ".ssh" / "config"
 
 
+def _default_broker_dir() -> Path:
+    """Return the workstation-wide persistent-command broker directory."""
+
+    configured = os.environ.get("O2_BROKER_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".agent_locks" / "o2-broker"
+
+
+def _default_transfer_broker_dir() -> Path:
+    """Return the private persistent-command directory for the transfer host."""
+
+    configured = os.environ.get("O2_TRANSFER_BROKER_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".agent_locks" / "o2-transfer-broker"
+
+
 @dataclass
 class O2Config:
     """Connection settings for HMS O2.
 
     Attributes:
-        host_alias: SSH alias for login/compute commands (the ControlMaster host).
+        host_alias: SSH alias used by the persistent login command broker.
         transfer_alias: SSH alias for bulk rsync transfers (the O2 transfer node).
         connect_timeout: SSH ``ConnectTimeout`` in seconds.
         policy_file: Workstation-wide JSON state controlling disabled,
@@ -52,6 +73,16 @@ class O2Config:
         ssh_config_file: User SSH config containing the O2 alias definitions.
             The connection layer reads and flattens this file without executing
             ``Match exec`` predicates before asking OpenSSH to expand a socket.
+        broker_dir: Private workstation-wide directory containing the broker's
+            Unix socket, lifecycle receipt, lock, and diagnostic log. Expanded
+            SSH configuration is passed through the one-shot launch descriptor
+            rather than persisted here.
+        broker_start_timeout: Maximum time to wait for the authorized persistent
+            channel to complete authentication and emit its protocol hello. A
+            timeout is reported without starting a second attempt.
+        transfer_broker_dir: Separate private broker directory for commands that
+            must execute on the O2 transfer host. Login and transfer grants and
+            channels remain distinct even when aliases happen to match.
     """
 
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
@@ -103,6 +134,11 @@ class O2Config:
     # into the one-shot login grant issued after explicit user approval.
     vpn_iface_prefix: str = field(default_factory=lambda: os.environ.get("O2_VPN_IFACE_PREFIX", "utun"))
     ssh_config_file: Path = field(default_factory=_default_ssh_config_file)
+    broker_dir: Path = field(default_factory=_default_broker_dir)
+    broker_start_timeout: float = field(
+        default_factory=lambda: float(os.environ.get("O2_BROKER_START_TIMEOUT_SECONDS", "90"))
+    )
+    transfer_broker_dir: Path = field(default_factory=_default_transfer_broker_dir)
 
     def __post_init__(self) -> None:
         """Normalize and validate process-independent local authority paths.
@@ -120,13 +156,53 @@ class O2Config:
                 "O2 policy path must be absolute; set O2_POLICY_FILE to one " "workstation-wide absolute path"
             )
         self.ssh_config_file = Path(self.ssh_config_file).expanduser()
+        broker_dir = Path(self.broker_dir).expanduser()
+        if not broker_dir.is_absolute():
+            raise ValueError("O2 broker directory must be one workstation-wide absolute path")
+        transfer_broker_dir = Path(self.transfer_broker_dir).expanduser()
+        if not transfer_broker_dir.is_absolute():
+            raise ValueError("O2 transfer broker directory must be one workstation-wide absolute path")
+        try:
+            # ``strict=False`` collapses ``..`` and resolves every existing
+            # symlinked ancestor without requiring the final authority
+            # directory to exist yet. Persist the canonical paths so later
+            # clients, stops, and receipts all address the same filesystem
+            # authority that was compared here.
+            self.broker_dir = broker_dir.resolve(strict=False)
+            self.transfer_broker_dir = transfer_broker_dir.resolve(strict=False)
+        except OSError as exc:
+            raise ValueError(f"Could not canonicalize O2 broker directories: {exc}") from exc
+        same_authority = self.transfer_broker_dir == self.broker_dir
+        if not same_authority and self.broker_dir.exists() and self.transfer_broker_dir.exists():
+            try:
+                same_authority = os.path.samefile(self.broker_dir, self.transfer_broker_dir)
+            except OSError as exc:
+                raise ValueError(f"Could not compare O2 broker directory identities: {exc}") from exc
+        if same_authority:
+            raise ValueError("O2 login and transfer brokers must use different authority directories")
+        # Validate the exact daemon-side contract while configuration is still
+        # local and no one-shot authorization can have been consumed. In
+        # particular, ``bool`` is an ``int`` subclass and must not become a
+        # surprising one-second startup allowance.
+        if (
+            isinstance(self.broker_start_timeout, bool)
+            or not isinstance(self.broker_start_timeout, (int, float))
+            or not math.isfinite(self.broker_start_timeout)
+            or self.broker_start_timeout <= 0
+            or self.broker_start_timeout > MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "O2 broker start timeout must be a finite positive number "
+                f"no greater than {MAX_TIMEOUT_SECONDS} seconds"
+            )
 
     def base_ssh_opts(self) -> list[str]:
         """Return baseline SSH options shared by login and reuse operations.
 
         These options make subprocesses non-interactive, but they intentionally do
-        not disable public-key authentication: :meth:`O2Connection.start_master`
-        needs public-key authentication for the one explicitly authorized login.
+        not disable public-key authentication: the legacy transfer-only
+        :meth:`O2Connection.start_master` path needs it for one explicitly
+        authorized transfer-host login.
         Ordinary commands and transfers must use :meth:`reuse_only_ssh_opts`
         instead so a missing ControlMaster cannot fall back to a fresh connection.
         """

@@ -19,12 +19,22 @@ from o2mcp import (
     CommandResult,
     O2AsyncTransfer,
     O2Config,
-    O2Connection,
     O2LockedError,
     O2MasterUnavailableError,
     O2Sync,
     async_transfer,
 )
+from o2mcp import (
+    O2Connection as _ProductionO2Connection,
+)
+
+
+class O2Connection(_ProductionO2Connection):
+    """Select the fake-runner transport used by detached-transfer unit tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", True)
+        super().__init__(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -135,7 +145,7 @@ def test_push_async_launches_detached_with_escaped_remote(tmp_path):
     transport = rsync_argv[rsync_argv.index("-e") + 1]
     assert "PreferredAuthentications=none" in transport
     assert "PubkeyAuthentication=no" in transport
-    assert rsync_argv[-1] == "o2:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
+    assert rsync_argv[-1] == "o2-transfer:" + remote.replace(" ", "\\ ")  # remote path escaped for the remote shell
 
     # metadata persisted (the schema status() reads); argv stored is the rsync argv, not the wrapper.
     meta = json.loads(Path(handle.meta_path).read_text())

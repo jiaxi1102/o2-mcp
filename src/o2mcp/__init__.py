@@ -1,11 +1,11 @@
 """Safe, testable HMS O2 cluster access (connection, Slurm, file transfer, workspace).
 
-A generic, project-agnostic toolkit for the HMS O2 cluster: a Duo-frugal SSH
-ControlMaster channel, Slurm submit/monitor, rsync transfers (blocking and
-non-blocking), and workspace/disk hygiene. The pure pieces here are stdlib-only
-and unit-tested offline. The MCP server that exposes them as agent tools lives in
-``o2mcp.server`` and is imported separately (it needs the optional ``mcp``
-dependency and Python >= 3.10).
+A generic, project-agnostic toolkit for the HMS O2 cluster: persistent framed
+command channels, a compatibility ControlMaster for rsync, Slurm submit/monitor,
+blocking and non-blocking transfers, and workspace/disk hygiene. The pure pieces
+here are stdlib-only and unit-tested offline. The MCP server that exposes them
+as agent tools lives in ``o2mcp.server`` and is imported separately (it needs the
+optional ``mcp`` dependency and Python >= 3.10).
 
 Project-specific layers (e.g. run-organization for a particular pipeline) build
 *on* this package rather than living in it.
@@ -14,6 +14,12 @@ Project-specific layers (e.g. run-organization for a particular pipeline) build
 from __future__ import annotations
 
 from o2mcp.async_transfer import O2AsyncTransfer, TransferHandle, default_spawner
+from o2mcp.broker import (
+    O2BrokerCommandOutcomeUnknownError,
+    O2BrokerError,
+    O2BrokerStartupError,
+    O2BrokerUnavailableError,
+)
 from o2mcp.config import O2Config
 from o2mcp.connection import (
     CommandResult,
@@ -49,6 +55,10 @@ __all__ = [
     "O2MasterUnavailableError",
     "O2OffVpnError",
     "O2UnsafeTransportError",
+    "O2BrokerError",
+    "O2BrokerCommandOutcomeUnknownError",
+    "O2BrokerUnavailableError",
+    "O2BrokerStartupError",
     "O2PolicyStore",
     "PolicySnapshot",
     "LoginGrant",

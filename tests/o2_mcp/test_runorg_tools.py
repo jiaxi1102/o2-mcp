@@ -16,7 +16,8 @@ pytest.importorskip("anyio")
 import anyio  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
-from o2mcp import CommandResult, O2Config, O2Connection  # noqa: E402
+from o2mcp import CommandResult, O2Config  # noqa: E402
+from o2mcp import O2Connection as _ProductionO2Connection
 from o2mcp.runorg import (  # noqa: E402
     O2Runs,
     RunPolicy,
@@ -24,6 +25,14 @@ from o2mcp.runorg import (  # noqa: E402
 )
 
 POLICY = RunPolicy(pipeline_keywords=(("grid", "grid"),), sweep_markers=("wip",))
+
+
+class O2Connection(_ProductionO2Connection):
+    """Select the explicit offline command path for MCP run-tool tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", True)
+        super().__init__(*args, **kwargs)
 
 
 class _Runner:

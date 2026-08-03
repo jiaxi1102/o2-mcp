@@ -20,13 +20,24 @@ from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
+    O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
-    O2Connection,
     async_transfer,  # noqa: E402
     transfer_tools,  # noqa: E402
 )
 from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
+from o2mcp import (
+    O2Connection as _ProductionO2Connection,
+)
 from o2mcp import server as o2server  # noqa: E402
+
+
+class O2Connection(_ProductionO2Connection):
+    """Select the explicit offline transport for MCP fake-runner tests."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("_legacy_test_transport", True)
+        super().__init__(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +135,9 @@ async def test_tool_registry_and_annotations():
         "o2_policy_enable_reuse",
         "o2_authorize_login",
         "o2_start_master",
+        "o2_stop_master",
+        "o2_start_broker",
+        "o2_stop_broker",
         "o2_exec",
         "o2_submit_job",
         "o2_squeue",
@@ -148,6 +162,8 @@ async def test_tool_registry_and_annotations():
     assert tools["o2_probe"].annotations.openWorldHint is True
     assert tools["o2_submit_job"].annotations.readOnlyHint is False
     assert tools["o2_cancel_job"].annotations.destructiveHint is True
+    assert tools["o2_stop_master"].annotations.destructiveHint is True
+    assert tools["o2_stop_broker"].annotations.destructiveHint is True
     assert tools["o2_workspace_gc"].annotations.destructiveHint is True
     assert tools["o2_disk_report"].annotations.readOnlyHint is True
     assert tools["o2_push_async"].annotations.readOnlyHint is False
@@ -233,6 +249,7 @@ async def test_local_status_reports_disabled_policy_without_ssh(monkeypatch, tmp
     assert payload["ok"] is True
     assert payload["policy"]["effective_mode"] == "disabled"
     assert payload["policy"]["path"] == str(tmp_path / "O2_POLICY.json")
+    assert set(payload["command_brokers"]) == {"login", "transfer"}
     assert runner.calls == []
 
 
@@ -291,14 +308,17 @@ async def test_run_without_master_is_actionable(monkeypatch, tmp_path):
 
 @pytest.mark.anyio
 async def test_start_master_refused_without_grant(monkeypatch, tmp_path):
+    """Login masters are retired because they still open challenged channels."""
+
     _patch_connection(monkeypatch, tmp_path, master=False)
     payload = await _call("o2_start_master", {"params": {}})
-    assert payload["ok"] is False and payload["error"] == "no_master"
+    assert payload["ok"] is False and payload["error"] == "login_master_retired"
+    assert "o2_start_broker" in payload["message"]
 
 
 @pytest.mark.anyio
 async def test_start_master_reports_failed_post_start_verification(monkeypatch, tmp_path):
-    """The MCP response must not call a vanished background master successful."""
+    """A vanished transfer master must not be reported as successful."""
 
     _patch_connection(monkeypatch, tmp_path, master=False, start_persists=False)
     status = await _call("o2_local_status", {})
@@ -308,18 +328,103 @@ async def test_start_master_reports_failed_post_start_verification(monkeypatch, 
             "params": {
                 "expected_revision": status["policy"]["revision"],
                 "expected_generation": status["policy"]["generation"],
-                "target": "login",
+                "target": "transfer",
                 "allow_offvpn": True,
                 "approval_reference": "explicit test approval",
             }
         },
     )
 
-    payload = await _call("o2_start_master", {"params": {"grant_id": authorization["grant_id"]}})
+    payload = await _call(
+        "o2_start_master",
+        {"params": {"grant_id": authorization["grant_id"], "transfer": True}},
+    )
 
     assert payload["ok"] is False
     assert payload["returncode"] == 255
     assert "post-start control-socket check failed" in payload["stderr"]
+
+
+@pytest.mark.anyio
+async def test_stop_master_targets_transfer_and_legacy_login_roles(monkeypatch, tmp_path):
+    """The MCP can retire either known master without restoring login startup."""
+
+    runner = _patch_connection(monkeypatch, tmp_path, master=True)
+
+    stopped = await _call("o2_stop_master", {"params": {"transfer": True}})
+    legacy = await _call("o2_stop_master", {"params": {"transfer": False}})
+
+    assert stopped["ok"] is True and stopped["alias"] == "o2-transfer"
+    assert legacy["ok"] is True and legacy["alias"] == "o2"
+    stop_calls = [call for call in runner.calls if "-O" in call["argv"]]
+    assert stop_calls[-2]["argv"][-3:] == ["-O", "exit", "o2-transfer"]
+    assert stop_calls[-1]["argv"][-3:] == ["-O", "exit", "o2"]
+
+
+@pytest.mark.anyio
+async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
+    """MCP input must carry transfer intent through start, probe, and stop."""
+
+    class _Config:
+        host_alias = "o2"
+        transfer_alias = "o2-transfer"
+        connect_timeout = 20
+
+    class _Connection:
+        config = _Config()
+
+        def __init__(self):
+            self.calls = []
+
+        def start_broker(self, *, grant_id=None, transfer=False):
+            self.calls.append(("start", grant_id, transfer))
+            return {"responsive": True}
+
+        def run(self, command, *, timeout, alias, broker_role=None):
+            self.calls.append(("run", command, timeout, alias, broker_role))
+            return CommandResult(["broker", alias, command], 0, "transfer-ok\n", "")
+
+        def stop_broker(self, *, reason, transfer=False):
+            self.calls.append(("stop", reason, transfer))
+            return {"type": "stopping"}
+
+    connection = _Connection()
+    monkeypatch.setattr(o2server, "_connection", lambda: connection)
+
+    started = await _call("o2_start_broker", {"params": {"grant_id": "grant-1", "transfer": True}})
+    probed = await _call("o2_probe", {"params": {"transfer": True}})
+    stopped = await _call(
+        "o2_stop_broker",
+        {"params": {"reason": "offline role-routing test", "transfer": True}},
+    )
+
+    assert started["ok"] is True and started["target"] == "transfer"
+    assert probed["ok"] is True and probed["alias"] == "o2-transfer"
+    assert stopped["ok"] is True and stopped["target"] == "transfer"
+    assert connection.calls == [
+        ("start", "grant-1", True),
+        ("run", "hostname; whoami; date", 25, "o2-transfer", "transfer"),
+        ("stop", "offline role-routing test", True),
+    ]
+
+
+@pytest.mark.anyio
+async def test_dispatched_result_loss_is_explicitly_not_retry_safe(monkeypatch):
+    """The MCP response must discourage duplicating an uncertain remote action."""
+
+    class _Connection:
+        def run(self, *_args, **_kwargs):
+            raise O2BrokerCommandOutcomeUnknownError("dispatched result was lost")
+
+    monkeypatch.setattr(o2server, "_connection", _Connection)
+    payload = await _call("o2_exec", {"params": {"command": "sbatch job.sh"}})
+
+    assert payload == {
+        "ok": False,
+        "error": "broker_outcome_unknown",
+        "message": "dispatched result was lost",
+        "retry_safe": False,
+    }
 
 
 @pytest.mark.anyio
@@ -487,7 +592,7 @@ async def test_push_async_returns_transfer_id_without_blocking(monkeypatch, tmp_
     transport = launched[0][launched[0].index("-e") + 1]
     assert "PreferredAuthentications=none" in transport
     assert "PubkeyAuthentication=no" in transport
-    assert launched[0][-1] == "o2:" + remote.replace(" ", "\\ ")
+    assert launched[0][-1] == "o2-transfer:" + remote.replace(" ", "\\ ")
 
 
 @pytest.mark.anyio
