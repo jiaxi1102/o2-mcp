@@ -41,6 +41,7 @@ from typing import Any, Callable, Literal
 
 PolicyMode = Literal["disabled", "reuse_only"]
 LoginTarget = Literal["login", "transfer"]
+LoginAuthorizationMethod = Literal["explicit_user_approval", "standing_on_vpn"]
 
 SCHEMA_VERSION = 1
 DEFAULT_GRANT_TTL_SECONDS = 300.0
@@ -119,6 +120,7 @@ class LoginGrant:
     expires_at: float
     remaining_attempts: int
     approval_reference: str
+    authorization_method: LoginAuthorizationMethod = "explicit_user_approval"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, now: float | None = None) -> LoginGrant:
@@ -136,6 +138,12 @@ class LoginGrant:
             raise O2PolicyInvalidError("login_grant is missing a required non-empty string field")
         if payload["target"] not in {"login", "transfer"}:
             raise O2PolicyInvalidError("login_grant.target must be 'login' or 'transfer'")
+        # Older schema-v1 grants predate this explicit field and were always
+        # issued from a fresh user approval. Preserve that interpretation while
+        # validating every newly persisted authorization method.
+        authorization_method = payload.get("authorization_method", "explicit_user_approval")
+        if authorization_method not in {"explicit_user_approval", "standing_on_vpn"}:
+            raise O2PolicyInvalidError("login_grant.authorization_method is unsupported")
         if type(payload.get("allow_offvpn")) is not bool:
             raise O2PolicyInvalidError("login_grant.allow_offvpn must be a boolean")
         if type(payload.get("remaining_attempts")) is not int or payload["remaining_attempts"] not in {0, 1}:
@@ -161,6 +169,7 @@ class LoginGrant:
             expires_at=float(payload["expires_at"]),
             remaining_attempts=payload["remaining_attempts"],
             approval_reference=payload["approval_reference"],
+            authorization_method=authorization_method,
         )
 
 
@@ -310,6 +319,7 @@ class O2PolicyStore:
         target: LoginTarget,
         allow_offvpn: bool,
         approval_reference: str,
+        authorization_method: LoginAuthorizationMethod = "explicit_user_approval",
         ttl_seconds: float = DEFAULT_GRANT_TTL_SECONDS,
     ) -> LoginGrant:
         """Issue one short-lived login grant bound to this MCP client and host."""
@@ -318,6 +328,10 @@ class O2PolicyStore:
             raise O2LoginGrantError("target must be exactly 'login' or 'transfer'")
         if type(allow_offvpn) is not bool:
             raise O2LoginGrantError("allow_offvpn must be a boolean")
+        if authorization_method not in {"explicit_user_approval", "standing_on_vpn"}:
+            raise O2LoginGrantError("authorization_method is unsupported")
+        if authorization_method == "standing_on_vpn" and allow_offvpn:
+            raise O2LoginGrantError("standing_on_vpn authorization cannot allow off-VPN login")
         if not 0 < ttl_seconds <= DEFAULT_GRANT_TTL_SECONDS:
             raise O2LoginGrantError(
                 f"ttl_seconds must be greater than zero and at most {DEFAULT_GRANT_TTL_SECONDS:.0f}"
@@ -361,6 +375,7 @@ class O2PolicyStore:
                 expires_at=now + ttl_seconds,
                 remaining_attempts=1,
                 approval_reference=reference,
+                authorization_method=authorization_method,
             )
             state["login_grant"] = self._grant_dict(grant)
             self._append_event(
@@ -369,6 +384,7 @@ class O2PolicyStore:
                 grant_id=grant.id,
                 target=target,
                 allow_offvpn=allow_offvpn,
+                authorization_method=authorization_method,
                 approval_reference=reference,
             )
             self._write_next_revision(state)
@@ -384,6 +400,39 @@ class O2PolicyStore:
 
         with self._locked():
             return self._consume_login_grant_locked(grant_id, target, launcher_pid=os.getpid())
+
+    def revoke_unused_standing_grant(self, grant_id: str, *, reason: str) -> bool:
+        """Revoke one unconsumed auto-start grant owned by this MCP process.
+
+        Local preflight can still fail after route proof and grant creation. The
+        caller must not strand an undisclosed client-bound grant that blocks the
+        workstation for its full TTL. Explicit user grants and grants belonging
+        to another process are never revoked through this cleanup path.
+        """
+
+        reference = self._clean_reference(reason, field="reason")
+        with self._locked():
+            state = self._read_valid_state()
+            raw = state.get("login_grant")
+            if not isinstance(raw, dict):
+                return False
+            grant = LoginGrant.from_dict(raw, now=self._clock())
+            if grant.id != grant_id:
+                return False
+            if grant.client_id != self.client_id:
+                raise O2LoginGrantError("Cannot revoke a standing grant owned by another MCP client.")
+            if grant.authorization_method != "standing_on_vpn":
+                raise O2LoginGrantError("Automatic cleanup cannot revoke an explicit user login grant.")
+            state["login_grant"] = None
+            self._append_event(
+                state,
+                "standing_login_grant_revoked",
+                grant_id=grant.id,
+                target=grant.target,
+                reason=reference,
+            )
+            self._write_next_revision(state)
+            return True
 
     @contextmanager
     def consume_login_grant_for_launch(self, grant_id: str, target: LoginTarget) -> Iterator[LoginGrant]:
@@ -509,13 +558,20 @@ class O2PolicyStore:
             "launcher_pid": launcher_pid,
             "target": grant.target,
             "allow_offvpn": grant.allow_offvpn,
+            "authorization_method": grant.authorization_method,
             "started_at": now,
             "finished_at": None,
             "outcome": "active",
             "returncode": None,
             "blocked_until": now + DEFAULT_LOGIN_COOLDOWN_SECONDS,
         }
-        self._append_event(state, "login_grant_consumed", grant_id=grant.id, target=target)
+        self._append_event(
+            state,
+            "login_grant_consumed",
+            grant_id=grant.id,
+            target=target,
+            authorization_method=grant.authorization_method,
+        )
         self._write_next_revision(state)
         return grant
 
@@ -660,6 +716,11 @@ class O2PolicyStore:
             raise O2PolicyInvalidError("login_attempt.outcome is unsupported")
         if type(attempt.get("allow_offvpn")) is not bool:
             raise O2PolicyInvalidError("login_attempt.allow_offvpn must be a boolean")
+        authorization_method = attempt.get("authorization_method", "explicit_user_approval")
+        if authorization_method not in {"explicit_user_approval", "standing_on_vpn"}:
+            raise O2PolicyInvalidError("login_attempt.authorization_method is unsupported")
+        if authorization_method == "standing_on_vpn" and attempt["allow_offvpn"]:
+            raise O2PolicyInvalidError("a standing_on_vpn login_attempt cannot allow off-VPN login")
         launcher_pid = attempt.get("launcher_pid")
         # Receipts created before the persistent-broker rollout did not record a
         # launcher PID. They remain valid cooldown evidence, but the new daemon
@@ -947,7 +1008,7 @@ class O2PolicyStore:
             "client_id": grant.client_id,
             "target": grant.target,
             "allow_offvpn": grant.allow_offvpn,
-            "authorization_method": "explicit_user_approval",
+            "authorization_method": grant.authorization_method,
             "approval_reference": grant.approval_reference,
             "created_at": grant.created_at,
             "expires_at": grant.expires_at,

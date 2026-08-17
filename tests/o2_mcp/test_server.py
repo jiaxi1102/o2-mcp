@@ -9,6 +9,7 @@ default 3.9 test environment (install with ``pip install -e ".[dev,o2]"`` on a 3
 from __future__ import annotations
 
 import json
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -107,7 +108,20 @@ def _patch_connection(
         connect_timeout=20,
         policy_file=policy_file,
         ssh_config_file=ssh_config,
+        globalprotect_settings_file=tmp_path / "globalprotect-settings.plist",
     )
+    with cfg.globalprotect_settings_file.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Palo Alto Networks": {
+                    "GlobalProtect": {
+                        "PanSetup": {"Portal": "vpn.hms.harvard.edu"},
+                        "PanGPS": {"PreferredIP_test": "10.116.16.225"},
+                    }
+                }
+            },
+            stream,
+        )
     runner = FakeRunner(master=master, responder=responder, start_persists=start_persists)
     connection = O2Connection(cfg, runner=runner)
     runner.connection = connection
@@ -376,8 +390,8 @@ async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def start_broker(self, *, grant_id=None, transfer=False):
-            self.calls.append(("start", grant_id, transfer))
+        def start_broker(self, *, grant_id=None, transfer=False, auto_authorize_on_vpn=False):
+            self.calls.append(("start", grant_id, transfer, auto_authorize_on_vpn))
             return {"responsive": True}
 
         def run(self, command, *, timeout, alias, broker_role=None):
@@ -402,10 +416,47 @@ async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
     assert probed["ok"] is True and probed["alias"] == "o2-transfer"
     assert stopped["ok"] is True and stopped["target"] == "transfer"
     assert connection.calls == [
-        ("start", "grant-1", True),
+        ("start", "grant-1", True, True),
         ("run", "hostname; whoami; date", 25, "o2-transfer", "transfer"),
         ("stop", "offline role-routing test", True),
     ]
+
+
+@pytest.mark.anyio
+async def test_transfer_master_auto_authorizes_only_on_proven_vpn(monkeypatch, tmp_path):
+    """The MCP default starts on VPN without requiring a separate grant call."""
+
+    def on_vpn(argv, _input_text):
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
+            return ("interface: utun6\n", "", 0)
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return ("inet 10.116.16.225 netmask 0xffffffff\n", "", 0)
+        return ("", "", 0)
+
+    runner = _patch_connection(monkeypatch, tmp_path, master=False, responder=on_vpn)
+    # FakeRunner owns ssh -G so add the HostName that route proof needs.
+    original = runner.__call__
+
+    def with_hostname(argv, timeout, input_text):
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            runner.calls.append({"argv": list(argv), "input": input_text})
+            return CommandResult(
+                list(argv),
+                0,
+                f"hostname transfer.rc.hms.harvard.edu\ncontrolpath /tmp/{argv[-1]}-control.sock\n",
+                "",
+            )
+        return original(argv, timeout, input_text)
+
+    runner.connection._runner = with_hostname
+
+    payload = await _call("o2_start_master", {"params": {"transfer": True}})
+
+    assert payload["ok"] is True and payload["alias"] == "o2-transfer"
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    attempt = runner.connection.policy.snapshot().state["login_attempt"]
+    assert attempt["target"] == "transfer"
+    assert attempt["allow_offvpn"] is False
 
 
 @pytest.mark.anyio

@@ -20,8 +20,10 @@ tested offline without ever touching the network.
 from __future__ import annotations
 
 import glob
+import ipaddress
 import json
 import os
+import plistlib
 import select
 import shlex
 import subprocess
@@ -46,6 +48,7 @@ from o2mcp.policy import (
     O2LoginGrantError,
     O2PolicyConflictError,
     O2PolicyDeniedError,
+    O2PolicyError,
     O2PolicyStore,
 )
 
@@ -95,6 +98,12 @@ Runner = Callable[[list[str], Optional[float], Optional[str]], CommandResult]
 # tests. Production MCP construction never supplies this sentinel and therefore
 # always routes commands through BrokerClient.
 _DEFAULT_BROKER_CLIENT = object()
+
+# This audit reference records why an on-VPN grant did not require a fresh
+# conversational approval. The permission is intentionally narrow: route proof
+# is rechecked before launch, the grant permits one attempt, and it never allows
+# an off-VPN connection.
+ON_VPN_AUTO_APPROVAL_REFERENCE = "standing user authorization for one start over a proven HMS VPN route"
 
 
 def default_runner(argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
@@ -192,6 +201,8 @@ class O2Connection:
     # Bare caller spellings are accepted for compatibility but normalized to the
     # absolute binaries before execution; all other paths are rejected.
     SSH_EXECUTABLE = "/usr/bin/ssh"
+    IFCONFIG_EXECUTABLE = "/sbin/ifconfig"
+    ROUTE_EXECUTABLE = "/sbin/route"
     RSYNC_EXECUTABLE = "/usr/bin/rsync"
 
     # Rsync accepts short options in clusters, but these options consume an
@@ -527,7 +538,13 @@ class O2Connection:
             remote_command,
         ]
 
-    def start_broker(self, *, grant_id: str | None = None, transfer: bool = False) -> dict[str, object]:
+    def start_broker(
+        self,
+        *,
+        grant_id: str | None = None,
+        transfer: bool = False,
+        auto_authorize_on_vpn: bool = False,
+    ) -> dict[str, object]:
         """Start exactly one role-specific persistent session after a grant.
 
         The child daemon acknowledges only after it has spawned the sole SSH
@@ -537,6 +554,12 @@ class O2Connection:
         disable therefore either prevents launch or observes an already-running
         operation. Authentication and the remote protocol hello may finish
         later; waiting for them is local-only and never retries.
+
+        ``auto_authorize_on_vpn`` is the standing-authorization path used by the
+        MCP start tool. When no explicit grant was supplied, it first proves the
+        selected O2 host routes through the configured VPN interface, then mints
+        one ordinary one-attempt grant with ``allow_offvpn=False``. Unknown or
+        non-VPN routing fails before policy state or network transport changes.
         """
 
         self.policy.require_reuse_allowed()
@@ -552,39 +575,51 @@ class O2Connection:
                 f"An O2 broker daemon already owns the lifetime lock (receipt status: {lifecycle}) but did not "
                 "answer the short local ping. It may be busy, awaiting Duo, or failing; do not start a second session."
             )
+        auto_grant_id: str | None = None
         if not grant_id:
-            raise O2BrokerStartupError(
-                f"No persistent O2 {logical_target} command broker is running. A short-lived one-shot "
-                f"{logical_target} grant is required before starting its single SSH session."
-            )
+            if not auto_authorize_on_vpn:
+                raise O2BrokerStartupError(
+                    f"No persistent O2 {logical_target} command broker is running. A short-lived one-shot "
+                    f"{logical_target} grant is required before starting its single SSH session."
+                )
+            grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
+            auto_grant_id = grant_id
 
         broker_dir = self.config.transfer_broker_dir if transfer else self.config.broker_dir
-        grant = self.policy.preview_login_grant(grant_id, logical_target)
-        if not grant.allow_offvpn:
-            self._require_on_vpn(target)
+        try:
+            grant = self.policy.preview_login_grant(grant_id, logical_target)
+            if not grant.allow_offvpn:
+                self._require_on_vpn(target)
 
-        # Config parsing and artifact writes are local-only and intentionally
-        # happen before grant consumption. A typo or unsafe Match block must not
-        # waste the user's one authorized authentication attempt.
-        paths = prepare_broker_directory(broker_dir)
-        destination = self._broker_destination(target)
-        launch_payload = {
-            "schema_version": 1,
-            "broker_dir": str(paths.root),
-            "policy_file": str(self.config.policy_file),
-            "alias": target,
-            "destination": destination,
-            "grant_id": grant_id,
-            "login_target": logical_target,
-            "launcher_client_id": grant.client_id,
-            "launcher_pid": os.getpid(),
-            "startup_timeout": self.config.broker_start_timeout,
-            "transport_argv": self._broker_transport_argv(target),
-        }
-        launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
-
-        launch_read_fd, launch_write_fd = os.pipe()
-        ack_read_fd, ack_write_fd = os.pipe()
+            # Config parsing and artifact writes are local-only and happen
+            # before grant consumption. Any failure after an automatic grant
+            # was minted revokes that exact unused standing grant below.
+            paths = prepare_broker_directory(broker_dir)
+            destination = self._broker_destination(target)
+            launch_payload = {
+                "schema_version": 1,
+                "broker_dir": str(paths.root),
+                "policy_file": str(self.config.policy_file),
+                "alias": target,
+                "destination": destination,
+                "grant_id": grant_id,
+                "login_target": logical_target,
+                "launcher_client_id": grant.client_id,
+                "launcher_pid": os.getpid(),
+                "startup_timeout": self.config.broker_start_timeout,
+                "transport_argv": self._broker_transport_argv(target),
+            }
+            launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
+            launch_read_fd, launch_write_fd = os.pipe()
+            try:
+                ack_read_fd, ack_write_fd = os.pipe()
+            except Exception:
+                os.close(launch_read_fd)
+                os.close(launch_write_fd)
+                raise
+        except Exception:
+            self._revoke_unused_auto_grant(auto_grant_id, reason="broker preflight failed before grant consumption")
+            raise
         daemon_argv = [
             sys.executable,
             "-c",
@@ -646,6 +681,11 @@ class O2Connection:
                 # original startup error with a duplicate-finish conflict.
                 with suppress(O2PolicyConflictError):
                     self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            if consumed is None:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="broker launch setup failed before grant consumption",
+                )
             raise
         finally:
             os.close(ack_read_fd)
@@ -720,7 +760,7 @@ class O2Connection:
             host = self._resolved_ssh_config(alias).get("hostname")
             if not host:
                 return None
-            route = self._runner(["route", "get", host], self.config.connect_timeout, None)
+            route = self._runner([self.ROUTE_EXECUTABLE, "get", host], self.config.connect_timeout, None)
             if not route.ok:
                 return None
             for line in route.stdout.splitlines():
@@ -735,11 +775,13 @@ class O2Connection:
             return None
 
     def _require_on_vpn(self, target: str) -> None:
-        """Refuse a new login that would leave via a non-VPN (physical) interface.
+        """Require target-specific proof of the configured HMS GlobalProtect tunnel.
 
-        O2 autopushes Duo to non-HMS source IPs. Unknown routing now fails closed:
-        the user may authorize the same one-shot login with ``allow_offvpn`` when
-        VPN routing is intentionally unavailable.
+        A ``utun`` name alone is insufficient because Tailscale and unrelated
+        VPN clients use the same macOS interface family. The route must use the
+        configured prefix, that interface must be live with an IP address, and
+        the same address must appear in PanGPS settings for the configured HMS
+        portal. Any unreadable, stale, or mismatched evidence fails closed.
         """
         iface = self._egress_interface(target)
         if iface is None or not iface.startswith(self.config.vpn_iface_prefix):
@@ -749,6 +791,113 @@ class O2Connection:
                 f"('{self.config.vpn_iface_prefix}*'). Connect GlobalProtect or issue a new one-shot login "
                 "grant with allow_offvpn=true after explicit user approval."
             )
+        interface_addresses = self._interface_addresses(iface)
+        portal, globalprotect_addresses = self._globalprotect_connection_evidence()
+        if portal != self.config.globalprotect_portal or interface_addresses.isdisjoint(globalprotect_addresses):
+            raise O2OffVpnError(
+                f"The local route for O2 target '{target}' uses '{iface}', but that interface could not be bound "
+                f"to the configured HMS GlobalProtect portal '{self.config.globalprotect_portal}'. Connect "
+                "GlobalProtect or issue a new one-shot login grant with allow_offvpn=true after explicit user approval."
+            )
+
+    def _interface_addresses(self, interface: str) -> set[str]:
+        """Return normalized IP addresses currently assigned to one interface."""
+
+        try:
+            result = self._runner(
+                [self.IFCONFIG_EXECUTABLE, interface],
+                self.config.connect_timeout,
+                None,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+        if not result.ok:
+            return set()
+        addresses: set[str] = set()
+        for line in result.stdout.splitlines():
+            fields = line.strip().split()
+            if len(fields) < 2 or fields[0] not in {"inet", "inet6"}:
+                continue
+            candidate = fields[1].split("%", 1)[0]
+            try:
+                addresses.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                # Malformed local interface output is indeterminate evidence,
+                # never a reason to weaken the route guard.
+                continue
+        return addresses
+
+    def _globalprotect_connection_evidence(self) -> tuple[str | None, set[str]]:
+        """Read the configured portal and PanGPS-owned tunnel IPs locally.
+
+        GlobalProtect keeps its active/preferred tunnel addresses in a
+        system-owned plist. Matching one of those addresses to the selected
+        route interface distinguishes HMS GlobalProtect from another ``utun``
+        provider without invoking a network command or trusting the GUI state.
+        """
+
+        try:
+            with self.config.globalprotect_settings_file.open("rb") as stream:
+                payload = plistlib.load(stream)
+            globalprotect = payload["Palo Alto Networks"]["GlobalProtect"]
+            portal = globalprotect["PanSetup"]["Portal"]
+            pangps = globalprotect["PanGPS"]
+        except (OSError, plistlib.InvalidFileException, KeyError, TypeError):
+            return None, set()
+        if not isinstance(portal, str) or not isinstance(pangps, dict):
+            return None, set()
+        addresses: set[str] = set()
+        for key, value in pangps.items():
+            if not isinstance(key, str) or not key.startswith(("PreferredIP_", "PreferredIPV6_")):
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                addresses.add(str(ipaddress.ip_address(value.strip())))
+            except ValueError:
+                continue
+        return portal.strip(), addresses
+
+    def _authorize_single_on_vpn_attempt(self, logical_target: LoginTarget, target: str) -> str:
+        """Mint one auditable start grant after local VPN route proof.
+
+        This helper deliberately uses the same policy grant and cooldown state
+        machine as explicit approvals. It does not introduce a durable bypass:
+        every call proves the route locally, authorizes only ``allow_offvpn=False``,
+        and returns a grant that the normal launch path consumes exactly once.
+        A second route check immediately before launch closes the most important
+        VPN-flap race; if that check fails, no SSH process is opened.
+        """
+
+        self._require_on_vpn(target)
+        snapshot = self.policy.snapshot()
+        # A valid reuse-only state was checked by the caller before reaching
+        # this point. Still reject a missing generation explicitly so an invalid
+        # policy file cannot be turned into an authorization attempt.
+        if not snapshot.valid or snapshot.generation is None:
+            raise O2PolicyDeniedError("Cannot auto-authorize an O2 start from invalid local policy state.")
+        grant = self.policy.authorize_login(
+            expected_revision=snapshot.revision,
+            expected_generation=snapshot.generation,
+            target=logical_target,
+            allow_offvpn=False,
+            approval_reference=ON_VPN_AUTO_APPROVAL_REFERENCE,
+            authorization_method="standing_on_vpn",
+        )
+        return grant.id
+
+    def _revoke_unused_auto_grant(self, grant_id: str | None, *, reason: str) -> None:
+        """Best-effort cleanup for a standing grant that never reached launch.
+
+        Preserve the original preflight/start exception if policy cleanup races
+        with another process or the policy itself becomes invalid. The revoke
+        API is narrowly scoped and cannot remove an explicit user grant.
+        """
+
+        if grant_id is None:
+            return
+        with suppress(O2PolicyError):
+            self.policy.revoke_unused_standing_grant(grant_id, reason=reason)
 
     def start_master(
         self,
@@ -756,16 +905,19 @@ class O2Connection:
         grant_id: str | None = None,
         alias: str | None = None,
         login_target: LoginTarget | None = None,
+        auto_authorize_on_vpn: bool = False,
     ) -> CommandResult:
-        """Open the legacy transfer ControlMaster after a matching policy grant.
+        """Open the legacy transfer ControlMaster under one-attempt authority.
 
         An already-running exact master is a local no-op and does not consume a
-        grant.  Otherwise the grant is route-checked, atomically consumed, and
+        grant. Otherwise an explicit grant is route-checked, atomically consumed, and
         converted to an active attempt receipt before the sole authentication-
         capable SSH subprocess is launched. Login-role masters are rejected at
         this public API boundary because new command execution uses the broker
         and opening per-command channels on a login master can still trigger
-        Duo. No failure path retries SSH.
+        Duo. With ``auto_authorize_on_vpn=True`` and no explicit grant, the
+        method proves the transfer-host route is on VPN and mints the same kind
+        of one-attempt, ``allow_offvpn=False`` grant. No failure path retries SSH.
         """
 
         self.policy.require_reuse_allowed()
@@ -796,15 +948,23 @@ class O2Connection:
             )
         if self.master_running(target):
             return CommandResult(self._master_check_argv(target), 0, "master already running", "")
+        auto_grant_id: str | None = None
         if not grant_id:
-            raise O2MasterUnavailableError(
-                f"No O2 ControlMaster is running for '{target}'. A short-lived one-shot login grant scoped to "
-                f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
-            )
+            if not auto_authorize_on_vpn:
+                raise O2MasterUnavailableError(
+                    f"No O2 ControlMaster is running for '{target}'. A short-lived one-shot login grant scoped to "
+                    f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
+                )
+            grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
+            auto_grant_id = grant_id
 
-        grant = self.policy.preview_login_grant(grant_id, logical_target)
-        if not grant.allow_offvpn:
-            self._require_on_vpn(target)
+        try:
+            grant = self.policy.preview_login_grant(grant_id, logical_target)
+            if not grant.allow_offvpn:
+                self._require_on_vpn(target)
+        except Exception:
+            self._revoke_unused_auto_grant(auto_grant_id, reason="master preflight failed before grant consumption")
+            raise
         consumed = None
         try:
             # Consumption and the authentication-capable runner call share the
@@ -835,10 +995,20 @@ class O2Connection:
         except subprocess.TimeoutExpired:
             if consumed is not None:
                 self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
+            else:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="master launch setup timed out before grant consumption",
+                )
             raise
         except Exception:
             if consumed is not None:
                 self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            else:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="master launch setup failed before grant consumption",
+                )
             raise
 
         if not result.ok:

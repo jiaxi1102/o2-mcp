@@ -467,6 +467,57 @@ def test_failed_attempt_remains_blocked_until_global_cooldown(tmp_path, outcome)
     assert replacement.id != grant.id
 
 
+def test_standing_vpn_grant_is_audited_distinctly_and_cannot_allow_offvpn(tmp_path):
+    """Standing route authority must not masquerade as fresh user approval."""
+
+    store = _reuse_store(tmp_path, client_id="client-a")
+    snapshot = store.snapshot()
+    grant = store.authorize_login(
+        expected_revision=snapshot.revision,
+        expected_generation=snapshot.generation,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="standing on-VPN test authority",
+        authorization_method="standing_on_vpn",
+    )
+
+    assert grant.authorization_method == "standing_on_vpn"
+    state = store.snapshot().state
+    assert state["login_grant"]["authorization_method"] == "standing_on_vpn"
+    assert state["events"][-1]["authorization_method"] == "standing_on_vpn"
+    assert store.revoke_unused_standing_grant(grant.id, reason="offline preflight failed") is True
+    revoked = store.snapshot().state
+    assert revoked["login_grant"] is None
+    assert revoked["events"][-1]["event"] == "standing_login_grant_revoked"
+
+    # A standing route rule can never be repurposed into the explicit off-VPN
+    # exception, even if a caller tries to combine the two parameters directly.
+    other = _reuse_store(tmp_path / "other", client_id="client-b")
+    other_snapshot = other.snapshot()
+    with pytest.raises(O2LoginGrantError, match="cannot allow off-VPN"):
+        other.authorize_login(
+            expected_revision=other_snapshot.revision,
+            expected_generation=other_snapshot.generation,
+            target="login",
+            allow_offvpn=True,
+            approval_reference="invalid standing authority",
+            authorization_method="standing_on_vpn",
+        )
+
+    explicit = _reuse_store(tmp_path / "explicit", client_id="client-c")
+    explicit_snapshot = explicit.snapshot()
+    explicit_grant = explicit.authorize_login(
+        expected_revision=explicit_snapshot.revision,
+        expected_generation=explicit_snapshot.generation,
+        target="login",
+        allow_offvpn=False,
+        approval_reference="fresh explicit approval",
+    )
+    with pytest.raises(O2LoginGrantError, match="cannot revoke an explicit"):
+        explicit.revoke_unused_standing_grant(explicit_grant.id, reason="must preserve explicit authority")
+    assert explicit.snapshot().state["login_grant"]["id"] == explicit_grant.id
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

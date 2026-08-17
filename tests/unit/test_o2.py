@@ -8,6 +8,7 @@ ControlMaster guards fire, and Slurm output is parsed correctly.
 from __future__ import annotations
 
 import json
+import plistlib
 import shlex
 import subprocess
 import threading
@@ -126,12 +127,26 @@ def _config(tmp_path: Path, *, locked: bool = False) -> O2Config:
         "  User jiz947\n"
         "  ControlPath /tmp/o2-transfer-control.sock\n"
     )
+    globalprotect_settings = tmp_path / "globalprotect-settings.plist"
+    with globalprotect_settings.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Palo Alto Networks": {
+                    "GlobalProtect": {
+                        "PanSetup": {"Portal": "vpn.hms.harvard.edu"},
+                        "PanGPS": {"PreferredIP_test": "10.116.16.225"},
+                    }
+                }
+            },
+            stream,
+        )
     return O2Config(
         host_alias="o2",
         transfer_alias="o2-transfer",
         connect_timeout=20,
         policy_file=policy_file,
         ssh_config_file=ssh_config,
+        globalprotect_settings_file=globalprotect_settings,
     )
 
 
@@ -161,6 +176,9 @@ def test_relative_policy_paths_are_rejected(monkeypatch):
         O2Config()
     with pytest.raises(ValueError, match="must be absolute"):
         O2Config(policy_file=Path("another-relative-policy.json"))
+    monkeypatch.delenv("O2_POLICY_FILE")
+    with pytest.raises(ValueError, match="GlobalProtect settings path must be absolute"):
+        O2Config(globalprotect_settings_file=Path("relative-globalprotect.plist"))
 
 
 def test_role_specific_broker_directories_are_absolute_and_distinct(tmp_path):
@@ -724,16 +742,18 @@ def test_timed_out_login_consumes_grant_and_leaves_attempt_receipt(tmp_path):
 
 
 # --- VPN egress guard (HMS O2 Duos non-HMS source IPs) -----------------------
-def _vpn_responder(interface):
-    """Responder answering the guard's `ssh -G` (HostName) and `route get` (interface)."""
+def _vpn_responder(interface, *, interface_ip="10.116.16.225"):
+    """Answer deterministic SSH, route, and GlobalProtect-interface evidence."""
 
     def responder(argv, input_text):
         if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             if interface is None:
                 return ("", "no route to host", 1)
             return (f"   route to: o2\n   interface: {interface}\n   gateway: x\n", "", 0)
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return (f"{argv[1]}: flags=8051<UP,RUNNING>\n\tinet {interface_ip} netmask 0xffffffff\n", "", 0)
         return ("", "", 0)
 
     return responder
@@ -757,6 +777,111 @@ def test_start_master_allows_on_vpn(tmp_path):
     grant = _authorize(conn)
     result = _start_transfer_master(conn, grant_id=grant.id)
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
+
+
+def test_start_master_auto_authorizes_one_on_vpn_attempt(tmp_path):
+    """Standing VPN authority uses the normal one-attempt grant and receipt."""
+
+    runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(
+        alias=conn.config.transfer_alias,
+        login_target="transfer",
+        auto_authorize_on_vpn=True,
+    )
+
+    assert result.ok
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    state = conn.policy.snapshot().state
+    assert state["login_grant"] is None
+    assert state["login_attempt"]["allow_offvpn"] is False
+    assert state["login_attempt"]["authorization_method"] == "standing_on_vpn"
+    assert state["login_attempt"]["target"] == "transfer"
+    assert state["login_attempt"]["outcome"] == "success"
+    authorized = [event for event in state["events"] if event["event"] == "login_authorized"]
+    assert authorized[-1]["approval_reference"].startswith("standing user authorization")
+    assert authorized[-1]["authorization_method"] == "standing_on_vpn"
+
+
+def test_start_master_auto_authorization_asks_off_vpn_without_policy_mutation(tmp_path):
+    """Off-VPN auto-start fails locally before minting a grant or opening SSH."""
+
+    runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    before = conn.policy.snapshot()
+
+    with pytest.raises(O2OffVpnError):
+        conn.start_master(
+            alias=conn.config.transfer_alias,
+            login_target="transfer",
+            auto_authorize_on_vpn=True,
+        )
+
+    after = conn.policy.snapshot()
+    assert after.revision == before.revision
+    assert after.state["login_grant"] is None
+    assert after.state["login_attempt"] is None
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
+
+
+def test_start_master_auto_authorization_rejects_unrelated_utun(tmp_path):
+    """A generic tunnel name cannot impersonate GlobalProtect route evidence."""
+
+    # The route uses utun6, but its live address differs from the PanGPS-owned
+    # address in the fixture plist. This models another VPN owning O2's route.
+    runner = RecordingRunner(
+        master=False,
+        responder=_vpn_responder("utun6", interface_ip="100.64.0.1"),
+    )
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2OffVpnError, match="could not be bound"):
+        conn.start_master(
+            alias=conn.config.transfer_alias,
+            login_target="transfer",
+            auto_authorize_on_vpn=True,
+        )
+
+    state = conn.policy.snapshot().state
+    assert state["login_grant"] is None
+    assert state["login_attempt"] is None
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
+
+
+def test_start_master_revokes_auto_grant_when_vpn_flaps_before_consumption(tmp_path):
+    """A failed second route proof must not strand an undisclosed grant."""
+
+    route_checks = 0
+
+    def responder(argv, _input_text):
+        nonlocal route_checks
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return ("hostname transfer.rc.hms.harvard.edu\n", "", 0)
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
+            route_checks += 1
+            interface = "utun6" if route_checks == 1 else "en0"
+            return (f"interface: {interface}\n", "", 0)
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return ("inet 10.116.16.225 netmask 0xffffffff\n", "", 0)
+        return ("", "", 0)
+
+    runner = RecordingRunner(master=False, responder=responder)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2OffVpnError):
+        conn.start_master(
+            alias=conn.config.transfer_alias,
+            login_target="transfer",
+            auto_authorize_on_vpn=True,
+        )
+
+    state = conn.policy.snapshot().state
+    assert route_checks == 2
+    assert state["login_grant"] is None
+    assert state["login_attempt"] is None
+    assert state["events"][-1]["event"] == "standing_login_grant_revoked"
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
 def test_start_master_offvpn_override(tmp_path):
@@ -785,7 +910,7 @@ def test_start_master_route_binary_missing_needs_offvpn_grant(tmp_path):
     def responder(argv, _input):
         if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             raise FileNotFoundError(2, "No such file or directory", "route")
         return ("", "", 0)
 
@@ -805,6 +930,8 @@ def test_o2config_new_fields_are_appended_for_positional_compatibility():
     assert names.index("policy_file") < names.index("default_user")
     assert names.index("vpn_iface_prefix") > names.index("default_user")
     assert names.index("ssh_config_file") > names.index("vpn_iface_prefix")
+    assert names.index("globalprotect_settings_file") > names.index("transfer_broker_dir")
+    assert names.index("globalprotect_portal") > names.index("globalprotect_settings_file")
 
 
 # --- Slurm submit/monitor ----------------------------------------------------
