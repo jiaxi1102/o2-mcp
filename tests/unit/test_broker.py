@@ -1509,3 +1509,61 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
         deadline = time.monotonic() + 5
         while client.launch_in_progress() and time.monotonic() < deadline:
             time.sleep(0.05)
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+def test_on_vpn_launcher_auto_authorizes_exactly_one_broker(tmp_path, broker_root, monkeypatch, transfer):
+    """Both host roles may use standing authority only after local VPN proof."""
+
+    policy = _reuse_policy(tmp_path)
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "unused-login-broker" if transfer else broker_root,
+        transfer_broker_dir=broker_root if transfer else tmp_path / "unused-transfer-broker",
+        ssh_config_file=tmp_path / "ssh_config",
+        broker_start_timeout=5,
+    )
+    config.ssh_config_file.write_text(
+        "Host o2\n  HostName example.invalid\nHost o2-transfer\n  HostName transfer.example.invalid\n"
+    )
+
+    def vpn_route_runner(argv, _timeout, _input_text):
+        """Resolve the safe SSH config and answer the local VPN route proof."""
+
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            host = "transfer.example.invalid" if argv[-1] == "o2-transfer" else "example.invalid"
+            return CommandResult(
+                list(argv),
+                0,
+                f"hostname {host}\nuser offline\nport 22\ncontrolpath /tmp/{argv[-1]}.sock\n",
+                "",
+            )
+        if argv[:2] == ["route", "get"]:
+            return CommandResult(list(argv), 0, "interface: utun6\n", "")
+        raise AssertionError(f"unexpected subprocess in offline broker test: {argv}")
+
+    client = BrokerClient(broker_root)
+    connection_kwargs = {"transfer_broker_client": client} if transfer else {"broker_client": client}
+    connection = O2Connection(config, runner=vpn_route_runner, policy=policy, **connection_kwargs)
+    monkeypatch.setattr(
+        connection,
+        "_broker_transport_argv",
+        lambda _target: [sys.executable, "-u", "-c", remote_helper_source()],
+    )
+
+    started = None
+    try:
+        started = connection.start_broker(transfer=transfer, auto_authorize_on_vpn=True)
+        assert started["responsive"] is True
+        attempt = policy.snapshot().state["login_attempt"]
+        assert attempt["target"] == ("transfer" if transfer else "login")
+        assert attempt["allow_offvpn"] is False
+        assert attempt["outcome"] == "success"
+    finally:
+        # Do not mask an earlier assertion or setup failure with a second error
+        # from trying to stop a broker that never reached its local endpoint.
+        if started is not None:
+            connection.stop_broker(reason="offline automatic launcher test complete", transfer=transfer)
+        deadline = time.monotonic() + 5
+        while client.launch_in_progress() and time.monotonic() < deadline:
+            time.sleep(0.05)

@@ -119,15 +119,15 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
 
 # --- input models ------------------------------------------------------------
 class StartMasterInput(BaseModel):
-    """Consume a previously issued one-shot authorization for one O2 host."""
+    """Configure one transfer-master start or local reuse check."""
 
     model_config = ConfigDict(extra="forbid")
     grant_id: str | None = Field(
         default=None,
         description=(
             "One-shot grant returned by o2_authorize_login. It is unnecessary when "
-            "the exact requested ControlMaster is already running, but mandatory "
-            "before any new authentication-capable SSH process."
+            "the exact requested ControlMaster is already running. When omitted, "
+            "auto_authorize_on_vpn controls the standing on-VPN authorization path."
         ),
     )
     transfer: bool = Field(
@@ -135,6 +135,14 @@ class StartMasterInput(BaseModel):
         description=(
             "Open the dedicated transfer-node master (o2-transfer). Login-node "
             "commands now use o2_start_broker instead of a ControlMaster."
+        ),
+    )
+    auto_authorize_on_vpn: bool = Field(
+        default=True,
+        description=(
+            "When grant_id is omitted, automatically authorize exactly one start only if the local route to the "
+            "transfer host is proven to use the HMS VPN. Off-VPN or indeterminate routing fails before SSH and "
+            "requires explicit user approval through o2_authorize_login with allow_offvpn=true."
         ),
     )
 
@@ -150,19 +158,28 @@ class StopMasterInput(BaseModel):
 
 
 class StartBrokerInput(BaseModel):
-    """Consume one role-matched grant to start a persistent command channel."""
+    """Configure one broker start or local reuse check for an O2 host role."""
 
     model_config = ConfigDict(extra="forbid")
     grant_id: str | None = Field(
         default=None,
         description=(
             "One-shot login grant returned by o2_authorize_login. It is unnecessary "
-            "only when the workstation broker is already locally responsive."
+            "when the workstation broker is already locally responsive. When omitted, "
+            "auto_authorize_on_vpn controls the standing on-VPN authorization path."
         ),
     )
     transfer: bool = Field(
         default=False,
         description="Start the separately granted transfer-host broker instead of the login-host broker.",
+    )
+    auto_authorize_on_vpn: bool = Field(
+        default=True,
+        description=(
+            "When grant_id is omitted, automatically authorize exactly one start only if the selected O2 host "
+            "is proven to route through the HMS VPN. Off-VPN or indeterminate routing fails before SSH and "
+            "requires explicit user approval through o2_authorize_login with allow_offvpn=true."
+        ),
     )
 
 
@@ -551,6 +568,7 @@ async def o2_start_master(params: StartMasterInput) -> str:
             grant_id=params.grant_id,
             alias=alias,
             login_target=login_target,
+            auto_authorize_on_vpn=params.auto_authorize_on_vpn,
         )
         return {"ok": result.ok, "alias": alias or conn.config.host_alias, **_command_payload(result)}
 
@@ -590,7 +608,11 @@ async def o2_start_broker(params: StartBrokerInput) -> str:
     """
 
     def work() -> dict[str, Any]:
-        status = _connection().start_broker(grant_id=params.grant_id, transfer=params.transfer)
+        status = _connection().start_broker(
+            grant_id=params.grant_id,
+            transfer=params.transfer,
+            auto_authorize_on_vpn=params.auto_authorize_on_vpn,
+        )
         return {
             "ok": status.get("responsive") is True,
             "target": "transfer" if params.transfer else "login",

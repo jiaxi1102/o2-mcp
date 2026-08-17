@@ -759,6 +759,50 @@ def test_start_master_allows_on_vpn(tmp_path):
     assert result.ok and any("-MNf" in call["argv"] for call in runner.calls)
 
 
+def test_start_master_auto_authorizes_one_on_vpn_attempt(tmp_path):
+    """Standing VPN authority uses the normal one-attempt grant and receipt."""
+
+    runner = RecordingRunner(master=False, responder=_vpn_responder("utun6"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    result = conn.start_master(
+        alias=conn.config.transfer_alias,
+        login_target="transfer",
+        auto_authorize_on_vpn=True,
+    )
+
+    assert result.ok
+    assert sum("-MNf" in call["argv"] for call in runner.calls) == 1
+    state = conn.policy.snapshot().state
+    assert state["login_grant"] is None
+    assert state["login_attempt"]["allow_offvpn"] is False
+    assert state["login_attempt"]["target"] == "transfer"
+    assert state["login_attempt"]["outcome"] == "success"
+    authorized = [event for event in state["events"] if event["event"] == "login_authorized"]
+    assert authorized[-1]["approval_reference"].startswith("standing user authorization")
+
+
+def test_start_master_auto_authorization_asks_off_vpn_without_policy_mutation(tmp_path):
+    """Off-VPN auto-start fails locally before minting a grant or opening SSH."""
+
+    runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
+    conn = O2Connection(_config(tmp_path), runner=runner)
+    before = conn.policy.snapshot()
+
+    with pytest.raises(O2OffVpnError):
+        conn.start_master(
+            alias=conn.config.transfer_alias,
+            login_target="transfer",
+            auto_authorize_on_vpn=True,
+        )
+
+    after = conn.policy.snapshot()
+    assert after.revision == before.revision
+    assert after.state["login_grant"] is None
+    assert after.state["login_attempt"] is None
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
+
+
 def test_start_master_offvpn_override(tmp_path):
     # Off-VPN permission is carried only by the consumed one-shot grant.
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))

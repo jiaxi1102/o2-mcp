@@ -96,6 +96,12 @@ Runner = Callable[[list[str], Optional[float], Optional[str]], CommandResult]
 # always routes commands through BrokerClient.
 _DEFAULT_BROKER_CLIENT = object()
 
+# This audit reference records why an on-VPN grant did not require a fresh
+# conversational approval. The permission is intentionally narrow: route proof
+# is rechecked before launch, the grant permits one attempt, and it never allows
+# an off-VPN connection.
+ON_VPN_AUTO_APPROVAL_REFERENCE = "standing user authorization for one start over a proven HMS VPN route"
+
 
 def default_runner(argv: list[str], timeout: float | None, input_text: str | None) -> CommandResult:
     """Run a command via subprocess without exposing the MCP protocol stream.
@@ -527,7 +533,13 @@ class O2Connection:
             remote_command,
         ]
 
-    def start_broker(self, *, grant_id: str | None = None, transfer: bool = False) -> dict[str, object]:
+    def start_broker(
+        self,
+        *,
+        grant_id: str | None = None,
+        transfer: bool = False,
+        auto_authorize_on_vpn: bool = False,
+    ) -> dict[str, object]:
         """Start exactly one role-specific persistent session after a grant.
 
         The child daemon acknowledges only after it has spawned the sole SSH
@@ -537,6 +549,12 @@ class O2Connection:
         disable therefore either prevents launch or observes an already-running
         operation. Authentication and the remote protocol hello may finish
         later; waiting for them is local-only and never retries.
+
+        ``auto_authorize_on_vpn`` is the standing-authorization path used by the
+        MCP start tool. When no explicit grant was supplied, it first proves the
+        selected O2 host routes through the configured VPN interface, then mints
+        one ordinary one-attempt grant with ``allow_offvpn=False``. Unknown or
+        non-VPN routing fails before policy state or network transport changes.
         """
 
         self.policy.require_reuse_allowed()
@@ -553,10 +571,12 @@ class O2Connection:
                 "answer the short local ping. It may be busy, awaiting Duo, or failing; do not start a second session."
             )
         if not grant_id:
-            raise O2BrokerStartupError(
-                f"No persistent O2 {logical_target} command broker is running. A short-lived one-shot "
-                f"{logical_target} grant is required before starting its single SSH session."
-            )
+            if not auto_authorize_on_vpn:
+                raise O2BrokerStartupError(
+                    f"No persistent O2 {logical_target} command broker is running. A short-lived one-shot "
+                    f"{logical_target} grant is required before starting its single SSH session."
+                )
+            grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
 
         broker_dir = self.config.transfer_broker_dir if transfer else self.config.broker_dir
         grant = self.policy.preview_login_grant(grant_id, logical_target)
@@ -750,22 +770,52 @@ class O2Connection:
                 "grant with allow_offvpn=true after explicit user approval."
             )
 
+    def _authorize_single_on_vpn_attempt(self, logical_target: LoginTarget, target: str) -> str:
+        """Mint one auditable start grant after local VPN route proof.
+
+        This helper deliberately uses the same policy grant and cooldown state
+        machine as explicit approvals. It does not introduce a durable bypass:
+        every call proves the route locally, authorizes only ``allow_offvpn=False``,
+        and returns a grant that the normal launch path consumes exactly once.
+        A second route check immediately before launch closes the most important
+        VPN-flap race; if that check fails, no SSH process is opened.
+        """
+
+        self._require_on_vpn(target)
+        snapshot = self.policy.snapshot()
+        # A valid reuse-only state was checked by the caller before reaching
+        # this point. Still reject a missing generation explicitly so an invalid
+        # policy file cannot be turned into an authorization attempt.
+        if not snapshot.valid or snapshot.generation is None:
+            raise O2PolicyDeniedError("Cannot auto-authorize an O2 start from invalid local policy state.")
+        grant = self.policy.authorize_login(
+            expected_revision=snapshot.revision,
+            expected_generation=snapshot.generation,
+            target=logical_target,
+            allow_offvpn=False,
+            approval_reference=ON_VPN_AUTO_APPROVAL_REFERENCE,
+        )
+        return grant.id
+
     def start_master(
         self,
         *,
         grant_id: str | None = None,
         alias: str | None = None,
         login_target: LoginTarget | None = None,
+        auto_authorize_on_vpn: bool = False,
     ) -> CommandResult:
-        """Open the legacy transfer ControlMaster after a matching policy grant.
+        """Open the legacy transfer ControlMaster under one-attempt authority.
 
         An already-running exact master is a local no-op and does not consume a
-        grant.  Otherwise the grant is route-checked, atomically consumed, and
+        grant. Otherwise an explicit grant is route-checked, atomically consumed, and
         converted to an active attempt receipt before the sole authentication-
         capable SSH subprocess is launched. Login-role masters are rejected at
         this public API boundary because new command execution uses the broker
         and opening per-command channels on a login master can still trigger
-        Duo. No failure path retries SSH.
+        Duo. With ``auto_authorize_on_vpn=True`` and no explicit grant, the
+        method proves the transfer-host route is on VPN and mints the same kind
+        of one-attempt, ``allow_offvpn=False`` grant. No failure path retries SSH.
         """
 
         self.policy.require_reuse_allowed()
@@ -797,10 +847,12 @@ class O2Connection:
         if self.master_running(target):
             return CommandResult(self._master_check_argv(target), 0, "master already running", "")
         if not grant_id:
-            raise O2MasterUnavailableError(
-                f"No O2 ControlMaster is running for '{target}'. A short-lived one-shot login grant scoped to "
-                f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
-            )
+            if not auto_authorize_on_vpn:
+                raise O2MasterUnavailableError(
+                    f"No O2 ControlMaster is running for '{target}'. A short-lived one-shot login grant scoped to "
+                    f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
+                )
+            grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
 
         grant = self.policy.preview_login_grant(grant_id, logical_target)
         if not grant.allow_offvpn:

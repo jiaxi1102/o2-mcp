@@ -23,7 +23,10 @@ separate transfer broker exists for commands that must execute on the transfer
 host:
 
 1. `o2_start_broker` consumes a short-lived, client-bound, one-attempt
-   role-matched grant and starts exactly one SSH process for that broker.
+   role-matched grant and starts exactly one SSH process for that broker. When
+   no grant is supplied, the MCP may mint that same one-attempt grant
+   automatically only after proving the selected O2 host routes through the HMS
+   VPN.
 2. That SSH process opens exactly one remote session running a small embedded
    Python helper.
 3. Every later `o2_exec`, Slurm, workspace, keepalive, and run-organization
@@ -101,12 +104,22 @@ grant remain MCP-only operations with explicit global or target-scoped approval.
 when your SSH egresses through the HMS VPN (GlobalProtect), not your normal internet
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), the one
 `o2_start_broker` login or transfer-host startup may Duo-push. To make accidental off-VPN launch impossible,
-`o2_start_broker` **refuses to open a new login unless the route to O2 egresses via a VPN
-tunnel interface** (it checks
+`o2_start_broker` and the transfer-only `o2_start_master` **refuse to open a new
+login unless the route to the selected O2 host egresses via a VPN tunnel
+interface** (they check
 `route get` locally — no connection, no Duo). An explicitly approved grant may
 scope `allow_offvpn: true` to that one attempt. There is no durable environment
 bypass. Tune the expected interface prefix with `O2_VPN_IFACE_PREFIX` (default
 `utun`).
+
+The start tools default `auto_authorize_on_vpn` to `true`. If the requested
+broker/master is absent and the route is proven on-VPN, the tool records the
+standing authorization in the policy audit log, mints one `allow_offvpn=false`
+grant, consumes it for one start, and never retries. If routing is off-VPN or
+indeterminate, it returns `error: off_vpn` before opening SSH; the agent must ask
+the user before separately issuing an `allow_offvpn=true` grant. This automatic
+connection permission does not authorize transfer, submission, cancellation,
+deletion, promotion, archive, or any other remote mutation.
 
 ## Install
 
@@ -154,9 +167,9 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_policy_disable` | Block every new remote O2 operation without killing existing processes | write/local |
 | `o2_policy_enable_reuse` | Explicitly enable existing broker/transport reuse at an observed generation/revision | write/local |
 | `o2_authorize_login` | Issue one short-lived login or transfer-host grant | write/local |
-| `o2_start_broker` | Consume one role-matched grant and open that host role's persistent command channel (`transfer=true` for the transfer host) | write |
+| `o2_start_broker` | Reuse a broker or open one role-specific command channel; without `grant_id`, auto-authorize one attempt only over a proven HMS VPN route (`transfer=true` for the transfer host) | write |
 | `o2_stop_broker` | Locally close one role-specific broker and its SSH process; no policy change | **destructive/local** |
-| `o2_start_master` | Transfer compatibility only; login-master starts are rejected | write |
+| `o2_start_master` | Transfer compatibility only; without `grant_id`, auto-authorize one attempt only over a proven HMS VPN route; login-master starts are rejected | write |
 | `o2_stop_master` | Locally close the transfer master or a pre-upgrade login master through its exact socket; shutdown-only and does not restore login startup | **destructive/local** |
 | `o2_probe` | One explicit fixed command through the existing broker; never retried | read-only |
 | `o2_exec` | Run an arbitrary command on a login node | write |
