@@ -1565,7 +1565,7 @@ def test_on_vpn_launcher_auto_authorizes_exactly_one_broker(tmp_path, broker_roo
                 f"hostname {host}\nuser offline\nport 22\ncontrolpath /tmp/{argv[-1]}.sock\n",
                 "",
             )
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             return CommandResult(list(argv), 0, "interface: utun6\n", "")
         if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
             return CommandResult(list(argv), 0, "inet 10.116.16.225 netmask 0xffffffff\n", "")

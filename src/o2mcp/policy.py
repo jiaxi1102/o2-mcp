@@ -401,6 +401,39 @@ class O2PolicyStore:
         with self._locked():
             return self._consume_login_grant_locked(grant_id, target, launcher_pid=os.getpid())
 
+    def revoke_unused_standing_grant(self, grant_id: str, *, reason: str) -> bool:
+        """Revoke one unconsumed auto-start grant owned by this MCP process.
+
+        Local preflight can still fail after route proof and grant creation. The
+        caller must not strand an undisclosed client-bound grant that blocks the
+        workstation for its full TTL. Explicit user grants and grants belonging
+        to another process are never revoked through this cleanup path.
+        """
+
+        reference = self._clean_reference(reason, field="reason")
+        with self._locked():
+            state = self._read_valid_state()
+            raw = state.get("login_grant")
+            if not isinstance(raw, dict):
+                return False
+            grant = LoginGrant.from_dict(raw, now=self._clock())
+            if grant.id != grant_id:
+                return False
+            if grant.client_id != self.client_id:
+                raise O2LoginGrantError("Cannot revoke a standing grant owned by another MCP client.")
+            if grant.authorization_method != "standing_on_vpn":
+                raise O2LoginGrantError("Automatic cleanup cannot revoke an explicit user login grant.")
+            state["login_grant"] = None
+            self._append_event(
+                state,
+                "standing_login_grant_revoked",
+                grant_id=grant.id,
+                target=grant.target,
+                reason=reference,
+            )
+            self._write_next_revision(state)
+            return True
+
     @contextmanager
     def consume_login_grant_for_launch(self, grant_id: str, target: LoginTarget) -> Iterator[LoginGrant]:
         """Consume a grant and hold the policy mutex through process launch.

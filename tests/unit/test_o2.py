@@ -748,7 +748,7 @@ def _vpn_responder(interface, *, interface_ip="10.116.16.225"):
     def responder(argv, input_text):
         if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             if interface is None:
                 return ("", "no route to host", 1)
             return (f"   route to: o2\n   interface: {interface}\n   gateway: x\n", "", 0)
@@ -849,6 +849,41 @@ def test_start_master_auto_authorization_rejects_unrelated_utun(tmp_path):
     assert not any("-MNf" in call["argv"] for call in runner.calls)
 
 
+def test_start_master_revokes_auto_grant_when_vpn_flaps_before_consumption(tmp_path):
+    """A failed second route proof must not strand an undisclosed grant."""
+
+    route_checks = 0
+
+    def responder(argv, _input_text):
+        nonlocal route_checks
+        if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
+            return ("hostname transfer.rc.hms.harvard.edu\n", "", 0)
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
+            route_checks += 1
+            interface = "utun6" if route_checks == 1 else "en0"
+            return (f"interface: {interface}\n", "", 0)
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return ("inet 10.116.16.225 netmask 0xffffffff\n", "", 0)
+        return ("", "", 0)
+
+    runner = RecordingRunner(master=False, responder=responder)
+    conn = O2Connection(_config(tmp_path), runner=runner)
+
+    with pytest.raises(O2OffVpnError):
+        conn.start_master(
+            alias=conn.config.transfer_alias,
+            login_target="transfer",
+            auto_authorize_on_vpn=True,
+        )
+
+    state = conn.policy.snapshot().state
+    assert route_checks == 2
+    assert state["login_grant"] is None
+    assert state["login_attempt"] is None
+    assert state["events"][-1]["event"] == "standing_login_grant_revoked"
+    assert not any("-MNf" in call["argv"] for call in runner.calls)
+
+
 def test_start_master_offvpn_override(tmp_path):
     # Off-VPN permission is carried only by the consumed one-shot grant.
     runner = RecordingRunner(master=False, responder=_vpn_responder("en0"))
@@ -875,7 +910,7 @@ def test_start_master_route_binary_missing_needs_offvpn_grant(tmp_path):
     def responder(argv, _input):
         if argv[:2] == [O2Connection.SSH_EXECUTABLE, "-G"]:
             return ("hostname o2.hms.harvard.edu\n", "", 0)
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             raise FileNotFoundError(2, "No such file or directory", "route")
         return ("", "", 0)
 

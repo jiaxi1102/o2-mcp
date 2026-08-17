@@ -427,7 +427,7 @@ async def test_transfer_master_auto_authorizes_only_on_proven_vpn(monkeypatch, t
     """The MCP default starts on VPN without requiring a separate grant call."""
 
     def on_vpn(argv, _input_text):
-        if argv[:2] == ["route", "get"]:
+        if argv[:2] == [O2Connection.ROUTE_EXECUTABLE, "get"]:
             return ("interface: utun6\n", "", 0)
         if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
             return ("inet 10.116.16.225 netmask 0xffffffff\n", "", 0)

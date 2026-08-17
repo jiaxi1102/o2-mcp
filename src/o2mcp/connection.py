@@ -48,6 +48,7 @@ from o2mcp.policy import (
     O2LoginGrantError,
     O2PolicyConflictError,
     O2PolicyDeniedError,
+    O2PolicyError,
     O2PolicyStore,
 )
 
@@ -201,6 +202,7 @@ class O2Connection:
     # absolute binaries before execution; all other paths are rejected.
     SSH_EXECUTABLE = "/usr/bin/ssh"
     IFCONFIG_EXECUTABLE = "/sbin/ifconfig"
+    ROUTE_EXECUTABLE = "/sbin/route"
     RSYNC_EXECUTABLE = "/usr/bin/rsync"
 
     # Rsync accepts short options in clusters, but these options consume an
@@ -573,6 +575,7 @@ class O2Connection:
                 f"An O2 broker daemon already owns the lifetime lock (receipt status: {lifecycle}) but did not "
                 "answer the short local ping. It may be busy, awaiting Duo, or failing; do not start a second session."
             )
+        auto_grant_id: str | None = None
         if not grant_id:
             if not auto_authorize_on_vpn:
                 raise O2BrokerStartupError(
@@ -580,34 +583,43 @@ class O2Connection:
                     f"{logical_target} grant is required before starting its single SSH session."
                 )
             grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
+            auto_grant_id = grant_id
 
         broker_dir = self.config.transfer_broker_dir if transfer else self.config.broker_dir
-        grant = self.policy.preview_login_grant(grant_id, logical_target)
-        if not grant.allow_offvpn:
-            self._require_on_vpn(target)
+        try:
+            grant = self.policy.preview_login_grant(grant_id, logical_target)
+            if not grant.allow_offvpn:
+                self._require_on_vpn(target)
 
-        # Config parsing and artifact writes are local-only and intentionally
-        # happen before grant consumption. A typo or unsafe Match block must not
-        # waste the user's one authorized authentication attempt.
-        paths = prepare_broker_directory(broker_dir)
-        destination = self._broker_destination(target)
-        launch_payload = {
-            "schema_version": 1,
-            "broker_dir": str(paths.root),
-            "policy_file": str(self.config.policy_file),
-            "alias": target,
-            "destination": destination,
-            "grant_id": grant_id,
-            "login_target": logical_target,
-            "launcher_client_id": grant.client_id,
-            "launcher_pid": os.getpid(),
-            "startup_timeout": self.config.broker_start_timeout,
-            "transport_argv": self._broker_transport_argv(target),
-        }
-        launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
-
-        launch_read_fd, launch_write_fd = os.pipe()
-        ack_read_fd, ack_write_fd = os.pipe()
+            # Config parsing and artifact writes are local-only and happen
+            # before grant consumption. Any failure after an automatic grant
+            # was minted revokes that exact unused standing grant below.
+            paths = prepare_broker_directory(broker_dir)
+            destination = self._broker_destination(target)
+            launch_payload = {
+                "schema_version": 1,
+                "broker_dir": str(paths.root),
+                "policy_file": str(self.config.policy_file),
+                "alias": target,
+                "destination": destination,
+                "grant_id": grant_id,
+                "login_target": logical_target,
+                "launcher_client_id": grant.client_id,
+                "launcher_pid": os.getpid(),
+                "startup_timeout": self.config.broker_start_timeout,
+                "transport_argv": self._broker_transport_argv(target),
+            }
+            launch_bytes = (json.dumps(launch_payload, sort_keys=True) + "\n").encode("utf-8")
+            launch_read_fd, launch_write_fd = os.pipe()
+            try:
+                ack_read_fd, ack_write_fd = os.pipe()
+            except Exception:
+                os.close(launch_read_fd)
+                os.close(launch_write_fd)
+                raise
+        except Exception:
+            self._revoke_unused_auto_grant(auto_grant_id, reason="broker preflight failed before grant consumption")
+            raise
         daemon_argv = [
             sys.executable,
             "-c",
@@ -669,6 +681,11 @@ class O2Connection:
                 # original startup error with a duplicate-finish conflict.
                 with suppress(O2PolicyConflictError):
                     self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            if consumed is None:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="broker launch setup failed before grant consumption",
+                )
             raise
         finally:
             os.close(ack_read_fd)
@@ -743,7 +760,7 @@ class O2Connection:
             host = self._resolved_ssh_config(alias).get("hostname")
             if not host:
                 return None
-            route = self._runner(["route", "get", host], self.config.connect_timeout, None)
+            route = self._runner([self.ROUTE_EXECUTABLE, "get", host], self.config.connect_timeout, None)
             if not route.ok:
                 return None
             for line in route.stdout.splitlines():
@@ -869,6 +886,19 @@ class O2Connection:
         )
         return grant.id
 
+    def _revoke_unused_auto_grant(self, grant_id: str | None, *, reason: str) -> None:
+        """Best-effort cleanup for a standing grant that never reached launch.
+
+        Preserve the original preflight/start exception if policy cleanup races
+        with another process or the policy itself becomes invalid. The revoke
+        API is narrowly scoped and cannot remove an explicit user grant.
+        """
+
+        if grant_id is None:
+            return
+        with suppress(O2PolicyError):
+            self.policy.revoke_unused_standing_grant(grant_id, reason=reason)
+
     def start_master(
         self,
         *,
@@ -918,6 +948,7 @@ class O2Connection:
             )
         if self.master_running(target):
             return CommandResult(self._master_check_argv(target), 0, "master already running", "")
+        auto_grant_id: str | None = None
         if not grant_id:
             if not auto_authorize_on_vpn:
                 raise O2MasterUnavailableError(
@@ -925,10 +956,15 @@ class O2Connection:
                     f"'{logical_target}' is required; ordinary booleans cannot authorize a Duo-pushing login."
                 )
             grant_id = self._authorize_single_on_vpn_attempt(logical_target, target)
+            auto_grant_id = grant_id
 
-        grant = self.policy.preview_login_grant(grant_id, logical_target)
-        if not grant.allow_offvpn:
-            self._require_on_vpn(target)
+        try:
+            grant = self.policy.preview_login_grant(grant_id, logical_target)
+            if not grant.allow_offvpn:
+                self._require_on_vpn(target)
+        except Exception:
+            self._revoke_unused_auto_grant(auto_grant_id, reason="master preflight failed before grant consumption")
+            raise
         consumed = None
         try:
             # Consumption and the authentication-capable runner call share the
@@ -959,10 +995,20 @@ class O2Connection:
         except subprocess.TimeoutExpired:
             if consumed is not None:
                 self.policy.finish_login_attempt(consumed.id, outcome="timed_out", returncode=None)
+            else:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="master launch setup timed out before grant consumption",
+                )
             raise
         except Exception:
             if consumed is not None:
                 self.policy.finish_login_attempt(consumed.id, outcome="error", returncode=None)
+            else:
+                self._revoke_unused_auto_grant(
+                    auto_grant_id,
+                    reason="master launch setup failed before grant consumption",
+                )
             raise
 
         if not result.ok:
