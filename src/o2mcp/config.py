@@ -57,6 +57,15 @@ def _default_transfer_broker_dir() -> Path:
     return Path.home() / ".agent_locks" / "o2-transfer-broker"
 
 
+def _default_globalprotect_settings_file() -> Path:
+    """Return Palo Alto's system-owned GlobalProtect connection settings."""
+
+    configured = os.environ.get("O2_GLOBALPROTECT_SETTINGS_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path("/Library/Preferences/com.paloaltonetworks.GlobalProtect.settings.plist")
+
+
 @dataclass
 class O2Config:
     """Connection settings for HMS O2.
@@ -83,6 +92,11 @@ class O2Config:
         transfer_broker_dir: Separate private broker directory for commands that
             must execute on the O2 transfer host. Login and transfer grants and
             channels remain distinct even when aliases happen to match.
+        globalprotect_settings_file: System-owned Palo Alto settings used to
+            bind the routed tunnel address to GlobalProtect rather than trusting
+            any interface whose name happens to begin with ``utun``.
+        globalprotect_portal: Expected HMS portal recorded in the GlobalProtect
+            settings. A different or unreadable portal fails closed.
     """
 
     host_alias: str = field(default_factory=lambda: os.environ.get("O2_SSH_HOST_ALIAS", "o2"))
@@ -139,6 +153,10 @@ class O2Config:
         default_factory=lambda: float(os.environ.get("O2_BROKER_START_TIMEOUT_SECONDS", "90"))
     )
     transfer_broker_dir: Path = field(default_factory=_default_transfer_broker_dir)
+    globalprotect_settings_file: Path = field(default_factory=_default_globalprotect_settings_file)
+    globalprotect_portal: str = field(
+        default_factory=lambda: os.environ.get("O2_GLOBALPROTECT_PORTAL", "vpn.hms.harvard.edu")
+    )
 
     def __post_init__(self) -> None:
         """Normalize and validate process-independent local authority paths.
@@ -156,6 +174,11 @@ class O2Config:
                 "O2 policy path must be absolute; set O2_POLICY_FILE to one " "workstation-wide absolute path"
             )
         self.ssh_config_file = Path(self.ssh_config_file).expanduser()
+        self.globalprotect_settings_file = Path(self.globalprotect_settings_file).expanduser()
+        if not self.globalprotect_settings_file.is_absolute():
+            raise ValueError("GlobalProtect settings path must be absolute")
+        if not self.globalprotect_portal.strip():
+            raise ValueError("GlobalProtect portal must be a non-empty hostname")
         broker_dir = Path(self.broker_dir).expanduser()
         if not broker_dir.is_absolute():
             raise ValueError("O2 broker directory must be one workstation-wide absolute path")

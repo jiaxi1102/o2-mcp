@@ -105,17 +105,22 @@ when your SSH egresses through the HMS VPN (GlobalProtect), not your normal inte
 interface. If the VPN is down (or split-tunnel isn't routing O2's subnet), the one
 `o2_start_broker` login or transfer-host startup may Duo-push. To make accidental off-VPN launch impossible,
 `o2_start_broker` and the transfer-only `o2_start_master` **refuse to open a new
-login unless the route to the selected O2 host egresses via a VPN tunnel
-interface** (they check
-`route get` locally — no connection, no Duo). An explicitly approved grant may
-scope `allow_offvpn: true` to that one attempt. There is no durable environment
-bypass. Tune the expected interface prefix with `O2_VPN_IFACE_PREFIX` (default
-`utun`).
+login unless the route to the selected O2 host is specifically bound to HMS
+GlobalProtect**. The guard checks `route get` locally, reads the selected
+interface's live address, and requires that address to match a PanGPS-owned
+preferred tunnel IP for the configured HMS portal. This prevents an unrelated
+VPN's `utun*` interface from being mistaken for GlobalProtect; all checks are
+local (no connection, no Duo). An explicitly approved grant may scope
+`allow_offvpn: true` to that one attempt. There is no durable bypass. The
+defaults can be pointed at another managed HMS installation with
+`O2_GLOBALPROTECT_SETTINGS_FILE`, `O2_GLOBALPROTECT_PORTAL`, and
+`O2_VPN_IFACE_PREFIX`.
 
 The start tools default `auto_authorize_on_vpn` to `true`. If the requested
 broker/master is absent and the route is proven on-VPN, the tool records the
-standing authorization in the policy audit log, mints one `allow_offvpn=false`
-grant, consumes it for one start, and never retries. If routing is off-VPN or
+standing authorization in the policy audit log as `standing_on_vpn` (distinct
+from `explicit_user_approval`), mints one `allow_offvpn=false` grant, consumes
+it for one start, and never retries. If routing is off-VPN or
 indeterminate, it returns `error: off_vpn` before opening SSH; the agent must ask
 the user before separately issuing an `allow_offvpn=true` grant. This automatic
 connection permission does not authorize transfer, submission, cancellation,

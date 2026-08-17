@@ -20,8 +20,10 @@ tested offline without ever touching the network.
 from __future__ import annotations
 
 import glob
+import ipaddress
 import json
 import os
+import plistlib
 import select
 import shlex
 import subprocess
@@ -198,6 +200,7 @@ class O2Connection:
     # Bare caller spellings are accepted for compatibility but normalized to the
     # absolute binaries before execution; all other paths are rejected.
     SSH_EXECUTABLE = "/usr/bin/ssh"
+    IFCONFIG_EXECUTABLE = "/sbin/ifconfig"
     RSYNC_EXECUTABLE = "/usr/bin/rsync"
 
     # Rsync accepts short options in clusters, but these options consume an
@@ -755,11 +758,13 @@ class O2Connection:
             return None
 
     def _require_on_vpn(self, target: str) -> None:
-        """Refuse a new login that would leave via a non-VPN (physical) interface.
+        """Require target-specific proof of the configured HMS GlobalProtect tunnel.
 
-        O2 autopushes Duo to non-HMS source IPs. Unknown routing now fails closed:
-        the user may authorize the same one-shot login with ``allow_offvpn`` when
-        VPN routing is intentionally unavailable.
+        A ``utun`` name alone is insufficient because Tailscale and unrelated
+        VPN clients use the same macOS interface family. The route must use the
+        configured prefix, that interface must be live with an IP address, and
+        the same address must appear in PanGPS settings for the configured HMS
+        portal. Any unreadable, stale, or mismatched evidence fails closed.
         """
         iface = self._egress_interface(target)
         if iface is None or not iface.startswith(self.config.vpn_iface_prefix):
@@ -769,6 +774,72 @@ class O2Connection:
                 f"('{self.config.vpn_iface_prefix}*'). Connect GlobalProtect or issue a new one-shot login "
                 "grant with allow_offvpn=true after explicit user approval."
             )
+        interface_addresses = self._interface_addresses(iface)
+        portal, globalprotect_addresses = self._globalprotect_connection_evidence()
+        if portal != self.config.globalprotect_portal or interface_addresses.isdisjoint(globalprotect_addresses):
+            raise O2OffVpnError(
+                f"The local route for O2 target '{target}' uses '{iface}', but that interface could not be bound "
+                f"to the configured HMS GlobalProtect portal '{self.config.globalprotect_portal}'. Connect "
+                "GlobalProtect or issue a new one-shot login grant with allow_offvpn=true after explicit user approval."
+            )
+
+    def _interface_addresses(self, interface: str) -> set[str]:
+        """Return normalized IP addresses currently assigned to one interface."""
+
+        try:
+            result = self._runner(
+                [self.IFCONFIG_EXECUTABLE, interface],
+                self.config.connect_timeout,
+                None,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+        if not result.ok:
+            return set()
+        addresses: set[str] = set()
+        for line in result.stdout.splitlines():
+            fields = line.strip().split()
+            if len(fields) < 2 or fields[0] not in {"inet", "inet6"}:
+                continue
+            candidate = fields[1].split("%", 1)[0]
+            try:
+                addresses.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                # Malformed local interface output is indeterminate evidence,
+                # never a reason to weaken the route guard.
+                continue
+        return addresses
+
+    def _globalprotect_connection_evidence(self) -> tuple[str | None, set[str]]:
+        """Read the configured portal and PanGPS-owned tunnel IPs locally.
+
+        GlobalProtect keeps its active/preferred tunnel addresses in a
+        system-owned plist. Matching one of those addresses to the selected
+        route interface distinguishes HMS GlobalProtect from another ``utun``
+        provider without invoking a network command or trusting the GUI state.
+        """
+
+        try:
+            with self.config.globalprotect_settings_file.open("rb") as stream:
+                payload = plistlib.load(stream)
+            globalprotect = payload["Palo Alto Networks"]["GlobalProtect"]
+            portal = globalprotect["PanSetup"]["Portal"]
+            pangps = globalprotect["PanGPS"]
+        except (OSError, plistlib.InvalidFileException, KeyError, TypeError):
+            return None, set()
+        if not isinstance(portal, str) or not isinstance(pangps, dict):
+            return None, set()
+        addresses: set[str] = set()
+        for key, value in pangps.items():
+            if not isinstance(key, str) or not key.startswith(("PreferredIP_", "PreferredIPV6_")):
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                addresses.add(str(ipaddress.ip_address(value.strip())))
+            except ValueError:
+                continue
+        return portal.strip(), addresses
 
     def _authorize_single_on_vpn_attempt(self, logical_target: LoginTarget, target: str) -> str:
         """Mint one auditable start grant after local VPN route proof.
@@ -794,6 +865,7 @@ class O2Connection:
             target=logical_target,
             allow_offvpn=False,
             approval_reference=ON_VPN_AUTO_APPROVAL_REFERENCE,
+            authorization_method="standing_on_vpn",
         )
         return grant.id
 

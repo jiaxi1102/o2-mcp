@@ -9,6 +9,7 @@ default 3.9 test environment (install with ``pip install -e ".[dev,o2]"`` on a 3
 from __future__ import annotations
 
 import json
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -107,7 +108,20 @@ def _patch_connection(
         connect_timeout=20,
         policy_file=policy_file,
         ssh_config_file=ssh_config,
+        globalprotect_settings_file=tmp_path / "globalprotect-settings.plist",
     )
+    with cfg.globalprotect_settings_file.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Palo Alto Networks": {
+                    "GlobalProtect": {
+                        "PanSetup": {"Portal": "vpn.hms.harvard.edu"},
+                        "PanGPS": {"PreferredIP_test": "10.116.16.225"},
+                    }
+                }
+            },
+            stream,
+        )
     runner = FakeRunner(master=master, responder=responder, start_persists=start_persists)
     connection = O2Connection(cfg, runner=runner)
     runner.connection = connection
@@ -415,6 +429,8 @@ async def test_transfer_master_auto_authorizes_only_on_proven_vpn(monkeypatch, t
     def on_vpn(argv, _input_text):
         if argv[:2] == ["route", "get"]:
             return ("interface: utun6\n", "", 0)
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return ("inet 10.116.16.225 netmask 0xffffffff\n", "", 0)
         return ("", "", 0)
 
     runner = _patch_connection(monkeypatch, tmp_path, master=False, responder=on_vpn)

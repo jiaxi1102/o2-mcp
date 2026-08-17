@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import plistlib
 import shlex
 import shutil
 import signal
@@ -1470,10 +1471,23 @@ def test_authorized_launcher_starts_one_detached_broker_and_reuses_it(tmp_path, 
         transfer_broker_dir=broker_root if transfer else tmp_path / "unused-transfer-broker",
         ssh_config_file=tmp_path / "ssh_config",
         broker_start_timeout=5,
+        globalprotect_settings_file=tmp_path / "globalprotect-settings.plist",
     )
     config.ssh_config_file.write_text(
         "Host o2\n  HostName example.invalid\nHost o2-transfer\n  HostName transfer.example.invalid\n"
     )
+    with config.globalprotect_settings_file.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Palo Alto Networks": {
+                    "GlobalProtect": {
+                        "PanSetup": {"Portal": "vpn.hms.harvard.edu"},
+                        "PanGPS": {"PreferredIP_test": "10.116.16.225"},
+                    }
+                }
+            },
+            stream,
+        )
     client = BrokerClient(broker_root)
     connection_kwargs = {"transfer_broker_client": client} if transfer else {"broker_client": client}
     connection = O2Connection(config, policy=policy, **connection_kwargs)
@@ -1522,10 +1536,23 @@ def test_on_vpn_launcher_auto_authorizes_exactly_one_broker(tmp_path, broker_roo
         transfer_broker_dir=broker_root if transfer else tmp_path / "unused-transfer-broker",
         ssh_config_file=tmp_path / "ssh_config",
         broker_start_timeout=5,
+        globalprotect_settings_file=tmp_path / "globalprotect-settings.plist",
     )
     config.ssh_config_file.write_text(
         "Host o2\n  HostName example.invalid\nHost o2-transfer\n  HostName transfer.example.invalid\n"
     )
+    with config.globalprotect_settings_file.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Palo Alto Networks": {
+                    "GlobalProtect": {
+                        "PanSetup": {"Portal": "vpn.hms.harvard.edu"},
+                        "PanGPS": {"PreferredIP_test": "10.116.16.225"},
+                    }
+                }
+            },
+            stream,
+        )
 
     def vpn_route_runner(argv, _timeout, _input_text):
         """Resolve the safe SSH config and answer the local VPN route proof."""
@@ -1540,6 +1567,8 @@ def test_on_vpn_launcher_auto_authorizes_exactly_one_broker(tmp_path, broker_roo
             )
         if argv[:2] == ["route", "get"]:
             return CommandResult(list(argv), 0, "interface: utun6\n", "")
+        if argv[:1] == [O2Connection.IFCONFIG_EXECUTABLE]:
+            return CommandResult(list(argv), 0, "inet 10.116.16.225 netmask 0xffffffff\n", "")
         raise AssertionError(f"unexpected subprocess in offline broker test: {argv}")
 
     client = BrokerClient(broker_root)
