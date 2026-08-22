@@ -76,13 +76,13 @@ def _plan(*, stages: tuple[StageSpec, ...] | None = None) -> ExecutionPlan:
             tasks=(
                 TaskSpec(
                     task_id="movie-0002",
-                    array_index=2,
+                    array_index=1,
                     command=_command("/usr/bin/python3", "-m", "example.analyze", "--task", "movie-0002"),
                     expected_receipts=(_receipt("analyze", "movie-0002"),),
                 ),
                 TaskSpec(
                     task_id="movie-0001",
-                    array_index=1,
+                    array_index=0,
                     command=_command("/usr/bin/python3", "-m", "example.analyze", "--task", "movie-0001"),
                     expected_receipts=(_receipt("analyze", "movie-0001"),),
                 ),
@@ -306,12 +306,12 @@ def test_array_tasks_bind_indices_and_exact_commands() -> None:
     analyze = next(stage for stage in plan.stages if stage.stage_id == "analyze")
     assert analyze.command is None
     assert [(task.array_index, task.task_id) for task in analyze.tasks] == [
-        (1, "movie-0001"),
-        (2, "movie-0002"),
+        (0, "movie-0001"),
+        (1, "movie-0002"),
     ]
     assert analyze.tasks[0].command.argv[-1] == "movie-0001"
 
-    duplicate_index = replace(analyze.tasks[1], array_index=1)
+    duplicate_index = replace(analyze.tasks[1], array_index=0)
     with pytest.raises(ValueError, match="array indices"):
         replace(analyze, tasks=(analyze.tasks[0], duplicate_index))
 
@@ -441,6 +441,29 @@ def test_malformed_paths_and_resources_fail_before_submission() -> None:
 
     with pytest.raises(ValueError, match="between 1 and 255"):
         RetryPolicy(max_attempts=2, retryable_exit_codes=(0,))
+
+
+def test_specialized_slurm_resources_are_preserved_without_raw_overrides() -> None:
+    """GPU model, constraints, exclusions, and licenses remain part of the plan SHA."""
+
+    resources = ResourceSpec(
+        partition="gpu",
+        cpus=4,
+        memory_mb=16384,
+        time_limit="01:00:00",
+        gpus=1,
+        gpu_type="l40s",
+        constraint="avx2&localdisk",
+        exclude_nodes=("compute-g-02", "compute-g-01"),
+        licenses=("gurobi:1",),
+    )
+    restored = ResourceSpec.from_dict(resources.to_dict())
+    assert restored == resources
+    assert restored.exclude_nodes == ("compute-g-01", "compute-g-02")
+    assert restored.to_dict()["gpu_type"] == "l40s"
+
+    with pytest.raises(ValueError, match="gpu_type requires"):
+        replace(resources, gpus=0)
 
 
 def test_run_identity_and_command_context_are_bound_to_canonical_paths() -> None:

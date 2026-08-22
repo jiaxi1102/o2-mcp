@@ -28,6 +28,8 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _TIME_LIMIT_RE = re.compile(r"^(?:\d+-)?\d{1,2}:\d{2}:\d{2}$")
+_CONSTRAINT_RE = re.compile(r"^[A-Za-z0-9._&|!*+()\[\]-]+$")
+_LICENSE_RE = re.compile(r"^[A-Za-z0-9._-]+:[1-9][0-9]*$")
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -311,13 +313,19 @@ class ResourceSpec:
     memory_mb: int
     time_limit: str
     gpus: int = 0
+    gpu_type: str | None = None
     array_parallelism: int = 1
     account: str | None = None
     qos: str | None = None
+    constraint: str | None = None
+    exclude_nodes: tuple[str, ...] = ()
+    licenses: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Bound resources so malformed plans fail before Slurm submission."""
 
+        if not isinstance(self.exclude_nodes, tuple) or not isinstance(self.licenses, tuple):
+            raise ValueError("exclude_nodes and licenses must be immutable tuples")
         for field_name in ("cpus", "memory_mb", "gpus", "array_parallelism"):
             if isinstance(getattr(self, field_name), bool) or not isinstance(getattr(self, field_name), int):
                 raise ValueError(f"{field_name} must be an integer")
@@ -341,12 +349,31 @@ class ResourceSpec:
             raise ValueError("time_limit must be positive and no longer than 14 days")
         if not 0 <= self.gpus <= 64:
             raise ValueError("gpus must be between 0 and 64")
+        if self.gpu_type is not None:
+            _validate_identifier(self.gpu_type, "gpu_type")
+            if self.gpus == 0:
+                raise ValueError("gpu_type requires a positive GPU count")
         if not 1 <= self.array_parallelism <= 10000:
             raise ValueError("array_parallelism must be between 1 and 10000")
         for field_name in ("account", "qos"):
             value = getattr(self, field_name)
             if value is not None:
                 _validate_identifier(value, field_name)
+        if self.constraint is not None and (
+            not isinstance(self.constraint, str) or not _CONSTRAINT_RE.fullmatch(self.constraint)
+        ):
+            raise ValueError("constraint contains unsupported Slurm feature-expression characters")
+        for node in self.exclude_nodes:
+            _validate_identifier(node, "exclude_nodes[]")
+        for license_spec in self.licenses:
+            if not isinstance(license_spec, str) or not _LICENSE_RE.fullmatch(license_spec):
+                raise ValueError("licenses entries must use NAME:POSITIVE_COUNT syntax")
+        if len(set(self.exclude_nodes)) != len(self.exclude_nodes):
+            raise ValueError("exclude_nodes cannot contain duplicates")
+        if len({item.split(":", 1)[0] for item in self.licenses}) != len(self.licenses):
+            raise ValueError("license names cannot contain duplicates")
+        object.__setattr__(self, "exclude_nodes", tuple(sorted(self.exclude_nodes)))
+        object.__setattr__(self, "licenses", tuple(sorted(self.licenses)))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation used by the plan digest."""
@@ -354,7 +381,10 @@ class ResourceSpec:
         data: dict[str, Any] = {
             "array_parallelism": self.array_parallelism,
             "cpus": self.cpus,
+            "exclude_nodes": sorted(self.exclude_nodes),
             "gpus": self.gpus,
+            "gpu_type": self.gpu_type,
+            "licenses": sorted(self.licenses),
             "memory_mb": self.memory_mb,
             "partition": self.partition,
             "time_limit": self.time_limit,
@@ -363,6 +393,8 @@ class ResourceSpec:
             data["account"] = self.account
         if self.qos is not None:
             data["qos"] = self.qos
+        if self.constraint is not None:
+            data["constraint"] = self.constraint
         return data
 
     @classmethod
@@ -378,21 +410,35 @@ class ResourceSpec:
                 "memory_mb",
                 "time_limit",
                 "gpus",
+                "gpu_type",
                 "array_parallelism",
                 "account",
                 "qos",
+                "constraint",
+                "exclude_nodes",
+                "licenses",
             },
             "resources",
         )
+        exclude_nodes = _require_sequence(data.get("exclude_nodes", []), "resources.exclude_nodes")
+        licenses = _require_sequence(data.get("licenses", []), "resources.licenses")
         return cls(
             partition=_require_str(data.get("partition"), "resources.partition"),
             cpus=_require_int(data.get("cpus"), "resources.cpus"),
             memory_mb=_require_int(data.get("memory_mb"), "resources.memory_mb"),
             time_limit=_require_str(data.get("time_limit"), "resources.time_limit"),
             gpus=_require_int(data.get("gpus", 0), "resources.gpus"),
+            gpu_type=(
+                _require_str(data["gpu_type"], "resources.gpu_type") if data.get("gpu_type") is not None else None
+            ),
             array_parallelism=_require_int(data.get("array_parallelism", 1), "resources.array_parallelism"),
             account=(_require_str(data["account"], "resources.account") if data.get("account") is not None else None),
             qos=(_require_str(data["qos"], "resources.qos") if data.get("qos") is not None else None),
+            constraint=(
+                _require_str(data["constraint"], "resources.constraint") if data.get("constraint") is not None else None
+            ),
+            exclude_nodes=tuple(_require_str(item, "resources.exclude_nodes[]") for item in exclude_nodes),
+            licenses=tuple(_require_str(item, "resources.licenses[]") for item in licenses),
         )
 
 

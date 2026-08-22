@@ -207,7 +207,8 @@ plan binds:
 - absolute executables and working directories plus authenticated runtime
   fingerprints and a clean environment containing only explicit non-secret
   values;
-- bounded Slurm resources and retry policies; and
+- bounded structured Slurm resources (including GPU model, constraints,
+  exclusions, and licenses) and retry policies; and
 - every stage- and task-level receipt expected below the run's canonical receipt
   tree.
 

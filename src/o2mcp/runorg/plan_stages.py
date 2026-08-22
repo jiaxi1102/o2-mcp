@@ -122,8 +122,8 @@ class TaskSpec:
             raise ValueError("task expected_receipts must be an immutable tuple")
         if any(type(receipt) is not ReceiptSpec for receipt in self.expected_receipts):
             raise ValueError("task expected_receipts entries must be ReceiptSpec objects")
-        if isinstance(self.array_index, bool) or not isinstance(self.array_index, int) or self.array_index < 1:
-            raise ValueError("task array_index must be a positive integer")
+        if isinstance(self.array_index, bool) or not isinstance(self.array_index, int) or self.array_index < 0:
+            raise ValueError("task array_index must be a nonnegative integer")
         if type(self.command) is not CommandSpec:
             raise ValueError("task command must be a CommandSpec")
         _validate_identifier(self.task_id, "task_id")
