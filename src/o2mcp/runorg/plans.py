@@ -145,6 +145,11 @@ class ExecutionPlan:
             absolute = posixpath.join(self.paths.run_root, receipt.path)
             if not _is_within(absolute, self.paths.receipts_root):
                 raise ValueError(f"{owner} receipt {receipt.path!r} must resolve inside paths.receipts_root")
+            engine_receipts = posixpath.join(self.paths.receipts_root, "execution")
+            if absolute == engine_receipts or _is_within(absolute, engine_receipts):
+                raise ValueError(
+                    f"{owner} receipt {receipt.path!r} overlaps the reserved execution-engine receipt namespace"
+                )
             previous = seen_paths.get(receipt.path)
             if previous is not None:
                 raise ValueError(f"receipt path {receipt.path!r} is shared by {previous} and {owner}")

@@ -19,6 +19,7 @@ No torch/cellpose/network imports — importable on the CPU-only core path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
@@ -49,7 +50,7 @@ REQUIRED_FOR_REGISTER = ("campaign", "pipeline", "datasets")
 
 # Marker word-lists, view-suffixes and the heavy-suffix threshold are project-specific
 # and come from a RunPolicy (see o2mcp.runorg.policy); the generic engine holds none.
-_RUN_ID_RE = re.compile(r"^RUN_(?P<ts>\d{8}T\d{0,6}Z?)_(?P<slug>.+)$")
+_RUN_ID_RE = re.compile(r"^RUN_(?P<ts>\d{8}T\d{6}Z)_(?P<slug>.+)$")
 
 
 # --- layout ------------------------------------------------------------------
@@ -96,7 +97,10 @@ class RunLayout:
 def _safe(component: str) -> str:
     """A filesystem-safe path component (campaigns become kebab-ish slugs)."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(component).strip()).strip("-")
-    return cleaned or "uncategorized"
+    # A literal dot component survives the character filter but still has path
+    # traversal semantics.  Treat it as absent rather than letting a campaign
+    # escape the configured storage root (issue #3).
+    return cleaned if cleaned and cleaned not in {".", ".."} else "uncategorized"
 
 
 def sort_job_ids(ids: Iterable[str]) -> list[str]:
@@ -132,6 +136,11 @@ class RunManifest:
     provenance: dict[str, Any] = field(default_factory=dict)
     tombstone: dict[str, Any] | None = None
     schema_version: int = SCHEMA_VERSION
+    # Forward-compatible fields are preserved verbatim when an older o2-mcp
+    # rewrites run.json during execution reconciliation.  They are deliberately
+    # excluded from the dataclass's normal field namespace and merged by
+    # :meth:`to_dict` so a future schema cannot be silently truncated.
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def validate(self, *, for_register: bool = False) -> list[str]:
         """Return a list of human-readable problems (empty == valid)."""
@@ -149,8 +158,21 @@ class RunManifest:
                 problems.append("at least one dataset is required")
         return problems
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a lossless manifest mapping, including unknown input fields."""
+
+        data = asdict(self)
+        extra = data.pop("extra")
+        conflicts = sorted(set(extra) & set(data))
+        if conflicts:
+            raise ValueError(f"manifest extra fields conflict with known fields: {conflicts}")
+        data.update(extra)
+        return data
+
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True)
+        """Serialize the lossless manifest in a stable, review-friendly form."""
+
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> RunManifest:
@@ -159,8 +181,10 @@ class RunManifest:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RunManifest:
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in known})
+        known = {f for f in cls.__dataclass_fields__ if f != "extra"}  # type: ignore[attr-defined]
+        values = {k: v for k, v in data.items() if k in known}
+        values["extra"] = {k: v for k, v in data.items() if k not in known and k != "extra"}
+        return cls(**values)
 
     def registry_row(self) -> dict[str, Any]:
         """The compact one-line summary stored in the registry JSONL."""
@@ -371,13 +395,24 @@ def parse_registry(text: str) -> list[dict[str, Any]]:
 
 # --- command planners (pure: build shell, never execute) ---------------------
 def plan_register_commands(layout: RunLayout, manifest: RunManifest, run_subdirs: Sequence[str] = ()) -> list[str]:
-    """Commands to create an active run dir (+ optional project subdirs) and drop ``run.json``."""
+    """Create one run directory exclusively, then seed its ``run.json``.
+
+    The run root itself uses plain ``mkdir`` rather than ``mkdir -p``.  A run ID
+    is an execution identity, so reusing an existing directory must fail instead
+    of overwriting its manifest and mixing two submissions.
+    """
+
     run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
     quoted = shlex.quote(run_dir)
-    targets = " ".join([quoted, *(shlex.quote(posixpath.join(run_dir, d)) for d in run_subdirs)])
+    parent = shlex.quote(posixpath.dirname(run_dir))
+    subdirs = " ".join(shlex.quote(posixpath.join(run_dir, d)) for d in run_subdirs)
     manifest_path = shlex.quote(posixpath.join(run_dir, "run.json"))
     heredoc = _heredoc(manifest.to_json())
-    return [f"mkdir -p {targets}", f"cat > {manifest_path} {heredoc}", f"printf '%s\\n' {quoted}"]
+    commands = [f"mkdir -p {parent} && mkdir {quoted}"]
+    if subdirs:
+        commands.append(f"mkdir -p {subdirs}")
+    commands.extend([f"cat > {manifest_path} {heredoc}", f"printf '%s\\n' {quoted}"])
+    return commands
 
 
 def plan_write_manifest_command(run_dir: str, manifest: RunManifest) -> str:
@@ -398,6 +433,8 @@ def plan_promote_script(layout: RunLayout, manifest: RunManifest, *, source_dir:
     with a second ``rsync -ni`` (must report no differences) before deleting source.
     """
     dest = layout.run_dir(STATUS_KEPT, manifest.campaign, manifest.run_id)
+    if posixpath.normpath(source_dir) == posixpath.normpath(dest):
+        raise ValueError("promotion source and durable destination must be different paths")
     kept = _with_status(manifest, STATUS_KEPT)
     return _render_transfer_script(
         title=f"promote {manifest.run_id} -> group (kept)",
@@ -427,21 +464,53 @@ def plan_archive_script(
     tarball = layout.archive_tarball(manifest.campaign, manifest.run_id)
     manifest_dest = layout.archive_manifest(manifest.campaign, manifest.run_id)
     checksum = layout.archive_checksum(manifest.campaign, manifest.run_id)
+    archive_parent = posixpath.dirname(tarball)
+    staging_template = posixpath.join(archive_parent, "." + manifest.run_id + ".archive.XXXXXX")
     parent = posixpath.dirname(source_dir.rstrip("/"))
     base = posixpath.basename(source_dir.rstrip("/"))
-    exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in archive_excludes)
+    exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in (*archive_excludes, ".execution-source.lock"))
+    manifest_json = archived.to_json()
     return "\n".join(
         [
             "#!/bin/bash",
             f"# archive {manifest.run_id} -> standby (cold, tar.zst)",
             "set -euo pipefail",
-            f"mkdir -p {shlex.quote(posixpath.dirname(tarball))}",
-            f"cat > {shlex.quote(manifest_dest)} {_heredoc(archived.to_json())}",
+            f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
+            "flock -x 8",
+            _source_snapshot_assignment(source_dir, "source_baseline_sha"),
+            f"mkdir -p {shlex.quote(archive_parent)}",
+            f"exec 9> {shlex.quote(posixpath.join(archive_parent, '.' + manifest.run_id + '.archive.lock'))}",
+            "flock -x 9",
+            # The manifest is the publication commit marker and is moved last.
+            # A previous complete or partial archive is never overwritten.  A
+            # partial package requires explicit inspection/cleanup, while the
+            # source remains intact because deletion happens only after commit.
+            f"if test -e {shlex.quote(manifest_dest)} || test -e {shlex.quote(tarball)} || "
+            f"test -e {shlex.quote(checksum)}; then echo 'archive destination already exists' >&2; exit 76; fi",
+            f"staging=$(mktemp -d {shlex.quote(staging_template)})",
+            "trap 'rm -rf -- \"$staging\"' EXIT",
             f"tar {exclude} --use-compress-program='zstd -19 --long=27 -T0' "
-            f"-cf {shlex.quote(tarball)} -C {shlex.quote(parent)} {shlex.quote(base)}",
-            f"sha256sum {shlex.quote(tarball)} > {shlex.quote(checksum)}",
-            f"test -s {shlex.quote(tarball)}",
-            f"zstd -t {shlex.quote(tarball)}",  # integrity-test the archive before deleting source
+            f'-cf "$staging/archive.tar.zst" -C {shlex.quote(parent)} {shlex.quote(base)}',
+            "archive_sha=$(sha256sum \"$staging/archive.tar.zst\" | cut -d' ' -f1)",
+            f'printf \'%s  %s\\n\' "$archive_sha" {shlex.quote(tarball)} > "$staging/archive.sha256"',
+            'test -s "$staging/archive.tar.zst"',
+            'zstd -t "$staging/archive.tar.zst"',
+            f'cat > "$staging/run.json" {_heredoc(manifest_json)}',
+            # Publish data first and the small manifest last.  Consumers must
+            # treat the manifest as the commit marker for the three-file package.
+            f'mv --no-clobber -- "$staging/archive.tar.zst" {shlex.quote(tarball)}',
+            'test ! -e "$staging/archive.tar.zst"',
+            f'mv --no-clobber -- "$staging/archive.sha256" {shlex.quote(checksum)}',
+            'test ! -e "$staging/archive.sha256"',
+            f'mv --no-clobber -- "$staging/run.json" {shlex.quote(manifest_dest)}',
+            'test ! -e "$staging/run.json"',
+            'rmdir -- "$staging"',
+            "trap - EXIT",
+            f"test \"$(sha256sum {shlex.quote(manifest_dest)} | cut -d' ' -f1)\" = "
+            f"{shlex.quote(hashlib.sha256((manifest_json + chr(10)).encode()).hexdigest())}",
+            _source_snapshot_assignment(source_dir, "source_final_sha"),
+            'if test "$source_final_sha" != "$source_baseline_sha"; then '
+            "echo 'source changed during archive; refusing deletion' >&2; exit 77; fi",
             f"echo ARCHIVED {shlex.quote(tarball)}",
             f"rm -rf {shlex.quote(source_dir.rstrip('/'))}",
             "echo FREED_SCRATCH",
@@ -460,7 +529,7 @@ def plan_gc_candidates_command(layout: RunLayout, *, older_than_days: int) -> st
 
 # --- helpers -----------------------------------------------------------------
 def _with_status(manifest: RunManifest, status: str) -> RunManifest:
-    clone = RunManifest.from_dict(asdict(manifest))
+    clone = RunManifest.from_dict(manifest.to_dict())
     clone.status = status
     return clone
 
@@ -480,23 +549,98 @@ def _render_transfer_script(
     excludes: Sequence[str],
     free_source: bool,
 ) -> str:
+    if posixpath.normpath(source_dir) == posixpath.normpath(dest_dir):
+        raise ValueError("transfer source and destination must be different paths")
     src_slash = shlex.quote(source_dir.rstrip("/") + "/")
-    dest_slash = shlex.quote(dest_dir.rstrip("/") + "/")
-    exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in excludes if e)
-    rsync = f"rsync -a {exclude} {src_slash} {dest_slash}".replace("   ", " ")
-    verify = f"rsync -ni -a {exclude} {src_slash} {dest_slash}".replace("   ", " ")
-    manifest_path = shlex.quote(posixpath.join(dest_dir, manifest_rel))
+    dest_parent = posixpath.dirname(dest_dir)
+    effective_excludes = tuple(item for item in excludes if item) + (".execution-source.lock",)
+    exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in effective_excludes)
+    rsync = f'rsync -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")
+    verify_forward = f'rsync -nric --delete -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")
+    verify_reverse = f'rsync -nric --delete -a {exclude} "$staging/" {src_slash}'.replace("   ", " ")
+    # ``_heredoc`` terminates the final JSON line with LF; authenticate the
+    # actual published bytes rather than the pre-heredoc Python string.
+    manifest_sha = hashlib.sha256((manifest_json + "\n").encode()).hexdigest()
+    staging_template = posixpath.join(
+        dest_parent,
+        "." + posixpath.basename(dest_dir) + ".promote.XXXXXX",
+    )
     lines = [
         "#!/bin/bash",
         f"# {title}",
         "set -euo pipefail",
-        f"mkdir -p {shlex.quote(dest_dir)}",
+        f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
+        "flock -x 8",
+        _source_snapshot_assignment(source_dir, "source_baseline_sha"),
+        f"mkdir -p {shlex.quote(dest_parent)}",
+        f"exec 9> {shlex.quote(posixpath.join(dest_parent, '.' + posixpath.basename(dest_dir) + '.promote.lock'))}",
+        "flock -x 9",
+        # Never merge into an old or partial durable tree.  A sibling staging
+        # directory is verified exactly and then renamed into an absent final path.
+        f"if test -e {shlex.quote(dest_dir)}; then echo 'durable destination already exists' >&2; exit 76; fi",
+        f"staging=$(mktemp -d {shlex.quote(staging_template)})",
+        "trap 'rm -rf -- \"$staging\"' EXIT",
         rsync,
-        f"cat > {manifest_path} {_heredoc(manifest_json)}",
-        # verify: a dry-run itemize must show nothing left to transfer
-        f"test -z \"$({verify} | grep -v '^$' || true)\"",
+        "verify_output=$(mktemp)",
+        'trap \'rm -f "$verify_output"; rm -rf -- "$staging"\' EXIT',
+        # Verify both directions so destination-only residue is impossible.  The
+        # lifecycle manifest is changed only after the copied active tree passes.
+        f'if ! {verify_forward} >"$verify_output"; then cat "$verify_output" >&2; exit 74; fi',
+        'if test -s "$verify_output"; then cat "$verify_output" >&2; exit 75; fi',
+        f'if ! {verify_reverse} >"$verify_output"; then cat "$verify_output" >&2; exit 74; fi',
+        'if test -s "$verify_output"; then cat "$verify_output" >&2; exit 75; fi',
+        'rm -f "$verify_output"',
+        f'cat > "$staging/{manifest_rel}" {_heredoc(manifest_json)}',
+        f'test "$(sha256sum "$staging/{manifest_rel}" | cut -d\' \' -f1)" = {shlex.quote(manifest_sha)}',
+        f'mv --no-clobber -T -- "$staging" {shlex.quote(dest_dir)}',
+        'test ! -e "$staging"',
+        "trap - EXIT",
+        _source_snapshot_assignment(source_dir, "source_final_sha"),
+        'if test "$source_final_sha" != "$source_baseline_sha"; then '
+        "echo 'source changed during promotion; refusing deletion' >&2; exit 77; fi",
         f"echo COPIED {shlex.quote(dest_dir)}",
     ]
     if free_source:
         lines += [f"rm -rf {shlex.quote(source_dir.rstrip('/'))}", "echo FREED_SCRATCH"]
     return "\n".join(lines)
+
+
+def _source_snapshot_assignment(source_dir: str, variable: str) -> str:
+    """Render a deterministic source-tree digest used before destructive cleanup.
+
+    The lifecycle lock itself is excluded because opening it is coordination,
+    not scientific data.  The dependency-free Python walker hashes relative
+    names, modes, types, symlink targets, and regular-file bytes without relying
+    on platform-specific GNU tar flags.
+    """
+
+    program = "\n".join(
+        [
+            "import hashlib, os, stat, sys",
+            "root = os.path.abspath(sys.argv[1])",
+            "digest = hashlib.sha256()",
+            "def visit(path, relative):",
+            "    info = os.lstat(path)",
+            "    mode = info.st_mode",
+            "    digest.update(relative.encode('utf-8') + b'\\0' + str(stat.S_IMODE(mode)).encode() + b'\\0')",
+            "    if stat.S_ISDIR(mode):",
+            "        digest.update(b'd\\0')",
+            "        for name in sorted(os.listdir(path)):",
+            "            if relative == '.' and name == '.execution-source.lock':",
+            "                continue",
+            "            child_relative = name if relative == '.' else relative + '/' + name",
+            "            visit(os.path.join(path, name), child_relative)",
+            "    elif stat.S_ISREG(mode):",
+            "        digest.update(b'f\\0')",
+            "        with open(path, 'rb') as handle:",
+            "            for chunk in iter(lambda: handle.read(1024 * 1024), b''):",
+            "                digest.update(chunk)",
+            "    elif stat.S_ISLNK(mode):",
+            "        digest.update(b'l\\0' + os.readlink(path).encode('utf-8') + b'\\0')",
+            "    else:",
+            "        raise SystemExit('unsupported special file in transition source: ' + relative)",
+            "visit(root, '.')",
+            "print(digest.hexdigest())",
+        ]
+    )
+    return f"{variable}=$(python3 -c {shlex.quote(program)} {shlex.quote(source_dir.rstrip('/'))})"

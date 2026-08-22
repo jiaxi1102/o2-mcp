@@ -1,0 +1,776 @@
+"""Adversarial regressions for execution ownership and state reconciliation.
+
+These tests deliberately force interleavings and out-of-order observations that
+ordinary happy-path fakes cannot produce.  The assertions encode the safety
+properties needed when multiple agents, delayed Slurm accounting, and registry
+repair all act on the same immutable execution plan.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import posixpath
+import shutil
+import subprocess
+import threading
+from collections import deque
+from types import SimpleNamespace
+
+import pytest
+
+from o2mcp.runorg import (
+    CanonicalPaths,
+    CommandSpec,
+    DatasetIdentity,
+    ExecutionEngine,
+    ExecutionPlan,
+    ReceiptObservation,
+    ReceiptSpec,
+    ResourceSpec,
+    RetryPolicy,
+    RunManifest,
+    SlurmJob,
+    SlurmTaskState,
+    StageSpec,
+    SubmissionRejected,
+    SubmissionRequest,
+    SubmissionUncertain,
+    SubmitOutcome,
+    TaskSpec,
+)
+from o2mcp.runorg.execution_models import PlannedTask, RegistryUpdate
+from o2mcp.runorg.execution_paths import reconciliation_path, task_attempt_path
+from o2mcp.runorg.execution_rendering import render_dispatcher
+from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
+
+CAMPAIGN = "adversarial-execution"
+RUN_ID = f"RUN_20260822T010203Z_{CAMPAIGN}__race"
+RUN_ROOT = f"/n/scratch/users/test/runs/{CAMPAIGN}/{RUN_ID}"
+
+
+class ConcurrentBackend:
+    """Thread-safe in-memory backend with controllable scheduler outcomes.
+
+    ``intent_barrier`` is applied only to submission-intent publication.  It
+    forces two callers through all prior reads before either caller can perform
+    the atomic create, reproducing the exact lost-response race that motivated
+    the creator-versus-observer return value.
+    """
+
+    def __init__(self, *, intent_barrier: threading.Barrier | None = None) -> None:
+        self.files: dict[str, str] = {}
+        self.jobs: dict[str, dict[str, object]] = {}
+        self.requests: list[SubmissionRequest] = []
+        self.outcomes: deque[SubmitOutcome] = deque()
+        self.next_job_id = 9000
+        self.intent_barrier = intent_barrier
+        self._lock = threading.RLock()
+
+    def find_jobs(self, comment: str):
+        """Return an atomic snapshot of jobs with one exact comment."""
+
+        with self._lock:
+            return tuple(
+                SlurmJob(job_id, comment, str(data["state"]))
+                for job_id, data in self.jobs.items()
+                if data["comment"] == comment
+            )
+
+    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
+        """Record a scheduler call and materialize a job only when accepted."""
+
+        with self._lock:
+            self.requests.append(request)
+            outcome = self.outcomes.popleft() if self.outcomes else SubmitOutcome(None, accepted=True)
+            if not outcome.accepted:
+                return outcome
+            job_id = outcome.job_id or str(self.next_job_id)
+            self.next_job_id = max(self.next_job_id + 1, int(job_id) + 1)
+            self.jobs[job_id] = {
+                "comment": request.comment,
+                "state": "PENDING",
+                "task_states": (SlurmTaskState(None, "PENDING", None),),
+            }
+            return SubmitOutcome(
+                job_id if outcome.response_received else None,
+                accepted=True,
+                response_received=outcome.response_received,
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            )
+
+    def task_states(self, job_id: str):
+        """Return a stable accounting snapshot for one fake job."""
+
+        with self._lock:
+            return tuple(self.jobs[job_id]["task_states"])
+
+    def set_states(self, job_id: str, *states: SlurmTaskState) -> None:
+        """Replace fake accounting state while preserving the job identity."""
+
+        with self._lock:
+            self.jobs[job_id]["task_states"] = tuple(states)
+            root = next((state for state in states if state.array_index is None), None)
+            if root is not None:
+                self.jobs[job_id]["state"] = root.state
+
+    def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
+        """Observe exact in-memory pipeline bytes under ``run_root``."""
+
+        path = posixpath.join(run_root, receipt.path)
+        with self._lock:
+            text = self.files.get(path)
+        digest = hashlib.sha256(text.encode()).hexdigest() if text is not None else None
+        return ReceiptObservation(receipt.path, text is not None, digest)
+
+    def put_receipt(self, receipt: ReceiptSpec, text: str = "ok\n") -> None:
+        """Create a pipeline-owned receipt for a reconciliation test."""
+
+        with self._lock:
+            self.files[posixpath.join(RUN_ROOT, receipt.path)] = text
+
+    def read_text(self, path: str) -> str | None:
+        """Read one file atomically from the fake filesystem."""
+
+        with self._lock:
+            return self.files.get(path)
+
+    def write_immutable_text(self, path: str, text: str) -> bool:
+        """Atomically publish complete bytes and return exclusive ownership."""
+
+        if self.intent_barrier is not None and "/submission-intents/" in path:
+            self.intent_barrier.wait(timeout=5)
+        with self._lock:
+            if path in self.files:
+                if self.files[path] != text:
+                    raise RuntimeError(f"immutable conflict: {path}")
+                return False
+            self.files[path] = text
+            return True
+
+    def write_mutable_text(self, path: str, text: str) -> None:
+        """Replace non-evidence current state under the same fake lock."""
+
+        with self._lock:
+            self.files[path] = text
+
+    def compare_and_swap_text(self, path: str, expected: str | None, replacement: str | None) -> bool:
+        """Atomically update one fake outbox item only from exact current bytes."""
+
+        with self._lock:
+            current = self.files.get(path)
+            if current != expected or (path not in self.files and expected is not None):
+                return False
+            if replacement is None:
+                self.files.pop(path, None)
+            else:
+                self.files[path] = replacement
+            return True
+
+
+def _receipt(task_id: str, *, stage: str = "compute") -> ReceiptSpec:
+    """Return a pipeline receipt outside the engine-reserved namespace."""
+
+    return ReceiptSpec(f"receipt-{stage}-{task_id}", f"receipts/stages/{stage}/{task_id}.json")
+
+
+def _command(name: str) -> CommandSpec:
+    """Build one deterministic fake scientific command."""
+
+    return CommandSpec(
+        argv=("/usr/bin/python3", "-m", "canary.worker", "--task", name),
+        working_directory=f"{RUN_ROOT}/work",
+        runtime_fingerprint_sha256="e" * 64,
+        environment=("LC_ALL=C",),
+    )
+
+
+def _resources(parallelism: int = 3) -> ResourceSpec:
+    """Return conservative typed resources for the fake requests."""
+
+    return ResourceSpec(
+        partition="short",
+        cpus=2,
+        memory_mb=4096,
+        time_limit="00:10:00",
+        array_parallelism=parallelism,
+    )
+
+
+def _compute_stage(*, max_attempts: int = 2) -> StageSpec:
+    """Build a three-movie array with stable zero-based indices."""
+
+    tasks = tuple(
+        TaskSpec(
+            task_id=f"movie-{index}",
+            array_index=index,
+            command=_command(f"movie-{index}"),
+            expected_receipts=(_receipt(f"movie-{index}"),),
+        )
+        for index in range(3)
+    )
+    return StageSpec(
+        stage_id="compute",
+        resources=_resources(),
+        expected_receipts=(),
+        tasks=tasks,
+        retry_policy=RetryPolicy(
+            max_attempts=max_attempts,
+            retryable_slurm_states=("NODE_FAIL",),
+            retry_missing_receipts=True,
+        ),
+    )
+
+
+def _plan(*, stages: tuple[StageSpec, ...] | None = None, source_commit: str = "a" * 40) -> ExecutionPlan:
+    """Build an immutable plan sharing one deliberately fixed registered run."""
+
+    return ExecutionPlan(
+        project="execution-tests",
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        run_id=RUN_ID,
+        source_commit=source_commit,
+        source_bundle_sha256="b" * 64,
+        datasets=(DatasetIdentity("dataset-1", "c" * 64),),
+        paths=CanonicalPaths(
+            run_root=RUN_ROOT,
+            work_root=f"{RUN_ROOT}/work",
+            results_root="/n/groups/lab/results/execution-tests/dataset-1",
+            receipts_root=f"{RUN_ROOT}/receipts",
+            logs_root=f"{RUN_ROOT}/logs",
+        ),
+        stages=stages or (_compute_stage(),),
+    )
+
+
+def test_two_callers_racing_identical_intent_submit_exactly_one_job() -> None:
+    """Only the atomic intent creator may submit after a forced two-caller race."""
+
+    backend = ConcurrentBackend(intent_barrier=threading.Barrier(2))
+    plan = _plan()
+    outcomes: list[object] = []
+
+    def invoke() -> None:
+        try:
+            outcomes.append(ExecutionEngine(backend).submit_stage(plan, "compute"))
+        except SubmissionUncertain as exc:
+            # The losing caller may query before the winner has made the new job
+            # visible.  Uncertainty is safe; a second scheduler call is not.
+            outcomes.append(exc)
+
+    callers = [threading.Thread(target=invoke) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=10)
+        assert not caller.is_alive()
+
+    assert len(backend.requests) == 1
+    assert len(backend.jobs) == 1
+    assert len(outcomes) == 2
+
+    # Disable the one-shot test barrier before replay.  The immutable submission
+    # record or scheduler identity must now recover the same single job.
+    backend.intent_barrier = None
+    replay = ExecutionEngine(backend).submit_stage(plan, "compute")
+    assert replay.record.job_id == "9000"
+    assert len(backend.requests) == 1
+
+
+def test_owner_crash_before_invocation_is_safely_recoverable() -> None:
+    """An intent alone proves sbatch was never crossed and may be recovered."""
+
+    class CrashAfterIntent(ConcurrentBackend):
+        crashed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            created = super().write_immutable_text(path, text)
+            if created and "/submission-intents/" in path and not self.crashed:
+                self.crashed = True
+                raise KeyboardInterrupt("owner died after intent")
+            return created
+
+    backend = CrashAfterIntent()
+    plan = _plan()
+    with pytest.raises(KeyboardInterrupt, match="after intent"):
+        ExecutionEngine(backend).submit_stage(plan, "compute")
+    assert not backend.requests and not backend.jobs
+
+    recovered = ExecutionEngine(backend).submit_stage(plan, "compute")
+    assert recovered.record.job_id == "9000"
+    assert len(backend.requests) == 1 and len(backend.jobs) == 1
+
+
+def test_owner_crash_after_invocation_never_uses_unsafe_takeover() -> None:
+    """Crossing the invocation marker remains query-only until Slurm proves a job."""
+
+    class CrashAfterInvocation(ConcurrentBackend):
+        crashed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            created = super().write_immutable_text(path, text)
+            if created and "/submission-invocations/" in path and not self.crashed:
+                self.crashed = True
+                raise KeyboardInterrupt("owner died at invocation boundary")
+            return created
+
+    backend = CrashAfterInvocation()
+    plan = _plan()
+    with pytest.raises(KeyboardInterrupt, match="invocation boundary"):
+        ExecutionEngine(backend).submit_stage(plan, "compute")
+    with pytest.raises(SubmissionUncertain, match="already owned"):
+        ExecutionEngine(backend).submit_stage(plan, "compute")
+    assert not backend.requests and not backend.jobs
+
+
+def test_registered_identity_validation_precedes_all_remote_writes() -> None:
+    """A mismatched prepared run cannot be bound or submitted first and rejected later."""
+
+    class RejectingRegistry:
+        def validate_plan(self, _plan: ExecutionPlan) -> bool:
+            return False
+
+        def synchronize(self, _plan: ExecutionPlan, _update: RegistryUpdate) -> bool:
+            raise AssertionError("invalid plans must never reach synchronization")
+
+    backend = ConcurrentBackend()
+    with pytest.raises(ValueError, match="registered active run"):
+        ExecutionEngine(backend, RejectingRegistry()).submit_stage(_plan(), "compute")
+    assert not backend.files and not backend.requests and not backend.jobs
+
+
+def test_definitive_rejection_is_stable_and_authorizes_only_next_attempt() -> None:
+    """A rejected attempt is replayable evidence, not a permanently poisoned intent."""
+
+    backend = ConcurrentBackend()
+    backend.outcomes.append(SubmitOutcome(None, accepted=False, stderr="invalid qos"))
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+
+    with pytest.raises(SubmissionRejected, match="invalid qos"):
+        engine.submit_stage(plan, "compute")
+    assert len(backend.requests) == 1 and not backend.jobs
+
+    # The same attempt never resubmits.  Its immutable rejection instead permits
+    # exactly attempt two with the same task set and signed scheduler arguments.
+    with pytest.raises(SubmissionRejected, match="definitively rejected"):
+        engine.submit_stage(plan, "compute")
+    accepted = engine.submit_stage(plan, "compute", attempt=2)
+    assert accepted.record.identity.attempt == 2
+    assert len(backend.requests) == 2 and len(backend.jobs) == 1
+
+    with pytest.raises(ValueError, match="exceeds signed max_attempts"):
+        engine.submit_stage(plan, "compute", attempt=3)
+
+
+def test_run_root_is_immutably_bound_to_one_complete_plan() -> None:
+    """Disjoint stage paths cannot let a second plan reuse a registered run."""
+
+    backend = ConcurrentBackend()
+    first = _plan()
+    ExecutionEngine(backend).submit_stage(first, "compute")
+
+    second = _plan(source_commit="d" * 40)
+    with pytest.raises(RuntimeError, match="immutable conflict"):
+        ExecutionEngine(backend).submit_stage(second, "compute")
+    assert len(backend.requests) == 1
+
+
+def test_pipeline_receipt_cannot_overlap_engine_evidence_namespace() -> None:
+    """A scientific command cannot forge completion using an engine receipt path."""
+
+    malicious = ReceiptSpec("forged", "receipts/execution/submissions/compute/attempt-001.json")
+    stage = StageSpec(
+        stage_id="compute",
+        command=_command("compute"),
+        resources=_resources(1),
+        expected_receipts=(malicious,),
+    )
+    with pytest.raises(ValueError, match="reserved execution-engine receipt namespace"):
+        _plan(stages=(stage,))
+
+
+def test_dispatcher_checks_runtime_bytes_before_exec(tmp_path) -> None:
+    """The signed runtime fingerprint is enforced on the compute-side script."""
+
+    work = tmp_path / "work"
+    work.mkdir()
+    worker = tmp_path / "worker.sh"
+    worker.write_text("#!/bin/sh\nprintf 'ran' > \"$1\"\n")
+    worker.chmod(0o755)
+    digest = hashlib.sha256(worker.read_bytes()).hexdigest()
+    output = tmp_path / "output.txt"
+    command = CommandSpec(
+        argv=(str(worker), str(output)),
+        working_directory=str(work),
+        runtime_fingerprint_sha256=digest,
+        runtime_fingerprint_path=str(worker),
+    )
+    dispatcher = render_dispatcher((PlannedTask("task", None, command, (_receipt("runtime"),)),))
+
+    # Production O2 nodes provide GNU sha256sum at the signed absolute path.
+    # macOS test hosts do not, so substitute the system's compatible shasum only
+    # for execution of this generated test script; the assertion below still
+    # verifies that production rendering names the exact O2 binary.
+    assert "/usr/bin/sha256sum" in dispatcher
+    if not posixpath.exists("/usr/bin/sha256sum"):
+        shasum = shutil.which("shasum")
+        assert shasum is not None
+        dispatcher = dispatcher.replace("/usr/bin/sha256sum", f"{shasum} -a 256")
+
+    good = subprocess.run(["/bin/bash"], input=dispatcher, text=True, capture_output=True, check=False)
+    assert good.returncode == 0
+    assert output.read_text() == "ran"
+
+    worker.write_text("#!/bin/sh\nprintf 'tampered' > \"$1\"\n")
+    bad = subprocess.run(["/bin/bash"], input=dispatcher, text=True, capture_output=True, check=False)
+    assert bad.returncode == 70
+    assert "runtime fingerprint mismatch" in bad.stderr
+    assert output.read_text() == "ran"
+
+
+def test_runtime_fingerprint_cannot_authenticate_an_unrelated_file(tmp_path) -> None:
+    """The executable itself, normally an immutable wrapper, must be hashed."""
+
+    executable = tmp_path / "worker"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    unrelated = tmp_path / "environment.lock"
+    unrelated.write_text("unchanged\n")
+    with pytest.raises(ValueError, match=r"must equal argv\[0\]"):
+        CommandSpec(
+            argv=(str(executable),),
+            working_directory=str(tmp_path),
+            runtime_fingerprint_path=str(unrelated),
+            runtime_fingerprint_sha256=hashlib.sha256(unrelated.read_bytes()).hexdigest(),
+        )
+
+
+def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None:
+    """A missing-only retry creates its own dependency-bound audit generation."""
+
+    reconciler = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), reconciler))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    first_audit = engine.submit_afterany_reconciler(plan, "audit").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    result = engine.reconcile_stage(plan, "compute")
+
+    assert result.retry_submission is not None
+    retry_job = result.retry_submission.job_id
+    audit_requests = [request for request in backend.requests if request.identity.stage_id == "audit"]
+    assert [request.identity.attempt for request in audit_requests] == [1, 2]
+    assert audit_requests[0].dependency_job_ids == (compute.job_id,)
+    assert audit_requests[1].dependency_job_ids == (retry_job,)
+    assert first_audit.identity.attempt == 1
+
+
+def test_retry_followup_outbox_recovers_crash_after_retry_record() -> None:
+    """Replaying an accepted retry repairs exactly one missing audit generation."""
+
+    class CrashAfterRetryRecord(ConcurrentBackend):
+        crashed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            created = super().write_immutable_text(path, text)
+            if created and "/submissions/compute/attempt-002.json" in path and not self.crashed:
+                self.crashed = True
+                raise KeyboardInterrupt("died before follow-up outbox")
+            return created
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = CrashAfterRetryRecord()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    with pytest.raises(KeyboardInterrupt, match="before follow-up"):
+        engine.reconcile_stage(plan, "compute")
+    assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"] == [1]
+
+    # Recovery replays the accepted compute attempt rather than polling its task
+    # state or resubmitting it.  The durable record converges the outbox once.
+    recovered = ExecutionEngine(backend).submit_stage(
+        plan,
+        "compute",
+        attempt=2,
+        task_ids=("movie-1",),
+    )
+    assert recovered.record.identity.attempt == 2
+    audit_attempts = [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"]
+    assert audit_attempts == [1, 2]
+    ExecutionEngine(backend).submit_stage(
+        plan,
+        "compute",
+        attempt=2,
+        task_ids=("movie-1",),
+    )
+    assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"] == [1, 2]
+
+
+def test_afterok_requires_authenticated_completion_not_scheduler_exit() -> None:
+    """A zero Slurm exit cannot release downstream work before receipt validation."""
+
+    downstream = StageSpec(
+        stage_id="publish",
+        command=_command("publish"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="publish"),),
+        depends_on=("compute",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(_compute_stage(), downstream))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+    )
+
+    with pytest.raises(ValueError, match="authenticated COMPLETED"):
+        engine.submit_stage(plan, "publish")
+    assert engine.reconcile_stage(plan, "compute").decision == "FAILED"
+
+    # Use a fresh plan/backend because terminal missing-receipt evidence is
+    # immutable.  Once all receipts are present, reconciliation certifies the
+    # prerequisite and the exact afterok dependency can be submitted.
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+    )
+    for index in range(3):
+        backend.put_receipt(_receipt(f"movie-{index}"))
+    assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
+    published = engine.submit_stage(plan, "publish")
+    assert published.record.dependency_job_ids == (compute.job_id,)
+
+
+def test_malformed_reconciliation_cannot_release_afterok_stage() -> None:
+    """A decision string without plan-bound task evidence is not completion proof."""
+
+    publish = StageSpec(
+        stage_id="publish",
+        command=_command("publish"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="publish"),),
+        depends_on=("compute",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(_compute_stage(), publish))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    engine.submit_stage(plan, "compute")
+    backend.files[reconciliation_path(plan, "compute", 1)] = '{"decision":"COMPLETED"}\n'
+
+    with pytest.raises(ValueError, match="invalid immutable reconciliation"):
+        engine.submit_stage(plan, "publish")
+    assert [request.identity.stage_id for request in backend.requests] == ["compute"]
+
+
+def test_afterok_rechecks_current_task_receipts_after_reconciliation() -> None:
+    """Historical success cannot hide a deleted or replaced files-as-truth receipt."""
+
+    publish = StageSpec(
+        stage_id="publish",
+        command=_command("publish"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="publish"),),
+        depends_on=("compute",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(_compute_stage(), publish))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+    )
+    for index in range(3):
+        backend.put_receipt(_receipt(f"movie-{index}"))
+    assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
+
+    del backend.files[posixpath.join(RUN_ROOT, _receipt("movie-1").path)]
+    with pytest.raises(ValueError, match="authenticated COMPLETED"):
+        engine.submit_stage(plan, "publish")
+    assert [request.identity.stage_id for request in backend.requests] == ["compute"]
+
+
+def test_untrustworthy_receipt_observation_never_authorizes_retry() -> None:
+    """A read failure remains transient instead of becoming missing evidence."""
+
+    class FailingReceiptProbe(ConcurrentBackend):
+        def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
+            if receipt.receipt_id == "receipt-compute-movie-1":
+                return ReceiptObservation(
+                    receipt.path,
+                    False,
+                    trustworthy=False,
+                    error="simulated transport failure",
+                )
+            return super().observe_receipt(run_root, receipt)
+
+    backend = FailingReceiptProbe()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+    )
+    for index in range(3):
+        backend.put_receipt(_receipt(f"movie-{index}"))
+
+    result = engine.reconcile_stage(plan, "compute")
+    assert result.decision == "WAIT"
+    assert result.active_task_ids == ("movie-1",)
+    assert len(backend.requests) == 1
+    assert backend.read_text(task_attempt_path(plan, record.identity, "movie-1")) is None
+
+
+def test_manifest_merge_is_monotonic_for_attempts_and_terminal_state() -> None:
+    """Delayed callbacks cannot regress attempt two or resurrect a failed plan."""
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+        extra={"future": {"preserved": True}},
+    )
+    retrying = RegistryUpdate(plan.plan_sha256, "compute", "RETRYING", "RETRYING", ("9000", "9001"), 2)
+    delayed = RegistryUpdate(plan.plan_sha256, "compute", "SUBMITTED", "SUBMITTED", ("9000",), 1)
+    failed = RegistryUpdate(plan.plan_sha256, "compute", "FAILED", "FAILED", ("9000", "9001"), 2)
+    late_audit = RegistryUpdate(plan.plan_sha256, "audit", "COMPLETED", "COMPLETED", ("9002",), 1)
+
+    merged = merge_execution_manifest(manifest, plan, retrying)
+    merged = merge_execution_manifest(merged, plan, delayed)
+    assert merged.provenance["execution"]["stages"]["compute"] == {
+        "attempt": 2,
+        "status": "RETRYING",
+    }
+    merged = merge_execution_manifest(merged, plan, failed)
+    merged = merge_execution_manifest(merged, plan, late_audit)
+    assert merged.provenance["execution"]["state"] == "FAILED"
+    assert merged.result["status"] == "FAILED"
+    assert merged.extra["future"] == {"preserved": True}
+
+
+def test_failed_registry_state_dominates_completed_in_both_orders() -> None:
+    """Terminal registry meaning is deterministic under callback reordering."""
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    completed = RegistryUpdate(plan.plan_sha256, "compute", "COMPLETED", "COMPLETED", ("9000",), 1)
+    failed = RegistryUpdate(plan.plan_sha256, "compute", "FAILED", "FAILED", ("9000",), 1)
+
+    for first, second in ((completed, failed), (failed, completed)):
+        merged = merge_execution_manifest(manifest, plan, first)
+        merged = merge_execution_manifest(merged, plan, second)
+        execution = merged.provenance["execution"]
+        assert execution["state"] == "FAILED"
+        assert execution["stages"]["compute"] == {"attempt": 1, "status": "FAILED"}
+
+
+def test_registry_transaction_reports_compare_and_swap_conflict() -> None:
+    """A stale reader receives a retryable conflict instead of clobbering run.json."""
+
+    class ConflictConnection:
+        """Connection stub representing another writer winning the remote lock."""
+
+        def run(self, _command, *, timeout, input_text):
+            return SimpleNamespace(ok=False, returncode=43, stdout="", stderr="")
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    update = RegistryUpdate(plan.plan_sha256, "compute", "SUBMITTED", "SUBMITTED", ("9000",), 1)
+    merged = merge_execution_manifest(manifest, plan, update)
+    result = synchronize_execution_transaction(
+        ConflictConnection(),
+        run_dir=RUN_ROOT,
+        registry_path="/n/groups/lab/registry.jsonl",
+        current_manifest_text=manifest.to_json(),
+        merged_manifest=merged,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "concurrent_update"
+
+
+def test_root_cancellation_with_absent_child_state_is_not_missing_retry() -> None:
+    """Root CANCELLED is inherited by absent child rows and remains terminal."""
+
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "CANCELLED", 0),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    result = engine.reconcile_stage(plan, "compute")
+
+    assert result.decision == "FAILED"
+    assert result.failed_task_ids == ("movie-1",)
+    assert len(backend.requests) == 1
