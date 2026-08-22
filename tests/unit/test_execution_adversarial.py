@@ -175,6 +175,12 @@ class ConcurrentBackend:
 
         self.lifecycle_claims.discard(claim_id)
 
+    def matching_lifecycle_claims(self, _run_root: str, operation_id: str) -> tuple[str, ...]:
+        """Return every in-memory holder with the operation-derived prefix."""
+
+        prefix = hashlib.sha256(operation_id.encode()).hexdigest() + "-"
+        return tuple(sorted(item for item in self.lifecycle_claims if item.startswith(prefix)))
+
 
 def _receipt(task_id: str, *, stage: str = "compute") -> ReceiptSpec:
     """Return a pipeline receipt outside the engine-reserved namespace."""
@@ -283,6 +289,21 @@ def test_two_callers_racing_identical_intent_submit_exactly_one_job() -> None:
     replay = ExecutionEngine(backend).submit_stage(plan, "compute")
     assert replay.record.job_id == "9000"
     assert len(backend.requests) == 1
+    assert not backend.lifecycle_claims
+
+
+def test_terminal_replay_retires_claim_abandoned_before_invocation() -> None:
+    """A pre-marker crash holder is recoverable from its operation identity."""
+
+    backend = ConcurrentBackend()
+    plan = _plan()
+    operation_id = f"submit:{plan.plan_sha256}:compute:1"
+    abandoned = backend.acquire_lifecycle_claim(plan.paths.run_root, operation_id)
+    assert abandoned is not None
+
+    result = ExecutionEngine(backend).submit_stage(plan, "compute")
+
+    assert result.record.identity.attempt == 1
     assert not backend.lifecycle_claims
 
 
@@ -691,6 +712,54 @@ def test_retry_followup_outbox_recovers_crash_after_retry_record() -> None:
         task_ids=("movie-1",),
     )
     assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"] == [1, 2]
+
+
+def test_rejected_followup_generation_advances_without_replaying_sbatch() -> None:
+    """A definitive audit rejection consumes its generation and authorizes the next."""
+
+    class RejectSecondAudit(ConcurrentBackend):
+        rejected = False
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            """Reject only the first retry-bound audit scheduler call."""
+
+            if request.identity.stage_id == "audit" and request.identity.attempt == 2 and not self.rejected:
+                self.rejected = True
+                self.outcomes.appendleft(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="audit qos rejected"))
+            return super().invoke_submission(request)
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = RejectSecondAudit()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    with pytest.raises(SubmissionRejected, match="audit qos rejected"):
+        engine.reconcile_stage(plan, "compute")
+    # Replaying the accepted compute retry consumes audit attempt two's signed
+    # rejection and submits attempt three exactly once.
+    ExecutionEngine(backend).submit_stage(plan, "compute", attempt=2, task_ids=("movie-1",))
+
+    audit_attempts = [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"]
+    assert audit_attempts == [1, 2, 3]
+    assert not backend.lifecycle_claims
 
 
 def test_afterok_requires_authenticated_completion_not_scheduler_exit() -> None:

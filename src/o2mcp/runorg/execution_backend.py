@@ -30,7 +30,7 @@ from o2mcp.runorg.execution_models import (
     SubmitOutcome,
 )
 from o2mcp.runorg.execution_remote_fs import remote_fs_command
-from o2mcp.runorg.lifecycle_coordination import coordination_command, new_claim_id
+from o2mcp.runorg.lifecycle_coordination import coordination_command, matching_claims_command, new_claim_id
 from o2mcp.runorg.plan_components import ReceiptSpec
 from o2mcp.runorg.strict_json import strict_json_object
 from o2mcp.slurm import O2Slurm
@@ -77,6 +77,9 @@ class ExecutionBackend(Protocol):
 
     def release_lifecycle_claim(self, run_root: str, claim_id: str) -> None:
         """Release one exact holder claim after durable convergence."""
+
+    def matching_lifecycle_claims(self, run_root: str, operation_id: str) -> Sequence[str]:
+        """Return every durable holder for one exact mutation operation."""
 
 
 class O2ExecutionBackend:
@@ -419,6 +422,20 @@ print(json.dumps(response, sort_keys=True))
         result = self.connection.run(coordination_command("release", run_root, claim_id), timeout=60)
         if not result.ok or result.stdout.strip() != "RELEASED":
             raise RuntimeError(f"lifecycle claim release failed: {result.stderr.strip()}")
+
+    def matching_lifecycle_claims(self, run_root: str, operation_id: str) -> Sequence[str]:
+        """List same-operation holders so terminal replay can retire orphans."""
+
+        result = self.connection.run(matching_claims_command(run_root, operation_id), timeout=60)
+        if not result.ok:
+            raise RuntimeError(f"lifecycle claim query failed: {result.stderr.strip()}")
+        try:
+            values = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("lifecycle claim query returned invalid JSON") from exc
+        if type(values) is not list or any(type(item) is not str for item in values):
+            raise RuntimeError("lifecycle claim query returned invalid holder identities")
+        return tuple(values)
 
 
 def receipt_matches(spec: ReceiptSpec, observation: ReceiptObservation) -> bool:

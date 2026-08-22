@@ -142,6 +142,26 @@ class ExecutionRegistryMixin:
         if release is not None and claim_id:
             release(plan.paths.run_root, claim_id)
 
+    def _submission_claim_ids(
+        self,
+        plan: ExecutionPlan,
+        identity: SubmissionIdentity,
+        *known_claim_ids: str | None,
+    ) -> tuple[str, ...]:
+        """Collect every holder of a terminally evidenced submit operation.
+
+        A process can die after acquiring its claim but before publishing the
+        invocation marker. Once a later caller has a durable record or rejection
+        for the same immutable attempt, every same-operation holder is safe to
+        place in the registry repair outbox and retire together.
+        """
+
+        operation_id = f"submit:{plan.plan_sha256}:{identity.stage_id}:{identity.attempt}"
+        matching = self.backend.matching_lifecycle_claims(plan.paths.run_root, operation_id)
+        values = {item for item in known_claim_ids if item}
+        values.update(matching)
+        return tuple(sorted(values))
+
     def _release_if_not_invocation_owner(
         self,
         plan: ExecutionPlan,
@@ -180,8 +200,13 @@ class ExecutionRegistryMixin:
         """
 
         owner_claim_id = read_submission_invocation_claim_id(self.backend, plan, identity)
-        if owner_claim_id is not None and owner_claim_id != observer_claim_id:
-            self._release_lifecycle(plan, owner_claim_id)
+        for claim_id in self._submission_claim_ids(
+            plan,
+            identity,
+            observer_claim_id,
+            owner_claim_id,
+        ):
+            self._release_lifecycle(plan, claim_id)
 
 
 __all__ = ["ExecutionRegistryMixin"]

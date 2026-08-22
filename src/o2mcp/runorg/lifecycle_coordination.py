@@ -137,4 +137,53 @@ def coordination_command(operation: str, run_root: str, claim_id: str) -> str:
     )
 
 
-__all__ = ["claim_name", "coordination_command", "coordination_lock", "coordination_root", "new_claim_id"]
+_MATCHING_CLAIMS_PROGRAM = r"""
+import fcntl, glob, json, os, stat, sys
+root, lock_path, prefix = sys.argv[1:4]
+lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+try:
+    if not stat.S_ISREG(os.fstat(lock).st_mode): raise SystemExit('coordination lock is not regular')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if not os.path.lexists(root):
+        print('[]'); raise SystemExit(0)
+    if os.path.islink(root) or not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode):
+        raise SystemExit('coordination root is not a real directory')
+    claims = []
+    for path in glob.glob(os.path.join(root, f'claim-{prefix}*.json')):
+        name = os.path.basename(path)
+        claim_id = name[len('claim-'):-len('.json')]
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd); raise SystemExit('claim is not regular')
+        with os.fdopen(fd, encoding='utf-8') as handle: value = json.load(handle)
+        if value != {'claim_id': claim_id}: raise SystemExit('claim ownership mismatch')
+        claims.append(claim_id)
+    print(json.dumps(sorted(claims)))
+finally:
+    os.close(lock)
+"""
+
+
+def matching_claims_command(run_root: str, operation_id: str) -> str:
+    """Render a locked query for every holder of one exact operation."""
+
+    prefix = hashlib.sha256(operation_id.encode()).hexdigest() + "-"
+    return " ".join(
+        (
+            "python3 -c",
+            shlex.quote(_MATCHING_CLAIMS_PROGRAM),
+            shlex.quote(coordination_root(run_root)),
+            shlex.quote(coordination_lock(run_root)),
+            shlex.quote(prefix),
+        )
+    )
+
+
+__all__ = [
+    "claim_name",
+    "coordination_command",
+    "coordination_lock",
+    "coordination_root",
+    "matching_claims_command",
+    "new_claim_id",
+]

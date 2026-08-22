@@ -115,6 +115,12 @@ class Backend:
 
         self.lifecycle_claims.discard(claim_id)
 
+    def matching_lifecycle_claims(self, _run_root: str, operation_id: str) -> tuple[str, ...]:
+        """Return every in-memory holder with the operation-derived prefix."""
+
+        prefix = hashlib.sha256(operation_id.encode()).hexdigest() + "-"
+        return tuple(sorted(item for item in self.lifecycle_claims if item.startswith(prefix)))
+
 
 @dataclass
 class Registry:
