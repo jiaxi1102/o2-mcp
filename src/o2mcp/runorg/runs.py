@@ -19,6 +19,7 @@ No torch/cellpose/network imports — importable on the CPU-only core path.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import posixpath
@@ -433,70 +434,114 @@ def parse_registry(text: str) -> list[dict[str, Any]]:
 
 
 # --- command planners (pure: build shell, never execute) ---------------------
+_REGISTER_PROGRAM = r"""
+import ctypes, errno, json, os, shutil, stat, sys, tempfile
+
+parent, run_dir, staging_prefix, subdirs_json, manifest_b64 = sys.argv[1:6]
+subdirs = json.loads(subdirs_json)
+manifest = __import__('base64').b64decode(manifest_b64, validate=True)
+staging = None
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+
+def rename_noreplace(source, destination):
+    # Atomically publish a complete directory without replacing an identity.
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes, destination_bytes = os.fsencode(source), os.fsencode(destination)
+    if sys.platform.startswith('linux'):
+        function = getattr(library, 'renameat2', None)
+        if function is None: raise OSError(errno.ENOSYS, 'renameat2 is unavailable')
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(-100, source_bytes, -100, destination_bytes, 1)  # RENAME_NOREPLACE
+    elif sys.platform == 'darwin':
+        function = getattr(library, 'renamex_np', None)
+        if function is None: raise OSError(errno.ENOSYS, 'renamex_np is unavailable')
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(source_bytes, destination_bytes, 0x00000004)  # RENAME_EXCL
+    else:
+        raise OSError(errno.ENOSYS, 'atomic no-replace directory rename is unsupported')
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+try:
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=staging_prefix, dir=parent)
+    for relative in subdirs:
+        os.makedirs(os.path.join(staging, *relative.split('/')), mode=0o700, exist_ok=True)
+    manifest_path = os.path.join(staging, 'run.json')
+    descriptor = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(manifest)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0: raise OSError('short write while preparing run manifest')
+            view = view[written:]
+        os.fsync(descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError('prepared run manifest is not a regular file')
+    finally:
+        os.close(descriptor)
+    # Persist the complete hidden tree before one atomic no-replace rename makes
+    # it canonical. A host/process failure can leave only a hidden staging tree
+    # or a complete recoverable run, never a partial canonical run directory.
+    for directory, _children, _files in os.walk(staging, topdown=False):
+        fsync_directory(directory)
+    rename_noreplace(staging, run_dir)
+    staging = None
+    fsync_directory(parent)
+    print(run_dir)
+finally:
+    if staging is not None:
+        shutil.rmtree(staging, ignore_errors=True)
+"""
+
+
 def plan_register_commands(layout: RunLayout, manifest: RunManifest, run_subdirs: Sequence[str] = ()) -> list[str]:
     """Create one run directory and its manifest as a recoverable transaction.
 
-    The run root itself uses plain ``mkdir`` rather than ``mkdir -p``.  A run ID
-    is an execution identity, so reusing an existing directory must fail instead
-    of overwriting its manifest and mixing two submissions.  Initialization is
-    rendered as one shell transaction: failures before the manifest commit
-    remove the exclusively created tree, while a lost response after the commit
-    leaves a strict manifest that :meth:`O2Runs.recover_prepared_execution_run`
-    can authenticate and resume.
+    A complete tree is built and fsynced under a hidden sibling name, then
+    atomically renamed into place with platform no-replace semantics. A run ID
+    is an execution identity, so an existing canonical directory is never
+    overwritten. Even SIGKILL or host failure can therefore leave only an
+    ignorable hidden staging tree or a complete run with strict ``run.json``;
+    the latter can be resumed by :meth:`O2Runs.recover_prepared_execution_run`.
     """
 
     run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
-    quoted = shlex.quote(run_dir)
-    parent = shlex.quote(posixpath.dirname(run_dir))
-    subdirs = " ".join(shlex.quote(posixpath.join(run_dir, d)) for d in run_subdirs)
-    manifest_path = posixpath.join(run_dir, "run.json")
-    quoted_manifest_path = shlex.quote(manifest_path)
-    temporary_template = shlex.quote(posixpath.join(run_dir, ".run.json.tmp.XXXXXX"))
-    heredoc = _heredoc(manifest.to_json())
-
-    # Keep the trap armed until the immutable identity marker (run.json) is in
-    # place.  A transport failure after that point is intentionally recoverable:
-    # the caller receives run_dir and can validate the exact persisted identity.
-    lines = [
-        "set -euo pipefail",
-        "created=0",
-        "committed=0",
-        "temporary=''",
-        "cleanup_registration() {",
-        "  rc=$?",
-        # Disable every handler first: calling exit from an EXIT handler would
-        # otherwise invoke the same function recursively on some shells.
-        "  trap - EXIT HUP INT TERM",
-        '  if test -n "$temporary"; then rm -f -- "$temporary"; fi',
-        f'  if test "$created" = 1 && test "$committed" = 0; then rm -rf -- {quoted}; fi',
-        '  exit "$rc"',
-        "}",
-        "trap cleanup_registration EXIT",
-        # Convert signals into explicit non-zero exits; EXIT then owns the one
-        # cleanup path and preserves the fact that initialization did not pass.
-        "trap 'exit 129' HUP",
-        "trap 'exit 130' INT",
-        "trap 'exit 143' TERM",
-        f"mkdir -p {parent}",
-        f"mkdir {quoted}",
-        "created=1",
-    ]
-    if subdirs:
-        lines.append(f"mkdir -p {subdirs}")
-    lines.extend(
-        [
-            f"temporary=$(mktemp {temporary_template})",
-            f'cat > "$temporary" {heredoc}',
-            # Rename publishes complete bytes at the canonical identity path;
-            # cleanup owns the private temporary file until this succeeds.
-            f'mv -- "$temporary" {quoted_manifest_path}',
-            "temporary=''",
-            "committed=1",
-            "trap - EXIT HUP INT TERM",
-            f"printf '%s\\n' {quoted}",
-        ]
+    normalized_subdirs: list[str] = []
+    for subdir in run_subdirs:
+        if (
+            type(subdir) is not str
+            or not subdir
+            or subdir.startswith("/")
+            or posixpath.normpath(subdir) != subdir
+            or any(part in {"", ".", ".."} for part in subdir.split("/"))
+        ):
+            raise ValueError(f"run skeleton subdirectory is unsafe: {subdir!r}")
+        normalized_subdirs.append(subdir)
+    parent = posixpath.dirname(run_dir)
+    arguments = (
+        parent,
+        run_dir,
+        f".{manifest.run_id}.prepare.",
+        json.dumps(normalized_subdirs),
+        base64.b64encode(manifest.to_json().encode()).decode("ascii"),
     )
-    return ["\n".join(lines)]
+    return [
+        " ".join(
+            (
+                "python3 -c",
+                shlex.quote(_REGISTER_PROGRAM),
+                *(shlex.quote(argument) for argument in arguments),
+            )
+        )
+    ]
 
 
 def plan_write_manifest_command(run_dir: str, manifest: RunManifest) -> str:

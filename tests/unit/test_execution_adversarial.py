@@ -1205,6 +1205,47 @@ def test_failed_ancestor_suppresses_only_afterok_descendants(
             require_current_terminal_evidence(backend, plan, "archive")
 
 
+def test_completed_afterany_stage_resets_failure_suppression() -> None:
+    """Required after-ok work below a successful recovery stage cannot be skipped."""
+
+    failed_compute = _compute_stage()
+    recovery = StageSpec(
+        stage_id="recovery",
+        command=_command("recovery"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="recovery"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+    )
+    publish = StageSpec(
+        stage_id="publish",
+        command=_command("publish"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="publish"),),
+        depends_on=("recovery",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(failed_compute, recovery, publish))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    compute = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "CANCELLED", 1),
+        *(SlurmTaskState(index, "CANCELLED", 1) for index in range(3)),
+    )
+    assert engine.reconcile_stage(plan, "compute").decision == "FAILED"
+
+    recovery_job = engine.submit_stage(plan, "recovery").record
+    backend.set_states(recovery_job.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="recovery"))
+    assert engine.reconcile_stage(plan, "recovery").decision == "COMPLETED"
+
+    with pytest.raises(ValueError, match="publish lacks authenticated terminal"):
+        require_current_terminal_evidence(backend, plan, "archive")
+
+
 def test_malformed_reconciliation_cannot_release_afterok_stage() -> None:
     """A decision string without plan-bound task evidence is not completion proof."""
 

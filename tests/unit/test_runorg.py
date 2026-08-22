@@ -6,10 +6,12 @@ an injected runner (no network). Everything is parameterized by a synthetic RunP
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,7 +41,7 @@ from o2mcp.runorg import (
     variant_of,
 )
 from o2mcp.runorg.executor import _infer_pipeline
-from o2mcp.runorg.runs import _safe
+from o2mcp.runorg.runs import _REGISTER_PROGRAM, _safe
 from o2mcp.runorg.transition_coordinator import TransitionBoundary
 
 
@@ -217,11 +219,13 @@ def test_plan_register_includes_policy_subdirs(tmp_path):
     )
     cmds = plan_register_commands(layout, m, TEST_POLICY.run_subdirs)
     assert any("logs" in c and "views" in c for c in cmds)  # mkdir creates the policy subdirs
-    assert f"mkdir {layout.run_dir(STATUS_ACTIVE, m.campaign, m.run_id)}" in cmds[0]
+    assert ".prepare." in cmds[0]
+    assert "RENAME_NOREPLACE" in cmds[0]
+    assert layout.run_dir(STATUS_ACTIVE, m.campaign, m.run_id) in cmds[0]
 
 
-def test_plan_register_removes_pre_manifest_partial_tree(tmp_path):
-    """A failure after exclusive mkdir does not strand an unusable run ID."""
+def test_plan_register_crash_leaves_only_hidden_complete_tree(tmp_path):
+    """An uncatchable pre-publication exit never creates the canonical run root."""
 
     layout = RunLayout(
         str(tmp_path / "scratch"),
@@ -236,15 +240,36 @@ def test_plan_register_removes_pre_manifest_partial_tree(tmp_path):
         created_utc="20260101T000000Z",
         datasets=["d"],
     )
-    # POSIX filesystems reject a path component longer than NAME_MAX.  That
-    # gives us a deterministic post-root-mkdir fault without weakening the
-    # production planner with a test-only injection hook.
-    command = plan_register_commands(layout, manifest, ("x" * 300,))[0]
-    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
-
     run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
-    assert result.returncode != 0
+    parent = os.path.dirname(run_dir)
+    prefix = f".{manifest.run_id}.prepare."
+    # Replace only the atomic publication call in a subprocess copy. os._exit
+    # bypasses finally exactly as SIGKILL/host loss would, leaving diagnostic
+    # staging bytes while proving the canonical identity remains untouched.
+    crash_program = _REGISTER_PROGRAM.replace(
+        "rename_noreplace(staging, run_dir)",
+        "os._exit(99)",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            crash_program,
+            parent,
+            run_dir,
+            prefix,
+            json.dumps(list(TEST_POLICY.run_subdirs)),
+            base64.b64encode(manifest.to_json().encode()).decode("ascii"),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 99
     assert not os.path.exists(run_dir)
+    staging = list(Path(parent).glob(f"{prefix}*"))
+    assert len(staging) == 1
+    assert RunManifest.from_json((staging[0] / "run.json").read_text(encoding="utf-8")) == manifest
 
 
 def test_plan_register_commits_complete_recoverable_manifest(tmp_path):
@@ -273,6 +298,14 @@ def test_plan_register_commits_complete_recoverable_manifest(tmp_path):
     assert os.path.isdir(os.path.join(run_dir, "logs"))
     assert os.path.isdir(os.path.join(run_dir, "views"))
 
+    # The platform primitive is no-replace rather than a check-then-rename.
+    # Replaying the allocator cannot overwrite the complete identity, and its
+    # losing hidden tree is cleaned without touching the winner.
+    replay = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+    assert replay.returncode != 0
+    assert RunManifest.from_json(Path(run_dir, "run.json").read_text(encoding="utf-8")) == manifest
+    assert list(Path(run_dir).parent.glob(f".{manifest.run_id}.prepare.*")) == []
+
 
 def test_prepare_execution_run_returns_identity_after_uncertain_initialization(tmp_path):
     """A lost transaction response tells callers exactly what to recover."""
@@ -281,7 +314,7 @@ def test_prepare_execution_run_returns_identity_after_uncertain_initialization(t
         command = argv[-1]
         if command == "date -u +%Y%m%dT%H%M%SZ":
             return ("20260101T000000Z\n", "", 0)
-        if "cleanup_registration" in command:
+        if "rename_noreplace" in command:
             # Model a transport that lost the response after the remote shell
             # may have committed run.json.  The executor cannot safely infer
             # either outcome and must surface the deterministic recovery path.

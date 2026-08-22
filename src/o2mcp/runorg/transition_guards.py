@@ -70,8 +70,22 @@ def require_current_terminal_evidence(backend: ExecutionBackend, plan: Execution
         if stage_id in seen:
             return False
         seen.add(stage_id)
-        dependencies = stages[stage_id].depends_on
-        return any(item in failed or blocked_by_failure(item, seen.copy()) for item in dependencies)
+        for dependency_id in stages[stage_id].depends_on:
+            dependency_receipt = receipts[dependency_id]
+            if dependency_id in failed:
+                return True
+            if dependency_receipt is not None:
+                # A completed dependency resets scheduler propagation: its own
+                # failed ancestor was intentionally handled (often by an
+                # after-any audit), so downstream after-ok work remains due.
+                continue
+            dependency = stages[dependency_id]
+            if dependency.dependency_mode == "afterok" and blocked_by_failure(
+                dependency_id,
+                seen.copy(),
+            ):
+                return True
+        return False
 
     for stage in plan.stages:
         receipt = receipts[stage.stage_id]
