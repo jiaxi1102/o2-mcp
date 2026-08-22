@@ -9,7 +9,7 @@ from o2mcp.runorg.execution_evidence import (
     read_submission_rejection,
 )
 from o2mcp.runorg.execution_models import RECONCILE_RETRY, SubmissionIdentity
-from o2mcp.runorg.execution_paths import submission_rejection_path
+from o2mcp.runorg.execution_paths import reconciler_followup_path, submission_rejection_path
 from o2mcp.runorg.execution_rendering import select_tasks
 from o2mcp.runorg.plan_stages import StageSpec
 from o2mcp.runorg.plans import ExecutionPlan
@@ -29,7 +29,13 @@ def derive_attempt_authorization(
     if attempt == 1:
         return all_task_ids, signed_dependency_jobs
 
-    if stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
+    followup_authorized = (
+        stage.dependency_mode == "afterany"
+        and stage.depends_on
+        and not stage.tasks
+        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
+    )
+    if followup_authorized:
         dependencies = authenticate_followup_authorization(
             backend,
             plan,

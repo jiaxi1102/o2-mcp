@@ -179,9 +179,6 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 raise DuplicateSubmissionError(
                     f"recorded job {existing_record.job_id} disagrees with scheduler job {scheduler_job}"
                 )
-            # Replay converges a retry's follow-up outbox without resubmitting it.
-            if attempt > 1 and stage.dependency_mode != "afterany":
-                self._ensure_reconciler_followups(plan, stage_id, existing_record)
             # A crash can occur after the immutable record is published but
             # before an outbox item exists.  Reconstruct the exact update from
             # authenticated evidence; merely draining existing outbox files
@@ -200,10 +197,21 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 plan,
                 existing_record.identity,
             )
+            claim_ids = self._submission_claim_ids(
+                plan,
+                existing_record.identity,
+                claim_id,
+                invocation_claim_id,
+            )
+            self._enqueue_registry_update(plan, update, claim_ids)
+            # Replay converges the follow-up only after the accepted compute job
+            # and its lifecycle holders have a durable registry repair pointer.
+            if attempt > 1 and stage.dependency_mode != "afterany":
+                self._ensure_reconciler_followups(plan, stage_id, existing_record)
             synced = self._sync_registry(
                 plan,
                 update,
-                self._submission_claim_ids(plan, existing_record.identity, claim_id, invocation_claim_id),
+                claim_ids,
             )
             return SubmissionResult(existing_record, submitted=False, registry_synced=synced)
 
@@ -346,8 +354,6 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             dependency_job_ids=authorized_dependencies,
         )
         self.backend.write_immutable_text(record_path, canonical_json(record.to_dict()))
-        if attempt > 1 and stage.dependency_mode != "afterany":
-            self._ensure_reconciler_followups(plan, stage_id, record)
         status = "RETRYING" if attempt > 1 else "SUBMITTED"
         update = RegistryUpdate(
             plan_sha256=plan.plan_sha256,
@@ -357,10 +363,14 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             job_ids=self._all_recorded_job_ids(plan),
             attempt=attempt,
         )
+        claim_ids = self._submission_claim_ids(plan, record.identity, claim_id, invocation_claim_id)
+        self._enqueue_registry_update(plan, update, claim_ids)
+        if attempt > 1 and stage.dependency_mode != "afterany":
+            self._ensure_reconciler_followups(plan, stage_id, record)
         registry_synced = self._sync_registry(
             plan,
             update,
-            self._submission_claim_ids(plan, record.identity, claim_id, invocation_claim_id),
+            claim_ids,
         )
         return SubmissionResult(record, submitted=submitted_now, registry_synced=registry_synced)
 

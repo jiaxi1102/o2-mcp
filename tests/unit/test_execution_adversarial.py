@@ -46,7 +46,12 @@ from o2mcp.runorg.execution_models import (
     RegistryUpdate,
     canonical_json,
 )
-from o2mcp.runorg.execution_paths import reconciliation_path, task_attempt_path
+from o2mcp.runorg.execution_paths import (
+    pending_registry_path,
+    reconciler_followup_path,
+    reconciliation_path,
+    task_attempt_path,
+)
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_sync import merge_execution_manifest
@@ -555,6 +560,126 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert audit_requests[0].dependency_job_ids == (compute.job_id,)
     assert audit_requests[1].dependency_job_ids == (retry_job,)
     assert first_audit.identity.attempt == 1
+
+
+def test_afterany_reconciler_uses_its_own_retry_policy_without_followup_authorization() -> None:
+    """An audit's own failure is distinct from a compute-triggered generation.
+
+    A retry-bound follow-up authorization exists only when an accepted upstream
+    retry requires a fresh scheduler dependency.  When the audit job itself
+    fails, its signed retry policy and immutable reconciliation receipt authorize
+    the next attempt directly; requiring a nonexistent upstream follow-up would
+    strand the audit despite its explicit retry budget.
+    """
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(
+            max_attempts=2,
+            retryable_slurm_states=("NODE_FAIL",),
+        ),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    engine.submit_stage(plan, "compute")
+    first_audit = engine.submit_afterany_reconciler(plan, "audit").record
+    backend.set_states(first_audit.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+
+    result = engine.reconcile_stage(plan, "audit")
+
+    assert result.retry_submission is not None
+    assert result.retry_submission.identity.attempt == 2
+    assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"] == [
+        1,
+        2,
+    ]
+    assert backend.read_text(reconciler_followup_path(plan, "audit", 2)) is None
+
+
+def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
+    """Persist accepted retry metadata before a fallible final audit launch.
+
+    The upstream retry has already crossed Slurm and produced immutable accepted
+    evidence.  Even if the last plan-authorized audit generation is definitively
+    rejected, a registry outbox must retain the accepted job and its lifecycle
+    holders so metadata-only reconciliation can converge without resubmission.
+    """
+
+    class ToggleRegistry:
+        """Authenticate plans while allowing synchronization to be paused."""
+
+        enabled = True
+
+        def __init__(self) -> None:
+            self.updates: list[RegistryUpdate] = []
+
+        def validate_plan(self, _plan: ExecutionPlan) -> bool:
+            return True
+
+        def synchronize(self, _plan: ExecutionPlan, update: RegistryUpdate) -> bool:
+            if not self.enabled:
+                return False
+            self.updates.append(update)
+            return True
+
+    class RejectFinalAudit(ConcurrentBackend):
+        """Reject only the compute-triggered second audit generation."""
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "audit" and request.identity.attempt == 2:
+                return SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="audit qos rejected")
+            return super().invoke_submission(request)
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = RejectFinalAudit()
+    registry = ToggleRegistry()
+    engine = ExecutionEngine(backend, registry)
+    compute = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    registry.enabled = False
+
+    with pytest.raises(SubmissionRejected, match="audit qos rejected"):
+        engine.reconcile_stage(plan, "compute")
+
+    retry_path = pending_registry_path(plan, "compute", 2)
+    pending = json.loads(backend.files[retry_path])
+    assert pending["attempt"] == 2
+    assert pending["job_ids"][-1] == "9002"
+    assert pending["lifecycle_claim_ids"]
+
+    # Replay consumes the rejected audit generation, retires its invocation
+    # owner, and still fails closed because the signed fan-in bound is exhausted.
+    with pytest.raises(ValueError, match="exhausted its signed attempt bound"):
+        engine.submit_stage(plan, "compute", attempt=2, task_ids=("movie-1",))
+
+    registry.enabled = True
+    assert engine.reconcile_registry(plan)
+    assert retry_path not in backend.files
+    assert any(update.stage_id == "compute" and update.attempt == 2 for update in registry.updates)
+    assert not backend.lifecycle_claims
 
 
 def test_each_retrying_dependency_receives_a_distinct_followup_generation() -> None:

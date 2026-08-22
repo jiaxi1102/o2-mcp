@@ -69,10 +69,7 @@ class ExecutionRegistryMixin:
             for claim_id in claim_ids:
                 self._release_lifecycle(plan, claim_id)
             return True
-        update = replace(
-            update,
-            lifecycle_claim_ids=tuple(sorted(set(update.lifecycle_claim_ids) | {item for item in claim_ids if item})),
-        )
+        update = self._update_with_claims(update, claim_ids)
         pending_path = pending_registry_path(plan, update.stage_id, update.attempt)
         pending_text = self._merge_outbox(pending_path, update)
         try:
@@ -96,6 +93,42 @@ class ExecutionRegistryMixin:
             except Exception:
                 return False
         return self.backend.compare_and_swap_text(pending_path, pending_text, None)
+
+    @staticmethod
+    def _update_with_claims(update: RegistryUpdate, claim_ids: tuple[str, ...]) -> RegistryUpdate:
+        """Return one registry update carrying every exact repairable holder."""
+
+        return replace(
+            update,
+            lifecycle_claim_ids=tuple(sorted(set(update.lifecycle_claim_ids) | {item for item in claim_ids if item})),
+        )
+
+    def _enqueue_registry_update(
+        self,
+        plan: ExecutionPlan,
+        update: RegistryUpdate,
+        claim_ids: tuple[str, ...],
+    ) -> None:
+        """Persist the registry/claim repair pointer before fallible follow-ups.
+
+        Accepted compute evidence must remain recoverable even when creating its
+        scheduler-visible audit later fails or exhausts the signed bound.
+        Production always has a registry; lightweight fake backends need no
+        durable metadata outbox.
+        """
+
+        if self.registry is None:
+            # The immutable submission record is the terminal metadata surface
+            # for registry-free test/local backends, so no outbox repair is
+            # needed before releasing its holders.
+            for claim_id in claim_ids:
+                self._release_lifecycle(plan, claim_id)
+            return
+        queued = self._update_with_claims(update, claim_ids)
+        self._merge_outbox(
+            pending_registry_path(plan, queued.stage_id, queued.attempt),
+            queued,
+        )
 
     def _merge_outbox(self, path: str, update: RegistryUpdate) -> str:
         """CAS-join ``update`` into one per-attempt outbox under contention."""

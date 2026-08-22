@@ -358,7 +358,14 @@ def _record_task_authorization(
     """Derive the task contract for one existing record."""
 
     all_task_ids = tuple(task.task_id for task in select_tasks(stage, None))
-    if attempt > 1 and stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
+    followup_authorized = (
+        attempt > 1
+        and stage.dependency_mode == "afterany"
+        and stage.depends_on
+        and not stage.tasks
+        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
+    )
+    if followup_authorized:
         dependency_values = authenticate_followup_authorization(backend, plan, stage, attempt)
         task_ids = all_task_ids
         if len(dependency_values) != len(stage.depends_on):
@@ -404,7 +411,14 @@ def _validate_record_dependencies(
         authorized_jobs = {item.job_id for item in dependency_records}
         if job_id not in authorized_jobs:
             raise ValueError(f"submission dependency job {job_id} is not authenticated evidence for stage {dependency}")
-    if record.identity.attempt > 1 and stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
+    followup_authorized = (
+        record.identity.attempt > 1
+        and stage.dependency_mode == "afterany"
+        and stage.depends_on
+        and not stage.tasks
+        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, record.identity.attempt)) is not None
+    )
+    if followup_authorized:
         dependency_values = authenticate_followup_authorization(
             backend,
             plan,
