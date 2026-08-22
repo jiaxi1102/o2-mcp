@@ -188,6 +188,25 @@ def test_identical_operations_hold_distinct_claims_until_each_owner_releases(tmp
     rollback_transition(connection, run_root, "b" * 64)
 
 
+def test_private_incomplete_claim_staging_does_not_block_transition(tmp_path) -> None:
+    """A pre-publication crash leaves no malformed final exclusion claim."""
+
+    connection = LocalConnection()
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_partial__claim")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    coordination = coordination_root(run_root)
+    os.makedirs(coordination)
+    # The atomic acquire program stages under a dot-prefixed private name.  A
+    # crash before hard-link publication may leave these bytes, but they are not
+    # an ownership claim and therefore cannot strand the lifecycle forever.
+    with open(os.path.join(coordination, ".claim-dead.json.tmp-orphan"), "w", encoding="utf-8") as handle:
+        handle.write('{"claim_id":')
+
+    boundary = begin_transition(connection, run_root, "d" * 64)
+    assert boundary.job_ids == ()
+    rollback_transition(connection, run_root, "d" * 64)
+
+
 def test_identical_transition_reentry_cannot_rollback_first_callers_marker(tmp_path) -> None:
     """A deterministic transition token does not confer marker ownership."""
 

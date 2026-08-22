@@ -30,6 +30,7 @@ from o2mcp.runorg import (
     SubmitOutcome,
     TaskSpec,
 )
+from o2mcp.runorg.execution_evidence import read_reconciliation_receipt
 from o2mcp.runorg.execution_models import (
     ACCEPTED,
     ACTIVE_SLURM_STATES,
@@ -757,6 +758,12 @@ def test_retry_bound_and_nonretryable_failure_fail_closed() -> None:
     exhausted = engine.reconcile_stage(plan, "analyze")
     assert exhausted.decision == RECONCILE_FAILED
     assert len(backend.jobs) == 2
+    # FAILED is a stage-level budget verdict.  The final task-attempt evidence
+    # remains truthfully retryable under policy, so the strict reader must also
+    # authenticate the exhausted signed-attempt bound.
+    stage = plan.stages[0]
+    sealed = read_reconciliation_receipt(backend, plan, stage, 2)
+    assert sealed is not None and sealed.decision == RECONCILE_FAILED
 
     no_retry = RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",))
     second_backend = FakeExecutionBackend()

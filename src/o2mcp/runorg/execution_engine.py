@@ -515,6 +515,9 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         next_attempt, rejected_attempts = next_unrejected_attempt(
             self.backend, plan, stage, current_attempt, tuple(sorted(retryable))
         )
+        # Rejection consumes an attempt without a SubmissionRecord. Advance the
+        # evidence path so terminal failure cannot overwrite an earlier retry.
+        evidence_attempt = max([current_attempt, *(item.attempt for item in rejected_attempts)])
         for rejected_identity in rejected_attempts:
             self._release_rejected_invocation_owner(plan, rejected_identity, claim_id)
         retry_submission = None
@@ -565,7 +568,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # decision; later polls then replay byte-identically.
         if decision != RECONCILE_WAIT:
             reconciliation = ReconciliationReceipt(
-                attempt=current_attempt,
+                attempt=evidence_attempt,
                 decision=decision,
                 failed_task_ids=tuple(sorted(failed)),
                 plan_sha256=plan.plan_sha256,
@@ -574,7 +577,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 successful_task_ids=tuple(sorted(successful)),
             )
             self.backend.write_immutable_text(
-                reconciliation_path(plan, stage_id, current_attempt),
+                reconciliation_path(plan, stage_id, evidence_attempt),
                 canonical_json(reconciliation.to_dict()),
             )
 
@@ -594,13 +597,16 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             stage_status=decision,
             execution_status=self._execution_status(plan, stage_id, decision),
             job_ids=self._all_recorded_job_ids(plan),
-            attempt=(retry_submission.identity.attempt if retry_submission is not None else current_attempt),
+            attempt=(retry_submission.identity.attempt if retry_submission is not None else evidence_attempt),
         )
-        registry_synced = self._sync_registry(plan, update, (claim_id,))
+        # Convergent evidence makes same-operation orphan holders safe to retire.
+        operation_id = f"reconcile:{plan.plan_sha256}:{stage_id}"
+        reconciliation_claims = self._operation_claim_ids(plan, operation_id, claim_id)
+        registry_synced = self._sync_registry(plan, update, reconciliation_claims)
         return ReconcileResult(
             decision=decision,
             stage_id=stage_id,
-            attempt=current_attempt,
+            attempt=evidence_attempt,
             successful_task_ids=tuple(sorted(successful)),
             retry_task_ids=tuple(sorted(retryable)),
             failed_task_ids=tuple(sorted(failed)),

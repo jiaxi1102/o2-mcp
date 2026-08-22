@@ -52,7 +52,7 @@ def claim_name(claim_id: str) -> str:
 
 
 COORDINATION_PROGRAM = r"""
-import fcntl, json, os, stat, sys
+import fcntl, json, os, stat, sys, tempfile
 op, root, lock_path, name, claim_id = sys.argv[1:6]
 parent = os.path.dirname(root)
 if not os.path.isabs(root) or os.path.basename(root) in ('', '.', '..'):
@@ -89,13 +89,23 @@ try:
         if os.path.lexists(marker):
             print('TRANSITION')
         else:
-            fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                json.dump({'claim_id': claim_id}, handle, sort_keys=True)
-                handle.flush(); os.fsync(handle.fileno())
-            # The file fsync preserves bytes; the directory fsync preserves the
-            # exclusion name itself across a metadata/server crash.
-            fsync_root()
+            # Never expose a final claim name until its complete ownership JSON
+            # is durable.  A process/host failure may leave only a dot-prefixed
+            # private staging file, which transition scans intentionally ignore.
+            fd, temporary = tempfile.mkstemp(prefix=f'.{name}.tmp-', dir=root)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    json.dump({'claim_id': claim_id}, handle, sort_keys=True)
+                    handle.flush(); os.fsync(handle.fileno())
+                # Hard-link publication is create-if-absent and cannot expose
+                # partial bytes.  The inode was fsynced through ``temporary``;
+                # the directory fsync makes the final exclusion name durable.
+                os.link(temporary, claim, follow_symlinks=False)
+                fsync_root()
+            finally:
+                try: os.unlink(temporary)
+                except FileNotFoundError: pass
+                fsync_root()
             print('ACQUIRED')
     elif op == 'release':
         try:

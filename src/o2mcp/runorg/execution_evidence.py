@@ -514,6 +514,7 @@ def _validate_task_evidence(
         **{task_id: "RETRY" for task_id in reconciliation.retry_task_ids},
         **{task_id: "FAILED" for task_id in reconciliation.failed_task_ids if task_id != "__stage_receipts__"},
     }
+    latest_verdicts: dict[str, tuple[bool, bool]] = {}
     for task_id, expected_category in categories.items():
         task = tasks[task_id]
         evidence: list[TaskAttemptReceipt] = []
@@ -537,10 +538,11 @@ def _validate_task_evidence(
             ):
                 raise ValueError(f"task-attempt evidence identity mismatch: {path}")
             try:
-                authenticated_task_verdict(stage, task, item)
+                verdict = authenticated_task_verdict(stage, task, item)
             except ValueError as exc:
                 raise ValueError(f"task-attempt evidence verdict mismatch: {path}") from exc
             evidence.append(item)
+            latest_verdicts[task_id] = verdict
 
         if not evidence:
             raise ValueError(f"reconciliation task {task_id} has no immutable attempt evidence")
@@ -551,8 +553,19 @@ def _validate_task_evidence(
             latest = evidence[-1]
             if expected_category == "RETRY" and (latest.successful or not latest.retryable):
                 raise ValueError(f"reconciliation retry for {task_id} lacks retryable evidence")
-            if expected_category == "FAILED" and (latest.successful or latest.retryable):
+            if expected_category == "FAILED" and latest.successful:
                 raise ValueError(f"reconciliation failure for {task_id} lacks terminal evidence")
+
+    if reconciliation.decision == "FAILED":
+        failed_tasks = set(reconciliation.failed_task_ids) - {"__stage_receipts__"}
+        retryable_failures = {task_id for task_id in failed_tasks if latest_verdicts.get(task_id) == (False, True)}
+        terminal_failures = {task_id for task_id in failed_tasks if latest_verdicts.get(task_id) == (False, False)}
+        # A retryable task may be classified FAILED only when another task has
+        # already made the exact stage irrecoverable, or when every signed
+        # attempt has been consumed.  This preserves raw retryability in the
+        # TaskAttemptReceipt while authenticating the stage-level budget rule.
+        if retryable_failures and not terminal_failures and reconciliation.attempt < signed_attempt_bound(plan, stage):
+            raise ValueError("reconciliation failure contains retryable tasks before the signed attempt bound")
 
 
 __all__ = [

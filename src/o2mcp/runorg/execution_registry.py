@@ -190,6 +190,22 @@ class ExecutionRegistryMixin:
         """
 
         operation_id = f"submit:{plan.plan_sha256}:{identity.stage_id}:{identity.attempt}"
+        return self._operation_claim_ids(plan, operation_id, *known_claim_ids)
+
+    def _operation_claim_ids(
+        self,
+        plan: ExecutionPlan,
+        operation_id: str,
+        *known_claim_ids: str | None,
+    ) -> tuple[str, ...]:
+        """Collect every holder for a terminally repairable operation.
+
+        Submission and reconciliation both acquire distinct ownership tokens.
+        Once a later caller reaches durable convergent evidence, an older token
+        abandoned before its first evidence write is no longer an active
+        mutation and can safely travel through the registry repair outbox.
+        """
+
         matching = self.backend.matching_lifecycle_claims(plan.paths.run_root, operation_id)
         values = {item for item in known_claim_ids if item}
         values.update(matching)
