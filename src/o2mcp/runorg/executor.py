@@ -440,6 +440,20 @@ class O2Runs(TransitionExecutorMixin):
             manifest = self.read_manifest(run_dir)
             if manifest is None or manifest.validate():
                 return {"ok": False, "error": "unknown_run", "message": f"no valid run manifest under {run_dir}"}
+            # Execution-plan runs are coordinated by ExecutionEngine's
+            # lifecycle claims, invocation evidence, and idempotent scheduler
+            # identity.  The legacy convenience path has none of those
+            # guarantees, so allowing it to attach would reopen a submit-versus-
+            # promote race at the destructive transition boundary.
+            provenance = manifest.provenance or {}
+            if isinstance(provenance, dict) and "execution_preparation" in provenance:
+                return {
+                    "ok": False,
+                    "error": "execution_plan_submission_required",
+                    "message": "prepared execution-plan runs must be submitted through the execution engine",
+                    "run_id": manifest.run_id,
+                    "run_dir": run_dir,
+                }
             run_id = manifest.run_id
         elif campaign and pipeline and datasets:
             reg, manifest = self._register(

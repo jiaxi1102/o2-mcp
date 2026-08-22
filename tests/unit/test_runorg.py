@@ -383,6 +383,39 @@ def test_submit_validates_script_before_allocating_run(tmp_path):
     assert not any("date -u" in command or "mkdir" in command for command in seen)
 
 
+def test_legacy_submit_rejects_prepared_execution_plan_run(tmp_path):
+    """The convenience submit path cannot bypass execution lifecycle claims."""
+
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+        provenance={"execution_preparation": {"project": "example-project"}},
+    )
+    submitted = False
+
+    def responder(argv, _inp):
+        nonlocal submitted
+        command = argv[-1]
+        if command.startswith("test -d "):
+            return ("", "", 0)
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest.to_json(), "", 0)
+        if "sbatch" in command:
+            submitted = True
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    run_dir = runs.layout.run_dir("active", manifest.campaign, manifest.run_id)
+    result = runs.submit_run(run_dir=run_dir, script_text="#!/bin/sh\ntrue\n")
+
+    assert result["ok"] is False
+    assert result["error"] == "execution_plan_submission_required"
+    assert submitted is False
+
+
 def test_record_job_surfaces_registry_failure_after_manifest_write(tmp_path):
     """Callers can distinguish a live job from its pending registry annotation."""
 

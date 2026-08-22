@@ -84,7 +84,12 @@ class ExecutionRegistryMixin:
         # for this exact owner. If release fails, preserve it and report pending
         # convergence rather than losing the only evidence that can repair the
         # otherwise transition-blocking claim.
-        for claim_id in update.lifecycle_claim_ids:
+        # ``_merge_outbox`` may have joined holders left by an earlier failed
+        # registry write with the holders supplied by this invocation.  Decode
+        # the exact bytes that synchronized successfully so every durable repair
+        # pointer is retired before those bytes are compare-cleared.
+        merged_update = decode_registry_update(pending_text)
+        for claim_id in merged_update.lifecycle_claim_ids:
             try:
                 self._release_lifecycle(plan, claim_id)
             except Exception:

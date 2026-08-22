@@ -30,6 +30,7 @@ import fcntl, glob, hashlib, json, os, stat, sys, tempfile
 run_root, coordination, lock_path, token = sys.argv[1:5]
 os.makedirs(os.path.dirname(coordination), exist_ok=True)
 lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+created = False
 try:
     if not stat.S_ISREG(os.fstat(lock).st_mode): raise SystemExit('coordination lock is not regular')
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -46,6 +47,7 @@ try:
             handle.write(token); handle.flush(); os.fsync(handle.fileno())
         try: os.link(temporary, marker)
         finally: os.unlink(temporary)
+        created = True
         directory_fd = os.open(coordination, os.O_RDONLY | os.O_DIRECTORY)
         try: os.fsync(directory_fd)
         finally: os.close(directory_fd)
@@ -53,6 +55,11 @@ try:
         if not stat.S_ISREG(os.fstat(marker_fd).st_mode): raise SystemExit('transition marker is not regular')
         with os.fdopen(marker_fd, encoding='utf-8') as handle: current = handle.read()
         if current != token: raise SystemExit('a different transition is already marked')
+        # The deterministic token identifies the reviewed transition, not this
+        # caller.  A second identical caller therefore observes, but never owns,
+        # the existing marker and must not be allowed to roll it back.
+        print(json.dumps({'already_marked': True, 'job_ids': []}, sort_keys=True))
+        raise SystemExit(0)
 
     execution = os.path.join(run_root, 'receipts', 'execution')
     records = {}
@@ -124,7 +131,18 @@ try:
         if type(values) is not list or any(type(job) is not str or not job.isdigit() for job in values):
             raise SystemExit('invalid registry outbox evidence')
         jobs.update(values)
-    print(json.dumps({'job_ids': sorted(jobs, key=int)}, sort_keys=True))
+    print(json.dumps({'already_marked': False, 'job_ids': sorted(jobs, key=int)}, sort_keys=True))
+except BaseException:
+    # Only this process knows whether it linked the marker.  Clean up a marker
+    # created by a failed evidence scan here, while the coordination lock is
+    # still held; callers must never guess ownership from a shared token.
+    if created:
+        try: os.unlink(marker)
+        except FileNotFoundError: pass
+        directory_fd = os.open(coordination, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+    raise
 finally:
     os.close(lock)
 """
@@ -166,14 +184,22 @@ def begin_transition(connection: O2Connection, run_root: str, token: str) -> Tra
     )
     result = connection.run(command, timeout=120)
     if not result.ok:
-        # The remote program marks before scanning evidence.  Clear only this
-        # exact token when the scan itself fails so a corrected retry is possible.
-        rollback_transition(connection, run_root, token)
+        # The remote helper tracks marker ownership and rolls back only a marker
+        # it created.  A local rollback here could erase another identical
+        # caller's transition after a lost or ambiguous response.
         raise ValueError(result.stderr.strip() or result.stdout.strip() or "could not mark lifecycle transition")
     value = strict_json_object(result.stdout, "transition boundary response")
     jobs = value.get("job_ids")
-    if set(value) != {"job_ids"} or type(jobs) is not list or any(type(job) is not str for job in jobs):
+    already_marked = value.get("already_marked")
+    if (
+        set(value) != {"already_marked", "job_ids"}
+        or type(already_marked) is not bool
+        or type(jobs) is not list
+        or any(type(job) is not str for job in jobs)
+    ):
         raise ValueError("transition boundary returned invalid job evidence")
+    if already_marked:
+        raise ValueError("the reviewed lifecycle transition is already marked by another caller")
     return TransitionBoundary(tuple(jobs))
 
 

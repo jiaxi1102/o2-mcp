@@ -282,6 +282,44 @@ def test_registry_outbox_is_per_attempt_monotonic_and_independently_cleared() ->
     assert audit_path not in backend.files
 
 
+def test_registry_success_releases_every_holder_joined_into_outbox() -> None:
+    """A later successful merge retires claims retained by an earlier failure."""
+
+    plan = _plan()
+    backend = Backend()
+    registry = Registry(accept=False)
+    engine = ExecutionEngine(backend, registry)
+    old_claim = backend.acquire_lifecycle_claim(plan.paths.run_root, "submit:old")
+    new_claim = backend.acquire_lifecycle_claim(plan.paths.run_root, "submit:new")
+    assert old_claim is not None and new_claim is not None
+
+    pending = RegistryUpdate(
+        plan.plan_sha256,
+        "compute",
+        "SUBMITTED",
+        "SUBMITTED",
+        ("7100",),
+        1,
+        (old_claim,),
+    )
+    assert engine._sync_registry(plan, pending) is False
+
+    registry.accept = True
+    completed = RegistryUpdate(
+        plan.plan_sha256,
+        "compute",
+        "COMPLETED",
+        "COMPLETED",
+        ("7100",),
+        1,
+        (new_claim,),
+    )
+    assert engine._sync_registry(plan, completed) is True
+    assert old_claim not in backend.lifecycle_claims
+    assert new_claim not in backend.lifecycle_claims
+    assert pending_registry_path(plan, "compute", 1) not in backend.files
+
+
 def test_registry_outbox_job_union_is_byte_deterministic() -> None:
     """Equivalent joins must serialize job IDs in stable numeric order."""
 

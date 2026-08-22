@@ -188,6 +188,25 @@ def test_identical_operations_hold_distinct_claims_until_each_owner_releases(tmp
     rollback_transition(connection, run_root, "b" * 64)
 
 
+def test_identical_transition_reentry_cannot_rollback_first_callers_marker(tmp_path) -> None:
+    """A deterministic transition token does not confer marker ownership."""
+
+    connection = LocalConnection()
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_same__transition")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    token = "c" * 64
+
+    begin_transition(connection, run_root, token)
+    marker = os.path.join(coordination_root(run_root), "transition.json")
+    with pytest.raises(ValueError, match="already marked by another caller"):
+        begin_transition(connection, run_root, token)
+
+    # The losing caller must leave the first caller's boundary intact.
+    with open(marker, encoding="utf-8") as handle:
+        assert handle.read() == token
+    rollback_transition(connection, run_root, token)
+
+
 def test_claim_release_rejects_duplicate_key_ownership_evidence(tmp_path) -> None:
     """Tampered claim JSON cannot collapse duplicate ownership keys on release."""
 
