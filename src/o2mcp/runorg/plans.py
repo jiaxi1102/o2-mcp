@@ -45,6 +45,7 @@ from o2mcp.runorg.plan_components import (
 )
 from o2mcp.runorg.plan_stages import CommandSpec, StageSpec, TaskSpec
 from o2mcp.runorg.runs import _RUN_ID_RE, campaign_of
+from o2mcp.runorg.strict_json import strict_json_value
 
 
 @dataclass(frozen=True)
@@ -297,27 +298,13 @@ class ExecutionPlan:
         authenticates the exact reviewed plan at a submission boundary.
         """
 
-        try:
-            decoded = json.loads(text, object_pairs_hook=_reject_duplicate_object_pairs)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"execution plan is not valid JSON: {exc}") from exc
+        decoded = strict_json_value(text, "execution plan")
         plan = cls.from_envelope(_require_mapping(decoded, "execution plan envelope"))
         if expected_plan_sha256 is not None:
             _validate_sha256(expected_plan_sha256, "expected_plan_sha256")
             if plan.plan_sha256 != expected_plan_sha256:
                 raise ValueError("execution plan does not match the independently trusted digest")
         return plan
-
-
-def _reject_duplicate_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Decode one JSON object while rejecting ambiguous duplicate member names."""
-
-    decoded: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in decoded:
-            raise ValueError(f"execution plan JSON contains duplicate key {key!r}")
-        decoded[key] = value
-    return decoded
 
 
 __all__ = [

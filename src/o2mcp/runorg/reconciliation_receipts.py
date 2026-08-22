@@ -26,7 +26,7 @@ _TERMINAL_DECISIONS = frozenset({RECONCILE_COMPLETE, RECONCILE_FAILED, RECONCILE
 def _strict_identifier_list(value: object, field_name: str) -> tuple[str, ...]:
     """Decode one sorted unique identifier array without coercing wire types."""
 
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+    if type(value) is not list or any(type(item) is not str for item in value):
         raise ValueError(f"reconciliation {field_name} must be an array of strings")
     identifiers = tuple(value)
     if identifiers != tuple(sorted(identifiers)) or len(set(identifiers)) != len(identifiers):
@@ -90,7 +90,7 @@ class ReconciliationReceipt:
     ) -> ReconciliationReceipt:
         """Strictly decode and bind a receipt to its expected plan and task scope."""
 
-        if not isinstance(value, dict):
+        if type(value) is not dict:
             raise ValueError("reconciliation receipt must be a JSON object")
         allowed = {
             "active_task_ids",
@@ -105,15 +105,15 @@ class ReconciliationReceipt:
         }
         if set(value) != allowed:
             raise ValueError("reconciliation receipt has unsupported or missing fields")
-        if not isinstance(value["plan_sha256"], str) or value["plan_sha256"] != plan_sha256:
+        if type(value["plan_sha256"]) is not str or value["plan_sha256"] != plan_sha256:
             raise ValueError("reconciliation receipt plan SHA mismatch")
-        if not isinstance(value["stage_id"], str) or value["stage_id"] != stage.stage_id:
+        if type(value["stage_id"]) is not str or value["stage_id"] != stage.stage_id:
             raise ValueError("reconciliation receipt stage mismatch")
-        if isinstance(value["attempt"], bool) or value["attempt"] != attempt:
+        if type(value["attempt"]) is not int or value["attempt"] != attempt:
             raise ValueError("reconciliation receipt attempt mismatch")
-        if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
+        if type(value["schema_version"]) is not int or value["schema_version"] != 1:
             raise ValueError("unsupported reconciliation schema version")
-        if not isinstance(value["decision"], str):
+        if type(value["decision"]) is not str:
             raise ValueError("reconciliation decision must be text")
 
         receipt = cls(

@@ -15,6 +15,7 @@ from typing import Any
 
 from o2mcp.runorg.plan_components import ReceiptSpec, ResourceSpec, _validate_identifier, _validate_sha256
 from o2mcp.runorg.plan_stages import CommandSpec
+from o2mcp.runorg.strict_json import exact_bool, exact_int, exact_list, exact_object, exact_str
 
 EXECUTION_RECEIPT_SCHEMA_VERSION = 1
 
@@ -223,15 +224,42 @@ class SlurmJob:
     state: str = ""
 
 
+DEFINITELY_NOT_INVOKED = "DEFINITELY_NOT_INVOKED"
+DEFINITELY_REJECTED = "DEFINITELY_REJECTED"
+ACCEPTED = "ACCEPTED"
+INVOKED_OUTCOME_UNKNOWN = "INVOKED_OUTCOME_UNKNOWN"
+
+
 @dataclass(frozen=True)
 class SubmitOutcome:
-    """Definitive or uncertain result returned by a backend submit call."""
+    """Explicit scheduler-boundary outcome with no ambiguous success coercion."""
 
-    job_id: str | None
-    accepted: bool
-    response_received: bool = True
+    status: str
+    job_id: str | None = None
+    returncode: int | None = None
     stdout: str = ""
     stderr: str = ""
+
+    def __post_init__(self) -> None:
+        """Require evidence consistent with the claimed invocation outcome."""
+
+        allowed = {DEFINITELY_NOT_INVOKED, DEFINITELY_REJECTED, ACCEPTED, INVOKED_OUTCOME_UNKNOWN}
+        if self.status not in allowed:
+            raise ValueError("submission outcome status is invalid")
+        if self.job_id is not None and (type(self.job_id) is not str or not self.job_id.isdigit()):
+            raise ValueError("submission outcome job_id must be a numeric string or None")
+        if self.returncode is not None and type(self.returncode) is not int:
+            raise ValueError("submission outcome returncode must be an integer or None")
+        if type(self.stdout) is not str or type(self.stderr) is not str:
+            raise ValueError("submission outcome stdout/stderr must be strings")
+        if self.status == ACCEPTED and self.job_id is None:
+            raise ValueError("ACCEPTED submission outcome requires a parsed job ID")
+        if self.status != ACCEPTED and self.job_id is not None:
+            raise ValueError("only ACCEPTED submission outcome may carry a job ID")
+        if self.status == DEFINITELY_REJECTED and (self.returncode is None or self.returncode == 0):
+            raise ValueError("DEFINITELY_REJECTED requires a proven nonzero sbatch return code")
+        if self.status == DEFINITELY_NOT_INVOKED and self.returncode is not None:
+            raise ValueError("preparation failure is not an sbatch return code")
 
 
 @dataclass(frozen=True)
@@ -369,28 +397,30 @@ class SubmissionRecord:
             "task_ids",
             "task_indices",
         }
-        if set(value) != allowed or value.get("schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
+        exact_object(value, allowed, "submission record")
+        if exact_int(value["schema_version"], "submission record schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
             raise ValueError("submission record has unsupported fields or schema")
-        identity = SubmissionIdentity(str(value["plan_sha256"]), str(value["stage_id"]), int(value["attempt"]))
-        if value.get("comment") != identity.comment:
+        identity = SubmissionIdentity(
+            exact_str(value["plan_sha256"], "submission record plan_sha256"),
+            exact_str(value["stage_id"], "submission record stage_id"),
+            exact_int(value["attempt"], "submission record attempt"),
+        )
+        if exact_str(value["comment"], "submission record comment") != identity.comment:
             raise ValueError("submission record comment does not match its identity")
-        job_id = str(value["job_id"])
+        job_id = exact_str(value["job_id"], "submission record job_id")
         if not job_id.isdigit():
             raise ValueError("submission record job_id must be numeric")
-        if not isinstance(value["recovered"], bool):
-            raise ValueError("submission record recovered must be a boolean")
-        if not isinstance(value["task_ids"], list) or not isinstance(value["task_indices"], list):
-            raise ValueError("submission record task identities must be arrays")
-        if not isinstance(value["dependency_job_ids"], list):
-            raise ValueError("submission record dependency_job_ids must be an array")
+        task_ids = exact_list(value["task_ids"], "submission record task_ids")
+        task_indices = exact_list(value["task_indices"], "submission record task_indices")
+        dependency_ids = exact_list(value["dependency_job_ids"], "submission record dependency_job_ids")
         return cls(
             identity=identity,
             job_id=job_id,
-            task_ids=tuple(str(item) for item in value["task_ids"]),
-            task_indices=tuple(int(item) for item in value.get("task_indices", [])),
-            recovered=value["recovered"],
-            dependency_mode=str(value["dependency_mode"]),
-            dependency_job_ids=tuple(str(item) for item in value["dependency_job_ids"]),
+            task_ids=tuple(exact_str(item, "submission record task_id") for item in task_ids),
+            task_indices=tuple(exact_int(item, "submission record task_index") for item in task_indices),
+            recovered=exact_bool(value["recovered"], "submission record recovered"),
+            dependency_mode=exact_str(value["dependency_mode"], "submission record dependency_mode"),
+            dependency_job_ids=tuple(exact_str(item, "submission record dependency job_id") for item in dependency_ids),
         )
 
 
@@ -407,6 +437,7 @@ class SubmissionRejectionRecord:
     identity: SubmissionIdentity
     task_ids: tuple[str, ...]
     task_indices: tuple[int, ...]
+    returncode: int
     stdout: str
     stderr: str
 
@@ -429,6 +460,8 @@ class SubmissionRejectionRecord:
             raise ValueError("array rejection must bind one index to every task")
         if len(set(self.task_indices)) != len(self.task_indices):
             raise ValueError("submission rejection task_indices cannot contain duplicates")
+        if type(self.returncode) is not int or self.returncode == 0:
+            raise ValueError("submission rejection requires a proven nonzero sbatch return code")
         for field_name in ("stdout", "stderr"):
             value = getattr(self, field_name)
             if not isinstance(value, str):
@@ -442,6 +475,7 @@ class SubmissionRejectionRecord:
             "comment": self.identity.comment,
             "decision": "RETRY_SUBMISSION",
             "plan_sha256": self.identity.plan_sha256,
+            "returncode": self.returncode,
             "schema_version": EXECUTION_RECEIPT_SCHEMA_VERSION,
             "stage_id": self.identity.stage_id,
             "stderr": self.stderr,
@@ -459,6 +493,7 @@ class SubmissionRejectionRecord:
             "comment",
             "decision",
             "plan_sha256",
+            "returncode",
             "schema_version",
             "stage_id",
             "stderr",
@@ -466,21 +501,28 @@ class SubmissionRejectionRecord:
             "task_ids",
             "task_indices",
         }
-        if set(value) != allowed or value.get("schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
+        exact_object(value, allowed, "submission rejection")
+        schema_version = exact_int(value["schema_version"], "submission rejection schema_version")
+        if schema_version != EXECUTION_RECEIPT_SCHEMA_VERSION:
             raise ValueError("submission rejection has unsupported fields or schema")
-        if value.get("decision") != "RETRY_SUBMISSION":
+        if exact_str(value["decision"], "submission rejection decision") != "RETRY_SUBMISSION":
             raise ValueError("submission rejection decision is invalid")
-        identity = SubmissionIdentity(str(value["plan_sha256"]), str(value["stage_id"]), int(value["attempt"]))
-        if value.get("comment") != identity.comment:
+        identity = SubmissionIdentity(
+            exact_str(value["plan_sha256"], "submission rejection plan_sha256"),
+            exact_str(value["stage_id"], "submission rejection stage_id"),
+            exact_int(value["attempt"], "submission rejection attempt"),
+        )
+        if exact_str(value["comment"], "submission rejection comment") != identity.comment:
             raise ValueError("submission rejection comment does not match its identity")
-        if not isinstance(value.get("task_ids"), list) or not isinstance(value.get("task_indices"), list):
-            raise ValueError("submission rejection task identities must be arrays")
+        task_ids = exact_list(value["task_ids"], "submission rejection task_ids")
+        task_indices = exact_list(value["task_indices"], "submission rejection task_indices")
         return cls(
             identity=identity,
-            task_ids=tuple(str(item) for item in value["task_ids"]),
-            task_indices=tuple(int(item) for item in value["task_indices"]),
-            stdout=str(value["stdout"]),
-            stderr=str(value["stderr"]),
+            task_ids=tuple(exact_str(item, "submission rejection task_id") for item in task_ids),
+            task_indices=tuple(exact_int(item, "submission rejection task_index") for item in task_indices),
+            returncode=exact_int(value["returncode"], "submission rejection returncode"),
+            stdout=exact_str(value["stdout"], "submission rejection stdout"),
+            stderr=exact_str(value["stderr"], "submission rejection stderr"),
         )
 
 
@@ -576,30 +618,46 @@ class TaskAttemptReceipt:
             "successful",
             "task_id",
         }
-        if set(value) != allowed or value.get("schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
+        exact_object(value, allowed, "task-attempt receipt")
+        if exact_int(value["schema_version"], "task-attempt schema_version") != EXECUTION_RECEIPT_SCHEMA_VERSION:
             raise ValueError("task-attempt receipt has unsupported fields or schema")
-        identity = SubmissionIdentity(str(value["plan_sha256"]), str(value["stage_id"]), int(value["attempt"]))
-        if value["comment"] != identity.comment:
+        identity = SubmissionIdentity(
+            exact_str(value["plan_sha256"], "task-attempt plan_sha256"),
+            exact_str(value["stage_id"], "task-attempt stage_id"),
+            exact_int(value["attempt"], "task-attempt attempt"),
+        )
+        if exact_str(value["comment"], "task-attempt comment") != identity.comment:
             raise ValueError("task-attempt receipt comment does not match its identity")
-        if not isinstance(value["receipts"], list):
-            raise ValueError("task-attempt receipts must be an array")
+        receipts = exact_list(value["receipts"], "task-attempt receipts")
         observations: list[ReceiptObservation] = []
-        for item in value["receipts"]:
-            if not isinstance(item, dict) or set(item) != {"exists", "path", "sha256"}:
-                raise ValueError("task-attempt receipt observation is malformed")
-            if not isinstance(item["exists"], bool):
-                raise ValueError("task-attempt receipt exists flag must be boolean")
-            observations.append(ReceiptObservation(str(item["path"]), item["exists"], item["sha256"]))
+        for item in receipts:
+            observation = exact_object(item, {"exists", "path", "sha256"}, "task-attempt observation")
+            sha256 = observation["sha256"]
+            if sha256 is not None:
+                sha256 = exact_str(sha256, "task-attempt observation sha256")
+            observations.append(
+                ReceiptObservation(
+                    exact_str(observation["path"], "task-attempt observation path"),
+                    exact_bool(observation["exists"], "task-attempt observation exists"),
+                    sha256,
+                )
+            )
+        array_index = value["array_index"]
+        if array_index is not None:
+            array_index = exact_int(array_index, "task-attempt array_index")
+        exit_code = value["exit_code"]
+        if exit_code is not None:
+            exit_code = exact_int(exit_code, "task-attempt exit_code")
         return cls(
             identity=identity,
-            task_id=str(value["task_id"]),
-            array_index=value["array_index"],
-            job_id=str(value["job_id"]),
-            slurm_state=str(value["slurm_state"]),
-            exit_code=value["exit_code"],
+            task_id=exact_str(value["task_id"], "task-attempt task_id"),
+            array_index=array_index,
+            job_id=exact_str(value["job_id"], "task-attempt job_id"),
+            slurm_state=exact_str(value["slurm_state"], "task-attempt slurm_state"),
+            exit_code=exit_code,
             receipt_observations=tuple(observations),
-            successful=value["successful"],
-            retryable=value["retryable"],
+            successful=exact_bool(value["successful"], "task-attempt successful"),
+            retryable=exact_bool(value["retryable"], "task-attempt retryable"),
         )
 
 
@@ -688,7 +746,10 @@ class DuplicateSubmissionError(RuntimeError):
 
 
 __all__ = [
+    "ACCEPTED",
     "ACTIVE_SLURM_STATES",
+    "DEFINITELY_NOT_INVOKED",
+    "DEFINITELY_REJECTED",
     "DuplicateSubmissionError",
     "PlannedTask",
     "ReceiptObservation",
@@ -704,6 +765,7 @@ __all__ = [
     "SubmissionRequest",
     "SubmissionUncertain",
     "SubmitOutcome",
+    "INVOKED_OUTCOME_UNKNOWN",
     "SUCCESS_SLURM_STATES",
     "TERMINAL_SLURM_STATES",
     "TaskAttemptReceipt",

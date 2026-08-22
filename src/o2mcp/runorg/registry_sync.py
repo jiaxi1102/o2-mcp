@@ -58,13 +58,15 @@ def merge_execution_manifest(
     if isinstance(previous_stage, dict):
         previous_attempt = previous_stage.get("attempt")
         previous_status = previous_stage.get("status")
-        if isinstance(previous_attempt, int) and (
+        if type(previous_attempt) is not int or type(previous_status) is not str:
+            raise ValueError("run.json execution stage state has invalid exact types")
+        if (
             previous_attempt > update.attempt
             or previous_attempt == update.attempt
-            and _STAGE_STATUS_RANK.get(str(previous_status), 0) > _STAGE_STATUS_RANK.get(update.stage_status, 0)
+            and _STAGE_STATUS_RANK.get(previous_status, 0) > _STAGE_STATUS_RANK.get(update.stage_status, 0)
         ):
             accept_stage_update = False
-        elif previous_attempt == update.attempt and {str(previous_status), update.stage_status} == {
+        elif previous_attempt == update.attempt and {previous_status, update.stage_status} == {
             "COMPLETED",
             "FAILED",
         }:
@@ -75,7 +77,9 @@ def merge_execution_manifest(
     if accept_stage_update:
         stages[update.stage_id] = {"attempt": update.attempt, "status": update.stage_status}
 
-    previous_state = str(previous_execution.get("state", ""))
+    previous_state = previous_execution.get("state", "")
+    if type(previous_state) is not str:
+        raise ValueError("run.json execution state must be a string")
     execution_state = update.execution_status
     if previous_state == "FAILED" or execution_state == "FAILED":
         execution_state = "FAILED"

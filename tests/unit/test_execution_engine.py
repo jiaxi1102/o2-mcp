@@ -26,10 +26,14 @@ from o2mcp.runorg import (
     StageSpec,
     SubmissionIdentity,
     SubmissionRequest,
+    SubmissionUncertain,
     SubmitOutcome,
     TaskSpec,
 )
 from o2mcp.runorg.execution_models import (
+    ACCEPTED,
+    DEFINITELY_NOT_INVOKED,
+    INVOKED_OUTCOME_UNKNOWN,
     RECONCILE_COMPLETE,
     RECONCILE_FAILED,
     RECONCILE_RETRY_SUBMITTED,
@@ -52,6 +56,8 @@ class FakeExecutionBackend:
         self.lose_next_submit_response = False
         self.hide_next_submitted_job = False
         self.intent_present_at_submit: list[bool] = []
+        self.lifecycle_claims: set[str] = set()
+        self.transition_marked = False
 
     def find_jobs(self, comment: str):
         return tuple(
@@ -60,7 +66,12 @@ class FakeExecutionBackend:
             if data["comment"] == comment and bool(data.get("visible", True))
         )
 
-    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
+    def prepare_submission(self, request: SubmissionRequest) -> None:
+        """The in-memory dispatcher needs no separate filesystem preparation."""
+
+        return None
+
+    def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
         intent_suffix = f"/submission-intents/{request.identity.stage_id}/attempt-{request.identity.attempt:03d}.json"
         self.intent_present_at_submit.append(any(path.endswith(intent_suffix) for path in self.files))
         self.requests.append(request)
@@ -76,8 +87,8 @@ class FakeExecutionBackend:
         if self.lose_next_submit_response:
             self.lose_next_submit_response = False
             # Slurm accepted the job, but the transport dropped its response.
-            return SubmitOutcome(None, accepted=True, response_received=False)
-        return SubmitOutcome(job_id, accepted=True)
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN)
+        return SubmitOutcome(ACCEPTED, job_id=job_id, returncode=0)
 
     def task_states(self, job_id: str):
         return self.jobs[job_id]["task_states"]
@@ -136,6 +147,19 @@ class FakeExecutionBackend:
         else:
             self.files[path] = replacement
         return True
+
+    def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> bool:
+        """Model the sibling transition/claim exclusion used in production."""
+
+        if self.transition_marked:
+            return False
+        self.lifecycle_claims.add(operation_id)
+        return True
+
+    def release_lifecycle_claim(self, _run_root: str, operation_id: str) -> None:
+        """Release exactly one converged operation claim."""
+
+        self.lifecycle_claims.discard(operation_id)
 
 
 @dataclass
@@ -539,3 +563,147 @@ def test_duplicate_scheduler_identity_fails_before_receipt_write() -> None:
 
     with pytest.raises(RuntimeError, match="multiple Slurm jobs"):
         ExecutionEngine(backend).submit_stage(plan, "analyze")
+
+
+def test_record_replay_reconstructs_registry_update_when_outbox_was_never_written() -> None:
+    """A crash after record publication cannot leave run.json unaware of the job."""
+
+    backend = FakeExecutionBackend()
+    registry = FakeRegistry(failures_remaining=1)
+    plan = _plan()
+    engine = ExecutionEngine(backend, registry)
+    first = engine.submit_stage(plan, "analyze")
+    assert not first.registry_synced
+    assert backend.lifecycle_claims
+    backend.files.pop(pending_registry_path(plan, "analyze", 1), None)
+
+    replay = engine.submit_stage(plan, "analyze")
+    assert not replay.submitted and replay.registry_synced
+    assert len(backend.requests) == 1
+    assert registry.updates[-1].job_ids == (first.record.job_id,)
+    assert registry.updates[-1].stage_status == "SUBMITTED"
+    assert not backend.lifecycle_claims
+
+
+def test_preparation_failure_is_same_attempt_recoverable_without_invocation_marker() -> None:
+    """Dispatcher/log preparation failure proves sbatch was not called."""
+
+    backend = FakeExecutionBackend()
+    plan = _plan()
+    original = backend.prepare_submission
+    failures = 1
+
+    def fail_once(request: SubmissionRequest):
+        nonlocal failures
+        if failures:
+            failures -= 1
+            return SubmitOutcome(DEFINITELY_NOT_INVOKED, stderr="temporary staging failure")
+        return original(request)
+
+    backend.prepare_submission = fail_once  # type: ignore[method-assign]
+    engine = ExecutionEngine(backend)
+    with pytest.raises(RuntimeError, match="temporary staging failure"):
+        engine.submit_stage(plan, "analyze")
+    assert not any("submission-invocations" in path for path in backend.files)
+    assert not backend.requests
+    assert engine.submit_stage(plan, "analyze").record.identity.attempt == 1
+
+
+def test_verified_pre_sbatch_failure_clears_invocation_ownership_for_same_attempt() -> None:
+    """A pinned-dispatcher failure proven before sbatch is not uncertain work."""
+
+    backend = FakeExecutionBackend()
+    plan = _plan()
+    original = backend.invoke_submission
+    failures = 1
+
+    def fail_before_sbatch(request: SubmissionRequest):
+        nonlocal failures
+        if failures:
+            failures -= 1
+            return SubmitOutcome(DEFINITELY_NOT_INVOKED, stderr="dispatcher digest mismatch")
+        return original(request)
+
+    backend.invoke_submission = fail_before_sbatch  # type: ignore[method-assign]
+    engine = ExecutionEngine(backend)
+    with pytest.raises(RuntimeError, match="dispatcher digest mismatch"):
+        engine.submit_stage(plan, "analyze")
+    assert not any("submission-invocations" in path for path in backend.files)
+    assert engine.submit_stage(plan, "analyze").record.identity.attempt == 1
+
+
+def test_uncertain_success_never_authorizes_retry_attempt() -> None:
+    """A zero/unparseable or lost success remains uncertain, not rejected."""
+
+    backend = FakeExecutionBackend()
+    backend.lose_next_submit_response = True
+    backend.hide_next_submitted_job = True
+    plan = _plan()
+    engine = ExecutionEngine(backend)
+    with pytest.raises(SubmissionUncertain):
+        engine.submit_stage(plan, "analyze")
+    assert not any("submission-rejections" in path for path in backend.files)
+    with pytest.raises(ValueError, match="no preceding reconciliation or rejection"):
+        engine.submit_stage(plan, "analyze", attempt=2)
+    assert len(backend.requests) == 1
+
+
+def test_deleted_current_receipt_invalidates_completed_dependency_gate() -> None:
+    """Historical COMPLETED evidence cannot release work after output deletion."""
+
+    upstream = StageSpec(
+        stage_id="upstream",
+        command=_command("upstream"),
+        resources=_resources(1),
+        expected_receipts=(ReceiptSpec("upstream-done", "receipts/stages/upstream/done.json"),),
+    )
+    downstream = StageSpec(
+        stage_id="downstream",
+        command=_command("downstream"),
+        resources=_resources(1),
+        expected_receipts=(ReceiptSpec("downstream-done", "receipts/stages/downstream/done.json"),),
+        depends_on=("upstream",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(upstream, downstream))
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    record = engine.submit_stage(plan, "upstream").record
+    backend.set_states(record.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    receipt_path = posixpath.join(RUN_ROOT, upstream.expected_receipts[0].path)
+    backend.files[receipt_path] = "certified\n"
+    assert engine.reconcile_stage(plan, "upstream").decision == RECONCILE_COMPLETE
+
+    del backend.files[receipt_path]
+    with pytest.raises(ValueError, match="lack authenticated COMPLETED"):
+        engine.submit_stage(plan, "downstream")
+
+
+def test_untrustworthy_final_receipt_recheck_waits_instead_of_sealing_failure() -> None:
+    """A transport/read fault at the final gate remains transient evidence."""
+
+    stage = StageSpec(
+        stage_id="single",
+        command=_command("single"),
+        resources=_resources(1),
+        expected_receipts=(ReceiptSpec("single-done", "receipts/stages/single/done.json"),),
+    )
+    plan = _plan(stages=(stage,))
+    backend = FakeExecutionBackend()
+    record = ExecutionEngine(backend).submit_stage(plan, "single").record
+    backend.set_states(record.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(stage.expected_receipts[0])
+    original = backend.observe_receipt
+    observations = 0
+
+    def fail_second_observation(run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
+        nonlocal observations
+        observations += 1
+        if observations == 2:
+            return ReceiptObservation(receipt.path, False, None, trustworthy=False, error="temporary read failure")
+        return original(run_root, receipt)
+
+    backend.observe_receipt = fail_second_observation  # type: ignore[method-assign]
+    result = ExecutionEngine(backend).reconcile_stage(plan, "single")
+    assert result.decision == "WAIT"
+    assert result.active_task_ids == ("__current_task_receipts__",)

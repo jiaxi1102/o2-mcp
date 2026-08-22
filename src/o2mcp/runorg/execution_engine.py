@@ -16,7 +16,6 @@ properties are:
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -24,6 +23,7 @@ from o2mcp.runorg.execution_authorization import derive_attempt_authorization
 from o2mcp.runorg.execution_backend import ExecutionBackend, O2ExecutionBackend, receipt_matches, text_sha256
 from o2mcp.runorg.execution_evidence import (
     authenticated_task_verdict,
+    current_task_receipts_status,
     current_task_receipts_valid,
     latest_reconciliation_receipt,
     read_plan_submission_records,
@@ -31,7 +31,11 @@ from o2mcp.runorg.execution_evidence import (
     read_submission_rejection,
 )
 from o2mcp.runorg.execution_models import (
+    ACCEPTED,
     ACTIVE_SLURM_STATES,
+    DEFINITELY_NOT_INVOKED,
+    DEFINITELY_REJECTED,
+    INVOKED_OUTCOME_UNKNOWN,
     RECONCILE_COMPLETE,
     RECONCILE_FAILED,
     RECONCILE_RETRY,
@@ -53,8 +57,6 @@ from o2mcp.runorg.execution_models import (
     canonical_json,
 )
 from o2mcp.runorg.execution_paths import (
-    bound_plan_path,
-    pending_registry_path,
     reconciler_followup_path,
     reconciliation_path,
     submission_intent_path,
@@ -64,11 +66,12 @@ from o2mcp.runorg.execution_paths import (
     task_attempt_path,
 )
 from o2mcp.runorg.execution_reconcile import is_retryable, stage_by_id, task_state
+from o2mcp.runorg.execution_registry import ExecutionRegistryMixin
 from o2mcp.runorg.execution_rendering import build_submission_request, select_tasks, submission_intent
 from o2mcp.runorg.plan_stages import StageSpec
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.reconciliation_receipts import ReconciliationReceipt
-from o2mcp.runorg.registry_outbox import decode_registry_update, merge_registry_updates
+from o2mcp.runorg.strict_json import strict_json_object
 
 
 class RegistrySynchronizer(Protocol):
@@ -81,7 +84,7 @@ class RegistrySynchronizer(Protocol):
         """Persist ``update`` and return whether both registry surfaces agree."""
 
 
-class ExecutionEngine:
+class ExecutionEngine(ExecutionRegistryMixin):
     """Coordinate exact plan attempts over a fakeable scheduler boundary."""
 
     def __init__(self, backend: ExecutionBackend, registry: RegistrySynchronizer | None = None) -> None:
@@ -91,6 +94,39 @@ class ExecutionEngine:
         self.registry = registry
 
     def submit_stage(
+        self,
+        plan: ExecutionPlan,
+        stage_id: str,
+        *,
+        attempt: int = 1,
+        task_ids: Sequence[str] | None = None,
+    ) -> SubmissionResult:
+        """Coordinate one mutation claim around an exact submission attempt.
+
+        Uncertain invocation and unsynchronized accepted-job outcomes retain the
+        claim so transition cannot delete their evidence.  Every proven
+        pre-invocation or definitive-rejection failure releases it immediately.
+        """
+
+        operation_id = f"submit:{plan.plan_sha256}:{stage_id}:{attempt}"
+        self._acquire_lifecycle(plan, operation_id)
+        try:
+            result = self._submit_stage_claimed(
+                plan,
+                stage_id,
+                attempt=attempt,
+                task_ids=task_ids,
+            )
+        except SubmissionUncertain:
+            raise
+        except Exception:
+            self._release_lifecycle(plan, operation_id)
+            raise
+        if result.registry_synced:
+            self._release_lifecycle(plan, operation_id)
+        return result
+
+    def _submit_stage_claimed(
         self,
         plan: ExecutionPlan,
         stage_id: str,
@@ -154,7 +190,21 @@ class ExecutionEngine:
             # Replay converges a retry's follow-up outbox without resubmitting it.
             if attempt > 1 and stage.dependency_mode != "afterany":
                 self._ensure_reconciler_followups(plan, stage_id, existing_record)
-            return SubmissionResult(existing_record, submitted=False, registry_synced=self.reconcile_registry(plan))
+            # A crash can occur after the immutable record is published but
+            # before an outbox item exists.  Reconstruct the exact update from
+            # authenticated evidence; merely draining existing outbox files
+            # would leave run.json unaware of an accepted live job forever.
+            status = "RETRYING" if attempt > 1 else "SUBMITTED"
+            update = RegistryUpdate(
+                plan_sha256=plan.plan_sha256,
+                stage_id=stage_id,
+                stage_status=status,
+                execution_status=status,
+                job_ids=self._all_recorded_job_ids(plan),
+                attempt=attempt,
+            )
+            synced = self._sync_registry(plan, update)
+            return SubmissionResult(existing_record, submitted=False, registry_synced=synced)
 
         rejection = read_submission_rejection(self.backend, submission_rejection_path(plan, identity))
         if rejection is not None:
@@ -177,6 +227,13 @@ class ExecutionEngine:
         found = self._unique_existing_job(identity)
         submitted_now = False
         if found is None:
+            preparation = self.backend.prepare_submission(request)
+            if preparation is not None:
+                if preparation.status != DEFINITELY_NOT_INVOKED:
+                    raise ValueError("submission preparation returned an invocation outcome")
+                # No durable rejection is written: this exact attempt may be
+                # prepared again because sbatch was provably never called.
+                raise RuntimeError(preparation.stderr.strip() or "submission preparation failed before sbatch")
             invocation = {
                 "attempt": identity.attempt,
                 "comment": identity.comment,
@@ -198,41 +255,57 @@ class ExecutionEngine:
                     "query again and do not resubmit"
                 )
             try:
-                outcome = self.backend.submit(request)
+                outcome = self.backend.invoke_submission(request)
             except Exception as exc:
-                # A transport exception does not prove sbatch rejected the job.
-                # Query the scheduler before surfacing an uncertain outcome.
-                found = self._unique_existing_job(identity)
-                if found is None:
-                    raise SubmissionUncertain(
-                        f"submission response for {identity.comment} was lost and no matching job is visible yet"
-                    ) from exc
+                outcome = None
+                invocation_error = exc
             else:
-                if outcome.job_id is not None and outcome.accepted:
-                    found = outcome.job_id
-                    submitted_now = True
-                else:
-                    found = self._unique_existing_job(identity)
-                    if found is None:
-                        if not outcome.response_received:
-                            raise SubmissionUncertain(
-                                f"submission response for {identity.comment} was lost and no matching job "
-                                "is visible yet"
-                            )
-                        rejection = SubmissionRejectionRecord(
-                            identity=identity,
-                            task_ids=expected_task_ids,
-                            task_indices=expected_task_indices,
-                            stdout=outcome.stdout,
-                            stderr=outcome.stderr,
+                invocation_error = None
+            if outcome is not None and outcome.status == ACCEPTED:
+                found = outcome.job_id
+                submitted_now = True
+            else:
+                # Even an explicit wrapper outcome is checked against Slurm by
+                # the signed comment before classifying the attempt.
+                found = self._unique_existing_job(identity)
+                if found is None and outcome is not None and outcome.status == DEFINITELY_NOT_INVOKED:
+                    invocation_path = submission_invocation_path(plan, identity)
+                    invocation_text = canonical_json(invocation)
+                    if not self.backend.compare_and_swap_text(invocation_path, invocation_text, None):
+                        raise SubmissionUncertain(
+                            f"pre-sbatch failure for {identity.comment} could not clear its exact invocation marker"
                         )
-                        self.backend.write_immutable_text(
-                            submission_rejection_path(plan, identity),
-                            canonical_json(rejection.to_dict()),
-                        )
-                        raise SubmissionRejected(
-                            outcome.stderr.strip() or outcome.stdout.strip() or "sbatch rejected the request"
-                        )
+                    raise RuntimeError(outcome.stderr.strip() or "submission failed before sbatch invocation")
+                if found is None and outcome is not None and outcome.status == DEFINITELY_REJECTED:
+                    if outcome.returncode is None:  # guarded by SubmitOutcome; retained for type narrowing
+                        raise ValueError("definitive rejection lacks a nonzero sbatch return code")
+                    rejection = SubmissionRejectionRecord(
+                        identity=identity,
+                        task_ids=expected_task_ids,
+                        task_indices=expected_task_indices,
+                        returncode=outcome.returncode,
+                        stdout=outcome.stdout,
+                        stderr=outcome.stderr,
+                    )
+                    self.backend.write_immutable_text(
+                        submission_rejection_path(plan, identity),
+                        canonical_json(rejection.to_dict()),
+                    )
+                    raise SubmissionRejected(
+                        outcome.stderr.strip() or outcome.stdout.strip() or "sbatch rejected the request"
+                    )
+                if found is None:
+                    detail = "sbatch invocation outcome is unknown"
+                    if invocation_error is not None:
+                        detail = str(invocation_error) or detail
+                    elif outcome is not None and outcome.status not in {
+                        INVOKED_OUTCOME_UNKNOWN,
+                        DEFINITELY_REJECTED,
+                    }:
+                        raise ValueError("backend returned an invalid post-invocation outcome")
+                    raise SubmissionUncertain(
+                        f"{detail} for {identity.comment}; no matching job is visible yet and retry is forbidden"
+                    ) from invocation_error
 
         # Re-query after acceptance before publishing canonical evidence.
         scheduler_job = self._unique_existing_job(identity)
@@ -240,12 +313,12 @@ class ExecutionEngine:
             if found is not None and scheduler_job != found:
                 raise DuplicateSubmissionError(f"scheduler identity {identity.comment} resolved to inconsistent jobs")
             found = scheduler_job
-        if found is None or not str(found).isdigit():
+        if found is None or type(found) is not str or not found.isdigit():
             raise SubmissionUncertain(f"no numeric Slurm job ID can be proven for {identity.comment}")
 
         record = SubmissionRecord(
             identity=identity,
-            job_id=str(found),
+            job_id=found,
             task_ids=expected_task_ids,
             task_indices=expected_task_indices,
             # The durable record must be independent of which concurrent caller
@@ -299,6 +372,28 @@ class ExecutionEngine:
         return self.submit_stage(plan, stage_id, attempt=attempt)
 
     def reconcile_stage(
+        self,
+        plan: ExecutionPlan,
+        stage_id: str,
+        *,
+        submit_retry: bool = True,
+    ) -> ReconcileResult:
+        """Coordinate lifecycle exclusion around stage reconciliation writes."""
+
+        operation_id = f"reconcile:{plan.plan_sha256}:{stage_id}"
+        self._acquire_lifecycle(plan, operation_id)
+        try:
+            result = self._reconcile_stage_claimed(plan, stage_id, submit_retry=submit_retry)
+        except SubmissionUncertain:
+            raise
+        except Exception:
+            self._release_lifecycle(plan, operation_id)
+            raise
+        if result.registry_synced:
+            self._release_lifecycle(plan, operation_id)
+        return result
+
+    def _reconcile_stage_claimed(
         self,
         plan: ExecutionPlan,
         stage_id: str,
@@ -365,8 +460,20 @@ class ExecutionEngine:
             else:
                 decision = RECONCILE_RETRY
         else:
+            # Re-observe the current task outputs immediately before certifying
+            # this stage. Historical attempt receipts are not proof that the
+            # pipeline files still exist unchanged.
+            task_receipts_valid = current_task_receipts_status(self.backend, plan, stage)
             stage_receipts_valid = self._stage_receipts_valid(plan, stage)
-            if stage_receipts_valid is None:
+            if task_receipts_valid is None:
+                decision = RECONCILE_WAIT
+                active.append("__current_task_receipts__")
+            elif not task_receipts_valid:
+                decision = RECONCILE_FAILED
+                # The existing sentinel denotes failure of the current
+                # files-as-truth surface, whether task- or stage-scoped.
+                failed.append("__stage_receipts__")
+            elif stage_receipts_valid is None:
                 decision = RECONCILE_WAIT
                 active.append("__stage_receipts__")
             elif not stage_receipts_valid:
@@ -427,37 +534,6 @@ class ExecutionEngine:
             registry_synced=registry_synced,
         )
 
-    def reconcile_registry(self, plan: ExecutionPlan) -> bool:
-        """Drain every per-stage/attempt outbox item without touching Slurm."""
-
-        if self.registry is None:
-            return True
-        self._bind_plan(plan)
-        all_synced = True
-        for stage in plan.stages:
-            for attempt in range(1, stage.retry_policy.max_attempts + 1):
-                path = pending_registry_path(plan, stage.stage_id, attempt)
-                while (text := self.backend.read_text(path)) is not None:
-                    update = decode_registry_update(text)
-                    if (
-                        update.plan_sha256 != plan.plan_sha256
-                        or update.stage_id != stage.stage_id
-                        or update.attempt != attempt
-                    ):
-                        raise ValueError("pending registry update belongs to a different path identity")
-                    try:
-                        synced = bool(self.registry.synchronize(plan, update))
-                    except Exception:
-                        synced = False
-                    if not synced:
-                        all_synced = False
-                        break
-                    # Compare-and-clear only the payload just synchronized.  If a
-                    # concurrent writer advanced it, loop and synchronize the
-                    # merged replacement rather than erasing that newer state.
-                    self.backend.compare_and_swap_text(path, text, None)
-        return all_synced
-
     def _reconcile_task(
         self,
         plan: ExecutionPlan,
@@ -474,8 +550,8 @@ class ExecutionEngine:
             existing_text = self.backend.read_text(attempt_path)
             if existing_text is not None:
                 try:
-                    existing = TaskAttemptReceipt.from_dict(json.loads(existing_text))
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    existing = TaskAttemptReceipt.from_dict(strict_json_object(existing_text, "task-attempt receipt"))
+                except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(f"malformed immutable task-attempt receipt: {attempt_path}") from exc
                 if (
                     existing.identity != record.identity
@@ -688,8 +764,6 @@ class ExecutionEngine:
         if any(self._latest_reconciliation_decision(plan, stage) == RECONCILE_FAILED for stage in plan.stages):
             return "FAILED"
         for stage in plan.stages:
-            if stage.stage_id == stage_id:
-                continue
             if not self._has_completed_reconciliation(plan, stage):
                 return "ACTIVE"
         return "COMPLETED"
@@ -710,52 +784,6 @@ class ExecutionEngine:
         return (
             current_task_receipts_valid(self.backend, plan, stage) and self._stage_receipts_valid(plan, stage) is True
         )
-
-    def _sync_registry(self, plan: ExecutionPlan, update: RegistryUpdate) -> bool:
-        """Enqueue, synchronize, then compare-clear one monotonic update."""
-
-        if self.registry is None:
-            return True
-        pending_path = pending_registry_path(plan, update.stage_id, update.attempt)
-        pending_text = self._merge_outbox(pending_path, update)
-        try:
-            synced = bool(self.registry.synchronize(plan, decode_registry_update(pending_text)))
-        except Exception:
-            synced = False
-        if not synced:
-            return False
-        return self.backend.compare_and_swap_text(pending_path, pending_text, None)
-
-    def _merge_outbox(self, path: str, update: RegistryUpdate) -> str:
-        """CAS-join ``update`` into one per-attempt outbox under contention."""
-
-        for _ in range(32):
-            current_text = self.backend.read_text(path)
-            current = decode_registry_update(current_text) if current_text is not None else None
-            merged = merge_registry_updates(current, update)
-            merged_text = canonical_json(merged.to_dict())
-            if current_text == merged_text:
-                return merged_text
-            if self.backend.compare_and_swap_text(path, current_text, merged_text):
-                return merged_text
-        raise RuntimeError(f"registry outbox remained contended: {path}")
-
-    def _bind_plan(self, plan: ExecutionPlan) -> None:
-        """Bind the registered run root to exactly one immutable plan envelope.
-
-        Stage-specific paths alone cannot prevent two plans with disjoint stage
-        IDs from sharing a run.  Publishing the full envelope before any intent
-        makes plan replacement an atomic immutable-file conflict.
-        """
-
-        if self.registry is not None:
-            try:
-                valid = bool(self.registry.validate_plan(plan))
-            except Exception as exc:
-                raise ValueError("registered run identity could not be authenticated before submission") from exc
-            if not valid:
-                raise ValueError("execution plan does not match the registered active run identity")
-        self.backend.write_immutable_text(bound_plan_path(plan), plan.to_json())
 
 
 __all__ = ["ExecutionEngine", "RegistrySynchronizer"]

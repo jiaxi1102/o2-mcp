@@ -6,6 +6,7 @@ an injected runner (no network). Everything is parameterized by a synthetic RunP
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -34,6 +35,17 @@ from o2mcp.runorg import (
 )
 from o2mcp.runorg.executor import _infer_pipeline
 from o2mcp.runorg.runs import _safe
+from o2mcp.runorg.transition_coordinator import TransitionBoundary
+
+
+def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> None:
+    """Create the marker normally established by the executor before launch."""
+
+    token = hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
+    root = os.path.join(os.path.dirname(source), f".{manifest.run_id}.execution-coordination")
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "transition.json"), "w", encoding="utf-8") as handle:
+        handle.write(token)
 
 
 class O2Connection(_ProductionO2Connection):
@@ -262,6 +274,7 @@ def test_promotion_refuses_existing_destination_without_deleting_source(tmp_path
         handle.write("stale\n")
 
     script = plan_promote_script(layout, manifest, source_dir=source)
+    _seed_transition_marker(source, manifest, "promote")
     assert "rsync -nric --delete" in script and "mv --no-clobber -T" in script
     result = subprocess.run(
         ["/bin/bash"],
@@ -302,6 +315,7 @@ def test_archive_refuses_partial_destination_without_clobbering_source(tmp_path)
         handle.write(b"existing archive bytes")
 
     script = plan_archive_script(layout, manifest, source_dir=source)
+    _seed_transition_marker(source, manifest, "archive")
     assert script.count("mv --no-clobber") == 3
     assert script.index('archive.sha256"') < script.index('run.json"')
     result = subprocess.run(
@@ -517,13 +531,14 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
 
 
-def test_live_transition_uses_persistent_transfer_broker(tmp_path):
+def test_live_transition_uses_persistent_transfer_broker(tmp_path, monkeypatch):
     """A detached promotion is framed through the role-specific transfer session."""
 
     manifest_json = (
         '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
         '"created_utc":"20260101T000000Z","status":"active","datasets":["d"],'
-        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED"}}}'
+        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED",'
+        '"plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}'
     )
 
     class _Broker:
@@ -553,7 +568,24 @@ def test_live_transition_uses_persistent_transfer_broker(tmp_path):
         TEST_POLICY,
     )
     run_dir = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
-
+    # This test isolates transfer-broker routing. Dedicated transition tests
+    # exercise marker creation and current receipt certification.
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.begin_transition", lambda *_args: TransitionBoundary(()))
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.read_text", lambda *_args: "{}")
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.ExecutionPlan.from_json",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            paths=SimpleNamespace(run_root=run_dir),
+            run_id="RUN_20260101T000000Z_camp__v1",
+            campaign="camp",
+            pipeline="grid",
+            datasets=(SimpleNamespace(dataset_id="d"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.require_current_terminal_evidence",
+        lambda *_args: None,
+    )
     plan = runs.promote(run_dir, dry_run=False)
 
     assert plan.started is True and plan.pid == "4321"

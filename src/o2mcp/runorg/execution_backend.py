@@ -8,22 +8,31 @@ authenticated :class:`~o2mcp.connection.O2Connection`.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import posixpath
+import re
 import shlex
 from collections.abc import Sequence
 from typing import Protocol
 
 from o2mcp.connection import O2Connection
 from o2mcp.runorg.execution_models import (
+    ACCEPTED,
+    DEFINITELY_NOT_INVOKED,
+    DEFINITELY_REJECTED,
+    INVOKED_OUTCOME_UNKNOWN,
     ReceiptObservation,
     SlurmJob,
     SlurmTaskState,
     SubmissionRequest,
     SubmitOutcome,
 )
+from o2mcp.runorg.execution_remote_fs import remote_fs_command
+from o2mcp.runorg.lifecycle_coordination import coordination_command
 from o2mcp.runorg.plan_components import ReceiptSpec
+from o2mcp.runorg.strict_json import strict_json_object
 from o2mcp.slurm import O2Slurm
 
 
@@ -33,8 +42,11 @@ class ExecutionBackend(Protocol):
     def find_jobs(self, comment: str) -> Sequence[SlurmJob]:
         """Return every root Slurm job whose comment exactly matches ``comment``."""
 
-    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
-        """Stage and submit one exact request without implementing retries."""
+    def prepare_submission(self, request: SubmissionRequest) -> SubmitOutcome | None:
+        """Prepare immutable inputs; return ``None`` only when invocation is safe."""
+
+    def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+        """Cross the sbatch boundary once and classify the evidence explicitly."""
 
     def task_states(self, job_id: str) -> Sequence[SlurmTaskState]:
         """Return sacct-like root and array-element states for ``job_id``."""
@@ -59,6 +71,12 @@ class ExecutionBackend(Protocol):
 
     def compare_and_swap_text(self, path: str, expected: str | None, replacement: str | None) -> bool:
         """Atomically replace/remove ``path`` only when exact current bytes match."""
+
+    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> bool:
+        """Exclude lifecycle transition marking before a control mutation."""
+
+    def release_lifecycle_claim(self, run_root: str, operation_id: str) -> None:
+        """Release an exact claim after its durable boundary is complete."""
 
 
 class O2ExecutionBackend:
@@ -117,10 +135,18 @@ class O2ExecutionBackend:
                 jobs[root_job_id] = SlurmJob(root_job_id, comment, state)
         return tuple(sorted(jobs.values(), key=lambda item: int(item.job_id)))
 
-    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
-        """Stage the immutable dispatcher and invoke ``sbatch`` exactly once."""
+    def prepare_submission(self, request: SubmissionRequest) -> SubmitOutcome | None:
+        """Stage and verify all scheduler inputs without invoking ``sbatch``.
 
-        self.write_immutable_text(request.script_path, request.script_text)
+        Preparation is intentionally recoverable on the same attempt because a
+        failure here proves that Slurm was never called.  The engine publishes
+        its invocation marker only after this method succeeds.
+        """
+
+        try:
+            self.write_immutable_text(request.script_path, request.script_text)
+        except Exception as exc:
+            return SubmitOutcome(DEFINITELY_NOT_INVOKED, stderr=str(exc))
         log_parents = sorted(
             {
                 posixpath.dirname(request.stdout_pattern),
@@ -132,15 +158,89 @@ class O2ExecutionBackend:
             timeout=60,
         )
         if not mkdir.ok:
-            return SubmitOutcome(None, accepted=False, stderr=mkdir.stderr or "could not create log directory")
-        submit = self.slurm.submit(request.script_path, sbatch_args=list(request.sbatch_args()), timeout=60)
-        return SubmitOutcome(
-            job_id=submit.job_id,
-            accepted=submit.submitted,
-            response_received=True,
-            stdout=submit.command.stdout,
-            stderr=submit.command.stderr,
+            return SubmitOutcome(DEFINITELY_NOT_INVOKED, stderr=mkdir.stderr or "could not create log directory")
+        return None
+
+    def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+        """Verify a held dispatcher descriptor and pass that descriptor to sbatch.
+
+        ``sbatch /proc/self/fd/N`` removes the usual hash-to-exec race: replacing
+        the pathname after verification cannot change the inode Slurm reads.
+        A zero return code without the canonical job-ID line is not rejection;
+        it is an uncertain accepted outcome that must be recovered by comment.
+        """
+
+        program = r"""
+import hashlib, json, os, stat, subprocess, sys
+path, expected, args_json = sys.argv[1:4]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode): raise ValueError('dispatcher is not a regular file')
+        payload = b''
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk: break
+            payload += chunk
+        if hashlib.sha256(payload).hexdigest() != expected: raise ValueError('dispatcher digest mismatch')
+        os.lseek(fd, 0, os.SEEK_SET)
+        result = subprocess.run(
+            ['sbatch', *json.loads(args_json), f'/proc/self/fd/{fd}'],
+            pass_fds=(fd,), text=True, capture_output=True,
         )
+    finally:
+        os.close(fd)
+except Exception as exc:
+    response = {'invoked': False, 'returncode': None, 'stdout': '', 'stderr': str(exc)}
+else:
+    response = {
+        'invoked': True, 'returncode': result.returncode,
+        'stdout': result.stdout, 'stderr': result.stderr,
+    }
+print(json.dumps(response, sort_keys=True))
+"""
+        command = " ".join(
+            (
+                "python3 -c",
+                shlex.quote(program),
+                shlex.quote(request.script_path),
+                shlex.quote(text_sha256(request.script_text)),
+                shlex.quote(json.dumps(list(request.sbatch_args()))),
+            )
+        )
+        try:
+            result = self.connection.run(command, timeout=60)
+        except Exception as exc:
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, stderr=str(exc))
+        if not result.ok and not result.stdout.strip():
+            # The transport may have failed after the remote sbatch process was
+            # started; transport return codes cannot prove scheduler rejection.
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, stdout=result.stdout, stderr=result.stderr)
+        try:
+            value = strict_json_object(result.stdout, "sbatch wrapper response")
+            if set(value) != {"invoked", "returncode", "stderr", "stdout"}:
+                raise ValueError("unexpected fields")
+            invoked = value["invoked"]
+            returncode = value["returncode"]
+            stdout = value["stdout"]
+            stderr = value["stderr"]
+            if type(invoked) is not bool or type(stdout) is not str or type(stderr) is not str:
+                raise ValueError("invalid response types")
+        except ValueError:
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, stdout=result.stdout, stderr=result.stderr)
+        if not invoked:
+            if returncode is not None:
+                return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, stdout=stdout, stderr=stderr)
+            return SubmitOutcome(DEFINITELY_NOT_INVOKED, stdout=stdout, stderr=stderr)
+        if type(returncode) is not int:
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, stdout=stdout, stderr=stderr)
+        if returncode != 0:
+            return SubmitOutcome(DEFINITELY_REJECTED, returncode=returncode, stdout=stdout, stderr=stderr)
+        match = re.search(r"Submitted batch job (\d+)", stdout) or re.search(r"Submitted batch job (\d+)", stderr)
+        if match is None:
+            return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, returncode=0, stdout=stdout, stderr=stderr)
+        return SubmitOutcome(ACCEPTED, job_id=match.group(1), returncode=0, stdout=stdout, stderr=stderr)
 
     def task_states(self, job_id: str) -> Sequence[SlurmTaskState]:
         """Read root and array-element states from Slurm accounting."""
@@ -204,7 +304,7 @@ class O2ExecutionBackend:
                 error=result.stderr.strip() or result.stdout.strip() or "receipt observation command failed",
             )
         try:
-            observed = json.loads(result.stdout)
+            observed = strict_json_object(result.stdout, "receipt observation")
             if not isinstance(observed, dict) or set(observed) != {"exists", "sha256"}:
                 raise ValueError("unexpected receipt observation fields")
             exists = observed["exists"]
@@ -212,7 +312,7 @@ class O2ExecutionBackend:
             if not isinstance(exists, bool) or (sha256 is not None and not isinstance(sha256, str)):
                 raise ValueError("invalid receipt observation types")
             return ReceiptObservation(receipt.path, exists, sha256)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             return ReceiptObservation(
                 receipt.path,
                 False,
@@ -224,8 +324,18 @@ class O2ExecutionBackend:
     def read_text(self, path: str) -> str | None:
         """Read one remote UTF-8 file while distinguishing absence from emptiness."""
 
-        result = self.connection.run(f"cat -- {shlex.quote(path)}", timeout=60)
-        return result.stdout if result.ok else None
+        result = self.connection.run(remote_fs_command("read", path), timeout=60, input_text="{}")
+        if not result.ok:
+            raise RuntimeError(f"safe control-file read failed: {path}: {result.stderr.strip()}")
+        value = strict_json_object(result.stdout, "safe read response")
+        if value.get("state") == "MISSING" and value.get("payload") is None:
+            return None
+        if set(value) != {"payload", "state"} or value["state"] != "PRESENT" or type(value["payload"]) is not str:
+            raise RuntimeError(f"safe control-file read returned invalid data for {path}")
+        try:
+            return base64.b64decode(value["payload"], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"safe control-file read returned invalid UTF-8 for {path}") from exc
 
     def write_immutable_text(self, path: str, text: str) -> bool:
         """Atomically publish a complete remote evidence file.
@@ -237,52 +347,18 @@ class O2ExecutionBackend:
         bytes and receives ``False`` rather than submission ownership.
         """
 
-        program = "\n".join(
-            [
-                "import os, sys, tempfile",
-                "path = sys.argv[1]",
-                "payload = sys.stdin.read()",
-                "parent = os.path.dirname(path)",
-                "os.makedirs(parent, exist_ok=True)",
-                "fd, temporary = tempfile.mkstemp(prefix='.immutable-', dir=parent)",
-                "try:",
-                "    with os.fdopen(fd, 'w', encoding='utf-8') as handle:",
-                "        handle.write(payload)",
-                "        handle.flush()",
-                "        os.fsync(handle.fileno())",
-                "    try:",
-                "        os.link(temporary, path)",
-                "    except FileExistsError:",
-                "        with open(path, encoding='utf-8') as handle:",
-                "            existing = handle.read()",
-                "        if existing != payload:",
-                "            raise SystemExit(42)",
-                "        print('EXISTING')",
-                "    else:",
-                "        directory_fd = os.open(parent, os.O_RDONLY)",
-                "        try:",
-                "            os.fsync(directory_fd)",
-                "        finally:",
-                "            os.close(directory_fd)",
-                "        print('CREATED')",
-                "finally:",
-                "    try:",
-                "        os.unlink(temporary)",
-                "    except FileNotFoundError:",
-                "        pass",
-            ]
-        )
+        payload = json.dumps({"payload": base64.b64encode(text.encode()).decode("ascii")})
         result = self.connection.run(
-            f"python3 -c {shlex.quote(program)} {shlex.quote(path)}",
+            remote_fs_command("immutable", path),
             timeout=120,
-            input_text=text,
+            input_text=payload,
         )
         if not result.ok:
             reason = (
                 "immutable receipt already exists with different bytes" if result.returncode == 42 else "write failed"
             )
             raise RuntimeError(f"{reason}: {path}: {result.stderr.strip()}")
-        outcome = result.stdout.strip()
+        outcome = strict_json_object(result.stdout, "immutable write response").get("state")
         if outcome not in {"CREATED", "EXISTING"}:
             raise RuntimeError(f"immutable write returned an invalid publication result for {path}: {outcome!r}")
         return outcome == "CREATED"
@@ -290,29 +366,11 @@ class O2ExecutionBackend:
     def write_mutable_text(self, path: str, text: str) -> None:
         """Atomically replace a remote current-state file after fsync."""
 
-        program = "\n".join(
-            [
-                "import os, sys, tempfile",
-                "path = sys.argv[1]",
-                "payload = sys.stdin.read()",
-                "parent = os.path.dirname(path)",
-                "os.makedirs(parent, exist_ok=True)",
-                "fd, temporary = tempfile.mkstemp(prefix='.tmp-', dir=parent)",
-                "try:",
-                "    with os.fdopen(fd, 'w', encoding='utf-8') as handle:",
-                "        handle.write(payload)",
-                "        handle.flush()",
-                "        os.fsync(handle.fileno())",
-                "    os.replace(temporary, path)",
-                "finally:",
-                "    if os.path.exists(temporary):",
-                "        os.unlink(temporary)",
-            ]
-        )
+        payload = json.dumps({"payload": base64.b64encode(text.encode()).decode("ascii")})
         result = self.connection.run(
-            f"python3 -c {shlex.quote(program)} {shlex.quote(path)}",
+            remote_fs_command("mutable", path),
             timeout=120,
-            input_text=text,
+            input_text=payload,
         )
         if not result.ok:
             raise RuntimeError(f"atomic state write failed: {path}: {result.stderr.strip()}")
@@ -325,61 +383,41 @@ class O2ExecutionBackend:
         callers to merge and compare-clear one exact outbox payload safely.
         """
 
-        payload = json.dumps({"expected": expected, "replacement": replacement}, ensure_ascii=False)
-        program = "\n".join(
-            [
-                "import fcntl, json, os, sys, tempfile",
-                "path = sys.argv[1]",
-                "payload = json.load(sys.stdin)",
-                "parent = os.path.dirname(path)",
-                "os.makedirs(parent, exist_ok=True)",
-                "lock_path = path + '.lock'",
-                "with open(lock_path, 'a+', encoding='utf-8') as lock:",
-                "    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)",
-                "    try:",
-                "        with open(path, encoding='utf-8') as handle:",
-                "            current = handle.read()",
-                "    except FileNotFoundError:",
-                "        current = None",
-                "    if current != payload['expected']:",
-                "        print('CONFLICT')",
-                "        raise SystemExit(0)",
-                "    replacement = payload['replacement']",
-                "    if replacement is None:",
-                "        try:",
-                "            os.unlink(path)",
-                "        except FileNotFoundError:",
-                "            pass",
-                "    else:",
-                "        fd, temporary = tempfile.mkstemp(prefix='.cas-', dir=parent)",
-                "        try:",
-                "            with os.fdopen(fd, 'w', encoding='utf-8') as handle:",
-                "                handle.write(replacement)",
-                "                handle.flush()",
-                "                os.fsync(handle.fileno())",
-                "            os.replace(temporary, path)",
-                "        finally:",
-                "            if os.path.exists(temporary):",
-                "                os.unlink(temporary)",
-                "    parent_fd = os.open(parent, os.O_RDONLY)",
-                "    try:",
-                "        os.fsync(parent_fd)",
-                "    finally:",
-                "        os.close(parent_fd)",
-                "    print('SWAPPED')",
-            ]
-        )
+        def encode(value: str | None) -> str | None:
+            """Encode optional exact bytes without conflating absence and empty text."""
+
+            return None if value is None else base64.b64encode(value.encode()).decode("ascii")
+
+        payload = json.dumps({"expected": encode(expected), "replacement": encode(replacement)})
         result = self.connection.run(
-            f"python3 -c {shlex.quote(program)} {shlex.quote(path)}",
+            remote_fs_command("cas", path),
             timeout=120,
             input_text=payload,
         )
         if not result.ok:
             raise RuntimeError(f"mutable CAS failed: {path}: {result.stderr.strip()}")
-        outcome = result.stdout.strip()
+        outcome = strict_json_object(result.stdout, "mutable CAS response").get("state")
         if outcome not in {"CONFLICT", "SWAPPED"}:
             raise RuntimeError(f"mutable CAS returned invalid result for {path}: {outcome!r}")
         return outcome == "SWAPPED"
+
+    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> bool:
+        """Atomically claim mutation rights unless a transition is marked."""
+
+        result = self.connection.run(coordination_command("acquire", run_root, operation_id), timeout=60)
+        if not result.ok:
+            raise RuntimeError(f"lifecycle claim failed: {result.stderr.strip()}")
+        outcome = result.stdout.strip()
+        if outcome not in {"ACQUIRED", "TRANSITION"}:
+            raise RuntimeError(f"invalid lifecycle claim response: {outcome!r}")
+        return outcome == "ACQUIRED"
+
+    def release_lifecycle_claim(self, run_root: str, operation_id: str) -> None:
+        """Remove the exact operation claim under the shared coordination lock."""
+
+        result = self.connection.run(coordination_command("release", run_root, operation_id), timeout=60)
+        if not result.ok or result.stdout.strip() != "RELEASED":
+            raise RuntimeError(f"lifecycle claim release failed: {result.stderr.strip()}")
 
 
 def receipt_matches(spec: ReceiptSpec, observation: ReceiptObservation) -> bool:

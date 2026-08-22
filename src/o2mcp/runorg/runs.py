@@ -30,6 +30,7 @@ from typing import Any
 
 from o2mcp.config import O2Config
 from o2mcp.runorg.policy import RunPolicy
+from o2mcp.runorg.strict_json import strict_json_object
 
 SCHEMA_VERSION = 1
 
@@ -176,11 +177,34 @@ class RunManifest:
 
     @classmethod
     def from_json(cls, text: str) -> RunManifest:
-        data = json.loads(text)
+        data = strict_json_object(text, "run manifest")
         return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RunManifest:
+        """Decode known manifest fields with exact JSON types and preserve extras."""
+
+        if type(data) is not dict:
+            raise ValueError("run manifest must be a plain JSON object")
+        string_fields = {"run_id", "campaign", "pipeline", "created_utc", "status", "variant", "retention"}
+        list_fields = {"datasets", "experiment_ids", "slurm_job_ids", "storage_roots"}
+        object_fields = {"source_view", "result", "provenance"}
+        for field_name in string_fields & set(data):
+            if type(data[field_name]) is not str:
+                raise ValueError(f"run manifest {field_name} must be a string")
+        for field_name in list_fields & set(data):
+            value = data[field_name]
+            if type(value) is not list or any(type(item) is not str for item in value):
+                raise ValueError(f"run manifest {field_name} must be an array of strings")
+        for field_name in object_fields & set(data):
+            if type(data[field_name]) is not dict:
+                raise ValueError(f"run manifest {field_name} must be an object")
+        if "size_bytes" in data and data["size_bytes"] is not None and type(data["size_bytes"]) is not int:
+            raise ValueError("run manifest size_bytes must be an integer or null")
+        if "schema_version" in data and type(data["schema_version"]) is not int:
+            raise ValueError("run manifest schema_version must be an integer")
+        if "tombstone" in data and data["tombstone"] is not None and type(data["tombstone"]) is not dict:
+            raise ValueError("run manifest tombstone must be an object or null")
         known = {f for f in cls.__dataclass_fields__ if f != "extra"}  # type: ignore[attr-defined]
         values = {k: v for k, v in data.items() if k in known}
         values["extra"] = {k: v for k, v in data.items() if k not in known and k != "extra"}
@@ -385,8 +409,8 @@ def parse_registry(text: str) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+            row = strict_json_object(line, "registry row")
+        except ValueError:
             continue
         if isinstance(row, dict) and row.get("run_id"):
             by_id[row["run_id"]] = row
@@ -425,7 +449,13 @@ def plan_write_manifest_command(run_dir: str, manifest: RunManifest) -> str:
     return f"cat > {manifest_path} {_heredoc(manifest.to_json())}"
 
 
-def plan_promote_script(layout: RunLayout, manifest: RunManifest, *, source_dir: str) -> str:
+def plan_promote_script(
+    layout: RunLayout,
+    manifest: RunManifest,
+    *,
+    source_dir: str,
+    transition_id: str | None = None,
+) -> str:
     """A bash script that copies an active run to durable group storage (verified),
     flips its manifest to ``kept``, and then frees the scratch copy.
 
@@ -444,6 +474,7 @@ def plan_promote_script(layout: RunLayout, manifest: RunManifest, *, source_dir:
         manifest_rel="run.json",
         excludes=[],
         free_source=True,
+        transition_id=transition_id or _default_transition_id(manifest, "promote"),
     )
 
 
@@ -453,6 +484,7 @@ def plan_archive_script(
     *,
     source_dir: str,
     archive_excludes: Sequence[str] = (),
+    transition_id: str | None = None,
 ) -> str:
     """A bash script that tars+zstd-compresses a run to standby, checksums it, writes
     the manifest beside it (uncompressed, queryable), verifies, then frees scratch.
@@ -461,6 +493,7 @@ def plan_archive_script(
     tarball — e.g. redundant source copies recorded elsewhere in the manifest.
     """
     archived = _with_status(manifest, STATUS_ARCHIVED)
+    transition_id = transition_id or _default_transition_id(manifest, "archive")
     tarball = layout.archive_tarball(manifest.campaign, manifest.run_id)
     manifest_dest = layout.archive_manifest(manifest.campaign, manifest.run_id)
     checksum = layout.archive_checksum(manifest.campaign, manifest.run_id)
@@ -475,6 +508,7 @@ def plan_archive_script(
             "#!/bin/bash",
             f"# archive {manifest.run_id} -> standby (cold, tar.zst)",
             "set -euo pipefail",
+            *_transition_marker_guard(source_dir, transition_id),
             f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
             "flock -x 8",
             _source_snapshot_assignment(source_dir, "source_baseline_sha"),
@@ -508,12 +542,8 @@ def plan_archive_script(
             "trap - EXIT",
             f"test \"$(sha256sum {shlex.quote(manifest_dest)} | cut -d' ' -f1)\" = "
             f"{shlex.quote(hashlib.sha256((manifest_json + chr(10)).encode()).hexdigest())}",
-            _source_snapshot_assignment(source_dir, "source_final_sha"),
-            'if test "$source_final_sha" != "$source_baseline_sha"; then '
-            "echo 'source changed during archive; refusing deletion' >&2; exit 77; fi",
             f"echo ARCHIVED {shlex.quote(tarball)}",
-            f"rm -rf {shlex.quote(source_dir.rstrip('/'))}",
-            "echo FREED_SCRATCH",
+            *_quarantine_and_delete_lines(source_dir, transition_id),
         ]
     )
 
@@ -548,6 +578,7 @@ def _render_transfer_script(
     manifest_rel: str,
     excludes: Sequence[str],
     free_source: bool,
+    transition_id: str,
 ) -> str:
     if posixpath.normpath(source_dir) == posixpath.normpath(dest_dir):
         raise ValueError("transfer source and destination must be different paths")
@@ -569,6 +600,7 @@ def _render_transfer_script(
         "#!/bin/bash",
         f"# {title}",
         "set -euo pipefail",
+        *_transition_marker_guard(source_dir, transition_id),
         f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
         "flock -x 8",
         _source_snapshot_assignment(source_dir, "source_baseline_sha"),
@@ -595,14 +627,62 @@ def _render_transfer_script(
         f'mv --no-clobber -T -- "$staging" {shlex.quote(dest_dir)}',
         'test ! -e "$staging"',
         "trap - EXIT",
-        _source_snapshot_assignment(source_dir, "source_final_sha"),
-        'if test "$source_final_sha" != "$source_baseline_sha"; then '
-        "echo 'source changed during promotion; refusing deletion' >&2; exit 77; fi",
         f"echo COPIED {shlex.quote(dest_dir)}",
     ]
     if free_source:
-        lines += [f"rm -rf {shlex.quote(source_dir.rstrip('/'))}", "echo FREED_SCRATCH"]
+        lines += _quarantine_and_delete_lines(source_dir, transition_id)
     return "\n".join(lines)
+
+
+def _default_transition_id(manifest: RunManifest, action: str) -> str:
+    """Return a deterministic marker token so exact previews are reproducible."""
+
+    return hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
+
+
+def _transition_marker_guard(source_dir: str, transition_id: str) -> list[str]:
+    """Verify the sibling transition marker before touching the source tree."""
+
+    source = source_dir.rstrip("/")
+    parent, run_id = posixpath.split(source)
+    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
+    marker = posixpath.join(coordination, "transition.json")
+    return [
+        f"exec 7> {shlex.quote(coordination + '.lock')}",
+        "flock -x 7",
+        f'test "$(cat -- {shlex.quote(marker)})" = {shlex.quote(transition_id)}',
+        "flock -u 7",
+    ]
+
+
+def _quarantine_and_delete_lines(source_dir: str, transition_id: str) -> list[str]:
+    """Rename to a frozen sibling before the final proof and deletion.
+
+    An injection that recreates the original path after rename is outside the
+    certified source and survives cleanup, closing the final-digest/delete race.
+    """
+
+    source = source_dir.rstrip("/")
+    parent, run_id = posixpath.split(source)
+    quarantine = posixpath.join(parent, f".{run_id}.deleting.{transition_id}")
+    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
+    marker = posixpath.join(coordination, "transition.json")
+    return [
+        _source_snapshot_assignment(source, "source_final_sha"),
+        'if test "$source_final_sha" != "$source_baseline_sha"; then '
+        "echo 'source changed during transition; refusing deletion' >&2; exit 77; fi",
+        f"test ! -e {shlex.quote(quarantine)}",
+        f"mv -T -- {shlex.quote(source)} {shlex.quote(quarantine)}",
+        _source_snapshot_assignment(quarantine, "quarantine_sha"),
+        'if test "$quarantine_sha" != "$source_baseline_sha"; then '
+        "echo 'frozen source changed after rename; refusing deletion' >&2; exit 78; fi",
+        f"rm -rf -- {shlex.quote(quarantine)}",
+        "flock -x 7",
+        f'test "$(cat -- {shlex.quote(marker)})" = {shlex.quote(transition_id)}',
+        f"rm -f -- {shlex.quote(marker)}",
+        "flock -u 7",
+        "echo FREED_SCRATCH",
+    ]
 
 
 def _source_snapshot_assignment(source_dir: str, variable: str) -> str:

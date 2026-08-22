@@ -28,7 +28,7 @@ from o2mcp.runorg import (
     SubmissionRecord,
     SubmitOutcome,
 )
-from o2mcp.runorg.execution_models import PlannedTask, SubmissionRequest, TaskAttemptReceipt, canonical_json
+from o2mcp.runorg.execution_models import ACCEPTED, PlannedTask, SubmissionRequest, TaskAttemptReceipt, canonical_json
 from o2mcp.runorg.execution_paths import pending_registry_path, submission_record_path, task_attempt_path
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.registry_outbox import merge_registry_updates
@@ -53,7 +53,12 @@ class Backend:
             if value["comment"] == comment
         )
 
-    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
+    def prepare_submission(self, request: SubmissionRequest) -> None:
+        """The fake has no remote dispatcher preparation step."""
+
+        return None
+
+    def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
         job_id = str(self.next_job)
         self.next_job += 1
         self.requests.append(request)
@@ -62,7 +67,7 @@ class Backend:
             "state": "PENDING",
             "task_states": (SlurmTaskState(None, "PENDING", None),),
         }
-        return SubmitOutcome(job_id, accepted=True)
+        return SubmitOutcome(ACCEPTED, job_id=job_id, returncode=0)
 
     def task_states(self, job_id: str):
         return self.jobs[job_id]["task_states"]

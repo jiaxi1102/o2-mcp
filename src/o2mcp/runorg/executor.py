@@ -13,7 +13,6 @@ from __future__ import annotations
 import posixpath
 import secrets
 import shlex
-from dataclasses import dataclass
 from typing import Any
 
 from o2mcp.connection import CommandResult, O2Connection
@@ -25,7 +24,6 @@ from o2mcp.runorg.prepared import PreparedRunIdentity
 from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
 from o2mcp.runorg.runs import (
     STATUS_ACTIVE,
-    STATUS_KEPT,
     RunLayout,
     RunManifest,
     campaign_of,
@@ -33,30 +31,15 @@ from o2mcp.runorg.runs import (
     merge_status_json,
     parse_registry,
     parse_submission_env,
-    plan_archive_script,
     plan_gc_candidates_command,
-    plan_promote_script,
     plan_register_commands,
     plan_write_manifest_command,
     registry_line,
     sort_job_ids,
     variant_of,
 )
-from o2mcp.runorg.transition_guards import live_jobs_command, require_certified_terminal_execution
+from o2mcp.runorg.transition_executor import TransitionExecutorMixin
 from o2mcp.slurm import O2Slurm
-
-
-@dataclass
-class TransitionPlan:
-    """The outcome of a promote/archive request (dry-run or launched)."""
-
-    run_id: str
-    action: str
-    script: str
-    started: bool = False
-    pid: str | None = None
-    log_path: str | None = None
-    message: str = ""
 
 
 class RunPreparationError(RuntimeError):
@@ -95,7 +78,7 @@ class O2RunRegistrySynchronizer:
 # status file degrades to empty, never an exception.
 
 
-class O2Runs:
+class O2Runs(TransitionExecutorMixin):
     """Run-lifecycle operations over an established O2 connection."""
 
     def __init__(self, connection: O2Connection, policy: RunPolicy, layout: RunLayout | None = None) -> None:
@@ -658,106 +641,6 @@ class O2Runs:
                 }
             )
         return sorted(rows, key=lambda r: (r["campaign"], r["run_id"]))
-
-    # -- tier transitions (run detached on the transfer node) ------------------
-    # Standby is writable only from the O2 transfer node (login/compute nodes
-    # cannot write it), and a tar+zstd of a large run takes hours, so transitions
-    # are launched DETACHED on the transfer node and return immediately. The script
-    # verifies (checksum / rsync-itemize) before it frees any scratch source.
-    def promote(self, run_dir: str, *, dry_run: bool = True, run_remote: bool = True) -> TransitionPlan:
-        manifest = self._validated_transition_source(
-            run_dir, action="promote", allowed_statuses=(STATUS_ACTIVE, STATUS_KEPT)
-        )
-        if manifest.status == STATUS_KEPT:
-            return TransitionPlan(
-                manifest.run_id,
-                "promote",
-                "",
-                started=False,
-                message="already kept at the canonical durable path; no transfer or deletion performed",
-            )
-        script = plan_promote_script(self.layout, manifest, source_dir=run_dir)
-        return self._transition(manifest.run_id, "promote", script, dry_run=dry_run, run_remote=run_remote)
-
-    def archive(self, run_dir: str, *, dry_run: bool = True, run_remote: bool = True) -> TransitionPlan:
-        manifest = self._validated_transition_source(
-            run_dir,
-            action="archive",
-            allowed_statuses=(STATUS_ACTIVE, STATUS_KEPT),
-        )
-        script = plan_archive_script(
-            self.layout, manifest, source_dir=run_dir, archive_excludes=self.policy.archive_excludes
-        )
-        return self._transition(manifest.run_id, "archive", script, dry_run=dry_run, run_remote=run_remote)
-
-    def _validated_transition_source(
-        self,
-        run_dir: str,
-        *,
-        action: str,
-        allowed_statuses: tuple[str, ...],
-    ) -> RunManifest:
-        """Require a strict manifest at its exact canonical tier before deletion.
-
-        Lifecycle transitions end by freeing ``run_dir``.  Legacy synthesis is
-        therefore intentionally forbidden: an arbitrary directory, typo, or
-        stale copied manifest must never become a destructive transfer source.
-        """
-
-        manifest = self._read_strict_manifest(run_dir)
-        if manifest is None:
-            raise ValueError(f"{action} requires an existing strict run.json")
-        if manifest.status not in allowed_statuses:
-            raise ValueError(f"{action} does not accept run status {manifest.status!r}")
-        expected = self.layout.run_dir(manifest.status, manifest.campaign, manifest.run_id)
-        if run_dir != expected:
-            raise ValueError(f"{action} source {run_dir!r} is not the canonical {manifest.status} path {expected!r}")
-        require_certified_terminal_execution(manifest, action)
-        live = self._run(live_jobs_command(manifest.slurm_job_ids), timeout=60)
-        if not live.ok:
-            raise ValueError(f"{action} could not prove that registered Slurm jobs are terminal")
-        if live.stdout.strip():
-            raise ValueError(f"{action} refuses a source with live Slurm jobs: {live.stdout.strip()}")
-        return manifest
-
-    def _transition(self, run_id: str, action: str, script: str, *, dry_run: bool, run_remote: bool) -> TransitionPlan:
-        if dry_run or not run_remote:
-            return TransitionPlan(run_id, action, script, started=False, message="dry_run: script not executed")
-        script_path = posixpath.join(self.layout.scratch_runs_root, ".jobs", f"{action}_{run_id}.sh")
-        log_path = script_path + ".log"
-        self._run(f"mkdir -p {shlex.quote(posixpath.dirname(script_path))}", timeout=60)
-        # stage the script body verbatim via stdin (cat writes exactly what it reads)
-        stage = self.conn.run(f"cat > {shlex.quote(script_path)}", timeout=60, input_text=script)
-        if not stage.ok:
-            return TransitionPlan(
-                run_id, action, script, started=False, message=stage.stderr.strip() or "staging failed"
-            )
-        launch = f"nohup bash {shlex.quote(script_path)} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo PID $!"
-        # Reuse the transfer master through the same authentication-disabled path
-        # as ordinary commands. Centralizing argv construction in O2Connection
-        # prevents this detached lifecycle operation from becoming an accidental
-        # cold-login escape hatch.
-        # The explicit role keeps transfer launches on their separately granted
-        # broker even when an installation maps both roles to the same SSH alias.
-        res = self.conn.run(
-            launch,
-            timeout=60,
-            alias=self.conn.config.transfer_alias,
-            broker_role="transfer",
-        )
-        pid = ""
-        for token in res.stdout.split():
-            if token.isdigit():
-                pid = token
-        return TransitionPlan(
-            run_id,
-            action,
-            script,
-            started=res.ok and bool(pid),
-            pid=pid or None,
-            log_path=log_path,
-            message=f"launched on transfer node (pid {pid}); tail {log_path}" if pid else res.stderr.strip(),
-        )
 
     # -- registry --------------------------------------------------------------
     def append_registry(self, manifest: RunManifest) -> CommandResult:

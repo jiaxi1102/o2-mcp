@@ -7,8 +7,6 @@ from accidentally treating malformed, foreign, or incomplete files as proof.
 
 from __future__ import annotations
 
-import json
-
 from o2mcp.runorg.execution_backend import ExecutionBackend, receipt_matches
 from o2mcp.runorg.execution_models import (
     RECONCILE_RETRY,
@@ -31,6 +29,74 @@ from o2mcp.runorg.execution_rendering import select_tasks
 from o2mcp.runorg.plan_stages import StageSpec
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.reconciliation_receipts import ReconciliationReceipt
+from o2mcp.runorg.strict_json import strict_json_object
+
+
+def authenticate_followup_authorization(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    attempt: int,
+    *,
+    expected_dependency_job_ids: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    """Authenticate an after-any follow-up and its retry trigger relation.
+
+    The follow-up file is not a signature by itself.  Each dependency job must
+    be an authenticated submission of the corresponding signed prerequisite,
+    and the trigger must be that prerequisite's retry job at the same ordered
+    dependency slot.  New submission calls additionally bind the authorization
+    to the exact dependency set derived immediately before intent publication.
+    """
+
+    path = reconciler_followup_path(plan, stage.stage_id, attempt)
+    value = read_strict_json(backend, path, "reconciler follow-up authorization")
+    allowed = {
+        "attempt",
+        "dependency_job_ids",
+        "plan_sha256",
+        "schema_version",
+        "stage_id",
+        "trigger_job_id",
+        "trigger_stage_id",
+    }
+    if set(value) != allowed:
+        raise ValueError("reconciler follow-up authorization has unsupported fields")
+    dependencies = value["dependency_job_ids"]
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["plan_sha256"]) is not str
+        or value["plan_sha256"] != plan.plan_sha256
+        or type(value["stage_id"]) is not str
+        or value["stage_id"] != stage.stage_id
+        or type(value["attempt"]) is not int
+        or value["attempt"] != attempt
+        or type(dependencies) is not list
+        or any(type(item) is not str or not item.isdigit() for item in dependencies)
+        or len(dependencies) != len(stage.depends_on)
+        or len(set(dependencies)) != len(dependencies)
+    ):
+        raise ValueError("reconciler follow-up authorization is malformed or foreign")
+    dependency_ids = tuple(dependencies)
+    if expected_dependency_job_ids is not None and dependency_ids != expected_dependency_job_ids:
+        raise ValueError("follow-up dependencies differ from the currently authorized signed DAG jobs")
+
+    stages = {candidate.stage_id: candidate for candidate in plan.stages}
+    trigger_stage = value["trigger_stage_id"]
+    trigger_job = value["trigger_job_id"]
+    if type(trigger_stage) is not str or trigger_stage not in stage.depends_on:
+        raise ValueError("follow-up trigger stage is not a signed dependency")
+    if type(trigger_job) is not str or not trigger_job.isdigit():
+        raise ValueError("follow-up trigger job is invalid")
+    for dependency, job_id in zip(stage.depends_on, dependency_ids):
+        records = read_plan_submission_records(backend, plan, stages[dependency])
+        matches = [record for record in records if record.job_id == job_id]
+        if len(matches) != 1:
+            raise ValueError(f"follow-up dependency job {job_id} is not authenticated for stage {dependency}")
+        if dependency == trigger_stage and (job_id != trigger_job or matches[0].identity.attempt <= 1):
+            raise ValueError("follow-up trigger must be the authenticated retry job for its dependency")
+    return dependency_ids
 
 
 def read_submission_record(
@@ -55,9 +121,7 @@ def read_submission_record(
     if text is None:
         return None
     try:
-        value = json.loads(text)
-        if not isinstance(value, dict):
-            raise ValueError("submission record must be a JSON object")
+        value = strict_json_object(text, "submission record")
         record = SubmissionRecord.from_dict(value)
         checks = (
             (expected_identity, record.identity, "identity"),
@@ -70,7 +134,7 @@ def read_submission_record(
             if expected is not None and observed != expected:
                 raise ValueError(f"submission record {label} do not match its authorized path contract")
         return record
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid immutable submission record: {path}") from exc
 
 
@@ -81,11 +145,9 @@ def read_submission_rejection(backend: ExecutionBackend, path: str) -> Submissio
     if text is None:
         return None
     try:
-        value = json.loads(text)
-        if not isinstance(value, dict):
-            raise ValueError("submission rejection must be a JSON object")
+        value = strict_json_object(text, "submission rejection")
         return SubmissionRejectionRecord.from_dict(value)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid immutable submission rejection: {path}") from exc
 
 
@@ -96,12 +158,9 @@ def read_strict_json(backend: ExecutionBackend, path: str, label: str) -> dict[s
     if not text:
         raise ValueError(f"{label} is missing: {path}")
     try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
+        return strict_json_object(text, label)
+    except ValueError as exc:
         raise ValueError(f"{label} is malformed: {path}") from exc
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object: {path}")
-    return value
 
 
 def read_reconciliation_receipt(
@@ -123,14 +182,14 @@ def read_reconciliation_receipt(
     if text is None:
         return None
     try:
-        value = json.loads(text)
+        value = strict_json_object(text, "reconciliation receipt")
         receipt = ReconciliationReceipt.from_dict(
             value,
             plan_sha256=plan.plan_sha256,
             stage=stage,
             attempt=attempt,
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid immutable reconciliation receipt: {path}") from exc
     _validate_task_evidence(backend, plan, stage, receipt)
     return receipt
@@ -199,34 +258,7 @@ def _record_task_authorization(
 
     all_task_ids = tuple(task.task_id for task in select_tasks(stage, None))
     if attempt > 1 and stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
-        authorization = read_strict_json(
-            backend,
-            reconciler_followup_path(plan, stage.stage_id, attempt),
-            "reconciler follow-up authorization",
-        )
-        dependency_values = authorization.get("dependency_job_ids")
-        allowed = {
-            "attempt",
-            "dependency_job_ids",
-            "plan_sha256",
-            "schema_version",
-            "stage_id",
-            "trigger_job_id",
-            "trigger_stage_id",
-        }
-        if (
-            set(authorization) != allowed
-            or authorization.get("schema_version") != 1
-            or authorization.get("plan_sha256") != plan.plan_sha256
-            or authorization.get("stage_id") != stage.stage_id
-            or authorization.get("attempt") != attempt
-            or not isinstance(dependency_values, list)
-            or any(not isinstance(item, str) or not item.isdigit() for item in dependency_values)
-            or authorization.get("trigger_stage_id") not in stage.depends_on
-            or not isinstance(authorization.get("trigger_job_id"), str)
-            or not str(authorization.get("trigger_job_id")).isdigit()
-        ):
-            raise ValueError("reconciler follow-up authorization is malformed or foreign")
+        dependency_values = authenticate_followup_authorization(backend, plan, stage, attempt)
         task_ids = all_task_ids
         if len(dependency_values) != len(stage.depends_on):
             raise ValueError("follow-up dependency cardinality differs from the signed DAG")
@@ -272,36 +304,32 @@ def _validate_record_dependencies(
         if job_id not in authorized_jobs:
             raise ValueError(f"submission dependency job {job_id} is not authenticated evidence for stage {dependency}")
     if record.identity.attempt > 1 and stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
-        authorization = read_strict_json(
+        dependency_values = authenticate_followup_authorization(
             backend,
-            reconciler_followup_path(plan, stage.stage_id, record.identity.attempt),
-            "reconciler follow-up authorization",
+            plan,
+            stage,
+            record.identity.attempt,
         )
-        dependency_values = authorization.get("dependency_job_ids")
-        if not isinstance(dependency_values, list) or tuple(dependency_values) != record.dependency_job_ids:
+        if dependency_values != record.dependency_job_ids:
             raise ValueError("submission record differs from its exact follow-up dependency authorization")
-        trigger_stage = authorization.get("trigger_stage_id")
-        trigger_job = authorization.get("trigger_job_id")
-        trigger_index = stage.depends_on.index(str(trigger_stage))
-        if record.dependency_job_ids[trigger_index] != trigger_job:
-            raise ValueError("follow-up trigger job is not the authorized dependency for its stage")
     if stage.depends_on and not record.dependency_job_ids:
         # Keep this explicit even though cardinality catches it: this is the
         # dangerous dependency-bypass shape the contract exists to prevent.
         raise ValueError("dependent submission record cannot omit authorized dependencies")
 
 
-def current_task_receipts_valid(
+def current_task_receipts_status(
     backend: ExecutionBackend,
     plan: ExecutionPlan,
     stage: StageSpec,
-) -> bool:
-    """Reverify current task receipt bytes before releasing downstream work.
+) -> bool | None:
+    """Return current task validity, or ``None`` for an untrustworthy read.
 
     Immutable attempt evidence proves what reconciliation observed, but pipeline
     receipts can still be deleted or replaced afterward.  ``afterok`` gating
-    therefore checks both the historical verdict and the current files-as-truth
-    surface.  Observation failures fail closed exactly like missing bytes.
+    therefore checks both historical verdicts and current files.  A transport
+    failure is distinct from proven missing bytes so reconciliation can wait
+    rather than sealing a false terminal failure.
     """
 
     for task in select_tasks(stage, None):
@@ -309,12 +337,22 @@ def current_task_receipts_valid(
             backend.observe_receipt(plan.paths.run_root, receipt) for receipt in task.expected_receipts
         )
         if any(not observation.trustworthy for observation in observations):
-            return False
+            return None
         if not all(
             receipt_matches(spec, observation) for spec, observation in zip(task.expected_receipts, observations)
         ):
             return False
     return True
+
+
+def current_task_receipts_valid(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+) -> bool:
+    """Fail closed unless current task receipts are positively valid."""
+
+    return current_task_receipts_status(backend, plan, stage) is True
 
 
 def authenticated_task_verdict(
@@ -372,11 +410,9 @@ def _validate_task_evidence(
             if text is None:
                 continue
             try:
-                value = json.loads(text)
-                if not isinstance(value, dict):
-                    raise ValueError("task-attempt evidence must be a JSON object")
+                value = strict_json_object(text, "task-attempt evidence")
                 item = TaskAttemptReceipt.from_dict(value)
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"invalid task-attempt evidence: {path}") from exc
             if (
                 item.identity != record.identity
@@ -405,7 +441,9 @@ def _validate_task_evidence(
 
 
 __all__ = [
+    "authenticate_followup_authorization",
     "current_task_receipts_valid",
+    "current_task_receipts_status",
     "authenticated_task_verdict",
     "latest_reconciliation_receipt",
     "read_reconciliation_receipt",

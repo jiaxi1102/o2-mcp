@@ -8,9 +8,8 @@ compare-and-swap backend provides the cross-process lock boundary.
 
 from __future__ import annotations
 
-import json
-
 from o2mcp.runorg.execution_models import RegistryUpdate
+from o2mcp.runorg.strict_json import exact_int, exact_list, exact_object, exact_str, strict_json_object
 
 _STAGE_RANK = {
     "SUBMITTED": 10,
@@ -34,10 +33,7 @@ _EXECUTION_RANK = {
 def decode_registry_update(text: str, *, label: str = "pending registry update") -> RegistryUpdate:
     """Strictly decode one outbox payload without permissive type coercion."""
 
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{label} is malformed") from exc
+    value = strict_json_object(text, label)
     expected = {
         "attempt",
         "execution_status",
@@ -46,22 +42,15 @@ def decode_registry_update(text: str, *, label: str = "pending registry update")
         "stage_id",
         "stage_status",
     }
-    if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError(f"{label} has unsupported fields")
-    if not isinstance(value["attempt"], int) or isinstance(value["attempt"], bool):
-        raise ValueError(f"{label} attempt must be an integer")
-    if not isinstance(value["job_ids"], list) or any(not isinstance(item, str) for item in value["job_ids"]):
-        raise ValueError(f"{label} job_ids must be an array of strings")
-    for field in ("execution_status", "plan_sha256", "stage_id", "stage_status"):
-        if not isinstance(value[field], str):
-            raise ValueError(f"{label} {field} must be text")
+    exact_object(value, expected, label)
+    jobs = exact_list(value["job_ids"], f"{label} job_ids")
     return RegistryUpdate(
-        plan_sha256=value["plan_sha256"],
-        stage_id=value["stage_id"],
-        stage_status=value["stage_status"],
-        execution_status=value["execution_status"],
-        job_ids=tuple(value["job_ids"]),
-        attempt=value["attempt"],
+        plan_sha256=exact_str(value["plan_sha256"], f"{label} plan_sha256"),
+        stage_id=exact_str(value["stage_id"], f"{label} stage_id"),
+        stage_status=exact_str(value["stage_status"], f"{label} stage_status"),
+        execution_status=exact_str(value["execution_status"], f"{label} execution_status"),
+        job_ids=tuple(exact_str(item, f"{label} job_id") for item in jobs),
+        attempt=exact_int(value["attempt"], f"{label} attempt"),
     )
 
 

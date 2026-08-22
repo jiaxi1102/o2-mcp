@@ -9,6 +9,7 @@ repair all act on the same immutable execution plan.
 from __future__ import annotations
 
 import hashlib
+import json
 import posixpath
 import shutil
 import subprocess
@@ -38,7 +39,14 @@ from o2mcp.runorg import (
     SubmitOutcome,
     TaskSpec,
 )
-from o2mcp.runorg.execution_models import PlannedTask, RegistryUpdate
+from o2mcp.runorg.execution_models import (
+    ACCEPTED,
+    DEFINITELY_REJECTED,
+    INVOKED_OUTCOME_UNKNOWN,
+    PlannedTask,
+    RegistryUpdate,
+    canonical_json,
+)
 from o2mcp.runorg.execution_paths import reconciliation_path, task_attempt_path
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
@@ -50,7 +58,6 @@ RUN_ROOT = f"/n/scratch/users/test/runs/{CAMPAIGN}/{RUN_ID}"
 
 class ConcurrentBackend:
     """Thread-safe in-memory backend with controllable scheduler outcomes.
-
     ``intent_barrier`` is applied only to submission-intent publication.  It
     forces two callers through all prior reads before either caller can perform
     the atomic create, reproducing the exact lost-response race that motivated
@@ -68,7 +75,6 @@ class ConcurrentBackend:
 
     def find_jobs(self, comment: str):
         """Return an atomic snapshot of jobs with one exact comment."""
-
         with self._lock:
             return tuple(
                 SlurmJob(job_id, comment, str(data["state"]))
@@ -76,38 +82,35 @@ class ConcurrentBackend:
                 if data["comment"] == comment
             )
 
-    def submit(self, request: SubmissionRequest) -> SubmitOutcome:
-        """Record a scheduler call and materialize a job only when accepted."""
+    def prepare_submission(self, request: SubmissionRequest) -> None:
+        """The in-memory backend always has prepared dispatcher inputs."""
+        return None
 
+    def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+        """Record a scheduler call and materialize a job only when accepted."""
         with self._lock:
             self.requests.append(request)
-            outcome = self.outcomes.popleft() if self.outcomes else SubmitOutcome(None, accepted=True)
-            if not outcome.accepted:
+            outcome = self.outcomes.popleft() if self.outcomes else None
+            if outcome is not None and outcome.status == DEFINITELY_REJECTED:
                 return outcome
-            job_id = outcome.job_id or str(self.next_job_id)
+            job_id = outcome.job_id if outcome is not None and outcome.status == ACCEPTED else str(self.next_job_id)
             self.next_job_id = max(self.next_job_id + 1, int(job_id) + 1)
             self.jobs[job_id] = {
                 "comment": request.comment,
                 "state": "PENDING",
                 "task_states": (SlurmTaskState(None, "PENDING", None),),
             }
-            return SubmitOutcome(
-                job_id if outcome.response_received else None,
-                accepted=True,
-                response_received=outcome.response_received,
-                stdout=outcome.stdout,
-                stderr=outcome.stderr,
-            )
+            if outcome is not None and outcome.status == INVOKED_OUTCOME_UNKNOWN:
+                return outcome
+            return SubmitOutcome(ACCEPTED, job_id=job_id, returncode=0)
 
     def task_states(self, job_id: str):
         """Return a stable accounting snapshot for one fake job."""
-
         with self._lock:
             return tuple(self.jobs[job_id]["task_states"])
 
     def set_states(self, job_id: str, *states: SlurmTaskState) -> None:
         """Replace fake accounting state while preserving the job identity."""
-
         with self._lock:
             self.jobs[job_id]["task_states"] = tuple(states)
             root = next((state for state in states if state.array_index is None), None)
@@ -116,7 +119,6 @@ class ConcurrentBackend:
 
     def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
         """Observe exact in-memory pipeline bytes under ``run_root``."""
-
         path = posixpath.join(run_root, receipt.path)
         with self._lock:
             text = self.files.get(path)
@@ -125,19 +127,16 @@ class ConcurrentBackend:
 
     def put_receipt(self, receipt: ReceiptSpec, text: str = "ok\n") -> None:
         """Create a pipeline-owned receipt for a reconciliation test."""
-
         with self._lock:
             self.files[posixpath.join(RUN_ROOT, receipt.path)] = text
 
     def read_text(self, path: str) -> str | None:
         """Read one file atomically from the fake filesystem."""
-
         with self._lock:
             return self.files.get(path)
 
     def write_immutable_text(self, path: str, text: str) -> bool:
         """Atomically publish complete bytes and return exclusive ownership."""
-
         if self.intent_barrier is not None and "/submission-intents/" in path:
             self.intent_barrier.wait(timeout=5)
         with self._lock:
@@ -150,13 +149,11 @@ class ConcurrentBackend:
 
     def write_mutable_text(self, path: str, text: str) -> None:
         """Replace non-evidence current state under the same fake lock."""
-
         with self._lock:
             self.files[path] = text
 
     def compare_and_swap_text(self, path: str, expected: str | None, replacement: str | None) -> bool:
         """Atomically update one fake outbox item only from exact current bytes."""
-
         with self._lock:
             current = self.files.get(path)
             if current != expected or (path not in self.files and expected is not None):
@@ -170,13 +167,11 @@ class ConcurrentBackend:
 
 def _receipt(task_id: str, *, stage: str = "compute") -> ReceiptSpec:
     """Return a pipeline receipt outside the engine-reserved namespace."""
-
     return ReceiptSpec(f"receipt-{stage}-{task_id}", f"receipts/stages/{stage}/{task_id}.json")
 
 
 def _command(name: str) -> CommandSpec:
     """Build one deterministic fake scientific command."""
-
     return CommandSpec(
         argv=("/usr/bin/python3", "-m", "canary.worker", "--task", name),
         working_directory=f"{RUN_ROOT}/work",
@@ -187,7 +182,6 @@ def _command(name: str) -> CommandSpec:
 
 def _resources(parallelism: int = 3) -> ResourceSpec:
     """Return conservative typed resources for the fake requests."""
-
     return ResourceSpec(
         partition="short",
         cpus=2,
@@ -199,7 +193,6 @@ def _resources(parallelism: int = 3) -> ResourceSpec:
 
 def _compute_stage(*, max_attempts: int = 2) -> StageSpec:
     """Build a three-movie array with stable zero-based indices."""
-
     tasks = tuple(
         TaskSpec(
             task_id=f"movie-{index}",
@@ -224,7 +217,6 @@ def _compute_stage(*, max_attempts: int = 2) -> StageSpec:
 
 def _plan(*, stages: tuple[StageSpec, ...] | None = None, source_commit: str = "a" * 40) -> ExecutionPlan:
     """Build an immutable plan sharing one deliberately fixed registered run."""
-
     return ExecutionPlan(
         project="execution-tests",
         campaign=CAMPAIGN,
@@ -246,7 +238,6 @@ def _plan(*, stages: tuple[StageSpec, ...] | None = None, source_commit: str = "
 
 def test_two_callers_racing_identical_intent_submit_exactly_one_job() -> None:
     """Only the atomic intent creator may submit after a forced two-caller race."""
-
     backend = ConcurrentBackend(intent_barrier=threading.Barrier(2))
     plan = _plan()
     outcomes: list[object] = []
@@ -344,7 +335,7 @@ def test_definitive_rejection_is_stable_and_authorizes_only_next_attempt() -> No
     """A rejected attempt is replayable evidence, not a permanently poisoned intent."""
 
     backend = ConcurrentBackend()
-    backend.outcomes.append(SubmitOutcome(None, accepted=False, stderr="invalid qos"))
+    backend.outcomes.append(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="invalid qos"))
     engine = ExecutionEngine(backend)
     plan = _plan()
 
@@ -409,10 +400,6 @@ def test_dispatcher_checks_runtime_bytes_before_exec(tmp_path) -> None:
     )
     dispatcher = render_dispatcher((PlannedTask("task", None, command, (_receipt("runtime"),)),))
 
-    # Production O2 nodes provide GNU sha256sum at the signed absolute path.
-    # macOS test hosts do not, so substitute the system's compatible shasum only
-    # for execution of this generated test script; the assertion below still
-    # verifies that production rendering names the exact O2 binary.
     assert "/usr/bin/sha256sum" in dispatcher
     if not posixpath.exists("/usr/bin/sha256sum"):
         shasum = shutil.which("shasum")
@@ -481,6 +468,46 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert audit_requests[0].dependency_job_ids == (compute.job_id,)
     assert audit_requests[1].dependency_job_ids == (retry_job,)
     assert first_audit.identity.attempt == 1
+
+
+def test_tampered_followup_dependency_is_rejected_before_intent_or_sbatch() -> None:
+    """After-any authorization authenticates jobs and trigger before mutation."""
+
+    class TamperFollowupBackend(ConcurrentBackend):
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if "/reconciler-followups/audit/attempt-002.json" in path:
+                value = json.loads(text)
+                value["dependency_job_ids"] = ["999999"]
+                text = canonical_json(value)
+            return super().write_immutable_text(path, text)
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = TamperFollowupBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    with pytest.raises(ValueError, match="dependency job|authorized signed DAG"):
+        engine.reconcile_stage(plan, "compute")
+    assert not any("submission-intents/audit/attempt-002" in path for path in backend.files)
+    assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"] == [1]
 
 
 def test_retry_followup_outbox_recovers_crash_after_retry_record() -> None:
@@ -568,9 +595,6 @@ def test_afterok_requires_authenticated_completion_not_scheduler_exit() -> None:
         engine.submit_stage(plan, "publish")
     assert engine.reconcile_stage(plan, "compute").decision == "FAILED"
 
-    # Use a fresh plan/backend because terminal missing-receipt evidence is
-    # immutable.  Once all receipts are present, reconciliation certifies the
-    # prerequisite and the exact afterok dependency can be submitted.
     backend = ConcurrentBackend()
     engine = ExecutionEngine(backend)
     compute = engine.submit_stage(plan, "compute").record
