@@ -32,18 +32,45 @@ from o2mcp.runorg import (
 )
 from o2mcp.runorg.execution_models import (
     ACCEPTED,
+    ACTIVE_SLURM_STATES,
     DEFINITELY_NOT_INVOKED,
     INVOKED_OUTCOME_UNKNOWN,
     RECONCILE_COMPLETE,
     RECONCILE_FAILED,
     RECONCILE_RETRY_SUBMITTED,
+    RECONCILE_WAIT,
 )
-from o2mcp.runorg.execution_paths import pending_registry_path
+from o2mcp.runorg.execution_paths import pending_registry_path, reconciliation_path, task_attempt_path
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 
 CAMPAIGN = "execution-canary"
 RUN_ID = f"RUN_20260822T010203Z_{CAMPAIGN}__fault-test"
 RUN_ROOT = f"/n/scratch/users/test/runs/{CAMPAIGN}/{RUN_ID}"
+
+# Slurm exposes active base states and can display these nonterminal state flags
+# in place of the base state.  Keeping an independent expected set makes this a
+# contract test rather than merely parameterizing from the production constant.
+OFFICIAL_NONTERMINAL_SLURM_STATES = (
+    "COMPLETING",
+    "CONFIGURING",
+    "EXPEDITING",
+    "LAUNCH_FAILED",
+    "PENDING",
+    "POWER_UP_NODE",
+    "RECONFIG_FAIL",
+    "REQUEUED",
+    "REQUEUE_FED",
+    "REQUEUE_HOLD",
+    "RESIZING",
+    "RESV_DEL_HOLD",
+    "RUNNING",
+    "SIGNALING",
+    "SPECIAL_EXIT",
+    "STAGE_OUT",
+    "STOPPED",
+    "SUSPENDED",
+    "UPDATE_DB",
+)
 
 
 class FakeExecutionBackend:
@@ -492,6 +519,88 @@ def test_task_attempt_receipts_are_immutable_and_idempotent() -> None:
     # rewrite it.  The files-as-truth receipt remains authoritative.
     assert engine.reconcile_stage(plan, "analyze").decision == RECONCILE_COMPLETE
     assert backend.files == snapshot
+
+
+def test_active_slurm_state_class_covers_every_official_nonterminal_state() -> None:
+    """The documented active class stays exhaustive as Slurm flags are added."""
+
+    assert frozenset(OFFICIAL_NONTERMINAL_SLURM_STATES) == ACTIVE_SLURM_STATES
+
+
+@pytest.mark.parametrize("slurm_state", OFFICIAL_NONTERMINAL_SLURM_STATES)
+def test_every_nonterminal_slurm_state_waits_without_immutable_evidence(slurm_state: str) -> None:
+    """No official nonterminal base state or flag can freeze a task failure."""
+
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "analyze").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, slurm_state, None),
+        *(SlurmTaskState(index, slurm_state, None) for index in range(3)),
+    )
+
+    waiting = engine.reconcile_stage(plan, "analyze")
+
+    assert waiting.decision == RECONCILE_WAIT
+    assert waiting.active_task_ids == ("movie-0", "movie-1", "movie-2")
+    assert waiting.successful_task_ids == waiting.retry_task_ids == waiting.failed_task_ids == ()
+    assert backend.read_text(reconciliation_path(plan, "analyze", 1)) is None
+    for task_id in waiting.active_task_ids:
+        assert backend.read_text(task_attempt_path(plan, record.identity, task_id)) is None
+
+    # A later terminal success must remain observable; a transient poll must not
+    # have left immutable failure bytes that conflict with the final evidence.
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+    )
+    for index in range(3):
+        backend.put_receipt(_receipt(f"movie-{index}"))
+    assert engine.reconcile_stage(plan, "analyze").decision == RECONCILE_COMPLETE
+
+
+@pytest.mark.parametrize("slurm_state", ("REQUEUED", "RESIZING"))
+def test_transient_root_state_does_not_terminally_fill_missing_array_children(slurm_state: str) -> None:
+    """A transient root row leaves absent array-element accounting active."""
+
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "analyze").record
+    backend.set_states(record.job_id, SlurmTaskState(None, slurm_state, None))
+
+    waiting = engine.reconcile_stage(plan, "analyze")
+
+    assert waiting.decision == RECONCILE_WAIT
+    assert waiting.active_task_ids == ("movie-0", "movie-1", "movie-2")
+    assert backend.read_text(reconciliation_path(plan, "analyze", 1)) is None
+    for task_id in waiting.active_task_ids:
+        assert backend.read_text(task_attempt_path(plan, record.identity, task_id)) is None
+
+
+def test_unknown_slurm_state_fails_closed_as_active() -> None:
+    """A future Slurm flag cannot be misclassified as immutable terminal proof."""
+
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "analyze").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "FUTURE_TRANSITION", None),
+        *(SlurmTaskState(index, "FUTURE_TRANSITION", None) for index in range(3)),
+    )
+
+    waiting = engine.reconcile_stage(plan, "analyze")
+
+    assert waiting.decision == RECONCILE_WAIT
+    assert waiting.active_task_ids == ("movie-0", "movie-1", "movie-2")
+    assert backend.read_text(reconciliation_path(plan, "analyze", 1)) is None
+    for task_id in waiting.active_task_ids:
+        assert backend.read_text(task_attempt_path(plan, record.identity, task_id)) is None
 
 
 def test_afterany_dependency_is_scheduler_visible() -> None:

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from o2mcp.runorg.executor import O2Runs
-from o2mcp.runorg.runs import RunLayout, RunManifest, plan_promote_script
+from o2mcp.runorg.runs import RunLayout, RunManifest, plan_archive_script, plan_promote_script
 from o2mcp.runorg.transition_guards import require_certified_terminal_execution
 
 
@@ -33,7 +33,7 @@ def _write_tool(path, name: str, body: str) -> None:
 
 
 def test_promotion_detects_source_write_after_copy_verification(tmp_path) -> None:
-    """A late writer leaves source intact instead of losing unverified bytes."""
+    """A late writer leaves source intact and no committed kept destination."""
 
     layout = RunLayout(
         str(tmp_path / "scratch"),
@@ -71,7 +71,16 @@ for arg in "$@"; do
     *) paths+=("$arg") ;;
   esac
 done
-if test "$dry" = 1; then exit 0; fi
+if test "$dry" = 1; then
+  count=0
+  if test -e "$INJECT_COUNT"; then count=$(cat "$INJECT_COUNT"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$INJECT_COUNT"
+  # Mutate only after both dry-run comparisons have passed.  The transition's
+  # independent final snapshot must still reject these unverified bytes.
+  if test "$count" = 2; then printf 'late bytes\n' > "$INJECT_SOURCE/late.txt"; fi
+  exit 0
+fi
 src=${paths[${#paths[@]}-2]}
 dst=${paths[${#paths[@]}-1]}
 mkdir -p -- "$dst"
@@ -90,9 +99,6 @@ done
 src=${paths[0]}
 dst=${paths[1]}
 /bin/mv -- "$src" "$dst"
-if test "$dst" = "$INJECT_DEST"; then
-  printf 'late bytes\n' > "$INJECT_SOURCE/late.txt"
-fi
 """,
     )
     _write_tool(
@@ -109,6 +115,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     assert ".execution-source.lock" in script
     assert "--exclude=/.execution-source.lock" in script
     assert "--exclude=.execution-source.lock" not in script
+    assert script.index("source_final_sha=") < script.index(f'mv --no-clobber -T -- "$staging" {destination}')
     assert script.index("source_final_sha=") < script.rindex("rm -rf")
     result = subprocess.run(
         ["/bin/bash"],
@@ -119,13 +126,109 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
             **os.environ,
             "PATH": f"{tools}:{os.environ['PATH']}",
             "INJECT_SOURCE": source,
-            "INJECT_DEST": destination,
+            "INJECT_COUNT": str(tmp_path / "rsync-dry-run-count"),
         },
         check=False,
     )
     assert result.returncode == 77, result.stderr
     assert os.path.exists(os.path.join(source, "payload.txt"))
     assert os.path.exists(os.path.join(source, "late.txt"))
+    assert not os.path.exists(destination)
+
+
+def test_archive_detects_source_write_before_publication(tmp_path) -> None:
+    """Archive exit 77 leaves no tarball, checksum, or manifest commit marker."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260822T010203Z_transition__archive-fault",
+        campaign="transition",
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset"],
+    )
+    source = layout.run_dir("active", manifest.campaign, manifest.run_id)
+    tarball = layout.archive_tarball(manifest.campaign, manifest.run_id)
+    checksum = layout.archive_checksum(manifest.campaign, manifest.run_id)
+    archived_manifest = layout.archive_manifest(manifest.campaign, manifest.run_id)
+    os.makedirs(source)
+    with open(os.path.join(source, "payload.txt"), "w", encoding="utf-8") as handle:
+        handle.write("authenticated bytes\n")
+
+    tools = tmp_path / "archive-tools"
+    tools.mkdir()
+    _write_tool(tools, "flock", "#!/bin/sh\nexit 0\n")
+    _write_tool(
+        tools,
+        "tar",
+        """#!/bin/bash
+set -e
+while test "$#" -gt 0; do
+  if test "$1" = "-cf"; then
+    shift
+    printf 'synthetic archive bytes\n' > "$1"
+    exit 0
+  fi
+  shift
+done
+exit 2
+""",
+    )
+    _write_tool(
+        tools,
+        "zstd",
+        """#!/bin/bash
+set -e
+# tar creation is stubbed separately, so this invocation is the integrity gate.
+printf 'late archive bytes\n' > "$INJECT_SOURCE/late.txt"
+exit 0
+""",
+    )
+    _write_tool(
+        tools,
+        "mv",
+        """#!/bin/bash
+set -e
+paths=()
+for arg in "$@"; do
+  case "$arg" in --no-clobber|-T|--) ;; *) paths+=("$arg") ;; esac
+done
+/bin/mv -- "${paths[0]}" "${paths[1]}"
+""",
+    )
+    _write_tool(
+        tools,
+        "sha256sum",
+        """#!/usr/bin/env python3
+import hashlib, pathlib, sys
+path = pathlib.Path(sys.argv[-1])
+print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
+""",
+    )
+
+    script = plan_archive_script(layout, manifest, source_dir=source)
+    _seed_transition_marker(source, manifest, "archive")
+    assert script.index("source_final_sha=") < script.index('mv --no-clobber -- "$staging/archive.tar.zst"')
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "INJECT_SOURCE": source},
+        check=False,
+    )
+
+    assert result.returncode == 77, result.stderr
+    assert os.path.exists(os.path.join(source, "payload.txt"))
+    assert os.path.exists(os.path.join(source, "late.txt"))
+    assert not os.path.exists(tarball)
+    assert not os.path.exists(checksum)
+    assert not os.path.exists(archived_manifest)
 
 
 def test_transition_requires_matching_certified_terminal_state() -> None:

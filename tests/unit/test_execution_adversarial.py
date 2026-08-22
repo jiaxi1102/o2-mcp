@@ -562,6 +562,63 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert first_audit.identity.attempt == 1
 
 
+def test_task_bearing_afterany_retry_still_rebinds_its_downstream_audit() -> None:
+    """Dependency mode must not make a compute array look like its audit stage.
+
+    Arrays can legitimately wait ``afterany`` on preflight work.  If such an
+    array retries, its downstream audit still needs a fresh scheduler generation
+    bound to the retry job, just like an otherwise independent compute stage.
+    """
+
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+    )
+    base_compute = _compute_stage()
+    dependent_compute = StageSpec(
+        stage_id=base_compute.stage_id,
+        resources=base_compute.resources,
+        expected_receipts=base_compute.expected_receipts,
+        tasks=base_compute.tasks,
+        depends_on=("preflight",),
+        dependency_mode="afterany",
+        retry_policy=base_compute.retry_policy,
+    )
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(preflight, dependent_compute, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    engine.submit_stage(plan, "preflight")
+    compute = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    result = engine.reconcile_stage(plan, "compute")
+
+    assert result.retry_submission is not None
+    retry_job = result.retry_submission.job_id
+    audit_requests = [request for request in backend.requests if request.identity.stage_id == "audit"]
+    assert [request.identity.attempt for request in audit_requests] == [1, 2]
+    assert audit_requests[-1].dependency_job_ids == (retry_job,)
+
+
 def test_afterany_reconciler_uses_its_own_retry_policy_without_followup_authorization() -> None:
     """An audit's own failure is distinct from a compute-triggered generation.
 

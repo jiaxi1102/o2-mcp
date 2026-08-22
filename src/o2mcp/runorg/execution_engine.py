@@ -31,7 +31,6 @@ from o2mcp.runorg.execution_evidence import (
 from o2mcp.runorg.execution_followups import ExecutionFollowupMixin
 from o2mcp.runorg.execution_models import (
     ACCEPTED,
-    ACTIVE_SLURM_STATES,
     DEFINITELY_NOT_INVOKED,
     DEFINITELY_REJECTED,
     INVOKED_OUTCOME_UNKNOWN,
@@ -41,6 +40,7 @@ from o2mcp.runorg.execution_models import (
     RECONCILE_RETRY_SUBMITTED,
     RECONCILE_WAIT,
     SUCCESS_SLURM_STATES,
+    TERMINAL_SLURM_STATES,
     DuplicateSubmissionError,
     PlannedTask,
     ReconcileResult,
@@ -80,6 +80,17 @@ class RegistrySynchronizer(Protocol):
 
     def synchronize(self, plan: ExecutionPlan, update: RegistryUpdate) -> bool:
         """Persist ``update`` and return whether both registry surfaces agree."""
+
+
+def _is_explicit_afterany_reconciler(stage: StageSpec) -> bool:
+    """Return whether ``stage`` is the engine's non-array audit/fan-in shape.
+
+    Task-bearing compute arrays may themselves use ``afterany`` to wait for an
+    upstream stage.  They still need downstream audit generations after their
+    own retries, so dependency mode alone cannot identify a reconciler.
+    """
+
+    return stage.dependency_mode == "afterany" and bool(stage.depends_on) and not stage.tasks
 
 
 class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
@@ -206,7 +217,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             self._enqueue_registry_update(plan, update, claim_ids)
             # Replay converges the follow-up only after the accepted compute job
             # and its lifecycle holders have a durable registry repair pointer.
-            if attempt > 1 and stage.dependency_mode != "afterany":
+            if attempt > 1 and not _is_explicit_afterany_reconciler(stage):
                 self._ensure_reconciler_followups(plan, stage_id, existing_record)
             synced = self._sync_registry(
                 plan,
@@ -365,7 +376,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         )
         claim_ids = self._submission_claim_ids(plan, record.identity, claim_id, invocation_claim_id)
         self._enqueue_registry_update(plan, update, claim_ids)
-        if attempt > 1 and stage.dependency_mode != "afterany":
+        if attempt > 1 and not _is_explicit_afterany_reconciler(stage):
             self._ensure_reconciler_followups(plan, stage_id, record)
         registry_synced = self._sync_registry(
             plan,
@@ -441,7 +452,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # any later reconciliation repairs a retry record whose follow-up audit
         # submission was interrupted after the compute job had been accepted.
         for record in records:
-            if record.identity.attempt > 1 and stage.dependency_mode != "afterany":
+            if record.identity.attempt > 1 and not _is_explicit_afterany_reconciler(stage):
                 self._ensure_reconciler_followups(plan, stage_id, record)
         tasks = {task.task_id: task for task in select_tasks(stage, None)}
         states_by_job = {record.job_id: tuple(self.backend.task_states(record.job_id)) for record in records}
@@ -596,7 +607,12 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 latest_verdict = "ACTIVE"
                 continue
             normalized = state.normalized_state()
-            if normalized in ACTIVE_SLURM_STATES:
+            if normalized not in TERMINAL_SLURM_STATES:
+                # Slurm may report a nonterminal state flag (for example,
+                # REQUEUED or RESIZING) instead of the underlying base state.
+                # Immutable attempt evidence is safe only for the explicit
+                # terminal semantic class. Unknown future flags therefore fail
+                # closed as active rather than freezing a false failure.
                 latest_verdict = "ACTIVE"
                 continue
 

@@ -21,11 +21,29 @@ EXECUTION_RECEIPT_SCHEMA_VERSION = 1
 
 ACTIVE_SLURM_STATES = frozenset(
     {
+        # Slurm can render a nonterminal state flag instead of the underlying
+        # base state.  Keep the official flag names here as well as the active
+        # base states so callers do not mistake a scheduler transition for a
+        # final accounting result.
         "CONFIGURING",
         "COMPLETING",
+        "EXPEDITING",
+        "LAUNCH_FAILED",
         "PENDING",
+        "POWER_UP_NODE",
+        "RECONFIG_FAIL",
+        "REQUEUED",
+        "REQUEUE_FED",
+        "REQUEUE_HOLD",
+        "RESIZING",
+        "RESV_DEL_HOLD",
         "RUNNING",
+        "SIGNALING",
+        "SPECIAL_EXIT",
+        "STAGE_OUT",
+        "STOPPED",
         "SUSPENDED",
+        "UPDATE_DB",
     }
 )
 SUCCESS_SLURM_STATES = frozenset({"COMPLETED"})

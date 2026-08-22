@@ -525,7 +525,7 @@ def plan_archive_script(
             f"if test -e {shlex.quote(manifest_dest)} || test -e {shlex.quote(tarball)} || "
             f"test -e {shlex.quote(checksum)}; then echo 'archive destination already exists' >&2; exit 76; fi",
             f"staging=$(mktemp -d {shlex.quote(staging_template)})",
-            "trap 'rm -rf -- \"$staging\"' EXIT",
+            *_rollback_uncommitted_transition_lines(source_dir, transition_id),
             f"tar {exclude} --use-compress-program='zstd -19 --long=27 -T0' "
             f'-cf "$staging/archive.tar.zst" -C {shlex.quote(parent)} {shlex.quote(base)}',
             "archive_sha=$(sha256sum \"$staging/archive.tar.zst\" | cut -d' ' -f1)",
@@ -533,20 +533,29 @@ def plan_archive_script(
             'test -s "$staging/archive.tar.zst"',
             'zstd -t "$staging/archive.tar.zst"',
             f'cat > "$staging/run.json" {_heredoc(manifest_json)}',
+            f'test "$(sha256sum "$staging/run.json" | cut -d\' \' -f1)" = '
+            f"{shlex.quote(hashlib.sha256((manifest_json + chr(10)).encode()).hexdigest())}",
+            # Freeze and authenticate the exact source tree before exposing any
+            # archive artifact.  The rollback trap restores this quarantine if
+            # publication itself fails, so neither tier looks committed.
+            *_freeze_source_before_publication_lines(source_dir, transition_id),
             # Publish data first and the small manifest last.  Consumers must
             # treat the manifest as the commit marker for the three-file package.
             f'mv --no-clobber -- "$staging/archive.tar.zst" {shlex.quote(tarball)}',
             'test ! -e "$staging/archive.tar.zst"',
+            f"published_paths+=({shlex.quote(tarball)})",
             f'mv --no-clobber -- "$staging/archive.sha256" {shlex.quote(checksum)}',
             'test ! -e "$staging/archive.sha256"',
+            f"published_paths+=({shlex.quote(checksum)})",
             f'mv --no-clobber -- "$staging/run.json" {shlex.quote(manifest_dest)}',
             'test ! -e "$staging/run.json"',
+            f"published_paths+=({shlex.quote(manifest_dest)})",
             'rmdir -- "$staging"',
-            "trap - EXIT",
             f"test \"$(sha256sum {shlex.quote(manifest_dest)} | cut -d' ' -f1)\" = "
             f"{shlex.quote(hashlib.sha256((manifest_json + chr(10)).encode()).hexdigest())}",
+            "trap - EXIT",
             f"echo ARCHIVED {shlex.quote(tarball)}",
-            *_quarantine_and_delete_lines(source_dir, transition_id),
+            *_delete_frozen_source_lines(source_dir, transition_id),
         ]
     )
 
@@ -616,10 +625,9 @@ def _render_transfer_script(
         # directory is verified exactly and then renamed into an absent final path.
         f"if test -e {shlex.quote(dest_dir)}; then echo 'durable destination already exists' >&2; exit 76; fi",
         f"staging=$(mktemp -d {shlex.quote(staging_template)})",
-        "trap 'rm -rf -- \"$staging\"' EXIT",
+        *_rollback_uncommitted_transition_lines(source_dir, transition_id),
         rsync,
         "verify_output=$(mktemp)",
-        'trap \'rm -f "$verify_output"; rm -rf -- "$staging"\' EXIT',
         # Verify both directions so destination-only residue is impossible.  The
         # lifecycle manifest is changed only after the copied active tree passes.
         f'if ! {verify_forward} >"$verify_output"; then cat "$verify_output" >&2; exit 74; fi',
@@ -629,13 +637,17 @@ def _render_transfer_script(
         'rm -f "$verify_output"',
         f'cat > "$staging/{manifest_rel}" {_heredoc(manifest_json)}',
         f'test "$(sha256sum "$staging/{manifest_rel}" | cut -d\' \' -f1)" = {shlex.quote(manifest_sha)}',
+        # The canonical kept directory is a commit marker.  Freeze and prove
+        # the source first so an exit 77/78 can only expose private staging.
+        *_freeze_source_before_publication_lines(source_dir, transition_id),
         f'mv --no-clobber -T -- "$staging" {shlex.quote(dest_dir)}',
         'test ! -e "$staging"',
+        f"published_paths+=({shlex.quote(dest_dir)})",
         "trap - EXIT",
         f"echo COPIED {shlex.quote(dest_dir)}",
     ]
     if free_source:
-        lines += _quarantine_and_delete_lines(source_dir, transition_id)
+        lines += _delete_frozen_source_lines(source_dir, transition_id)
     return "\n".join(lines)
 
 
@@ -660,27 +672,82 @@ def _transition_marker_guard(source_dir: str, transition_id: str) -> list[str]:
     ]
 
 
-def _quarantine_and_delete_lines(source_dir: str, transition_id: str) -> list[str]:
-    """Rename to a frozen sibling before the final proof and deletion.
-
-    An injection that recreates the original path after rename is outside the
-    certified source and survives cleanup, closing the final-digest/delete race.
-    """
+def _source_quarantine_path(source_dir: str, transition_id: str) -> str:
+    """Return the private sibling used to freeze a transition source."""
 
     source = source_dir.rstrip("/")
     parent, run_id = posixpath.split(source)
-    quarantine = posixpath.join(parent, f".{run_id}.deleting.{transition_id}")
-    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
-    marker = posixpath.join(coordination, "transition.json")
+    return posixpath.join(parent, f".{run_id}.deleting.{transition_id}")
+
+
+def _rollback_uncommitted_transition_lines(source_dir: str, transition_id: str) -> list[str]:
+    """Install an EXIT trap that removes private work and restores a frozen source.
+
+    ``published_paths`` records only destinations this script proved it moved
+    successfully.  This avoids deleting a pre-existing path when
+    ``mv --no-clobber`` declines a race, while still rolling back a partially
+    published archive package before its manifest commit can escape.
+    """
+
+    source = source_dir.rstrip("/")
+    quarantine = _source_quarantine_path(source, transition_id)
+    return [
+        "source_frozen=0",
+        "published_paths=()",
+        "cleanup_uncommitted_transition() {",
+        "  status=$?",
+        "  trap - EXIT",
+        # Cleanup must attempt every rollback step even when one filesystem
+        # operation fails; the original transition status remains authoritative.
+        "  set +e",
+        '  rm -f -- "${verify_output:-}"',
+        '  rm -rf -- "$staging"',
+        # Roll publication back in reverse commit order.  For archives this
+        # removes the manifest marker before its checksum and payload.
+        "  for ((published_index=${#published_paths[@]} - 1; published_index >= 0; published_index--)); do",
+        '    rm -rf -- "${published_paths[$published_index]}"',
+        "  done",
+        f'  if test "$source_frozen" = 1 && test ! -e {shlex.quote(source)}; then',
+        f"    mv -T -- {shlex.quote(quarantine)} {shlex.quote(source)}",
+        "  fi",
+        '  exit "$status"',
+        "}",
+        "trap cleanup_uncommitted_transition EXIT",
+    ]
+
+
+def _freeze_source_before_publication_lines(source_dir: str, transition_id: str) -> list[str]:
+    """Prove and quarantine the source before publishing a lifecycle destination.
+
+    An injection that recreates the original path after rename is outside the
+    certified source and survives cleanup.  A mismatch exits while the rollback
+    trap still owns only private staging, so no kept/archive commit is visible.
+    """
+
+    source = source_dir.rstrip("/")
+    quarantine = _source_quarantine_path(source, transition_id)
     return [
         _source_snapshot_assignment(source, "source_final_sha"),
         'if test "$source_final_sha" != "$source_baseline_sha"; then '
-        "echo 'source changed during transition; refusing deletion' >&2; exit 77; fi",
+        "echo 'source changed during transition; refusing publication' >&2; exit 77; fi",
         f"test ! -e {shlex.quote(quarantine)}",
         f"mv -T -- {shlex.quote(source)} {shlex.quote(quarantine)}",
+        "source_frozen=1",
         _source_snapshot_assignment(quarantine, "quarantine_sha"),
         'if test "$quarantine_sha" != "$source_baseline_sha"; then '
-        "echo 'frozen source changed after rename; refusing deletion' >&2; exit 78; fi",
+        "echo 'frozen source changed after rename; refusing publication' >&2; exit 78; fi",
+    ]
+
+
+def _delete_frozen_source_lines(source_dir: str, transition_id: str) -> list[str]:
+    """Delete a pre-certified quarantine after destination publication commits."""
+
+    source = source_dir.rstrip("/")
+    parent, run_id = posixpath.split(source)
+    quarantine = _source_quarantine_path(source, transition_id)
+    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
+    marker = posixpath.join(coordination, "transition.json")
+    return [
         f"rm -rf -- {shlex.quote(quarantine)}",
         "flock -x 7",
         f'test "$(cat -- {shlex.quote(marker)})" = {shlex.quote(transition_id)}',
