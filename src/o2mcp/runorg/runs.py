@@ -501,7 +501,10 @@ def plan_archive_script(
     staging_template = posixpath.join(archive_parent, "." + manifest.run_id + ".archive.XXXXXX")
     parent = posixpath.dirname(source_dir.rstrip("/"))
     base = posixpath.basename(source_dir.rstrip("/"))
-    exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in (*archive_excludes, ".execution-source.lock"))
+    # Tar sees paths relative to ``parent`` and prefixed by the run-directory
+    # basename. Include that prefix so only this script's root lock is omitted.
+    archive_patterns = (*archive_excludes, ".execution-source.lock")
+    exclude = " ".join(f"--exclude={shlex.quote(posixpath.join(base, item))}" for item in archive_patterns)
     manifest_json = archived.to_json()
     return "\n".join(
         [
@@ -584,7 +587,9 @@ def _render_transfer_script(
         raise ValueError("transfer source and destination must be different paths")
     src_slash = shlex.quote(source_dir.rstrip("/") + "/")
     dest_parent = posixpath.dirname(dest_dir)
-    effective_excludes = tuple(item for item in excludes if item) + (".execution-source.lock",)
+    # A leading slash anchors rsync patterns at the transfer root. Without it,
+    # nested scientific files sharing the lock basename would be silently lost.
+    effective_excludes = tuple(item for item in excludes if item) + ("/.execution-source.lock",)
     exclude = " ".join(f"--exclude={shlex.quote(e)}" for e in effective_excludes)
     rsync = f'rsync -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")
     verify_forward = f'rsync -nric --delete -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")

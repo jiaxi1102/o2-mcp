@@ -107,6 +107,8 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     script = plan_promote_script(layout, manifest, source_dir=source)
     _seed_transition_marker(source, manifest, "promote")
     assert ".execution-source.lock" in script
+    assert "--exclude=/.execution-source.lock" in script
+    assert "--exclude=.execution-source.lock" not in script
     assert script.index("source_final_sha=") < script.rindex("rm -rf")
     result = subprocess.run(
         ["/bin/bash"],

@@ -1,14 +1,11 @@
 """Idempotent submission and files-as-truth reconciliation for O2 plans.
 
-The engine deliberately separates *what should run* (an immutable
-:class:`~o2mcp.runorg.plans.ExecutionPlan`) from *how O2 is contacted* (an
-:class:`~o2mcp.runorg.execution_backend.ExecutionBackend`).  Its core safety
+The engine separates immutable plans from the execution backend. Its safety
 properties are:
 
 * one plan/stage/attempt maps to one reversible Slurm comment;
 * a missing ``sbatch`` response is queried, never blindly resubmitted;
-* completed tasks are proven by immutable attempt receipts and excluded from
-  retries;
+* immutable attempt receipts prove completed tasks and exclude them from retries;
 * retries are bounded by the signed stage policy; and
 * registry failures are recorded as pending metadata work, not reported as a
   failed submission that could tempt a caller to duplicate live jobs.
@@ -26,6 +23,7 @@ from o2mcp.runorg.execution_evidence import (
     current_task_receipts_status,
     current_task_receipts_valid,
     latest_reconciliation_receipt,
+    next_unrejected_attempt,
     read_plan_submission_records,
     read_strict_json,
     read_submission_invocation_claim_id,
@@ -450,6 +448,11 @@ class ExecutionEngine(ExecutionRegistryMixin):
                 failed.append(task_id)
 
         current_attempt = max(record.identity.attempt for record in records)
+        next_attempt, rejected_attempts = next_unrejected_attempt(
+            self.backend, plan, stage, current_attempt, tuple(sorted(retryable))
+        )
+        for rejected_identity in rejected_attempts:
+            self._release_rejected_invocation_owner(plan, rejected_identity, claim_id)
         retry_submission = None
         if active:
             decision = RECONCILE_WAIT
@@ -461,7 +464,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
             retryable = []
             decision = RECONCILE_FAILED
         elif retryable:
-            if current_attempt >= stage.retry_policy.max_attempts:
+            if next_attempt > stage.retry_policy.max_attempts:
                 failed.extend(retryable)
                 retryable = []
                 decision = RECONCILE_FAILED
@@ -515,7 +518,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
             retry_result = self.submit_stage(
                 plan,
                 stage_id,
-                attempt=current_attempt + 1,
+                attempt=next_attempt,
                 task_ids=tuple(sorted(retryable)),
             )
             retry_submission = retry_result.record

@@ -157,6 +157,41 @@ def read_submission_rejection(backend: ExecutionBackend, path: str) -> Submissio
         raise ValueError(f"invalid immutable submission rejection: {path}") from exc
 
 
+def next_unrejected_attempt(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    after_attempt: int,
+    expected_task_ids: tuple[str, ...],
+) -> tuple[int, tuple[SubmissionIdentity, ...]]:
+    """Advance across a contiguous chain of authenticated scheduler rejections.
+
+    Definitive rejection consumes a signed attempt without creating a submission
+    record. Reconciliation must therefore inspect those immutable receipts when
+    selecting the next bounded attempt, while refusing gaps, foreign identities,
+    or a task set that differs from the preceding retry authorization.
+    """
+
+    rejected: list[SubmissionIdentity] = []
+    attempt = after_attempt + 1
+    if not expected_task_ids:
+        return attempt, ()
+    while attempt <= stage.retry_policy.max_attempts:
+        identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt)
+        rejection = read_submission_rejection(
+            backend,
+            submission_rejection_path(plan, identity),
+        )
+        if rejection is None:
+            break
+        authorized = _record_task_authorization(backend, plan, stage, attempt)
+        if rejection.identity != identity or rejection.task_ids != expected_task_ids or authorized != expected_task_ids:
+            raise ValueError("submission rejection differs from its signed retry authorization")
+        rejected.append(identity)
+        attempt += 1
+    return attempt, tuple(rejected)
+
+
 def read_submission_invocation_claim_id(
     backend: ExecutionBackend,
     plan: ExecutionPlan,
@@ -511,6 +546,7 @@ __all__ = [
     "current_task_receipts_status",
     "authenticated_task_verdict",
     "latest_reconciliation_receipt",
+    "next_unrejected_attempt",
     "read_reconciliation_receipt",
     "read_plan_submission_records",
     "read_strict_json",

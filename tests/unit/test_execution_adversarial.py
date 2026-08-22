@@ -516,6 +516,32 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert first_audit.identity.attempt == 1
 
 
+def test_reconciliation_advances_past_a_definitively_rejected_retry() -> None:
+    """A rejected retry consumes attempt two but does not strand attempt three."""
+
+    plan = _plan(stages=(_compute_stage(max_attempts=3),))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    backend.outcomes.append(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="invalid qos"))
+
+    with pytest.raises(SubmissionRejected, match="invalid qos"):
+        engine.reconcile_stage(plan, "compute")
+    recovered = engine.reconcile_stage(plan, "compute")
+
+    assert recovered.retry_submission is not None
+    assert recovered.retry_submission.identity.attempt == 3
+    assert [request.identity.attempt for request in backend.requests] == [1, 2, 3]
+
+
 def test_tampered_followup_dependency_is_rejected_before_intent_or_sbatch() -> None:
     """After-any authorization authenticates jobs and trigger before mutation."""
 

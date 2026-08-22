@@ -234,7 +234,8 @@ def test_plan_archive_uses_policy_excludes(tmp_path):
         source_dir="/scratch/runs/camp/RUN_20260101T000000Z_camp__v1",
         archive_excludes=TEST_POLICY.archive_excludes,
     )
-    assert "--exclude=source_views" in script and "zstd" in script
+    assert f"--exclude={m.run_id}/source_views" in script and "zstd" in script
+    assert f"--exclude={m.run_id}/.execution-source.lock" in script
 
 
 def _transition_test_environment(tmp_path):
@@ -561,7 +562,7 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     promote = runs.promote(rd, dry_run=True)
     assert promote.started is False and "rsync" in promote.script
     archive = runs.archive(rd, dry_run=True)
-    assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
+    assert archive.started is False and f"--exclude={archive.run_id}/source_views" in archive.script
 
 
 def test_live_transition_uses_persistent_transfer_broker(tmp_path, monkeypatch):
