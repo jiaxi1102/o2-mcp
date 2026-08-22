@@ -7,6 +7,7 @@ from dataclasses import replace
 from o2mcp.runorg.execution_evidence import read_submission_invocation_claim_id
 from o2mcp.runorg.execution_models import RegistryUpdate, SubmissionIdentity, canonical_json
 from o2mcp.runorg.execution_paths import bound_plan_path, pending_registry_path
+from o2mcp.runorg.execution_reconcile import signed_attempt_bound
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.registry_outbox import decode_registry_update, merge_registry_updates
 
@@ -25,7 +26,7 @@ class ExecutionRegistryMixin:
             self._bind_plan(plan)
             all_synced = True
             for stage in plan.stages:
-                for attempt in range(1, stage.retry_policy.max_attempts + 1):
+                for attempt in range(1, signed_attempt_bound(plan, stage) + 1):
                     path = pending_registry_path(plan, stage.stage_id, attempt)
                     while (text := self.backend.read_text(path)) is not None:
                         update = decode_registry_update(text)

@@ -18,6 +18,22 @@ def stage_by_id(plan: ExecutionPlan, stage_id: str) -> StageSpec:
     raise ValueError(f"unknown stage_id {stage_id!r}")
 
 
+def signed_attempt_bound(plan: ExecutionPlan, stage: StageSpec) -> int:
+    """Return the plan-derived submission bound for one stage.
+
+    An ``afterany`` non-array reconciler needs its own signed retry budget plus
+    one new generation for every possible accepted retry of each dependency.
+    Deriving the extension solely from immutable stage policies keeps the
+    scheduler identity space bounded without requiring adapters to guess a
+    fan-in-specific reconciler limit.
+    """
+
+    bound = stage.retry_policy.max_attempts
+    if stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
+        bound += sum(stage_by_id(plan, dependency).retry_policy.max_attempts - 1 for dependency in stage.depends_on)
+    return bound
+
+
 def task_sort_key(task: PlannedTask) -> tuple[int, int, str]:
     """Sort array indices numerically while keeping non-array stages deterministic."""
 
@@ -54,4 +70,4 @@ def is_retryable(stage: StageSpec, state: str, exit_code: int | None, receipts_v
     return signed_terminal_condition or missing_task_condition
 
 
-__all__ = ["is_retryable", "stage_by_id", "task_sort_key", "task_state"]
+__all__ = ["is_retryable", "signed_attempt_bound", "stage_by_id", "task_sort_key", "task_state"]

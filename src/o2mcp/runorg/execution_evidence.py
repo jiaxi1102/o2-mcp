@@ -29,7 +29,7 @@ from o2mcp.runorg.execution_paths import (
     submission_rejection_path,
     task_attempt_path,
 )
-from o2mcp.runorg.execution_reconcile import is_retryable
+from o2mcp.runorg.execution_reconcile import is_retryable, signed_attempt_bound
 from o2mcp.runorg.execution_rendering import select_tasks
 from o2mcp.runorg.lifecycle_coordination import claim_name
 from o2mcp.runorg.plan_stages import StageSpec
@@ -176,7 +176,7 @@ def next_unrejected_attempt(
     attempt = after_attempt + 1
     if not expected_task_ids:
         return attempt, ()
-    while attempt <= stage.retry_policy.max_attempts:
+    while attempt <= signed_attempt_bound(plan, stage):
         identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt)
         rejection = read_submission_rejection(
             backend,
@@ -302,7 +302,7 @@ def latest_reconciliation_receipt(
 ) -> ReconciliationReceipt | None:
     """Return the latest valid bounded reconciliation receipt for ``stage``."""
 
-    for attempt in range(stage.retry_policy.max_attempts, 0, -1):
+    for attempt in range(signed_attempt_bound(plan, stage), 0, -1):
         receipt = read_reconciliation_receipt(backend, plan, stage, attempt)
         if receipt is not None:
             return receipt
@@ -324,7 +324,8 @@ def read_plan_submission_records(
     immediately preceding reconciliation/rejection authorization.
     """
 
-    upper = min(through_attempt or stage.retry_policy.max_attempts, stage.retry_policy.max_attempts)
+    attempt_bound = signed_attempt_bound(plan, stage)
+    upper = min(through_attempt or attempt_bound, attempt_bound)
     records: list[SubmissionRecord] = []
     for attempt in range(1, upper + 1):
         identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt)

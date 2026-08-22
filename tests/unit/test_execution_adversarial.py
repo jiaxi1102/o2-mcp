@@ -202,19 +202,24 @@ def _resources(parallelism: int = 3) -> ResourceSpec:
     )
 
 
-def _compute_stage(*, max_attempts: int = 2) -> StageSpec:
+def _compute_stage(
+    *,
+    max_attempts: int = 2,
+    stage_id: str = "compute",
+    task_prefix: str = "movie",
+) -> StageSpec:
     """Build a three-movie array with stable zero-based indices."""
     tasks = tuple(
         TaskSpec(
-            task_id=f"movie-{index}",
+            task_id=f"{task_prefix}-{index}",
             array_index=index,
-            command=_command(f"movie-{index}"),
-            expected_receipts=(_receipt(f"movie-{index}"),),
+            command=_command(f"{task_prefix}-{index}"),
+            expected_receipts=(_receipt(f"{task_prefix}-{index}"),),
         )
         for index in range(3)
     )
     return StageSpec(
-        stage_id="compute",
+        stage_id=stage_id,
         resources=_resources(),
         expected_receipts=(),
         tasks=tasks,
@@ -514,6 +519,52 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert audit_requests[0].dependency_job_ids == (compute.job_id,)
     assert audit_requests[1].dependency_job_ids == (retry_job,)
     assert first_audit.identity.attempt == 1
+
+
+def test_each_retrying_dependency_receives_a_distinct_followup_generation() -> None:
+    """Fan-in retries cannot exhaust a reconciler's per-stage retry budget."""
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(compute_a, compute_b, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def make_one_task_retryable(job_id: str, prefix: str) -> None:
+        """Complete two tasks and leave the middle task for one bounded retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    make_one_task_retryable(first_a.job_id, "a")
+    retry_a = engine.reconcile_stage(plan, "compute-a").retry_submission
+    assert retry_a is not None
+    make_one_task_retryable(first_b.job_id, "b")
+    retry_b = engine.reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+
+    audit_requests = [request for request in backend.requests if request.identity.stage_id == "audit"]
+    assert [request.identity.attempt for request in audit_requests] == [1, 2, 3]
+    assert audit_requests[-1].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
+    assert not backend.lifecycle_claims
 
 
 def test_reconciliation_advances_past_a_definitively_rejected_retry() -> None:

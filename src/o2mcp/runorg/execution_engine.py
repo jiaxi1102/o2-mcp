@@ -64,7 +64,7 @@ from o2mcp.runorg.execution_paths import (
     submission_rejection_path,
     task_attempt_path,
 )
-from o2mcp.runorg.execution_reconcile import is_retryable, stage_by_id, task_state
+from o2mcp.runorg.execution_reconcile import is_retryable, signed_attempt_bound, stage_by_id, task_state
 from o2mcp.runorg.execution_registry import ExecutionRegistryMixin
 from o2mcp.runorg.execution_rendering import build_submission_request, select_tasks, submission_intent
 from o2mcp.runorg.plan_stages import StageSpec
@@ -137,10 +137,9 @@ class ExecutionEngine(ExecutionRegistryMixin):
         self._bind_plan(plan)
         stage = stage_by_id(plan, stage_id)
         self._validate_afterok_dependencies(plan, stage)
-        if attempt > stage.retry_policy.max_attempts:
-            raise ValueError(
-                f"stage {stage_id} attempt {attempt} exceeds signed max_attempts={stage.retry_policy.max_attempts}"
-            )
+        attempt_bound = signed_attempt_bound(plan, stage)
+        if attempt > attempt_bound:
+            raise ValueError(f"stage {stage_id} attempt {attempt} exceeds signed max_attempts bound={attempt_bound}")
         identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
         existing_record = next(
             (record for record in self._submission_records(plan, stage) if record.identity.attempt == attempt),
@@ -464,7 +463,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
             retryable = []
             decision = RECONCILE_FAILED
         elif retryable:
-            if next_attempt > stage.retry_policy.max_attempts:
+            if next_attempt > signed_attempt_bound(plan, stage):
                 failed.extend(retryable)
                 retryable = []
                 decision = RECONCILE_FAILED
@@ -681,7 +680,8 @@ class ExecutionEngine(ExecutionRegistryMixin):
             # died after writing it or after accepting its Slurm job, replay the
             # same generation instead of allocating another reconciler attempt.
             existing_generation = None
-            for candidate in range(1, reconciler.retry_policy.max_attempts + 1):
+            reconciler_bound = signed_attempt_bound(plan, reconciler)
+            for candidate in range(1, reconciler_bound + 1):
                 path = reconciler_followup_path(plan, reconciler.stage_id, candidate)
                 text = self.backend.read_text(path)
                 if text is None:
@@ -708,7 +708,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
                 )
                 continue
             next_attempt = max((record.identity.attempt for record in records), default=0) + 1
-            if next_attempt > reconciler.retry_policy.max_attempts:
+            if next_attempt > reconciler_bound:
                 raise ValueError(
                     f"afterany reconciler {reconciler.stage_id} exhausted its signed attempt bound "
                     f"while rebinding retry job {retry_record.job_id}"
