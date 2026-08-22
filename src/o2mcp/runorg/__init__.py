@@ -15,6 +15,20 @@ dependency) and are registered by a consumer onto its own FastMCP server.
 from __future__ import annotations
 
 from o2mcp.runorg.executor import O2Runs, TransitionPlan
+from o2mcp.runorg.plans import (
+    DEPENDENCY_MODES,
+    EXECUTION_PLAN_SCHEMA_VERSION,
+    RETRYABLE_SLURM_STATES,
+    CanonicalPaths,
+    CommandSpec,
+    DatasetIdentity,
+    ExecutionPlan,
+    ReceiptSpec,
+    ResourceSpec,
+    RetryPolicy,
+    StageSpec,
+    TaskSpec,
+)
 from o2mcp.runorg.policy import (
     DEFAULT_HEAVY_SLUG_MARKERS,
     DEFAULT_HEAVY_THRESHOLD_BYTES,
@@ -50,6 +64,18 @@ from o2mcp.runorg.runs import (
 __all__ = [
     "O2Runs",
     "TransitionPlan",
+    "ExecutionPlan",
+    "DatasetIdentity",
+    "CanonicalPaths",
+    "CommandSpec",
+    "ResourceSpec",
+    "ReceiptSpec",
+    "RetryPolicy",
+    "TaskSpec",
+    "StageSpec",
+    "DEPENDENCY_MODES",
+    "EXECUTION_PLAN_SCHEMA_VERSION",
+    "RETRYABLE_SLURM_STATES",
     "RunPolicy",
     "GENERIC_POLICY",
     "DEFAULT_KEEP_MARKERS",
