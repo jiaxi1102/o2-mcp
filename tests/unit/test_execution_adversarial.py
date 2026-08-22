@@ -953,6 +953,64 @@ def test_afterok_followup_waits_for_every_regenerated_prerequisite() -> None:
     )
 
 
+def test_afterok_followup_uses_latest_success_after_replacement_retry() -> None:
+    """A failed replacement cannot remain the trigger for its successful retry."""
+
+    root = StageSpec(
+        stage_id="root",
+        command=_command("root"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="root"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    middle = StageSpec(
+        stage_id="middle",
+        command=_command("middle"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="middle"),),
+        depends_on=("root",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    child = StageSpec(
+        stage_id="child",
+        command=_command("child"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="child"),),
+        depends_on=("middle",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(root, middle, child))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    root_one = engine.submit_stage(plan, "root").record
+    middle_one = engine.submit_afterany_reconciler(plan, "middle").record
+    backend.set_states(middle_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="middle"))
+    assert engine.reconcile_stage(plan, "middle").decision == "COMPLETED"
+    child_one = engine.submit_stage(plan, "child").record
+    backend.set_states(child_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="child"))
+    assert engine.reconcile_stage(plan, "child").decision == "COMPLETED"
+
+    backend.set_states(root_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    assert engine.reconcile_stage(plan, "root").retry_submission is not None
+    middle_two = engine._submission_records(plan, middle)[-1]
+    backend.set_states(middle_two.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    middle_retry = engine.reconcile_stage(plan, "middle").retry_submission
+    assert middle_retry is not None and middle_retry.identity.attempt == 3
+
+    backend.set_states(middle_retry.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    assert engine.reconcile_stage(plan, "middle").decision == "COMPLETED"
+
+    child_requests = [request for request in backend.requests if request.identity.stage_id == "child"]
+    assert [request.identity.attempt for request in child_requests] == [1, 2]
+    assert child_requests[-1].dependency_job_ids == (middle_retry.job_id,)
+    authorization = json.loads(backend.files[reconciler_followup_path(plan, "child", 2)])
+    assert authorization["trigger_job_id"] == middle_retry.job_id
+
+
 def test_task_bearing_afterany_retry_still_rebinds_its_downstream_audit() -> None:
     """Dependency mode must not make a compute array look like its audit stage.
 

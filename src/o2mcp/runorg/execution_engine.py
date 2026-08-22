@@ -514,9 +514,13 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # Recovery is convergent rather than tied to the original caller's stack:
         # any later reconciliation repairs a retry record whose follow-up audit
         # submission was interrupted after the compute job had been accepted.
-        for record in records:
-            if record.identity.attempt > 1:
-                self._ensure_reconciler_followups(plan, stage_id, record)
+        latest_record = records[-1]
+        if latest_record.identity.attempt > 1:
+            # Historical retry generations are stale once a newer accepted
+            # attempt exists. Recover only the latest record so an afterok
+            # authorization cannot name an older failed trigger while binding
+            # its dependency set to the newest successful job.
+            self._ensure_reconciler_followups(plan, stage_id, latest_record)
         generation_start = latest_followup_attempt(self.backend, plan, stage)
         if generation_start is not None:
             # Upstream-triggered afterany generations supersede every earlier
@@ -641,9 +645,9 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             # A replacement ``afterok`` child cannot be authorized until this
             # exact upstream generation is certified. Trigger it only after the
             # completion receipt and registry repair pointer are durable.
-            for record in records:
-                if record.identity.attempt > 1:
-                    self._ensure_reconciler_followups(plan, stage_id, record)
+            latest_record = records[-1]
+            if latest_record.identity.attempt > 1:
+                self._ensure_reconciler_followups(plan, stage_id, latest_record)
         return ReconcileResult(
             decision=decision,
             stage_id=stage_id,
