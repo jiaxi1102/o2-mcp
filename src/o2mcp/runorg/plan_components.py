@@ -85,6 +85,8 @@ def _require_str(value: Any, field_name: str, *, allow_empty: bool = False) -> s
         raise ValueError(f"{field_name} must be a string")
     if not allow_empty and not value:
         raise ValueError(f"{field_name} cannot be empty")
+    if _contains_surrogate(value):
+        raise ValueError(f"{field_name} cannot contain unpaired Unicode surrogates")
     return value
 
 
@@ -99,7 +101,18 @@ def _require_int(value: Any, field_name: str) -> int:
 def _is_single_line_string(value: Any) -> bool:
     """Return whether a value is a non-empty string safe for argv or env use."""
 
-    return isinstance(value, str) and bool(value) and not any(char in value for char in ("\x00", "\n", "\r"))
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not _contains_surrogate(value)
+        and not any(char in value for char in ("\x00", "\n", "\r"))
+    )
+
+
+def _contains_surrogate(value: str) -> bool:
+    """Return whether a decoded string contains a non-Unicode scalar value."""
+
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
 
 
 def _validate_identifier(value: str, field_name: str) -> None:
@@ -175,8 +188,8 @@ class DatasetIdentity:
         _validate_sha256(self.manifest_sha256, "manifest_sha256")
         if self.storage_binding_sha256 is not None:
             _validate_sha256(self.storage_binding_sha256, "storage_binding_sha256")
-        if self.source_uri is not None and (not isinstance(self.source_uri, str) or not self.source_uri):
-            raise ValueError("source_uri must be a non-empty string when supplied")
+        if self.source_uri is not None and not _is_single_line_string(self.source_uri):
+            raise ValueError("source_uri must be a non-empty single-line Unicode string when supplied")
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation used by the plan digest."""
@@ -247,13 +260,14 @@ class CanonicalPaths:
             if not _is_within(path, self.run_root):
                 raise ValueError(f"{field_name} must be strictly inside run_root")
 
-        mutable_roots = {
+        non_overlapping_roots = {
             "work_root": self.work_root,
             "receipts_root": self.receipts_root,
             "logs_root": self.logs_root,
+            "results_root": self.results_root,
         }
-        for left_name, left_path in mutable_roots.items():
-            for right_name, right_path in mutable_roots.items():
+        for left_name, left_path in non_overlapping_roots.items():
+            for right_name, right_path in non_overlapping_roots.items():
                 if left_name >= right_name:
                     continue
                 if posixpath.commonpath((left_path, right_path)) in {left_path, right_path}:

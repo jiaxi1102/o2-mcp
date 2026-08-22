@@ -510,12 +510,39 @@ def test_mutable_run_roots_and_environment_inheritance_are_disallowed() -> None:
             logs_root=f"{RUN_ROOT}/logs",
         )
 
+    with pytest.raises(ValueError, match="distinct and non-overlapping"):
+        CanonicalPaths(
+            run_root=RUN_ROOT,
+            work_root=f"{RUN_ROOT}/work",
+            results_root=f"{RUN_ROOT}/work/results",
+            receipts_root=f"{RUN_ROOT}/receipts",
+            logs_root=f"{RUN_ROOT}/logs",
+        )
+
     with pytest.raises(ValueError, match="environment_mode"):
         CommandSpec(
             argv=("/usr/bin/true",),
             working_directory=f"{RUN_ROOT}/work",
             runtime_fingerprint_sha256="e" * 64,
             environment_mode="inherit",
+        )
+
+
+def test_unpaired_unicode_surrogates_fail_during_contract_validation() -> None:
+    """Malformed decoded strings never leak a UnicodeEncodeError from hashing."""
+
+    with pytest.raises(ValueError, match="Unicode"):
+        DatasetIdentity(
+            dataset_id="surrogate",
+            manifest_sha256="a" * 64,
+            source_uri="amdata://bad/\ud800",
+        )
+
+    with pytest.raises(ValueError, match="single-line"):
+        CommandSpec(
+            argv=("/usr/bin/true", "\ud800"),
+            working_directory=f"{RUN_ROOT}/work",
+            runtime_fingerprint_sha256="e" * 64,
         )
 
 
