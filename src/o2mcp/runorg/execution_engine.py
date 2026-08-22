@@ -101,7 +101,11 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
     ) -> SubmissionResult:
         """Retain ownership after uncertain calls; release proven safe failures."""
 
-        operation_id = f"submit:{plan.plan_sha256}:{stage_id}:{attempt}"
+        # Validate the caller-controlled identity before creating a durable
+        # lifecycle holder. Invalid operations have no evidence path through
+        # which a later replay could safely retire an abandoned claim.
+        identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
+        operation_id = f"submit:{identity.plan_sha256}:{identity.stage_id}:{identity.attempt}"
         claim_id = self._acquire_lifecycle(plan, operation_id)
         try:
             result = self._submit_stage_claimed(
@@ -117,7 +121,6 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         except SubmissionUncertain:
             raise
         except Exception:
-            identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
             self._release_if_not_invocation_owner(plan, identity, claim_id)
             raise
         return result

@@ -8,6 +8,7 @@ recovery reviewable without expanding the central submission coordinator.
 from __future__ import annotations
 
 from o2mcp.runorg.execution_evidence import (
+    authenticate_followup_authorization,
     next_unrejected_attempt,
     read_strict_json,
     read_submission_rejection,
@@ -48,12 +49,23 @@ class ExecutionFollowupMixin:
             # The authorization is a durable outbox item. Replay its exact
             # generation after a crash unless immutable rejection consumed it.
             existing_generation = None
+            occupied_generations: list[int] = []
             reconciler_bound = signed_attempt_bound(plan, reconciler)
             for candidate in range(1, reconciler_bound + 1):
                 path = reconciler_followup_path(plan, reconciler.stage_id, candidate)
                 text = self.backend.read_text(path)
                 if text is None:
                     continue
+                # Every authorization occupies its immutable attempt identity,
+                # even when it belongs to another dependency trigger or its
+                # scheduler call was rejected without producing a record.
+                authenticate_followup_authorization(
+                    self.backend,
+                    plan,
+                    reconciler,
+                    candidate,
+                )
+                occupied_generations.append(candidate)
                 authorization = read_strict_json(self.backend, path, "reconciler follow-up authorization")
                 if (
                     authorization.get("plan_sha256") == plan.plan_sha256
@@ -63,7 +75,6 @@ class ExecutionFollowupMixin:
                     and authorization.get("trigger_stage_id") == retried_stage_id
                 ):
                     existing_generation = candidate
-                    break
             if existing_generation is not None:
                 identity = SubmissionIdentity(plan.plan_sha256, reconciler.stage_id, existing_generation)
                 rejection = read_submission_rejection(
@@ -90,7 +101,15 @@ class ExecutionFollowupMixin:
                 for rejected_identity in rejected:
                     self._release_rejected_invocation_owner(plan, rejected_identity, "")
             else:
-                next_attempt = max((record.identity.attempt for record in records), default=0) + 1
+                next_attempt = 1
+            next_attempt = max(
+                next_attempt,
+                max(
+                    [record.identity.attempt for record in records] + occupied_generations,
+                    default=0,
+                )
+                + 1,
+            )
             if next_attempt > reconciler_bound:
                 raise ValueError(
                     f"afterany reconciler {reconciler.stage_id} exhausted its signed attempt bound "

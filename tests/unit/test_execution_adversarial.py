@@ -307,6 +307,21 @@ def test_terminal_replay_retires_claim_abandoned_before_invocation() -> None:
     assert not backend.lifecycle_claims
 
 
+@pytest.mark.parametrize(
+    ("stage_id", "attempt"),
+    (("compute", 0), ("bad/stage", 1)),
+)
+def test_invalid_submission_identity_never_acquires_lifecycle_claim(stage_id: str, attempt: int) -> None:
+    """Malformed caller input fails before publishing transition blockers."""
+
+    backend = ConcurrentBackend()
+
+    with pytest.raises(ValueError):
+        ExecutionEngine(backend).submit_stage(_plan(), stage_id, attempt=attempt)
+
+    assert not backend.lifecycle_claims
+
+
 def test_owner_crash_before_invocation_is_safely_recoverable() -> None:
     """An intent alone proves sbatch was never crossed and may be recovered."""
 
@@ -759,6 +774,66 @@ def test_rejected_followup_generation_advances_without_replaying_sbatch() -> Non
 
     audit_attempts = [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"]
     assert audit_attempts == [1, 2, 3]
+    assert not backend.lifecycle_claims
+
+
+def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
+    """Another dependency cannot overwrite a rejected generation's authorization."""
+
+    class RejectSecondAudit(ConcurrentBackend):
+        rejected = False
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            """Reject A's first retry audit, then accept later generations."""
+
+            if request.identity.stage_id == "audit" and request.identity.attempt == 2 and not self.rejected:
+                self.rejected = True
+                self.outcomes.appendleft(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="audit qos rejected"))
+            return super().invoke_submission(request)
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(compute_a, compute_b, audit))
+    backend = RejectSecondAudit()
+    engine = ExecutionEngine(backend)
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def make_retryable(job_id: str, prefix: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    make_retryable(first_a.job_id, "a")
+    with pytest.raises(SubmissionRejected, match="audit qos rejected"):
+        engine.reconcile_stage(plan, "compute-a")
+
+    # B retries before A's rejected follow-up is repaired. It must allocate
+    # attempt three rather than conflict with A's immutable attempt-two outbox.
+    make_retryable(first_b.job_id, "b")
+    retry_b = engine.reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+    ExecutionEngine(backend).submit_stage(plan, "compute-a", attempt=2, task_ids=("a-1",))
+
+    audit_attempts = [request.identity.attempt for request in backend.requests if request.identity.stage_id == "audit"]
+    assert audit_attempts == [1, 2, 3, 4]
     assert not backend.lifecycle_claims
 
 
