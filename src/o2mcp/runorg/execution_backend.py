@@ -107,18 +107,21 @@ class O2ExecutionBackend:
         self.slurm = O2Slurm(connection)
 
     def find_jobs(self, comment: str) -> Sequence[SlurmJob]:
-        """Search live and recent accounting records for an exact Slurm comment."""
+        """Search live and lifetime accounting records for an exact Slurm comment."""
 
         # squeue catches newly accepted jobs before accounting ingestion; sacct
-        # catches fast-completing jobs that already left the queue.  The seven-day
-        # window is intentionally bounded because recovery happens immediately
-        # around submission, not as an unscoped historical search.
+        # catches jobs that already left the queue. Invocation evidence is
+        # durable for the lifetime of a run, so recovery must use the same
+        # lifetime rather than an arbitrary recent-time window. Restrict the
+        # historical query to the current user while searching from the Unix
+        # epoch; otherwise an old lost response becomes permanently
+        # unrecoverable after the former seven-day cutoff.
         command = "\n".join(
             [
                 "set +e",
                 "squeue -u \"$USER\" -h -o '%i|%k|%T' 2>&1",
                 "squeue_status=$?",
-                "sacct -X -S now-7days -n -P --format=JobIDRaw,Comment,State 2>&1",
+                'sacct -X -S 1970-01-01 -u "$USER" -n -P --format=JobIDRaw,Comment,State 2>&1',
                 "sacct_status=$?",
                 'printf \'__O2MCP_QUERY_STATUS__|%s|%s\\n\' "$squeue_status" "$sacct_status"',
             ]

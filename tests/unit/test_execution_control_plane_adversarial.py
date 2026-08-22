@@ -19,7 +19,7 @@ from o2mcp.runorg.registry_outbox import decode_registry_update
 from o2mcp.runorg.registry_sync import synchronize_execution_transaction
 from o2mcp.runorg.runs import RunManifest
 from o2mcp.runorg.strict_json import strict_json_object
-from o2mcp.runorg.transition_coordinator import begin_transition, rollback_transition
+from o2mcp.runorg.transition_coordinator import begin_transition, recover_transition, rollback_transition
 
 
 class LocalConnection:
@@ -140,6 +140,32 @@ def test_remote_control_fs_immutable_and_cas_round_trip(tmp_path) -> None:
     assert not backend.compare_and_swap_text(path, "one", None)
     assert backend.compare_and_swap_text(path, "two", None)
     assert backend.read_text(path) is None
+
+
+def test_submission_recovery_search_has_no_short_accounting_horizon() -> None:
+    """Durable invocation evidence must remain recoverable after seven days."""
+
+    class AccountingConnection:
+        """Capture the production query while returning one historical job."""
+
+        def __init__(self) -> None:
+            self.command = ""
+
+        def run(self, command, *, timeout, **_kwargs):
+            self.command = command
+            assert timeout == 60
+            return SimpleNamespace(
+                ok=True,
+                stdout="12345|immutable-comment|COMPLETED\n__O2MCP_QUERY_STATUS__|0|0\n",
+                stderr="",
+            )
+
+    connection = AccountingConnection()
+    jobs = O2ExecutionBackend(connection).find_jobs("immutable-comment")
+
+    assert [job.job_id for job in jobs] == ["12345"]
+    assert "now-7days" not in connection.command
+    assert 'sacct -X -S 1970-01-01 -u "$USER"' in connection.command
 
 
 def test_fenced_control_write_cannot_recreate_quarantined_run_root(tmp_path) -> None:
@@ -278,6 +304,72 @@ def test_identical_transition_reentry_cannot_rollback_first_callers_marker(tmp_p
     # The losing caller must leave the first caller's boundary intact.
     with open(marker, encoding="utf-8") as handle:
         assert handle.read() == token
+    rollback_transition(connection, run_root, token)
+
+
+def test_retained_transition_marker_has_explicit_clean_recovery(tmp_path) -> None:
+    """A never-launched transition can be inspected and durably unfenced."""
+
+    connection = LocalConnection()
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_recover__clean")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    token = "4" * 64
+    begin_transition(connection, run_root, token)
+    destination = str(tmp_path / "kept" / "RUN_20260822T010203Z_recover__clean")
+    quarantine = run_root + ".quarantine"
+    script_path = str(tmp_path / "jobs" / "promote.sh")
+
+    preview = recover_transition(
+        connection,
+        run_root,
+        token,
+        script_path=script_path,
+        must_be_absent=(quarantine, destination),
+        absent_patterns=(str(tmp_path / "kept" / ".recover.promote.??????"),),
+    )
+    assert preview.status == "recoverable"
+    assert preview.marker_present is True
+    assert preview.cleared is False
+
+    applied = recover_transition(
+        connection,
+        run_root,
+        token,
+        script_path=script_path,
+        must_be_absent=(quarantine, destination),
+        absent_patterns=(str(tmp_path / "kept" / ".recover.promote.??????"),),
+        apply=True,
+    )
+    assert applied.status == "cleared"
+    assert applied.cleared is True
+    assert not os.path.exists(os.path.join(coordination_root(run_root), "transition.json"))
+
+
+def test_transition_recovery_retains_marker_for_partial_state(tmp_path) -> None:
+    """Published or staged artifacts keep an abandoned transition fenced."""
+
+    connection = LocalConnection()
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_recover__partial")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    token = "5" * 64
+    begin_transition(connection, run_root, token)
+    destination = tmp_path / "kept" / "RUN_20260822T010203Z_recover__partial"
+    destination.mkdir(parents=True)
+
+    recovery = recover_transition(
+        connection,
+        run_root,
+        token,
+        script_path=str(tmp_path / "jobs" / "promote.sh"),
+        must_be_absent=(str(destination),),
+        absent_patterns=(),
+        apply=True,
+    )
+
+    assert recovery.status == "manual_recovery_required"
+    assert recovery.cleared is False
+    assert recovery.blockers == (f"unexpected_path:{destination}",)
+    assert os.path.exists(os.path.join(coordination_root(run_root), "transition.json"))
     rollback_transition(connection, run_root, token)
 
 

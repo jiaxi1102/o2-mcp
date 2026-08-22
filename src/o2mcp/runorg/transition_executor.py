@@ -19,12 +19,20 @@ from o2mcp.runorg.execution_models import ReceiptObservation
 from o2mcp.runorg.plan_components import ReceiptSpec
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.runs import STATUS_ACTIVE, STATUS_KEPT, RunManifest, plan_archive_script, plan_promote_script
-from o2mcp.runorg.transition_coordinator import begin_transition, rollback_transition
+from o2mcp.runorg.transition_coordinator import (
+    TransitionRecovery,
+    begin_transition,
+    rollback_transition,
+)
+from o2mcp.runorg.transition_coordinator import (
+    recover_transition as recover_marked_transition,
+)
 from o2mcp.runorg.transition_guards import (
     live_jobs_command,
     require_certified_terminal_execution,
     require_current_terminal_evidence,
 )
+from o2mcp.runorg.transition_scripts import source_quarantine_path
 
 
 class _RelocatedEvidenceBackend:
@@ -135,6 +143,68 @@ class TransitionExecutorMixin:
             run_remote=run_remote,
         )
 
+    def recover_transition(
+        self,
+        run_dir: str,
+        action: str,
+        *,
+        dry_run: bool = True,
+    ) -> TransitionRecovery:
+        """Inspect or clear a cleanly abandoned promote/archive marker.
+
+        This operation is deliberately explicit and defaults to read-only. It
+        does not attempt to repair partial copies or quarantines: those states
+        remain fenced for manual review. Applying recovery is allowed only when
+        the source is still certified and canonical, no registered job is live,
+        no transition process remains, and no staging or destination artifact
+        exists.
+        """
+
+        if action not in {"archive", "promote"}:
+            raise ValueError("transition recovery action must be 'promote' or 'archive'")
+        manifest = self._validated_transition_source(
+            run_dir,
+            action=action,
+            allowed_statuses=(STATUS_ACTIVE, STATUS_KEPT),
+        )
+        transition_id = self._transition_id(manifest, action)
+        script_path = self._transition_script_path(action, manifest.run_id)
+        quarantine = source_quarantine_path(run_dir, transition_id)
+
+        if action == "promote":
+            destination = self.layout.run_dir(STATUS_KEPT, manifest.campaign, manifest.run_id)
+            must_be_absent = (quarantine, destination)
+            absent_patterns = (
+                posixpath.join(
+                    posixpath.dirname(destination),
+                    f".{posixpath.basename(destination)}.promote.??????",
+                ),
+            )
+        else:
+            tarball = self.layout.archive_tarball(manifest.campaign, manifest.run_id)
+            must_be_absent = (
+                quarantine,
+                tarball,
+                self.layout.archive_checksum(manifest.campaign, manifest.run_id),
+                self.layout.archive_manifest(manifest.campaign, manifest.run_id),
+            )
+            absent_patterns = (
+                posixpath.join(
+                    posixpath.dirname(tarball),
+                    f".{manifest.run_id}.archive.??????",
+                ),
+            )
+
+        return recover_marked_transition(
+            self.conn,
+            run_dir,
+            transition_id,
+            script_path=script_path,
+            must_be_absent=must_be_absent,
+            absent_patterns=absent_patterns,
+            apply=not dry_run,
+        )
+
     def _validated_transition_source(
         self, run_dir: str, *, action: str, allowed_statuses: tuple[str, ...]
     ) -> RunManifest:
@@ -232,7 +302,7 @@ class TransitionExecutorMixin:
     ) -> TransitionPlan:
         """Stage and detach a marked transition, rolling back pre-launch errors."""
 
-        script_path = posixpath.join(self.layout.scratch_runs_root, ".jobs", f"{action}_{run_id}.sh")
+        script_path = self._transition_script_path(action, run_id)
         log_path = script_path + ".log"
         try:
             mkdir = self._run(f"mkdir -p {shlex.quote(posixpath.dirname(script_path))}", timeout=60)
@@ -283,6 +353,11 @@ class TransitionExecutorMixin:
             log_path=log_path,
             message=message,
         )
+
+    def _transition_script_path(self, action: str, run_id: str) -> str:
+        """Return the stable staged script path used for launch inspection."""
+
+        return posixpath.join(self.layout.scratch_runs_root, ".jobs", f"{action}_{run_id}.sh")
 
 
 __all__ = ["TransitionExecutorMixin", "TransitionPlan"]
