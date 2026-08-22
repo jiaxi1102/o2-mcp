@@ -43,21 +43,37 @@ class ExecutionFollowupMixin:
 
         submitted: list[SubmissionRecord] = []
         retried_stage = next(stage for stage in plan.stages if stage.stage_id == retried_stage_id)
+        stages_by_id = {stage.stage_id: stage for stage in plan.stages}
         for reconciler in plan.stages:
             if retried_stage_id not in reconciler.depends_on:
                 continue
+            records = self._submission_records(plan, reconciler)
             if reconciler.dependency_mode == "afterok":
+                if not records:
+                    # An afterok child that never ran has no stale generation to
+                    # replace. Its ordinary attempt one remains the correct
+                    # launch once every prerequisite is certified.
+                    continue
+                prerequisite_completions = tuple(
+                    latest_reconciliation_receipt(
+                        self.backend,
+                        plan,
+                        stages_by_id[dependency],
+                    )
+                    for dependency in reconciler.depends_on
+                )
                 completion = latest_reconciliation_receipt(self.backend, plan, retried_stage)
                 if (
                     completion is None
                     or completion.decision != RECONCILE_COMPLETE
                     or completion.attempt < retry_record.identity.attempt
+                    or any(item is None or item.decision != RECONCILE_COMPLETE for item in prerequisite_completions)
                 ):
                     # The accepted replacement is not yet scientifically
-                    # certified. Reconciliation calls this helper again after
-                    # publishing its current completion receipt.
+                    # certified, or another current prerequisite is still
+                    # incomplete. Reconciliation calls this helper again after
+                    # each parent publishes its current completion receipt.
                     continue
-            records = self._submission_records(plan, reconciler)
             # The authorization is a durable outbox item. Replay its exact
             # generation after a crash unless immutable rejection consumed it.
             existing_generation = None

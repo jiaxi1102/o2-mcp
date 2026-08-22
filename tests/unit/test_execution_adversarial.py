@@ -844,6 +844,115 @@ def test_afterany_replacement_rebinds_completed_afterok_child() -> None:
     assert latest_reconciliation_receipt(backend, plan, last) is None
 
 
+def test_first_successful_parent_retry_does_not_create_child_followup() -> None:
+    """A never-launched afterok child keeps ordinary attempt-one authorization."""
+
+    parent = StageSpec(
+        stage_id="parent",
+        command=_command("parent"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="parent"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    child = StageSpec(
+        stage_id="child",
+        command=_command("child"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="child"),),
+        depends_on=("parent",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(parent, child))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    first = engine.submit_stage(plan, "parent").record
+    backend.set_states(first.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    retry = engine.reconcile_stage(plan, "parent").retry_submission
+    assert retry is not None and retry.identity.attempt == 2
+
+    backend.set_states(retry.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="parent"))
+    assert engine.reconcile_stage(plan, "parent").decision == "COMPLETED"
+
+    assert engine._submission_records(plan, child) == ()
+    assert backend.read_text(reconciler_followup_path(plan, "child", 1)) is None
+    assert engine.submit_stage(plan, "child").record.identity.attempt == 1
+
+
+def test_afterok_followup_waits_for_every_regenerated_prerequisite() -> None:
+    """Fan-in authorization is published only after every latest parent completes."""
+
+    roots = tuple(
+        StageSpec(
+            stage_id=f"root-{name}",
+            command=_command(f"root-{name}"),
+            resources=_resources(1),
+            expected_receipts=(_receipt("done", stage=f"root-{name}"),),
+            retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+        )
+        for name in ("a", "b")
+    )
+    middles = tuple(
+        StageSpec(
+            stage_id=f"middle-{name}",
+            command=_command(f"middle-{name}"),
+            resources=_resources(1),
+            expected_receipts=(_receipt("done", stage=f"middle-{name}"),),
+            depends_on=(f"root-{name}",),
+            dependency_mode="afterany",
+        )
+        for name in ("a", "b")
+    )
+    child = StageSpec(
+        stage_id="fan-in",
+        command=_command("fan-in"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="fan-in"),),
+        depends_on=("middle-a", "middle-b"),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(*roots, *middles, child))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    root_records = {stage.stage_id: engine.submit_stage(plan, stage.stage_id).record for stage in roots}
+    middle_records = {
+        stage.stage_id: engine.submit_afterany_reconciler(plan, stage.stage_id).record for stage in middles
+    }
+    for stage in middles:
+        record = middle_records[stage.stage_id]
+        backend.set_states(record.job_id, SlurmTaskState(None, "COMPLETED", 0))
+        backend.put_receipt(_receipt("done", stage=stage.stage_id))
+        assert engine.reconcile_stage(plan, stage.stage_id).decision == "COMPLETED"
+
+    first_child = engine.submit_stage(plan, "fan-in").record
+    backend.set_states(first_child.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="fan-in"))
+    assert engine.reconcile_stage(plan, "fan-in").decision == "COMPLETED"
+
+    for stage_id, record in root_records.items():
+        backend.set_states(record.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+        assert engine.reconcile_stage(plan, stage_id).retry_submission is not None
+
+    replacements = {stage.stage_id: engine._submission_records(plan, stage)[-1] for stage in middles}
+    first_replacement = replacements["middle-a"]
+    backend.set_states(first_replacement.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    assert engine.reconcile_stage(plan, "middle-a").decision == "COMPLETED"
+    assert backend.read_text(reconciler_followup_path(plan, "fan-in", 2)) is None
+
+    second_replacement = replacements["middle-b"]
+    backend.set_states(second_replacement.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    assert engine.reconcile_stage(plan, "middle-b").decision == "COMPLETED"
+
+    child_requests = [request for request in backend.requests if request.identity.stage_id == "fan-in"]
+    assert [request.identity.attempt for request in child_requests] == [1, 2]
+    assert child_requests[-1].dependency_job_ids == (
+        first_replacement.job_id,
+        second_replacement.job_id,
+    )
+
+
 def test_task_bearing_afterany_retry_still_rebinds_its_downstream_audit() -> None:
     """Dependency mode must not make a compute array look like its audit stage.
 
