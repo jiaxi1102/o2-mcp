@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import posixpath
+import re
 import shlex
 from dataclasses import dataclass
+from typing import Any
 
 from o2mcp.runorg.execution_backend import O2ExecutionBackend
+from o2mcp.runorg.execution_models import ReceiptObservation
+from o2mcp.runorg.plan_components import ReceiptSpec
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.runs import STATUS_ACTIVE, STATUS_KEPT, RunManifest, plan_archive_script, plan_promote_script
 from o2mcp.runorg.transition_coordinator import begin_transition, rollback_transition
@@ -21,6 +25,48 @@ from o2mcp.runorg.transition_guards import (
     require_certified_terminal_execution,
     require_current_terminal_evidence,
 )
+
+
+class _RelocatedEvidenceBackend:
+    """Read copied execution evidence through its immutable original paths.
+
+    Promotion copies an execution plan without rewriting it, so a plan in the
+    durable kept tree still names the former scratch run root.  Destructive
+    transition validation must preserve that signed identity while reading the
+    corresponding copied evidence from the canonical kept source.  The wrapper
+    intentionally relocates reads only; all other backend operations retain the
+    delegate's behavior.
+    """
+
+    def __init__(self, delegate: O2ExecutionBackend, original_root: str, current_root: str) -> None:
+        self._delegate = delegate
+        self._original_root = original_root.rstrip("/")
+        self._current_root = current_root.rstrip("/")
+
+    def _current_path(self, path: str) -> str:
+        """Map a path inside the signed run root onto the current source tree."""
+
+        if path == self._original_root:
+            return self._current_root
+        prefix = self._original_root + "/"
+        if path.startswith(prefix):
+            return self._current_root + path[len(self._original_root) :]
+        return path
+
+    def read_text(self, path: str) -> str | None:
+        """Read immutable execution metadata from the relocated copy."""
+
+        return self._delegate.read_text(self._current_path(path))
+
+    def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
+        """Observe pipeline receipts below the relocated run root."""
+
+        return self._delegate.observe_receipt(self._current_path(run_root), receipt)
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward unused protocol operations without changing their semantics."""
+
+        return getattr(self._delegate, name)
 
 
 @dataclass
@@ -150,15 +196,26 @@ class TransitionExecutorMixin:
             backend = O2ExecutionBackend(self.conn)
             plan_text = backend.read_text(posixpath.join(run_dir, "receipts", "execution", "execution-plan.json"))
             plan = ExecutionPlan.from_json(plan_text or "", expected_plan_sha256=expected_sha)
+            # A kept run contains a byte-identical copy of the plan registered in
+            # scratch.  Permit that one canonical relocation without weakening
+            # any of the plan's signed identity fields or rewriting its digest.
+            allowed_plan_roots = {run_dir}
+            if manifest.status == STATUS_KEPT:
+                allowed_plan_roots.add(self.layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id))
             if (
-                plan.paths.run_root != run_dir
+                plan.paths.run_root not in allowed_plan_roots
                 or plan.run_id != manifest.run_id
                 or plan.campaign != manifest.campaign
                 or plan.pipeline != manifest.pipeline
                 or sorted(item.dataset_id for item in plan.datasets) != sorted(manifest.datasets)
             ):
                 raise ValueError(f"{action} execution plan identity differs from the marked source run")
-            require_current_terminal_evidence(backend, plan, action)
+            evidence_backend = (
+                backend
+                if plan.paths.run_root == run_dir
+                else _RelocatedEvidenceBackend(backend, plan.paths.run_root, run_dir)
+            )
+            require_current_terminal_evidence(evidence_backend, plan, action)
             jobs = sorted(set(manifest.slurm_job_ids) | set(boundary.job_ids), key=int)
             live = self._run(live_jobs_command(jobs), timeout=60)
             if not live.ok:
@@ -177,24 +234,54 @@ class TransitionExecutorMixin:
 
         script_path = posixpath.join(self.layout.scratch_runs_root, ".jobs", f"{action}_{run_id}.sh")
         log_path = script_path + ".log"
-        self._run(f"mkdir -p {shlex.quote(posixpath.dirname(script_path))}", timeout=60)
-        stage = self.conn.run(f"cat > {shlex.quote(script_path)}", timeout=60, input_text=script)
+        try:
+            mkdir = self._run(f"mkdir -p {shlex.quote(posixpath.dirname(script_path))}", timeout=60)
+        except Exception:
+            rollback_transition(self.conn, run_dir, transition_id)
+            raise
+        if not mkdir.ok:
+            rollback_transition(self.conn, run_dir, transition_id)
+            return TransitionPlan(run_id, action, script, message=mkdir.stderr.strip() or "staging directory failed")
+        try:
+            stage = self.conn.run(f"cat > {shlex.quote(script_path)}", timeout=60, input_text=script)
+        except Exception:
+            rollback_transition(self.conn, run_dir, transition_id)
+            raise
         if not stage.ok:
             rollback_transition(self.conn, run_dir, transition_id)
             return TransitionPlan(run_id, action, script, message=stage.stderr.strip() or "staging failed")
         launch = f"nohup bash {shlex.quote(script_path)} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo PID $!"
-        result = self.conn.run(launch, timeout=60, alias=self.conn.config.transfer_alias, broker_role="transfer")
-        pid = next((token for token in result.stdout.split() if token.isdigit()), "")
-        if not (result.ok and pid):
-            rollback_transition(self.conn, run_dir, transition_id)
+        try:
+            result = self.conn.run(launch, timeout=60, alias=self.conn.config.transfer_alias, broker_role="transfer")
+        except Exception as exc:
+            # Raising here would hide the most important fact: the transport may
+            # have failed after the remote shell launched the detached process.
+            return TransitionPlan(
+                run_id,
+                action,
+                script,
+                log_path=log_path,
+                message=f"launch outcome ambiguous; transition marker retained for reconciliation: {exc}",
+            )
+        pid_matches = re.findall(r"(?m)^PID ([0-9]+)\s*$", result.stdout)
+        pid = pid_matches[0] if len(pid_matches) == 1 else ""
+        launched = result.ok and bool(pid)
+        if launched:
+            message = f"launched on transfer node (pid {pid}); tail {log_path}"
+        else:
+            # Once the detached command has been sent, a transport failure or
+            # missing PID cannot prove it did not start.  Retaining the marker
+            # prevents concurrent submissions from racing a possible transition.
+            detail = result.stderr.strip() or result.stdout.strip() or "no PID returned"
+            message = f"launch outcome ambiguous; transition marker retained for reconciliation: {detail}"
         return TransitionPlan(
             run_id,
             action,
             script,
-            started=result.ok and bool(pid),
-            pid=pid or None,
+            started=launched,
+            pid=pid if launched else None,
             log_path=log_path,
-            message=f"launched on transfer node (pid {pid}); tail {log_path}" if pid else result.stderr.strip(),
+            message=message,
         )
 
 

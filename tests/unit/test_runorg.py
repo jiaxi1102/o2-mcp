@@ -628,6 +628,100 @@ def test_live_transition_uses_persistent_transfer_broker(tmp_path, monkeypatch):
     assert launch["timeout"] == 60.0
 
 
+def test_archive_reads_kept_evidence_without_rewriting_original_plan_root(tmp_path, monkeypatch):
+    """A promoted run archives using copied evidence under its durable path."""
+
+    run_id = "RUN_20260101T000000Z_camp__v1"
+    manifest_json = (
+        '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
+        '"created_utc":"20260101T000000Z","status":"kept","datasets":["d"],'
+        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED",'
+        '"plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}'
+    )
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest_json, "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    active_root = runs.layout.run_dir("active", "camp", run_id)
+    kept_root = runs.layout.run_dir("kept", "camp", run_id)
+    observed_reads: list[str] = []
+    observed_roots: list[str] = []
+
+    def read_text(_backend, path):
+        observed_reads.append(path)
+        return "{}"
+
+    def observe_receipt(_backend, root, _receipt):
+        observed_roots.append(root)
+        return SimpleNamespace()
+
+    def verify_relocated(backend, plan, action):
+        assert action == "archive"
+        # Evidence readers continue deriving signed paths from the immutable
+        # active-root plan; only the backend redirects those reads to kept.
+        backend.read_text(f"{plan.paths.run_root}/receipts/execution/reconcile.json")
+        backend.observe_receipt(plan.paths.run_root, SimpleNamespace())
+
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.begin_transition", lambda *_args: TransitionBoundary(()))
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.read_text", read_text)
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.observe_receipt", observe_receipt)
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.ExecutionPlan.from_json",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            paths=SimpleNamespace(run_root=active_root),
+            run_id=run_id,
+            campaign="camp",
+            pipeline="grid",
+            datasets=(SimpleNamespace(dataset_id="d"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.require_current_terminal_evidence",
+        verify_relocated,
+    )
+    monkeypatch.setattr(
+        runs,
+        "_stage_and_launch_transition",
+        lambda *_args: SimpleNamespace(started=True),
+    )
+
+    result = runs.archive(kept_root, dry_run=False)
+
+    assert result.started is True
+    assert observed_reads[0] == f"{kept_root}/receipts/execution/execution-plan.json"
+    assert observed_reads[1] == f"{kept_root}/receipts/execution/reconcile.json"
+    assert observed_roots == [kept_root]
+
+
+def test_ambiguous_transition_launch_retains_coordination_marker(tmp_path, monkeypatch):
+    """A lost transfer response cannot release a possibly running transition."""
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command.startswith("nohup bash "):
+            return ("", "transfer channel closed", 255)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rolled_back: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.rollback_transition",
+        lambda _conn, run_root, transition_id: rolled_back.append((run_root, transition_id)),
+    )
+
+    result = runs._stage_and_launch_transition("RUN_test", "archive", "echo archive\n", "/run", "transition")
+
+    assert result.started is False
+    assert result.pid is None
+    assert "outcome ambiguous" in result.message
+    assert "marker retained" in result.message
+    assert rolled_back == []
+
+
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
     sentinel = RunManifest(
         run_id="RUN_20260101T000000Z_camp__v1",
