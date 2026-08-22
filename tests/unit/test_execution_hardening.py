@@ -47,6 +47,7 @@ class Backend:
         self.requests: list[SubmissionRequest] = []
         self.next_job = 7100
         self.lifecycle_claims: set[str] = set()
+        self.lifecycle_acquisitions: list[str] = []
         self.transition_marked = False
         self.mark_transition_on_task_state = False
 
@@ -130,6 +131,7 @@ class Backend:
     def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> str | None:
         """Return one holder ID for this single-threaded backend."""
 
+        self.lifecycle_acquisitions.append(operation_id)
         claim_id = new_claim_id(operation_id)
         self.lifecycle_claims.add(claim_id)
         return claim_id
@@ -327,6 +329,30 @@ def test_registry_outbox_is_per_attempt_monotonic_and_independently_cleared() ->
     assert audit_path in backend.files
     assert engine.reconcile_registry(plan) is True
     assert audit_path not in backend.files
+
+
+def test_registry_repair_does_not_create_an_unrecoverable_lifecycle_claim() -> None:
+    """Metadata-only repair relies on fenced writes rather than a crashable holder."""
+
+    plan = _plan()
+    backend = Backend()
+    registry = Registry(accept=False)
+    engine = ExecutionEngine(backend, registry)
+    update = RegistryUpdate(
+        plan.plan_sha256,
+        "compute",
+        "SUBMITTED",
+        "SUBMITTED",
+        ("7100",),
+        1,
+    )
+    assert engine._sync_registry(plan, update) is False
+    backend.lifecycle_acquisitions.clear()
+
+    registry.accept = True
+    assert engine.reconcile_registry(plan) is True
+    assert backend.lifecycle_acquisitions == []
+    assert not backend.lifecycle_claims
 
 
 def test_registry_success_releases_every_holder_joined_into_outbox() -> None:

@@ -46,7 +46,7 @@ def authenticate_followup_authorization(
     *,
     expected_dependency_job_ids: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
-    """Authenticate an after-any follow-up and its retry trigger relation.
+    """Authenticate a dependency follow-up and its retry trigger relation.
 
     The follow-up file is not a signature by itself.  Each dependency job must
     be an authenticated submission of the corresponding signed prerequisite,
@@ -302,7 +302,7 @@ def latest_reconciliation_receipt(
 ) -> ReconciliationReceipt | None:
     """Return terminal evidence for the latest occupied stage generation.
 
-    A dependency retry can authorize and submit a newer ``afterany`` generation
+    A dependency retry can authorize and submit a newer downstream generation
     after an older one completed. Once that authorization exists, the old
     receipt is no longer current evidence: callers must wait for the new exact
     attempt to reconcile (or reject terminal certification if it never can).
@@ -386,7 +386,6 @@ def _record_task_authorization(
     all_task_ids = tuple(task.task_id for task in select_tasks(stage, None))
     followup_authorized = (
         attempt > 1
-        and stage.dependency_mode == "afterany"
         and stage.depends_on
         and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
     )
@@ -438,7 +437,6 @@ def _validate_record_dependencies(
             raise ValueError(f"submission dependency job {job_id} is not authenticated evidence for stage {dependency}")
     followup_authorized = (
         record.identity.attempt > 1
-        and stage.dependency_mode == "afterany"
         and stage.depends_on
         and backend.read_text(reconciler_followup_path(plan, stage.stage_id, record.identity.attempt)) is not None
     )

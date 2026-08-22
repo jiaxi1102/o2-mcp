@@ -849,6 +849,44 @@ def test_ambiguous_transition_launch_retains_coordination_marker(tmp_path, monke
     assert rolled_back == []
 
 
+def test_transition_recovery_inspects_transfer_host_processes(tmp_path, monkeypatch):
+    """Recovery must query node-local PID evidence on the launch host."""
+
+    runs = _runs(tmp_path)
+    run_id = "RUN_20260822T010203Z_recovery-host__v1"
+    manifest = RunManifest(
+        run_id=run_id,
+        campaign="recovery-host",
+        pipeline="grid",
+        created_utc="20260822T010203Z",
+        datasets=["d"],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        runs,
+        "_validated_transition_source",
+        lambda *_args, **_kwargs: manifest,
+    )
+
+    def inspect(_connection, _run_dir, _token, **kwargs):
+        """Capture the selected broker without executing a remote helper."""
+
+        captured.update(kwargs)
+        return SimpleNamespace(status="recoverable")
+
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.recover_marked_transition",
+        inspect,
+    )
+
+    result = runs.recover_transition("/canonical/source", "promote")
+
+    assert result.status == "recoverable"
+    assert captured["alias"] == runs.conn.config.transfer_alias
+    assert captured["broker_role"] == "transfer"
+
+
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
     sentinel = RunManifest(
         run_id="RUN_20260101T000000Z_camp__v1",

@@ -203,6 +203,11 @@ class TransitionExecutorMixin:
             must_be_absent=must_be_absent,
             absent_patterns=absent_patterns,
             apply=not dry_run,
+            # The detached transition shell is launched on the transfer host.
+            # Its PID is node-local evidence, so recovery must inspect /proc on
+            # that same host rather than the login broker.
+            alias=self.conn.config.transfer_alias,
+            broker_role="transfer",
         )
 
     def _validated_transition_source(

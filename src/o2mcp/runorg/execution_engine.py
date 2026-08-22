@@ -453,8 +453,22 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         stage = stage_by_id(plan, stage_id)
         if stage.dependency_mode != "afterany" or not stage.depends_on:
             raise ValueError("an afterany follow-up must have signed dependencies")
+        return self.submit_dependency_followup(plan, stage_id, attempt=attempt)
+
+    def submit_dependency_followup(
+        self,
+        plan: ExecutionPlan,
+        stage_id: str,
+        *,
+        attempt: int,
+    ) -> SubmissionResult:
+        """Submit one immutable replacement generation for either dependency mode."""
+
+        stage = stage_by_id(plan, stage_id)
+        if not stage.depends_on:
+            raise ValueError("a dependency follow-up must have signed dependencies")
         if attempt <= 1:
-            raise ValueError("an afterany follow-up generation must use attempt > 1")
+            raise ValueError("a dependency follow-up generation must use attempt > 1")
         return self.submit_stage(plan, stage_id, attempt=attempt)
 
     def reconcile_stage(
@@ -623,6 +637,13 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             attempt=(retry_submission.identity.attempt if retry_submission is not None else evidence_attempt),
         )
         registry_synced = self._sync_registry(plan, update)
+        if decision == RECONCILE_COMPLETE:
+            # A replacement ``afterok`` child cannot be authorized until this
+            # exact upstream generation is certified. Trigger it only after the
+            # completion receipt and registry repair pointer are durable.
+            for record in records:
+                if record.identity.attempt > 1:
+                    self._ensure_reconciler_followups(plan, stage_id, record)
         return ReconcileResult(
             decision=decision,
             stage_id=stage_id,

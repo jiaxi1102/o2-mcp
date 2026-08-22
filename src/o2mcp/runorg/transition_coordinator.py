@@ -318,6 +318,8 @@ def recover_transition(
     must_be_absent: tuple[str, ...],
     absent_patterns: tuple[str, ...],
     apply: bool = False,
+    alias: str | None = None,
+    broker_role: str | None = None,
 ) -> TransitionRecovery:
     """Inspect and optionally clear one cleanly abandoned transition marker.
 
@@ -342,7 +344,12 @@ def recover_transition(
             "1" if apply else "0",
         )
     )
-    result = connection.run(command, timeout=120)
+    connection_kwargs = {}
+    if alias is not None:
+        connection_kwargs["alias"] = alias
+    if broker_role is not None:
+        connection_kwargs["broker_role"] = broker_role
+    result = connection.run(command, timeout=120, **connection_kwargs)
     if not result.ok:
         raise ValueError(result.stderr.strip() or result.stdout.strip() or "could not inspect lifecycle transition")
     value = strict_json_object(result.stdout, "transition recovery response")

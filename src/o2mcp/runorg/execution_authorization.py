@@ -29,10 +29,13 @@ def derive_attempt_authorization(
     if attempt == 1:
         return all_task_ids, signed_dependency_jobs
 
-    followup_authorized = (
-        stage.dependency_mode == "afterany"
-        and stage.depends_on
-        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
+    # Both dependency modes can require a replacement generation. ``afterany``
+    # children rebind as soon as an upstream retry is accepted; ``afterok``
+    # children rebind only after that replacement dependency is authenticated
+    # as complete. In both cases the immutable authorization fixes the exact
+    # latest dependency job IDs and reruns the full signed task set.
+    followup_authorized = bool(stage.depends_on) and (
+        backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
     )
     if followup_authorized:
         dependencies = authenticate_followup_authorization(

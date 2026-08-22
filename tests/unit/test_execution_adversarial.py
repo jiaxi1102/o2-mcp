@@ -782,6 +782,68 @@ def test_afterany_retry_generation_propagates_through_nested_chain() -> None:
     )
 
 
+def test_afterany_replacement_rebinds_completed_afterok_child() -> None:
+    """A completed afterok child cannot certify an obsolete parent generation."""
+
+    first = StageSpec(
+        stage_id="first",
+        command=_command("first"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="first"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    middle = StageSpec(
+        stage_id="middle",
+        command=_command("middle"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="middle"),),
+        depends_on=("first",),
+        dependency_mode="afterany",
+    )
+    last = StageSpec(
+        stage_id="last",
+        command=_command("last"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="last"),),
+        depends_on=("middle",),
+        dependency_mode="afterok",
+    )
+    plan = _plan(stages=(first, middle, last))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    first_submission = engine.submit_stage(plan, "first").record
+    first_middle = engine.submit_afterany_reconciler(plan, "middle").record
+    backend.set_states(first_middle.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="middle"))
+    assert engine.reconcile_stage(plan, "middle").decision == "COMPLETED"
+
+    first_last = engine.submit_stage(plan, "last").record
+    backend.set_states(first_last.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="last"))
+    assert engine.reconcile_stage(plan, "last").decision == "COMPLETED"
+
+    # The root retry immediately creates middle generation two. The afterok
+    # child remains untouched until that replacement parent is certified.
+    backend.set_states(first_submission.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    first_retry = engine.reconcile_stage(plan, "first").retry_submission
+    assert first_retry is not None
+    middle_records = engine._submission_records(plan, middle)
+    assert [record.identity.attempt for record in middle_records] == [1, 2]
+    assert [request.identity.attempt for request in backend.requests if request.identity.stage_id == "last"] == [1]
+
+    replacement_middle = middle_records[-1]
+    backend.set_states(replacement_middle.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    assert engine.reconcile_stage(plan, "middle").decision == "COMPLETED"
+
+    last_requests = [request for request in backend.requests if request.identity.stage_id == "last"]
+    assert [request.identity.attempt for request in last_requests] == [1, 2]
+    assert last_requests[-1].dependency_job_ids == (replacement_middle.job_id,)
+    assert signed_attempt_bound(plan, last) == 2
+    # The old completion is no longer current once generation two is authorized.
+    assert latest_reconciliation_receipt(backend, plan, last) is None
+
+
 def test_task_bearing_afterany_retry_still_rebinds_its_downstream_audit() -> None:
     """Dependency mode must not make a compute array look like its audit stage.
 

@@ -55,6 +55,38 @@ def open_parent(target, create=False):
         os.close(fd)
         raise
 
+def open_fenced_parent(root, target, create=False):
+    # Fenced writers may create receipt subdirectories, but they must never
+    # recreate a run hierarchy that a completed promotion/archive removed. The
+    # no-follow walk to root therefore runs with creation disabled before the
+    # relative output suffix is traversed.
+    prefix = root.rstrip('/') + '/'
+    if not target.startswith(prefix):
+        fail('fenced control path is outside its run root')
+    relative = target[len(prefix):]
+    pieces = [part for part in relative.split('/') if part]
+    if not pieces:
+        fail('fenced control path must name a leaf below its run root')
+    leaf = pieces.pop()
+    fd = open_parent(root.rstrip('/') + '/.anchor', create=False)[0]
+    try:
+        for part in pieces:
+            if part in ('.', '..'):
+                fail('relative path component rejected')
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd, leaf
+    except BaseException:
+        os.close(fd)
+        raise
+
 def read_leaf(parent, leaf):
     try:
         fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
@@ -154,7 +186,14 @@ try:
             fail('coordination root is not a real directory')
         if os.path.lexists(os.path.join(coordination, 'transition.json')):
             fail('run lifecycle transition is in progress', 44)
-    parent, leaf = open_parent(path, create=op in ('immutable', 'mutable', 'cas'))
+    if run_root is None:
+        parent, leaf = open_parent(path, create=op in ('immutable', 'mutable', 'cas'))
+    else:
+        parent, leaf = open_fenced_parent(
+            run_root,
+            path,
+            create=op in ('immutable', 'mutable', 'cas'),
+        )
     anchored_parent = os.fstat(parent)
     if op == 'read':
         value, _ = read_leaf(parent, leaf)

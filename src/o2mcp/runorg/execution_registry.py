@@ -21,42 +21,39 @@ class ExecutionRegistryMixin:
 
         if self.registry is None:
             return True
-        operation_id = f"registry:{plan.plan_sha256}"
-        claim_id = self._acquire_lifecycle(plan, operation_id)
-        try:
-            self._bind_plan(plan)
-            all_synced = True
-            for stage in plan.stages:
-                for attempt in range(1, signed_attempt_bound(plan, stage) + 1):
-                    path = pending_registry_path(plan, stage.stage_id, attempt)
-                    while (text := self.backend.read_text(path)) is not None:
-                        update = decode_registry_update(text)
-                        if (
-                            update.plan_sha256 != plan.plan_sha256
-                            or update.stage_id != stage.stage_id
-                            or update.attempt != attempt
-                        ):
-                            raise ValueError("pending registry update belongs to a different path identity")
-                        try:
-                            synced = bool(self.registry.synchronize(plan, update))
-                        except Exception:
-                            synced = False
-                        if not synced:
-                            all_synced = False
-                            break
-                        # A holder recorded in this exact outbox has finished
-                        # every scheduler/evidence mutation before enqueueing it.
-                        # Retire those exact owners before compare-clear so a
-                        # release failure leaves durable repair work to replay.
-                        for repaired_claim_id in update.lifecycle_claim_ids:
-                            self._release_lifecycle(plan, repaired_claim_id)
-                        self._compare_and_swap_text(plan, path, text, None)
-            return all_synced
-        finally:
-            # Registry repair itself never invokes Slurm. Pending outboxes retain
-            # their originating mutation claims, so this metadata-only holder
-            # need not remain after a failed synchronization attempt.
-            self._release_lifecycle(plan, claim_id)
+        # Registry repair is metadata-only. It must not create its own persistent
+        # lifecycle claim because a process/host crash could strand that claim
+        # without an outbox capable of naming and retiring it. The fenced plan
+        # write, registry transaction, claim releases, and outbox CAS each hold
+        # the shared lifecycle lock at their mutation boundary instead.
+        self._bind_plan(plan)
+        all_synced = True
+        for stage in plan.stages:
+            for attempt in range(1, signed_attempt_bound(plan, stage) + 1):
+                path = pending_registry_path(plan, stage.stage_id, attempt)
+                while (text := self.backend.read_text(path)) is not None:
+                    update = decode_registry_update(text)
+                    if (
+                        update.plan_sha256 != plan.plan_sha256
+                        or update.stage_id != stage.stage_id
+                        or update.attempt != attempt
+                    ):
+                        raise ValueError("pending registry update belongs to a different path identity")
+                    try:
+                        synced = bool(self.registry.synchronize(plan, update))
+                    except Exception:
+                        synced = False
+                    if not synced:
+                        all_synced = False
+                        break
+                    # A holder recorded in this exact outbox has finished every
+                    # scheduler/evidence mutation before enqueueing it. Retire
+                    # those exact owners before compare-clear so a release
+                    # failure leaves durable repair work to replay.
+                    for repaired_claim_id in update.lifecycle_claim_ids:
+                        self._release_lifecycle(plan, repaired_claim_id)
+                    self._compare_and_swap_text(plan, path, text, None)
+        return all_synced
 
     def _sync_registry(
         self,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -186,6 +187,24 @@ def test_fenced_control_write_cannot_recreate_quarantined_run_root(tmp_path) -> 
 
     assert not os.path.exists(run_root)
     assert not os.path.exists(os.path.join(quarantine, "receipts", "execution", "late.json"))
+
+
+def test_fenced_control_write_cannot_recreate_completed_transition_source(tmp_path) -> None:
+    """A late evidence writer cannot resurrect a source after marker cleanup."""
+
+    backend = O2ExecutionBackend(LocalConnection())
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_fenced__completed")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    target = os.path.join(run_root, "receipts", "execution", "late.json")
+
+    # Model the terminal transition state: the source and marker are both gone.
+    # The sibling coordination lock may still exist, but it cannot authorize
+    # recreating the deleted run hierarchy.
+    shutil.rmtree(run_root)
+    with pytest.raises(RuntimeError, match="write failed"):
+        backend.write_immutable_text_fenced(run_root, target, "late")
+
+    assert not os.path.exists(run_root)
 
 
 def test_fenced_registry_sync_cannot_recreate_quarantined_run_root(tmp_path) -> None:
