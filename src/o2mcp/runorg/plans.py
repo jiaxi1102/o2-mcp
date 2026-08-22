@@ -113,6 +113,12 @@ class ExecutionPlan:
         # Computing the order detects cycles and supplies a deterministic order for
         # later launchers without requiring the input JSON to be topologically sorted.
         self.topological_stage_ids()
+        for stage_id, bound in self._derived_attempt_bounds().items():
+            if bound > 999:
+                # SubmissionIdentity encodes attempts as exactly three decimal
+                # digits. Reject an otherwise valid dense DAG here rather than
+                # letting evidence scans fail only after a run is registered.
+                raise ValueError(f"stage {stage_id} derived attempt bound {bound} exceeds the identity limit 999")
         self._validate_receipt_tree()
         self._validate_command_roots()
 
@@ -195,6 +201,43 @@ class ExecutionPlan:
         for stage_id in sorted(by_id):
             visit(stage_id, ())
         return tuple(ordered)
+
+    def _derived_attempt_bounds(self) -> dict[str, int]:
+        """Derive complete bounded identity spaces for every signed stage.
+
+        An ``afterany`` stage needs one replacement generation for every
+        noninitial generation of each direct dependency. Dependency bounds
+        already include their own upstream-triggered generations, so this
+        recursive sum propagates the finite allowance through nested DAGs.
+        """
+
+        by_id = {stage.stage_id: stage for stage in self.stages}
+        derived: dict[str, int] = {}
+
+        def derive(stage_id: str) -> int:
+            """Memoize one node after the graph's cycle check has succeeded."""
+
+            if stage_id in derived:
+                return derived[stage_id]
+            stage = by_id[stage_id]
+            bound = stage.retry_policy.max_attempts
+            if stage.dependency_mode == "afterany" and stage.depends_on:
+                bound += sum(derive(dependency) - 1 for dependency in stage.depends_on)
+            derived[stage_id] = bound
+            return bound
+
+        for stage_id in self.topological_stage_ids():
+            derive(stage_id)
+        return derived
+
+    def signed_attempt_bound(self, stage_id: str) -> int:
+        """Return one stage's plan-validated scheduler identity bound."""
+
+        bounds = self._derived_attempt_bounds()
+        try:
+            return bounds[stage_id]
+        except KeyError as error:
+            raise ValueError(f"unknown stage_id {stage_id!r}") from error
 
     def to_dict(self) -> dict[str, Any]:
         """Return the unhashed canonical plan payload."""

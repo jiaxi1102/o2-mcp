@@ -30,25 +30,10 @@ def signed_attempt_bound(plan: ExecutionPlan, stage: StageSpec) -> int:
     fan-in-specific reconciler limit.
     """
 
-    derived: dict[str, int] = {}
-
-    def derive(stage_id: str) -> int:
-        """Memoize each DAG node's complete upstream-derived allowance."""
-
-        if stage_id in derived:
-            return derived[stage_id]
-        current = stage_by_id(plan, stage_id)
-        bound = current.retry_policy.max_attempts
-        if current.dependency_mode == "afterany" and current.depends_on:
-            # Every noninitial accepted generation of a direct dependency can
-            # invalidate this stage's previous output. A dependency's own bound
-            # already includes generations induced by its upstreams, so using
-            # the complete bound propagates finite allowances through chains.
-            bound += sum(derive(dependency) - 1 for dependency in current.depends_on)
-        derived[stage_id] = bound
-        return bound
-
-    return derive(stage.stage_id)
+    planned = stage_by_id(plan, stage.stage_id)
+    if planned is not stage and planned != stage:
+        raise ValueError(f"stage {stage.stage_id!r} does not match the immutable execution plan")
+    return plan.signed_attempt_bound(stage.stage_id)
 
 
 def task_sort_key(task: PlannedTask) -> tuple[int, int, str]:

@@ -272,6 +272,28 @@ def test_stage_graph_rejects_unknown_dependencies_and_cycles() -> None:
         _plan(stages=(first, second))
 
 
+def test_plan_rejects_derived_attempt_bounds_above_identity_limit() -> None:
+    """Dense retry DAGs must fail before three-digit attempt identities overflow."""
+
+    stages: list[StageSpec] = []
+    for index in range(9):
+        stage_id = f"dense-{index}"
+        stages.append(
+            StageSpec(
+                stage_id=stage_id,
+                command=_command("/usr/bin/true"),
+                resources=_resources(),
+                expected_receipts=(_receipt(stage_id),),
+                depends_on=tuple(stage.stage_id for stage in stages),
+                dependency_mode="afterany" if stages else "afterok",
+                retry_policy=RetryPolicy(max_attempts=5),
+            )
+        )
+
+    with pytest.raises(ValueError, match="derived attempt bound 1025 exceeds.*999"):
+        _plan(stages=tuple(stages))
+
+
 def test_dependency_mode_distinguishes_stage_gates_from_reconcilers() -> None:
     """The signed DAG must preserve after-success versus after-terminal intent."""
 
