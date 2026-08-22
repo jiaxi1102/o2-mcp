@@ -31,6 +31,21 @@ from typing import Any
 from o2mcp.config import O2Config
 from o2mcp.runorg.policy import RunPolicy
 from o2mcp.runorg.strict_json import strict_json_object
+from o2mcp.runorg.transition_scripts import (
+    delete_frozen_source_lines as _delete_frozen_source_lines,
+)
+from o2mcp.runorg.transition_scripts import (
+    freeze_source_before_publication_lines as _freeze_source_before_publication_lines,
+)
+from o2mcp.runorg.transition_scripts import (
+    rollback_uncommitted_transition_lines as _rollback_uncommitted_transition_lines,
+)
+from o2mcp.runorg.transition_scripts import (
+    source_snapshot_assignment as _source_snapshot_assignment,
+)
+from o2mcp.runorg.transition_scripts import (
+    transition_marker_guard as _transition_marker_guard,
+)
 
 SCHEMA_VERSION = 1
 
@@ -512,6 +527,7 @@ def plan_archive_script(
             f"# archive {manifest.run_id} -> standby (cold, tar.zst)",
             "set -euo pipefail",
             *_transition_marker_guard(source_dir, transition_id),
+            *_rollback_uncommitted_transition_lines(source_dir, transition_id),
             f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
             "flock -x 8",
             _source_snapshot_assignment(source_dir, "source_baseline_sha"),
@@ -525,7 +541,6 @@ def plan_archive_script(
             f"if test -e {shlex.quote(manifest_dest)} || test -e {shlex.quote(tarball)} || "
             f"test -e {shlex.quote(checksum)}; then echo 'archive destination already exists' >&2; exit 76; fi",
             f"staging=$(mktemp -d {shlex.quote(staging_template)})",
-            *_rollback_uncommitted_transition_lines(source_dir, transition_id),
             f"tar {exclude} --use-compress-program='zstd -19 --long=27 -T0' "
             f'-cf "$staging/archive.tar.zst" -C {shlex.quote(parent)} {shlex.quote(base)}',
             "archive_sha=$(sha256sum \"$staging/archive.tar.zst\" | cut -d' ' -f1)",
@@ -615,6 +630,7 @@ def _render_transfer_script(
         f"# {title}",
         "set -euo pipefail",
         *_transition_marker_guard(source_dir, transition_id),
+        *_rollback_uncommitted_transition_lines(source_dir, transition_id),
         f"exec 8> {shlex.quote(posixpath.join(source_dir, '.execution-source.lock'))}",
         "flock -x 8",
         _source_snapshot_assignment(source_dir, "source_baseline_sha"),
@@ -625,7 +641,6 @@ def _render_transfer_script(
         # directory is verified exactly and then renamed into an absent final path.
         f"if test -e {shlex.quote(dest_dir)}; then echo 'durable destination already exists' >&2; exit 76; fi",
         f"staging=$(mktemp -d {shlex.quote(staging_template)})",
-        *_rollback_uncommitted_transition_lines(source_dir, transition_id),
         rsync,
         "verify_output=$(mktemp)",
         # Verify both directions so destination-only residue is impossible.  The
@@ -655,144 +670,3 @@ def _default_transition_id(manifest: RunManifest, action: str) -> str:
     """Return a deterministic marker token so exact previews are reproducible."""
 
     return hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
-
-
-def _transition_marker_guard(source_dir: str, transition_id: str) -> list[str]:
-    """Verify the sibling transition marker before touching the source tree."""
-
-    source = source_dir.rstrip("/")
-    parent, run_id = posixpath.split(source)
-    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
-    marker = posixpath.join(coordination, "transition.json")
-    return [
-        f"exec 7> {shlex.quote(coordination + '.lock')}",
-        "flock -x 7",
-        f'test "$(cat -- {shlex.quote(marker)})" = {shlex.quote(transition_id)}',
-        "flock -u 7",
-    ]
-
-
-def _source_quarantine_path(source_dir: str, transition_id: str) -> str:
-    """Return the private sibling used to freeze a transition source."""
-
-    source = source_dir.rstrip("/")
-    parent, run_id = posixpath.split(source)
-    return posixpath.join(parent, f".{run_id}.deleting.{transition_id}")
-
-
-def _rollback_uncommitted_transition_lines(source_dir: str, transition_id: str) -> list[str]:
-    """Install an EXIT trap that removes private work and restores a frozen source.
-
-    ``published_paths`` records only destinations this script proved it moved
-    successfully.  This avoids deleting a pre-existing path when
-    ``mv --no-clobber`` declines a race, while still rolling back a partially
-    published archive package before its manifest commit can escape.
-    """
-
-    source = source_dir.rstrip("/")
-    quarantine = _source_quarantine_path(source, transition_id)
-    return [
-        "source_frozen=0",
-        "published_paths=()",
-        "cleanup_uncommitted_transition() {",
-        "  status=$?",
-        "  trap - EXIT",
-        # Cleanup must attempt every rollback step even when one filesystem
-        # operation fails; the original transition status remains authoritative.
-        "  set +e",
-        '  rm -f -- "${verify_output:-}"',
-        '  rm -rf -- "$staging"',
-        # Roll publication back in reverse commit order.  For archives this
-        # removes the manifest marker before its checksum and payload.
-        "  for ((published_index=${#published_paths[@]} - 1; published_index >= 0; published_index--)); do",
-        '    rm -rf -- "${published_paths[$published_index]}"',
-        "  done",
-        f'  if test "$source_frozen" = 1 && test ! -e {shlex.quote(source)}; then',
-        f"    mv -T -- {shlex.quote(quarantine)} {shlex.quote(source)}",
-        "  fi",
-        '  exit "$status"',
-        "}",
-        "trap cleanup_uncommitted_transition EXIT",
-    ]
-
-
-def _freeze_source_before_publication_lines(source_dir: str, transition_id: str) -> list[str]:
-    """Prove and quarantine the source before publishing a lifecycle destination.
-
-    An injection that recreates the original path after rename is outside the
-    certified source and survives cleanup.  A mismatch exits while the rollback
-    trap still owns only private staging, so no kept/archive commit is visible.
-    """
-
-    source = source_dir.rstrip("/")
-    quarantine = _source_quarantine_path(source, transition_id)
-    return [
-        _source_snapshot_assignment(source, "source_final_sha"),
-        'if test "$source_final_sha" != "$source_baseline_sha"; then '
-        "echo 'source changed during transition; refusing publication' >&2; exit 77; fi",
-        f"test ! -e {shlex.quote(quarantine)}",
-        f"mv -T -- {shlex.quote(source)} {shlex.quote(quarantine)}",
-        "source_frozen=1",
-        _source_snapshot_assignment(quarantine, "quarantine_sha"),
-        'if test "$quarantine_sha" != "$source_baseline_sha"; then '
-        "echo 'frozen source changed after rename; refusing publication' >&2; exit 78; fi",
-    ]
-
-
-def _delete_frozen_source_lines(source_dir: str, transition_id: str) -> list[str]:
-    """Delete a pre-certified quarantine after destination publication commits."""
-
-    source = source_dir.rstrip("/")
-    parent, run_id = posixpath.split(source)
-    quarantine = _source_quarantine_path(source, transition_id)
-    coordination = posixpath.join(parent, f".{run_id}.execution-coordination")
-    marker = posixpath.join(coordination, "transition.json")
-    return [
-        f"rm -rf -- {shlex.quote(quarantine)}",
-        "flock -x 7",
-        f'test "$(cat -- {shlex.quote(marker)})" = {shlex.quote(transition_id)}',
-        f"rm -f -- {shlex.quote(marker)}",
-        "flock -u 7",
-        "echo FREED_SCRATCH",
-    ]
-
-
-def _source_snapshot_assignment(source_dir: str, variable: str) -> str:
-    """Render a deterministic source-tree digest used before destructive cleanup.
-
-    The lifecycle lock itself is excluded because opening it is coordination,
-    not scientific data.  The dependency-free Python walker hashes relative
-    names, modes, types, symlink targets, and regular-file bytes without relying
-    on platform-specific GNU tar flags.
-    """
-
-    program = "\n".join(
-        [
-            "import hashlib, os, stat, sys",
-            "root = os.path.abspath(sys.argv[1])",
-            "digest = hashlib.sha256()",
-            "def visit(path, relative):",
-            "    info = os.lstat(path)",
-            "    mode = info.st_mode",
-            "    digest.update(relative.encode('utf-8') + b'\\0' + str(stat.S_IMODE(mode)).encode() + b'\\0')",
-            "    if stat.S_ISDIR(mode):",
-            "        digest.update(b'd\\0')",
-            "        for name in sorted(os.listdir(path)):",
-            "            if relative == '.' and name == '.execution-source.lock':",
-            "                continue",
-            "            child_relative = name if relative == '.' else relative + '/' + name",
-            "            visit(os.path.join(path, name), child_relative)",
-            "    elif stat.S_ISREG(mode):",
-            "        digest.update(b'f\\0')",
-            "        with open(path, 'rb') as handle:",
-            "            for chunk in iter(lambda: handle.read(1024 * 1024), b''):",
-            "                digest.update(chunk)",
-            "    elif stat.S_ISLNK(mode):",
-            "        digest.update(b'l\\0' + os.readlink(path).encode('utf-8') + b'\\0')",
-            "    else:",
-            "        raise SystemExit('unsupported special file in transition source: ' + relative)",
-            "visit(root, '.')",
-            "print(digest.hexdigest())",
-        ]
-    )
-    return f"{variable}=$(python3 -c {shlex.quote(program)} {shlex.quote(source_dir.rstrip('/'))})"

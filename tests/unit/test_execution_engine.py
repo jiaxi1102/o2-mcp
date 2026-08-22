@@ -581,6 +581,31 @@ def test_transient_root_state_does_not_terminally_fill_missing_array_children(sl
         assert backend.read_text(task_attempt_path(plan, record.identity, task_id)) is None
 
 
+def test_completed_root_with_absent_child_reaches_missing_receipt_retry_policy() -> None:
+    """Synthetic MISSING is terminal evidence, not an indefinitely active task."""
+
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    record = engine.submit_stage(plan, "analyze").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "COMPLETED", 0),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    result = engine.reconcile_stage(plan, "analyze")
+
+    assert result.decision == RECONCILE_RETRY_SUBMITTED
+    assert result.retry_task_ids == ("movie-1",)
+    assert result.active_task_ids == result.failed_task_ids == ()
+    assert result.retry_submission is not None
+    assert result.retry_submission.task_ids == ("movie-1",)
+
+
 def test_unknown_slurm_state_fails_closed_as_active() -> None:
     """A future Slurm flag cannot be misclassified as immutable terminal proof."""
 

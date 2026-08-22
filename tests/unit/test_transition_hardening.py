@@ -14,14 +14,16 @@ from o2mcp.runorg.runs import RunLayout, RunManifest, plan_archive_script, plan_
 from o2mcp.runorg.transition_guards import require_certified_terminal_execution
 
 
-def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> None:
-    """Create the exact executor-owned sibling marker for script fault tests."""
+def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> str:
+    """Create and return the exact executor-owned sibling marker path."""
 
     token = hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
     root = os.path.join(os.path.dirname(source), f".{manifest.run_id}.execution-coordination")
     os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "transition.json"), "w", encoding="utf-8") as handle:
+    marker = os.path.join(root, "transition.json")
+    with open(marker, "w", encoding="utf-8") as handle:
         handle.write(token)
+    return marker
 
 
 def _write_tool(path, name: str, body: str) -> None:
@@ -111,7 +113,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
 """,
     )
     script = plan_promote_script(layout, manifest, source_dir=source)
-    _seed_transition_marker(source, manifest, "promote")
+    marker = _seed_transition_marker(source, manifest, "promote")
     assert ".execution-source.lock" in script
     assert "--exclude=/.execution-source.lock" in script
     assert "--exclude=.execution-source.lock" not in script
@@ -134,6 +136,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     assert os.path.exists(os.path.join(source, "payload.txt"))
     assert os.path.exists(os.path.join(source, "late.txt"))
     assert not os.path.exists(destination)
+    assert not os.path.exists(marker)
 
 
 def test_archive_detects_source_write_before_publication(tmp_path) -> None:
@@ -212,7 +215,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     )
 
     script = plan_archive_script(layout, manifest, source_dir=source)
-    _seed_transition_marker(source, manifest, "archive")
+    marker = _seed_transition_marker(source, manifest, "archive")
     assert script.index("source_final_sha=") < script.index('mv --no-clobber -- "$staging/archive.tar.zst"')
     result = subprocess.run(
         ["/bin/bash"],
@@ -229,6 +232,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     assert not os.path.exists(tarball)
     assert not os.path.exists(checksum)
     assert not os.path.exists(archived_manifest)
+    assert not os.path.exists(marker)
 
 
 def test_transition_requires_matching_certified_terminal_state() -> None:

@@ -38,14 +38,16 @@ from o2mcp.runorg.runs import _safe
 from o2mcp.runorg.transition_coordinator import TransitionBoundary
 
 
-def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> None:
-    """Create the marker normally established by the executor before launch."""
+def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> str:
+    """Create and return the marker normally established before launch."""
 
     token = hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
     root = os.path.join(os.path.dirname(source), f".{manifest.run_id}.execution-coordination")
     os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "transition.json"), "w", encoding="utf-8") as handle:
+    marker = os.path.join(root, "transition.json")
+    with open(marker, "w", encoding="utf-8") as handle:
         handle.write(token)
+    return marker
 
 
 class O2Connection(_ProductionO2Connection):
@@ -275,7 +277,7 @@ def test_promotion_refuses_existing_destination_without_deleting_source(tmp_path
         handle.write("stale\n")
 
     script = plan_promote_script(layout, manifest, source_dir=source)
-    _seed_transition_marker(source, manifest, "promote")
+    marker = _seed_transition_marker(source, manifest, "promote")
     assert "rsync -nric --delete" in script and "mv --no-clobber -T" in script
     result = subprocess.run(
         ["/bin/bash"],
@@ -288,6 +290,7 @@ def test_promotion_refuses_existing_destination_without_deleting_source(tmp_path
     assert result.returncode == 76
     assert os.path.exists(os.path.join(source, "clean.txt"))
     assert os.path.exists(os.path.join(destination, "stale.txt"))
+    assert not os.path.exists(marker)
 
 
 def test_archive_refuses_partial_destination_without_clobbering_source(tmp_path):
@@ -316,7 +319,7 @@ def test_archive_refuses_partial_destination_without_clobbering_source(tmp_path)
         handle.write(b"existing archive bytes")
 
     script = plan_archive_script(layout, manifest, source_dir=source)
-    _seed_transition_marker(source, manifest, "archive")
+    marker = _seed_transition_marker(source, manifest, "archive")
     assert script.count("mv --no-clobber") == 3
     assert script.index('archive.sha256"') < script.index('run.json"')
     result = subprocess.run(
@@ -331,6 +334,7 @@ def test_archive_refuses_partial_destination_without_clobbering_source(tmp_path)
     with open(tarball, "rb") as handle:
         assert handle.read() == b"existing archive bytes"
     assert os.path.exists(os.path.join(source, "clean.txt"))
+    assert not os.path.exists(marker)
 
 
 # --- executor (injected runner) ----------------------------------------------

@@ -645,12 +645,14 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 latest_verdict = "ACTIVE"
                 continue
             normalized = state.normalized_state()
-            if normalized not in TERMINAL_SLURM_STATES:
+            if normalized not in TERMINAL_SLURM_STATES and normalized != "MISSING":
                 # Slurm may report a nonterminal state flag (for example,
                 # REQUEUED or RESIZING) instead of the underlying base state.
                 # Immutable attempt evidence is safe only for the explicit
-                # terminal semantic class. Unknown future flags therefore fail
-                # closed as active rather than freezing a false failure.
+                # terminal semantic class. ``MISSING`` is the engine's synthetic
+                # verdict for an absent child under a terminal COMPLETED array
+                # root, so it must reach the signed missing-receipt retry policy.
+                # Unknown future flags fail closed as active instead.
                 latest_verdict = "ACTIVE"
                 continue
 
