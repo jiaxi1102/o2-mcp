@@ -236,7 +236,19 @@ class O2Runs(TransitionExecutorMixin):
         for command in plan_register_commands(self.layout, manifest, self.policy.run_subdirs):
             res = self._run(command, timeout=60)
             if not res.ok:
-                return {"ok": False, "problems": [res.stderr.strip() or "register command failed"], "run_id": rid}, None
+                # The transaction removes every pre-manifest partial tree.  If
+                # the transport lost a successful response after run.json was
+                # committed, this identity is sufficient for the caller to use
+                # recover_prepared_execution_run() instead of allocating a
+                # duplicate run.
+                return {
+                    "ok": False,
+                    "error": "run_initialization_failed_or_uncertain",
+                    "run_id": rid,
+                    "run_dir": run_dir,
+                    "recovery": "validate_with_recover_prepared_execution_run",
+                    "problems": [res.stderr.strip() or "register command failed or response was lost"],
+                }, None
         registry = self.append_registry(manifest)
         if not registry.ok:
             return {

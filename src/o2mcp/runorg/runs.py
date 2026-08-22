@@ -434,24 +434,69 @@ def parse_registry(text: str) -> list[dict[str, Any]]:
 
 # --- command planners (pure: build shell, never execute) ---------------------
 def plan_register_commands(layout: RunLayout, manifest: RunManifest, run_subdirs: Sequence[str] = ()) -> list[str]:
-    """Create one run directory exclusively, then seed its ``run.json``.
+    """Create one run directory and its manifest as a recoverable transaction.
 
     The run root itself uses plain ``mkdir`` rather than ``mkdir -p``.  A run ID
     is an execution identity, so reusing an existing directory must fail instead
-    of overwriting its manifest and mixing two submissions.
+    of overwriting its manifest and mixing two submissions.  Initialization is
+    rendered as one shell transaction: failures before the manifest commit
+    remove the exclusively created tree, while a lost response after the commit
+    leaves a strict manifest that :meth:`O2Runs.recover_prepared_execution_run`
+    can authenticate and resume.
     """
 
     run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
     quoted = shlex.quote(run_dir)
     parent = shlex.quote(posixpath.dirname(run_dir))
     subdirs = " ".join(shlex.quote(posixpath.join(run_dir, d)) for d in run_subdirs)
-    manifest_path = shlex.quote(posixpath.join(run_dir, "run.json"))
+    manifest_path = posixpath.join(run_dir, "run.json")
+    quoted_manifest_path = shlex.quote(manifest_path)
+    temporary_template = shlex.quote(posixpath.join(run_dir, ".run.json.tmp.XXXXXX"))
     heredoc = _heredoc(manifest.to_json())
-    commands = [f"mkdir -p {parent} && mkdir {quoted}"]
+
+    # Keep the trap armed until the immutable identity marker (run.json) is in
+    # place.  A transport failure after that point is intentionally recoverable:
+    # the caller receives run_dir and can validate the exact persisted identity.
+    lines = [
+        "set -euo pipefail",
+        "created=0",
+        "committed=0",
+        "temporary=''",
+        "cleanup_registration() {",
+        "  rc=$?",
+        # Disable every handler first: calling exit from an EXIT handler would
+        # otherwise invoke the same function recursively on some shells.
+        "  trap - EXIT HUP INT TERM",
+        '  if test -n "$temporary"; then rm -f -- "$temporary"; fi',
+        f'  if test "$created" = 1 && test "$committed" = 0; then rm -rf -- {quoted}; fi',
+        '  exit "$rc"',
+        "}",
+        "trap cleanup_registration EXIT",
+        # Convert signals into explicit non-zero exits; EXIT then owns the one
+        # cleanup path and preserves the fact that initialization did not pass.
+        "trap 'exit 129' HUP",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
+        f"mkdir -p {parent}",
+        f"mkdir {quoted}",
+        "created=1",
+    ]
     if subdirs:
-        commands.append(f"mkdir -p {subdirs}")
-    commands.extend([f"cat > {manifest_path} {heredoc}", f"printf '%s\\n' {quoted}"])
-    return commands
+        lines.append(f"mkdir -p {subdirs}")
+    lines.extend(
+        [
+            f"temporary=$(mktemp {temporary_template})",
+            f'cat > "$temporary" {heredoc}',
+            # Rename publishes complete bytes at the canonical identity path;
+            # cleanup owns the private temporary file until this succeeds.
+            f'mv -- "$temporary" {quoted_manifest_path}',
+            "temporary=''",
+            "committed=1",
+            "trap - EXIT HUP INT TERM",
+            f"printf '%s\\n' {quoted}",
+        ]
+    )
+    return ["\n".join(lines)]
 
 
 def plan_write_manifest_command(run_dir: str, manifest: RunManifest) -> str:

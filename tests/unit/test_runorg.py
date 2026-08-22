@@ -10,7 +10,10 @@ import hashlib
 import json
 import os
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from o2mcp import CommandResult, O2Config
 from o2mcp import O2Connection as _ProductionO2Connection
@@ -18,12 +21,14 @@ from o2mcp.broker import BrokerExecutionResult
 from o2mcp.runorg import (
     RETENTION_KEEP,
     RETENTION_SWEEP,
+    STATUS_ACTIVE,
     STATUS_KEPT,
     O2Runs,
     RegistryUpdate,
     RunLayout,
     RunManifest,
     RunPolicy,
+    RunPreparationError,
     campaign_of,
     classify_run,
     is_regenerable_intermediate,
@@ -212,7 +217,92 @@ def test_plan_register_includes_policy_subdirs(tmp_path):
     )
     cmds = plan_register_commands(layout, m, TEST_POLICY.run_subdirs)
     assert any("logs" in c and "views" in c for c in cmds)  # mkdir creates the policy subdirs
-    assert "&& mkdir " in cmds[0]  # run root itself is an exclusive create
+    assert f"mkdir {layout.run_dir(STATUS_ACTIVE, m.campaign, m.run_id)}" in cmds[0]
+
+
+def test_plan_register_removes_pre_manifest_partial_tree(tmp_path):
+    """A failure after exclusive mkdir does not strand an unusable run ID."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    # POSIX filesystems reject a path component longer than NAME_MAX.  That
+    # gives us a deterministic post-root-mkdir fault without weakening the
+    # production planner with a test-only injection hook.
+    command = plan_register_commands(layout, manifest, ("x" * 300,))[0]
+    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+
+    run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
+    assert result.returncode != 0
+    assert not os.path.exists(run_dir)
+
+
+def test_plan_register_commits_complete_recoverable_manifest(tmp_path):
+    """Successful initialization leaves the exact manifest as commit marker."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    command = plan_register_commands(layout, manifest, TEST_POLICY.run_subdirs)[0]
+    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+
+    run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
+    assert result.returncode == 0
+    assert result.stdout.strip() == run_dir
+    assert RunManifest.from_json(Path(run_dir, "run.json").read_text(encoding="utf-8")) == manifest
+    assert os.path.isdir(os.path.join(run_dir, "logs"))
+    assert os.path.isdir(os.path.join(run_dir, "views"))
+
+
+def test_prepare_execution_run_returns_identity_after_uncertain_initialization(tmp_path):
+    """A lost transaction response tells callers exactly what to recover."""
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command == "date -u +%Y%m%dT%H%M%SZ":
+            return ("20260101T000000Z\n", "", 0)
+        if "cleanup_registration" in command:
+            # Model a transport that lost the response after the remote shell
+            # may have committed run.json.  The executor cannot safely infer
+            # either outcome and must surface the deterministic recovery path.
+            return ("", "transport response lost", 1)
+        return ("", "", 0)
+
+    run_id = "RUN_20260101T000000Z_camp__v1"
+    with pytest.raises(RunPreparationError) as raised:
+        _runs(tmp_path, responder).prepare_execution_run(
+            project="example-project",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id=run_id,
+        )
+
+    details = raised.value.details
+    assert details["error"] == "run_initialization_failed_or_uncertain"
+    assert details["run_id"] == run_id
+    assert details["run_dir"].endswith(f"/camp/{run_id}")
+    assert details["recovery"] == "validate_with_recover_prepared_execution_run"
 
 
 def test_plan_archive_uses_policy_excludes(tmp_path):
