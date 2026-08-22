@@ -23,7 +23,8 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from o2mcp.runorg.executor import O2Runs, TransitionPlan
+from o2mcp.runorg.executor import O2Runs
+from o2mcp.runorg.transition_executor import TransitionPlan
 
 RunsFactory = Callable[[], O2Runs]
 RunToolWrapper = Callable[[Callable[[], dict]], Awaitable[str]]
