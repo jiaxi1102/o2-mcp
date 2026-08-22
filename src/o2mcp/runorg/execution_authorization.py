@@ -32,7 +32,6 @@ def derive_attempt_authorization(
     followup_authorized = (
         stage.dependency_mode == "afterany"
         and stage.depends_on
-        and not stage.tasks
         and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
     )
     if followup_authorized:

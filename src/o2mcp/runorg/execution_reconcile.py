@@ -21,15 +21,17 @@ def stage_by_id(plan: ExecutionPlan, stage_id: str) -> StageSpec:
 def signed_attempt_bound(plan: ExecutionPlan, stage: StageSpec) -> int:
     """Return the plan-derived submission bound for one stage.
 
-    An ``afterany`` non-array reconciler needs its own signed retry budget plus
-    one new generation for every possible accepted retry of each dependency.
+    Any ``afterany`` descendant needs its own signed retry budget plus one new
+    generation for every possible accepted retry of each dependency. This
+    includes task-bearing stages: their original tasks observed the earlier
+    dependency generation and must run again against replacement outputs.
     Deriving the extension solely from immutable stage policies keeps the
     scheduler identity space bounded without requiring adapters to guess a
     fan-in-specific reconciler limit.
     """
 
     bound = stage.retry_policy.max_attempts
-    if stage.dependency_mode == "afterany" and stage.depends_on and not stage.tasks:
+    if stage.dependency_mode == "afterany" and stage.depends_on:
         bound += sum(stage_by_id(plan, dependency).retry_policy.max_attempts - 1 for dependency in stage.depends_on)
     return bound
 

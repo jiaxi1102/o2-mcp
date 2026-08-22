@@ -38,6 +38,7 @@ from o2mcp.runorg import (
     SubmitOutcome,
     TaskSpec,
 )
+from o2mcp.runorg.execution_evidence import latest_reconciliation_receipt
 from o2mcp.runorg.execution_models import (
     ACCEPTED,
     DEFINITELY_REJECTED,
@@ -644,6 +645,90 @@ def test_retry_submission_automatically_binds_next_afterany_reconciler() -> None
     assert audit_requests[0].dependency_job_ids == (compute.job_id,)
     assert audit_requests[1].dependency_job_ids == (retry_job,)
     assert first_audit.identity.attempt == 1
+
+
+def test_new_afterany_generation_invalidates_older_completion() -> None:
+    """A completed audit cannot certify outputs from a later upstream retry."""
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    compute = engine.submit_stage(plan, "compute").record
+    first_audit = engine.submit_afterany_reconciler(plan, "audit").record
+    backend.set_states(first_audit.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="audit"))
+    assert engine.reconcile_stage(plan, "audit").decision == "COMPLETED"
+    assert latest_reconciliation_receipt(backend, plan, audit).attempt == 1
+
+    backend.set_states(
+        compute.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    retry = engine.reconcile_stage(plan, "compute").retry_submission
+    assert retry is not None
+
+    audit_records = engine._submission_records(plan, audit)
+    second_audit = max(audit_records, key=lambda record: record.identity.attempt)
+    assert second_audit.identity.attempt == 2
+    # The immutable attempt-1 completion still exists, but it is no longer
+    # current terminal evidence once generation 2 is authorized.
+    assert latest_reconciliation_receipt(backend, plan, audit) is None
+
+    backend.set_states(second_audit.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    assert engine.reconcile_stage(plan, "audit").decision == "COMPLETED"
+    latest = latest_reconciliation_receipt(backend, plan, audit)
+    assert latest is not None and latest.attempt == 2
+
+
+def test_task_bearing_afterany_stage_rebinds_after_upstream_retry() -> None:
+    """Every signed task reruns against a replacement dependency generation."""
+
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    base_compute = _compute_stage()
+    dependent_compute = StageSpec(
+        stage_id=base_compute.stage_id,
+        resources=base_compute.resources,
+        expected_receipts=base_compute.expected_receipts,
+        tasks=base_compute.tasks,
+        depends_on=("preflight",),
+        dependency_mode="afterany",
+        retry_policy=base_compute.retry_policy,
+    )
+    plan = _plan(stages=(preflight, dependent_compute))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    first_preflight = engine.submit_stage(plan, "preflight").record
+    engine.submit_stage(plan, "compute")
+    backend.set_states(first_preflight.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+
+    retry = engine.reconcile_stage(plan, "preflight").retry_submission
+
+    assert retry is not None and retry.identity.attempt == 2
+    compute_requests = [request for request in backend.requests if request.identity.stage_id == "compute"]
+    assert [request.identity.attempt for request in compute_requests] == [1, 2]
+    assert compute_requests[1].dependency_job_ids == (retry.job_id,)
+    assert tuple(task.task_id for task in compute_requests[1].tasks) == tuple(
+        task.task_id for task in base_compute.tasks
+    )
 
 
 def test_task_bearing_afterany_retry_still_rebinds_its_downstream_audit() -> None:

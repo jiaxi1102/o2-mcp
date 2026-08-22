@@ -300,12 +300,38 @@ def latest_reconciliation_receipt(
     plan: ExecutionPlan,
     stage: StageSpec,
 ) -> ReconciliationReceipt | None:
-    """Return the latest valid bounded reconciliation receipt for ``stage``."""
+    """Return terminal evidence for the latest occupied stage generation.
 
+    A dependency retry can authorize and submit a newer ``afterany`` generation
+    after an older one completed. Once that authorization exists, the old
+    receipt is no longer current evidence: callers must wait for the new exact
+    attempt to reconcile (or reject terminal certification if it never can).
+    """
+
+    latest_followup = latest_followup_attempt(backend, plan, stage)
     for attempt in range(signed_attempt_bound(plan, stage), 0, -1):
         receipt = read_reconciliation_receipt(backend, plan, stage, attempt)
-        if receipt is not None:
+        if attempt == latest_followup or receipt is not None:
+            # Returning None here is intentional: a newer authorized audit or
+            # task generation without its own terminal receipt invalidates an
+            # older COMPLETED decision.
             return receipt
+    return None
+
+
+def latest_followup_attempt(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+) -> int | None:
+    """Return the newest authenticated upstream-triggered generation."""
+
+    for attempt in range(signed_attempt_bound(plan, stage), 1, -1):
+        path = reconciler_followup_path(plan, stage.stage_id, attempt)
+        if backend.read_text(path) is None:
+            continue
+        authenticate_followup_authorization(backend, plan, stage, attempt)
+        return attempt
     return None
 
 
@@ -362,7 +388,6 @@ def _record_task_authorization(
         attempt > 1
         and stage.dependency_mode == "afterany"
         and stage.depends_on
-        and not stage.tasks
         and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
     )
     if followup_authorized:
@@ -415,7 +440,6 @@ def _validate_record_dependencies(
         record.identity.attempt > 1
         and stage.dependency_mode == "afterany"
         and stage.depends_on
-        and not stage.tasks
         and backend.read_text(reconciler_followup_path(plan, stage.stage_id, record.identity.attempt)) is not None
     )
     if followup_authorized:
@@ -574,6 +598,7 @@ __all__ = [
     "current_task_receipts_status",
     "authenticated_task_verdict",
     "latest_reconciliation_receipt",
+    "latest_followup_attempt",
     "next_unrejected_attempt",
     "read_reconciliation_receipt",
     "read_plan_submission_records",

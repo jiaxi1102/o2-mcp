@@ -22,6 +22,7 @@ from o2mcp.runorg.execution_evidence import (
     authenticated_task_verdict,
     current_task_receipts_status,
     current_task_receipts_valid,
+    latest_followup_attempt,
     latest_reconciliation_receipt,
     next_unrejected_attempt,
     read_plan_submission_records,
@@ -445,6 +446,28 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             raise ValueError("an explicit dependency reconciler must be a non-array stage")
         return self.submit_stage(plan, stage_id, attempt=attempt)
 
+    def submit_afterany_followup(
+        self,
+        plan: ExecutionPlan,
+        stage_id: str,
+        *,
+        attempt: int,
+    ) -> SubmissionResult:
+        """Submit one authorized generation after an upstream retry.
+
+        Unlike the initial reconciler convenience method, this path permits a
+        task-bearing ``afterany`` stage. Its follow-up authorization reruns all
+        signed tasks against the newest dependency jobs, preventing stale
+        downstream outputs from surviving an upstream replacement attempt.
+        """
+
+        stage = stage_by_id(plan, stage_id)
+        if stage.dependency_mode != "afterany" or not stage.depends_on:
+            raise ValueError("an afterany follow-up must have signed dependencies")
+        if attempt <= 1:
+            raise ValueError("an afterany follow-up generation must use attempt > 1")
+        return self.submit_stage(plan, stage_id, attempt=attempt)
+
     def reconcile_stage(
         self,
         plan: ExecutionPlan,
@@ -491,6 +514,17 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         for record in records:
             if record.identity.attempt > 1 and not _is_explicit_afterany_reconciler(stage):
                 self._ensure_reconciler_followups(plan, stage_id, record)
+        generation_start = latest_followup_attempt(self.backend, plan, stage)
+        if generation_start is not None:
+            # Upstream-triggered afterany generations supersede every earlier
+            # task verdict, including prior successes. Own retries submitted
+            # after this authorization remain in the same generation and can
+            # still preserve successes from its earlier attempts.
+            records = tuple(record for record in records if record.identity.attempt >= generation_start)
+            if not records:
+                raise ValueError(
+                    f"stage {stage_id} latest afterany generation {generation_start} has no accepted submission"
+                )
         tasks = {task.task_id: task for task in select_tasks(stage, None)}
         states_by_job = {record.job_id: tuple(self.backend.task_states(record.job_id)) for record in records}
 

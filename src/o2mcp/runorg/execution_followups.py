@@ -29,21 +29,19 @@ class ExecutionFollowupMixin:
         retried_stage_id: str,
         retry_record: SubmissionRecord,
     ) -> tuple[SubmissionRecord, ...]:
-        """Rebind downstream ``afterany`` reconcilers to an accepted retry job.
+        """Rebind downstream ``afterany`` stages to an accepted retry job.
 
-        An initial reconciler is dependency-bound only to the initial compute
+        An initial descendant is dependency-bound only to the initial upstream
         attempt. Each accepted retry gets a new immutable authorization against
-        the latest jobs of all dependencies. Definitively rejected generations
-        are consumed and advanced within the plan-derived aggregate bound.
+        the latest jobs of all dependencies. Task-bearing descendants rerun all
+        signed tasks because their earlier outputs observed stale dependency
+        inputs. Definitively rejected generations are consumed and advanced
+        within the plan-derived aggregate bound.
         """
 
         submitted: list[SubmissionRecord] = []
         for reconciler in plan.stages:
-            if (
-                reconciler.dependency_mode != "afterany"
-                or retried_stage_id not in reconciler.depends_on
-                or reconciler.tasks
-            ):
+            if reconciler.dependency_mode != "afterany" or retried_stage_id not in reconciler.depends_on:
                 continue
             records = self._submission_records(plan, reconciler)
             # The authorization is a durable outbox item. Replay its exact
@@ -83,7 +81,7 @@ class ExecutionFollowupMixin:
                 )
                 if rejection is None:
                     submitted.append(
-                        self.submit_afterany_reconciler(
+                        self.submit_afterany_followup(
                             plan,
                             reconciler.stage_id,
                             attempt=existing_generation,
@@ -130,7 +128,7 @@ class ExecutionFollowupMixin:
                 reconciler_followup_path(plan, reconciler.stage_id, next_attempt),
                 canonical_json(authorization),
             )
-            submitted.append(self.submit_afterany_reconciler(plan, reconciler.stage_id, attempt=next_attempt).record)
+            submitted.append(self.submit_afterany_followup(plan, reconciler.stage_id, attempt=next_attempt).record)
         return tuple(submitted)
 
 
