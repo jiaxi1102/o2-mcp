@@ -72,6 +72,18 @@ class ExecutionBackend(Protocol):
     def compare_and_swap_text(self, path: str, expected: str | None, replacement: str | None) -> bool:
         """Atomically replace/remove ``path`` only when exact current bytes match."""
 
+    def write_immutable_text_fenced(self, run_root: str, path: str, text: str) -> bool:
+        """Publish immutable bytes while excluding a destructive transition."""
+
+    def compare_and_swap_text_fenced(
+        self,
+        run_root: str,
+        path: str,
+        expected: str | None,
+        replacement: str | None,
+    ) -> bool:
+        """Apply one exact CAS while excluding a destructive transition."""
+
     def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> str | None:
         """Return an exact holder claim, or ``None`` when transition has won."""
 
@@ -350,9 +362,19 @@ print(json.dumps(response, sort_keys=True))
         bytes and receives ``False`` rather than submission ownership.
         """
 
+        return self._write_immutable_text(path, text, run_root=None)
+
+    def write_immutable_text_fenced(self, run_root: str, path: str, text: str) -> bool:
+        """Publish immutable evidence under the transition coordination lock."""
+
+        return self._write_immutable_text(path, text, run_root=run_root)
+
+    def _write_immutable_text(self, path: str, text: str, *, run_root: str | None) -> bool:
+        """Implement ordinary and lifecycle-fenced immutable publication."""
+
         payload = json.dumps({"payload": base64.b64encode(text.encode()).decode("ascii")})
         result = self.connection.run(
-            remote_fs_command("immutable", path),
+            remote_fs_command("immutable", path, run_root=run_root),
             timeout=120,
             input_text=payload,
         )
@@ -386,6 +408,29 @@ print(json.dumps(response, sort_keys=True))
         callers to merge and compare-clear one exact outbox payload safely.
         """
 
+        return self._compare_and_swap_text(path, expected, replacement, run_root=None)
+
+    def compare_and_swap_text_fenced(
+        self,
+        run_root: str,
+        path: str,
+        expected: str | None,
+        replacement: str | None,
+    ) -> bool:
+        """Apply one CAS under the transition coordination lock."""
+
+        return self._compare_and_swap_text(path, expected, replacement, run_root=run_root)
+
+    def _compare_and_swap_text(
+        self,
+        path: str,
+        expected: str | None,
+        replacement: str | None,
+        *,
+        run_root: str | None,
+    ) -> bool:
+        """Implement ordinary and lifecycle-fenced exact-byte CAS."""
+
         def encode(value: str | None) -> str | None:
             """Encode optional exact bytes without conflating absence and empty text."""
 
@@ -393,7 +438,7 @@ print(json.dumps(response, sort_keys=True))
 
         payload = json.dumps({"expected": encode(expected), "replacement": encode(replacement)})
         result = self.connection.run(
-            remote_fs_command("cas", path),
+            remote_fs_command("cas", path, run_root=run_root),
             timeout=120,
             input_text=payload,
         )

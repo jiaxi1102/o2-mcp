@@ -16,6 +16,7 @@ from o2mcp.runorg.execution_backend import O2ExecutionBackend
 from o2mcp.runorg.execution_models import RegistryUpdate, SubmissionRecord
 from o2mcp.runorg.lifecycle_coordination import claim_name, coordination_root
 from o2mcp.runorg.registry_outbox import decode_registry_update
+from o2mcp.runorg.registry_sync import synchronize_execution_transaction
 from o2mcp.runorg.runs import RunManifest
 from o2mcp.runorg.strict_json import strict_json_object
 from o2mcp.runorg.transition_coordinator import begin_transition, rollback_transition
@@ -139,6 +140,60 @@ def test_remote_control_fs_immutable_and_cas_round_trip(tmp_path) -> None:
     assert not backend.compare_and_swap_text(path, "one", None)
     assert backend.compare_and_swap_text(path, "two", None)
     assert backend.read_text(path) is None
+
+
+def test_fenced_control_write_cannot_recreate_quarantined_run_root(tmp_path) -> None:
+    """A transition marker wins atomically over every later evidence mutation."""
+
+    connection = LocalConnection()
+    backend = O2ExecutionBackend(connection)
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_fenced__write")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    target = os.path.join(run_root, "receipts", "execution", "late.json")
+
+    begin_transition(connection, run_root, "a" * 64)
+    quarantine = run_root + ".quarantine"
+    os.rename(run_root, quarantine)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        backend.write_immutable_text_fenced(run_root, target, "late")
+
+    assert not os.path.exists(run_root)
+    assert not os.path.exists(os.path.join(quarantine, "receipts", "execution", "late.json"))
+
+
+def test_fenced_registry_sync_cannot_recreate_quarantined_run_root(tmp_path) -> None:
+    """run.json/registry synchronization shares the same transition fence."""
+
+    connection = LocalConnection()
+    run_id = "RUN_20260822T010203Z_fenced__registry"
+    run_root = str(tmp_path / "campaign" / run_id)
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+    manifest = RunManifest(
+        run_id=run_id,
+        campaign="fenced",
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset"],
+    )
+    with open(os.path.join(run_root, "run.json"), "w", encoding="utf-8") as handle:
+        handle.write(manifest.to_json())
+
+    begin_transition(connection, run_root, "b" * 64)
+    quarantine = run_root + ".quarantine"
+    os.rename(run_root, quarantine)
+    result = synchronize_execution_transaction(
+        connection,
+        run_dir=run_root,
+        registry_path=str(tmp_path / "registry.jsonl"),
+        current_manifest_text=manifest.to_json(),
+        merged_manifest=manifest,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "lifecycle_transition_in_progress"
+    assert not os.path.exists(run_root)
+    assert not (tmp_path / "registry.jsonl").exists()
 
 
 def test_submission_claim_and_transition_marker_have_one_atomic_winner(tmp_path) -> None:

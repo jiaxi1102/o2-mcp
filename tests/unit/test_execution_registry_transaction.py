@@ -84,3 +84,35 @@ def test_registry_transaction_reports_compare_and_swap_conflict() -> None:
     )
     assert result["ok"] is False
     assert result["error"] == "concurrent_update"
+
+
+def test_registry_transaction_reports_transition_fence() -> None:
+    """A marked transition rejects run.json writes with a distinct outcome."""
+
+    class TransitionConnection:
+        """Represent the sibling lifecycle lock observing transition.json."""
+
+        def run(self, _command, *, timeout, input_text):
+            """Return the remote helper's dedicated transition status."""
+
+            return SimpleNamespace(ok=False, returncode=44, stdout="", stderr="")
+
+    plan = _registry_plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign="adversarial-execution",
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    update = RegistryUpdate(plan.plan_sha256, "compute", "COMPLETED", "COMPLETED", ("9000",), 1)
+    result = synchronize_execution_transaction(
+        TransitionConnection(),
+        run_dir=RUN_ROOT,
+        registry_path="/n/groups/lab/registry.jsonl",
+        current_manifest_text=manifest.to_json(),
+        merged_manifest=merge_execution_manifest(manifest, plan, update),
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "lifecycle_transition_in_progress"

@@ -125,7 +125,8 @@ class ExecutionFollowupMixin:
                 "trigger_job_id": retry_record.job_id,
                 "trigger_stage_id": retried_stage_id,
             }
-            self.backend.write_immutable_text(
+            self._write_immutable_text(
+                plan,
                 reconciler_followup_path(plan, reconciler.stage_id, next_attempt),
                 canonical_json(authorization),
             )

@@ -16,6 +16,7 @@ from typing import Any
 
 from o2mcp.connection import O2Connection
 from o2mcp.runorg.execution_models import RegistryUpdate
+from o2mcp.runorg.lifecycle_coordination import coordination_lock, coordination_root
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.runs import RunManifest, registry_line, sort_job_ids
 
@@ -122,14 +123,27 @@ def synchronize_execution_transaction(
     )
     program = _transaction_program()
     result = connection.run(
-        f"python3 -c {shlex.quote(program)} {shlex.quote(run_dir)} {shlex.quote(registry_path)}",
+        " ".join(
+            (
+                "python3 -c",
+                shlex.quote(program),
+                shlex.quote(run_dir),
+                shlex.quote(registry_path),
+                shlex.quote(coordination_root(run_dir)),
+                shlex.quote(coordination_lock(run_dir)),
+            )
+        ),
         timeout=120,
         input_text=payload,
     )
     if not result.ok:
         return {
             "ok": False,
-            "error": "concurrent_update" if result.returncode == 43 else "registry_transaction_failed",
+            "error": (
+                "concurrent_update"
+                if result.returncode == 43
+                else "lifecycle_transition_in_progress" if result.returncode == 44 else "registry_transaction_failed"
+            ),
             "problems": [result.stderr.strip() or result.stdout.strip() or "execution registry transaction failed"],
         }
     return {
@@ -143,43 +157,70 @@ def synchronize_execution_transaction(
 def _transaction_program() -> str:
     """Return the dependency-free remote CAS transaction program."""
 
-    return "\n".join(
-        [
-            "import fcntl, hashlib, json, os, sys, tempfile",
-            "run_dir, registry_path = sys.argv[1], sys.argv[2]",
-            "payload = json.load(sys.stdin)",
-            "manifest_path = os.path.join(run_dir, 'run.json')",
-            "lock_path = os.path.join(run_dir, '.execution-registry.lock')",
-            "with open(lock_path, 'a+', encoding='utf-8') as lock:",
-            "    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)",
-            "    with open(manifest_path, encoding='utf-8') as handle:",
-            "        current = handle.read()",
-            "    if hashlib.sha256(current.encode('utf-8')).hexdigest() != payload['expected_manifest_sha256']:",
-            "        raise SystemExit(43)",
-            "    fd, temporary = tempfile.mkstemp(prefix='.run-json-', dir=run_dir)",
-            "    try:",
-            "        with os.fdopen(fd, 'w', encoding='utf-8') as handle:",
-            "            handle.write(payload['manifest_text'])",
-            "            handle.flush()",
-            "            os.fsync(handle.fileno())",
-            "        os.replace(temporary, manifest_path)",
-            "        directory_fd = os.open(run_dir, os.O_RDONLY)",
-            "        try:",
-            "            os.fsync(directory_fd)",
-            "        finally:",
-            "            os.close(directory_fd)",
-            "    finally:",
-            "        if os.path.exists(temporary):",
-            "            os.unlink(temporary)",
-            "    registry_parent = os.path.dirname(registry_path)",
-            "    os.makedirs(registry_parent, exist_ok=True)",
-            "    with open(registry_path, 'a', encoding='utf-8') as registry:",
-            "        registry.write(payload['registry_line'] + '\\n')",
-            "        registry.flush()",
-            "        os.fsync(registry.fileno())",
-            "print(json.dumps({'ok': True}, sort_keys=True))",
-        ]
-    )
+    return r"""
+import fcntl, hashlib, json, os, stat, sys, tempfile
+run_dir, registry_path, coordination, lifecycle_lock_path = sys.argv[1:5]
+payload = json.load(sys.stdin)
+manifest_path = os.path.join(run_dir, 'run.json')
+registry_lock_path = os.path.join(run_dir, '.execution-registry.lock')
+
+# Transition marking takes this same sibling lock. The check and every run-root
+# or registry mutation therefore happen before a transition can quarantine the
+# source, without relying on a persistent reconciliation claim.
+os.makedirs(os.path.dirname(coordination), exist_ok=True)
+lifecycle_lock = os.open(
+    lifecycle_lock_path,
+    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+    0o600,
+)
+try:
+    if not stat.S_ISREG(os.fstat(lifecycle_lock).st_mode):
+        raise SystemExit('coordination lock is not regular')
+    fcntl.flock(lifecycle_lock, fcntl.LOCK_EX)
+    if os.path.lexists(coordination) and (
+        os.path.islink(coordination)
+        or not stat.S_ISDIR(os.stat(coordination, follow_symlinks=False).st_mode)
+    ):
+        raise SystemExit('coordination root is not a real directory')
+    if os.path.lexists(os.path.join(coordination, 'transition.json')):
+        raise SystemExit(44)
+
+    with open(registry_lock_path, 'a+', encoding='utf-8') as registry_lock:
+        fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+        with open(manifest_path, encoding='utf-8') as handle:
+            current = handle.read()
+        if hashlib.sha256(current.encode('utf-8')).hexdigest() != payload['expected_manifest_sha256']:
+            raise SystemExit(43)
+        fd, temporary = tempfile.mkstemp(prefix='.run-json-', dir=run_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(payload['manifest_text'])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest_path)
+            directory_fd = os.open(run_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+                cleanup_directory_fd = os.open(run_dir, os.O_RDONLY)
+                try:
+                    os.fsync(cleanup_directory_fd)
+                finally:
+                    os.close(cleanup_directory_fd)
+        registry_parent = os.path.dirname(registry_path)
+        os.makedirs(registry_parent, exist_ok=True)
+        with open(registry_path, 'a', encoding='utf-8') as registry:
+            registry.write(payload['registry_line'] + '\n')
+            registry.flush()
+            os.fsync(registry.fileno())
+finally:
+    os.close(lifecycle_lock)
+print(json.dumps({'ok': True}, sort_keys=True))
+""".strip()
 
 
 __all__ = ["merge_execution_manifest", "synchronize_execution_transaction"]

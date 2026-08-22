@@ -47,6 +47,8 @@ class Backend:
         self.requests: list[SubmissionRequest] = []
         self.next_job = 7100
         self.lifecycle_claims: set[str] = set()
+        self.transition_marked = False
+        self.mark_transition_on_task_state = False
 
     def find_jobs(self, comment: str):
         return tuple(
@@ -72,6 +74,8 @@ class Backend:
         return SubmitOutcome(ACCEPTED, job_id=job_id, returncode=0)
 
     def task_states(self, job_id: str):
+        if self.mark_transition_on_task_state:
+            self.transition_marked = True
         return self.jobs[job_id]["task_states"]
 
     def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
@@ -90,6 +94,13 @@ class Backend:
         self.files[path] = text
         return True
 
+    def write_immutable_text_fenced(self, _run_root: str, path: str, text: str) -> bool:
+        """Model the production lock-and-marker check around one write."""
+
+        if self.transition_marked:
+            raise RuntimeError("run lifecycle transition is in progress")
+        return self.write_immutable_text(path, text)
+
     def write_mutable_text(self, path: str, text: str) -> None:
         self.files[path] = text
 
@@ -102,6 +113,19 @@ class Backend:
         else:
             self.files[path] = replacement
         return True
+
+    def compare_and_swap_text_fenced(
+        self,
+        _run_root: str,
+        path: str,
+        expected: str | None,
+        replacement: str | None,
+    ) -> bool:
+        """Model the production lock-and-marker check around one CAS."""
+
+        if self.transition_marked:
+            raise RuntimeError("run lifecycle transition is in progress")
+        return self.compare_and_swap_text(path, expected, replacement)
 
     def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> str | None:
         """Return one holder ID for this single-threaded backend."""
@@ -254,6 +278,23 @@ def test_reconcile_authenticates_active_run_before_writing() -> None:
     before = dict(backend.files)
     with pytest.raises(ValueError, match="registered active run"):
         ExecutionEngine(backend, RejectingRegistry()).reconcile_stage(plan, "compute")
+    assert backend.files == before
+
+
+def test_reconcile_write_is_fenced_when_transition_starts_after_authentication() -> None:
+    """A transition that wins after _bind_plan prevents late evidence writes."""
+
+    plan = _plan()
+    backend = Backend()
+    engine = ExecutionEngine(backend)
+    record = engine.submit_stage(plan, "compute").record
+    backend.jobs[record.job_id]["task_states"] = (SlurmTaskState(None, "FAILED", 1),)
+    backend.mark_transition_on_task_state = True
+    before = dict(backend.files)
+
+    with pytest.raises(RuntimeError, match="lifecycle transition"):
+        engine.reconcile_stage(plan, "compute")
+
     assert backend.files == before
 
 

@@ -50,7 +50,7 @@ class ExecutionRegistryMixin:
                         # release failure leaves durable repair work to replay.
                         for repaired_claim_id in update.lifecycle_claim_ids:
                             self._release_lifecycle(plan, repaired_claim_id)
-                        self.backend.compare_and_swap_text(path, text, None)
+                        self._compare_and_swap_text(plan, path, text, None)
             return all_synced
         finally:
             # Registry repair itself never invokes Slurm. Pending outboxes retain
@@ -72,7 +72,7 @@ class ExecutionRegistryMixin:
             return True
         update = self._update_with_claims(update, claim_ids)
         pending_path = pending_registry_path(plan, update.stage_id, update.attempt)
-        pending_text = self._merge_outbox(pending_path, update)
+        pending_text = self._merge_outbox(plan, pending_path, update)
         try:
             synced = bool(self.registry.synchronize(plan, decode_registry_update(pending_text)))
         except Exception:
@@ -93,7 +93,7 @@ class ExecutionRegistryMixin:
                 self._release_lifecycle(plan, claim_id)
             except Exception:
                 return False
-        return self.backend.compare_and_swap_text(pending_path, pending_text, None)
+        return self._compare_and_swap_text(plan, pending_path, pending_text, None)
 
     @staticmethod
     def _update_with_claims(update: RegistryUpdate, claim_ids: tuple[str, ...]) -> RegistryUpdate:
@@ -127,11 +127,12 @@ class ExecutionRegistryMixin:
             return
         queued = self._update_with_claims(update, claim_ids)
         self._merge_outbox(
+            plan,
             pending_registry_path(plan, queued.stage_id, queued.attempt),
             queued,
         )
 
-    def _merge_outbox(self, path: str, update: RegistryUpdate) -> str:
+    def _merge_outbox(self, plan: ExecutionPlan, path: str, update: RegistryUpdate) -> str:
         """CAS-join ``update`` into one per-attempt outbox under contention."""
 
         for _ in range(32):
@@ -140,7 +141,7 @@ class ExecutionRegistryMixin:
             merged_text = canonical_json(merge_registry_updates(current, update).to_dict())
             if current_text == merged_text:
                 return merged_text
-            if self.backend.compare_and_swap_text(path, current_text, merged_text):
+            if self._compare_and_swap_text(plan, path, current_text, merged_text):
                 return merged_text
         raise RuntimeError(f"registry outbox remained contended: {path}")
 
@@ -154,7 +155,34 @@ class ExecutionRegistryMixin:
                 raise ValueError("registered run identity could not be authenticated before submission") from exc
             if not valid:
                 raise ValueError("execution plan does not match the registered active run identity")
-        self.backend.write_immutable_text(bound_plan_path(plan), plan.to_json())
+        self._write_immutable_text(plan, bound_plan_path(plan), plan.to_json())
+
+    def _write_immutable_text(self, plan: ExecutionPlan, path: str, text: str) -> bool:
+        """Publish control evidence atomically with the transition boundary.
+
+        Production backends hold the sibling coordination lock while checking
+        ``transition.json`` and writing. Lightweight test backends retain the
+        original method, which keeps the execution engine duck-type friendly.
+        """
+
+        fenced = getattr(self.backend, "write_immutable_text_fenced", None)
+        if fenced is not None:
+            return bool(fenced(plan.paths.run_root, path, text))
+        return bool(self.backend.write_immutable_text(path, text))
+
+    def _compare_and_swap_text(
+        self,
+        plan: ExecutionPlan,
+        path: str,
+        expected: str | None,
+        replacement: str | None,
+    ) -> bool:
+        """Apply one control-record CAS atomically with transition marking."""
+
+        fenced = getattr(self.backend, "compare_and_swap_text_fenced", None)
+        if fenced is not None:
+            return bool(fenced(plan.paths.run_root, path, expected, replacement))
+        return bool(self.backend.compare_and_swap_text(path, expected, replacement))
 
     def _acquire_lifecycle(self, plan: ExecutionPlan, operation_id: str) -> str:
         """Acquire and return one distinct transition-boundary holder ID."""

@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import shlex
 
+from o2mcp.runorg.lifecycle_coordination import coordination_lock, coordination_root
+
 # Kept as a real multiline program rather than shell fragments so all four
 # operations share exactly the same path-walk and post-publication checks.
 REMOTE_FS_PROGRAM = r"""
 import base64, errno, fcntl, json, os, stat, sys, tempfile
 
 op, path = sys.argv[1:3]
+if len(sys.argv) not in (3, 6):
+    raise SystemExit('invalid remote filesystem argument count')
+run_root = sys.argv[3] if len(sys.argv) == 6 else None
+coordination = sys.argv[4] if len(sys.argv) == 6 else None
+coordination_lock_path = sys.argv[5] if len(sys.argv) == 6 else None
 request = json.loads(sys.stdin.read() or '{}')
 
 def fail(message, code=41):
@@ -110,13 +117,43 @@ def publish(parent, leaf, payload, *, replace):
             fail('published leaf changed during verification')
     finally:
         os.close(fd)
+        removed = False
         try:
             os.unlink(temporary, dir_fd=parent)
+            removed = True
         except FileNotFoundError:
             pass
+        if removed:
+            # The publication barrier also persisted the temporary hard-link
+            # name. Persist its cleanup before reporting a complete operation.
+            os.fsync(parent)
 
+lifecycle_lock_fd = None
 parent = None
 try:
+    if run_root is not None:
+        # Hold the same sibling lock used to publish transition.json for the
+        # entire control-record mutation. This avoids persistent poll claims
+        # while making check-and-write indivisible with respect to promotion or
+        # archive, even if the run root is renamed immediately afterward.
+        if not path.startswith(run_root.rstrip('/') + '/'):
+            fail('fenced control path is outside its run root')
+        os.makedirs(os.path.dirname(coordination), exist_ok=True)
+        lifecycle_lock_fd = os.open(
+            coordination_lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(lifecycle_lock_fd).st_mode):
+            fail('coordination lock is not regular')
+        fcntl.flock(lifecycle_lock_fd, fcntl.LOCK_EX)
+        if os.path.lexists(coordination) and (
+            os.path.islink(coordination)
+            or not stat.S_ISDIR(os.stat(coordination, follow_symlinks=False).st_mode)
+        ):
+            fail('coordination root is not a real directory')
+        if os.path.lexists(os.path.join(coordination, 'transition.json')):
+            fail('run lifecycle transition is in progress', 44)
     parent, leaf = open_parent(path, create=op in ('immutable', 'mutable', 'cas'))
     anchored_parent = os.fstat(parent)
     if op == 'read':
@@ -183,13 +220,24 @@ except FileNotFoundError:
 finally:
     if parent is not None:
         os.close(parent)
+    if lifecycle_lock_fd is not None:
+        os.close(lifecycle_lock_fd)
 """
 
 
-def remote_fs_command(operation: str, path: str) -> str:
-    """Render the fixed remote program with shell-quoted operation and path."""
+def remote_fs_command(operation: str, path: str, *, run_root: str | None = None) -> str:
+    """Render one remote operation, optionally fenced against transitions."""
 
-    return f"python3 -c {shlex.quote(REMOTE_FS_PROGRAM)} {shlex.quote(operation)} {shlex.quote(path)}"
+    arguments = [operation, path]
+    if run_root is not None:
+        arguments.extend(
+            (
+                run_root,
+                coordination_root(run_root),
+                coordination_lock(run_root),
+            )
+        )
+    return " ".join(("python3 -c", shlex.quote(REMOTE_FS_PROGRAM), *(shlex.quote(item) for item in arguments)))
 
 
 __all__ = ["REMOTE_FS_PROGRAM", "remote_fs_command"]

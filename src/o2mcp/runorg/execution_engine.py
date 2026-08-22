@@ -246,7 +246,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # the scheduler boundary.
         intent_path = submission_intent_path(plan, identity)
         intent_text = canonical_json(submission_intent(request))
-        self.backend.write_immutable_text(intent_path, intent_text)
+        self._write_immutable_text(plan, intent_path, intent_text)
 
         found = self._unique_existing_job(identity)
         invocation_path = submission_invocation_path(plan, identity)
@@ -278,7 +278,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 "stage_id": stage_id,
             }
             try:
-                invocation_created = self.backend.write_immutable_text(invocation_path, canonical_json(invocation))
+                invocation_created = self._write_immutable_text(plan, invocation_path, canonical_json(invocation))
             except RuntimeError:
                 invocation_created = False
             if not invocation_created:
@@ -310,7 +310,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 if found is None and outcome is not None and outcome.status == DEFINITELY_NOT_INVOKED:
                     invocation_path = submission_invocation_path(plan, identity)
                     invocation_text = canonical_json(invocation)
-                    if not self.backend.compare_and_swap_text(invocation_path, invocation_text, None):
+                    if not self._compare_and_swap_text(plan, invocation_path, invocation_text, None):
                         raise SubmissionUncertain(
                             f"pre-sbatch failure for {identity.comment} could not clear its exact invocation marker"
                         )
@@ -329,7 +329,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                     rejection_path = submission_rejection_path(plan, identity)
                     rejection_text = canonical_json(rejection.to_dict())
                     try:
-                        self.backend.write_immutable_text(rejection_path, rejection_text)
+                        self._write_immutable_text(plan, rejection_path, rejection_text)
                     except Exception as rejection_error:
                         # A lost write response may still have published the
                         # exact rejection. Authenticate that case before making
@@ -355,7 +355,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                         # invocation marker; if compare-clear loses a race, keep
                         # the claim and fail uncertain rather than risk a duplicate.
                         invocation_text = canonical_json(invocation)
-                        if not self.backend.compare_and_swap_text(
+                        if not self._compare_and_swap_text(
+                            plan,
                             invocation_path,
                             invocation_text,
                             None,
@@ -407,7 +408,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             dependency_mode=stage.dependency_mode,
             dependency_job_ids=authorized_dependencies,
         )
-        self.backend.write_immutable_text(record_path, canonical_json(record.to_dict()))
+        self._write_immutable_text(plan, record_path, canonical_json(record.to_dict()))
         status = "RETRYING" if attempt > 1 else "SUBMITTED"
         update = RegistryUpdate(
             plan_sha256=plan.plan_sha256,
@@ -574,7 +575,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 stage_id=stage_id,
                 successful_task_ids=tuple(sorted(successful)),
             )
-            self.backend.write_immutable_text(
+            self._write_immutable_text(
+                plan,
                 reconciliation_path(plan, stage_id, evidence_attempt),
                 canonical_json(reconciliation.to_dict()),
             )
@@ -682,7 +684,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 successful=successful,
                 retryable=retryable,
             )
-            self.backend.write_immutable_text(
+            self._write_immutable_text(
+                plan,
                 task_attempt_path(plan, receipt.identity, receipt.task_id),
                 canonical_json(receipt.to_dict()),
             )
