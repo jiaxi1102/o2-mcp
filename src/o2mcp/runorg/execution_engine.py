@@ -208,6 +208,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 plan,
                 existing_record.identity,
             )
+            if invocation_claim_id is not None:
+                self._release_preinvocation_losers(plan, existing_record.identity, invocation_claim_id)
             claim_ids = self._submission_claim_ids(
                 plan,
                 existing_record.identity,
@@ -288,6 +290,9 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                     f"sbatch invocation for {identity.comment} is already owned but no matching job is visible; "
                     "query again and do not resubmit"
                 )
+            # The marker fences every other pre-marker holder: each loser must
+            # observe this owner and abort before crossing sbatch.
+            self._release_preinvocation_losers(plan, identity, claim_id)
             try:
                 outcome = self.backend.invoke_submission(request)
             except Exception as exc:
@@ -448,19 +453,12 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
     ) -> ReconcileResult:
         """Coordinate lifecycle exclusion around stage reconciliation writes."""
 
-        operation_id = f"reconcile:{plan.plan_sha256}:{stage_id}"
-        claim_id = self._acquire_lifecycle(plan, operation_id)
-        try:
-            result = self._reconcile_stage_claimed(plan, stage_id, submit_retry=submit_retry, claim_id=claim_id)
-        except SubmissionUncertain:
-            # The nested submit claim guards Slurm; this metadata-only holder
-            # must not become an unrelated permanent transition blocker.
-            self._release_lifecycle(plan, claim_id)
-            raise
-        except Exception:
-            self._release_lifecycle(plan, claim_id)
-            raise
-        return result
+        # Reconciliation itself is convergent metadata work. Any retry crosses
+        # Slurm through submit_stage's separate lifecycle claim, while deletion
+        # still requires terminal receipts plus synchronized registry state.
+        # Avoiding a long-lived poll claim removes its pre-evidence crash window
+        # without bulk-releasing a concurrent caller.
+        return self._reconcile_stage_claimed(plan, stage_id, submit_retry=submit_retry)
 
     def _reconcile_stage_claimed(
         self,
@@ -599,10 +597,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             job_ids=self._all_recorded_job_ids(plan),
             attempt=(retry_submission.identity.attempt if retry_submission is not None else evidence_attempt),
         )
-        # Convergent evidence makes same-operation orphan holders safe to retire.
-        operation_id = f"reconcile:{plan.plan_sha256}:{stage_id}"
-        reconciliation_claims = self._operation_claim_ids(plan, operation_id, claim_id)
-        registry_synced = self._sync_registry(plan, update, reconciliation_claims)
+        registry_synced = self._sync_registry(plan, update)
         return ReconcileResult(
             decision=decision,
             stage_id=stage_id,

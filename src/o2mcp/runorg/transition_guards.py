@@ -76,7 +76,10 @@ def require_current_terminal_evidence(backend: ExecutionBackend, plan: Execution
     for stage in plan.stages:
         receipt = receipts[stage.stage_id]
         if receipt is None:
-            if action == "archive" and blocked_by_failure(stage.stage_id):
+            # Only after-ok descendants are scheduler-suppressed by an upstream
+            # failure. After-any work is required to run after that failure and
+            # must therefore produce its own authenticated terminal receipt.
+            if action == "archive" and stage.dependency_mode == "afterok" and blocked_by_failure(stage.stage_id):
                 continue
             raise ValueError(f"{action} stage {stage.stage_id} lacks authenticated terminal reconciliation")
         if receipt.decision == RECONCILE_FAILED:

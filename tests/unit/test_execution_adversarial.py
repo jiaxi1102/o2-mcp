@@ -55,6 +55,7 @@ from o2mcp.runorg.execution_paths import (
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_sync import merge_execution_manifest
+from o2mcp.runorg.transition_guards import require_current_terminal_evidence
 
 CAMPAIGN = "adversarial-execution"
 RUN_ID = f"RUN_20260822T010203Z_{CAMPAIGN}__race"
@@ -312,8 +313,8 @@ def test_terminal_replay_retires_claim_abandoned_before_invocation() -> None:
     assert not backend.lifecycle_claims
 
 
-def test_reconciliation_replay_retires_claim_abandoned_before_evidence() -> None:
-    """A later convergent poll retires every same-operation metadata holder."""
+def test_reconciliation_never_creates_a_transition_claim() -> None:
+    """Convergent polling delegates every scheduler mutation to submit_stage."""
 
     backend = ConcurrentBackend()
     plan = _plan()
@@ -326,10 +327,6 @@ def test_reconciliation_replay_retires_claim_abandoned_before_evidence() -> None
     )
     for index in range(3):
         backend.put_receipt(_receipt(f"movie-{index}"))
-
-    operation_id = f"reconcile:{plan.plan_sha256}:compute"
-    abandoned = backend.acquire_lifecycle_claim(plan.paths.run_root, operation_id)
-    assert abandoned is not None
 
     assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
     assert not backend.lifecycle_claims
@@ -1172,6 +1169,40 @@ def test_afterok_requires_authenticated_completion_not_scheduler_exit() -> None:
     assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
     published = engine.submit_stage(plan, "publish")
     assert published.record.dependency_job_ids == (compute.job_id,)
+
+
+@pytest.mark.parametrize(("dependency_mode", "allowed"), (("afterok", True), ("afterany", False)))
+def test_failed_ancestor_suppresses_only_afterok_descendants(
+    dependency_mode: str,
+    allowed: bool,
+) -> None:
+    """Archive still requires terminal evidence from after-any descendants."""
+
+    upstream = _compute_stage()
+    downstream = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode=dependency_mode,
+    )
+    plan = _plan(stages=(upstream, downstream))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    record = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        record.job_id,
+        SlurmTaskState(None, "CANCELLED", 1),
+        *(SlurmTaskState(index, "CANCELLED", 1) for index in range(3)),
+    )
+    assert engine.reconcile_stage(plan, "compute").decision == "FAILED"
+
+    if allowed:
+        require_current_terminal_evidence(backend, plan, "archive")
+    else:
+        with pytest.raises(ValueError, match="audit lacks authenticated terminal"):
+            require_current_terminal_evidence(backend, plan, "archive")
 
 
 def test_malformed_reconciliation_cannot_release_afterok_stage() -> None:

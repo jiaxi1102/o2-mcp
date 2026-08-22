@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import replace
 
 from o2mcp.runorg.execution_evidence import read_submission_invocation_claim_id
@@ -181,35 +182,34 @@ class ExecutionRegistryMixin:
         identity: SubmissionIdentity,
         *known_claim_ids: str | None,
     ) -> tuple[str, ...]:
-        """Collect every holder of a terminally evidenced submit operation.
+        """Collect only explicitly evidenced owners of one submit operation."""
 
-        A process can die after acquiring its claim but before publishing the
-        invocation marker. Once a later caller has a durable record or rejection
-        for the same immutable attempt, every same-operation holder is safe to
-        place in the registry repair outbox and retire together.
+        del plan, identity
+        return tuple(sorted({item for item in known_claim_ids if item}))
+
+    def _release_preinvocation_losers(
+        self,
+        plan: ExecutionPlan,
+        identity: SubmissionIdentity,
+        owner_claim_id: str,
+    ) -> None:
+        """Best-effort retire holders fenced out by an invocation marker.
+
+        The immutable marker names the sole process allowed to call sbatch.
+        Every other same-operation holder is abandoned or must observe the
+        marker and abort before scheduler mutation. Cleanup cannot block the
+        owner from invoking: record/rejection replay retries a lost release.
         """
 
         operation_id = f"submit:{plan.plan_sha256}:{identity.stage_id}:{identity.attempt}"
-        return self._operation_claim_ids(plan, operation_id, *known_claim_ids)
-
-    def _operation_claim_ids(
-        self,
-        plan: ExecutionPlan,
-        operation_id: str,
-        *known_claim_ids: str | None,
-    ) -> tuple[str, ...]:
-        """Collect every holder for a terminally repairable operation.
-
-        Submission and reconciliation both acquire distinct ownership tokens.
-        Once a later caller reaches durable convergent evidence, an older token
-        abandoned before its first evidence write is no longer an active
-        mutation and can safely travel through the registry repair outbox.
-        """
-
         matching = self.backend.matching_lifecycle_claims(plan.paths.run_root, operation_id)
-        values = {item for item in known_claim_ids if item}
-        values.update(matching)
-        return tuple(sorted(values))
+        for claim_id in matching:
+            if claim_id == owner_claim_id:
+                continue
+            # Keep the scheduler owner live even if cleanup's response is lost;
+            # terminal replay can retry this fenced loser safely.
+            with suppress(Exception):
+                self._release_lifecycle(plan, claim_id)
 
     def _release_if_not_invocation_owner(
         self,
@@ -249,6 +249,8 @@ class ExecutionRegistryMixin:
         """
 
         owner_claim_id = read_submission_invocation_claim_id(self.backend, plan, identity)
+        if owner_claim_id is not None:
+            self._release_preinvocation_losers(plan, identity, owner_claim_id)
         for claim_id in self._submission_claim_ids(
             plan,
             identity,
