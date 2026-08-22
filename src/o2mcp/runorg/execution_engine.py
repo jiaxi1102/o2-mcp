@@ -321,10 +321,48 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                         stdout=outcome.stdout,
                         stderr=outcome.stderr,
                     )
-                    self.backend.write_immutable_text(
-                        submission_rejection_path(plan, identity),
-                        canonical_json(rejection.to_dict()),
-                    )
+                    rejection_path = submission_rejection_path(plan, identity)
+                    rejection_text = canonical_json(rejection.to_dict())
+                    try:
+                        self.backend.write_immutable_text(rejection_path, rejection_text)
+                    except Exception as rejection_error:
+                        # A lost write response may still have published the
+                        # exact rejection. Authenticate that case before making
+                        # the invocation identity reusable.
+                        try:
+                            persisted_rejection = self.backend.read_text(rejection_path)
+                        except Exception as read_error:
+                            raise SubmissionUncertain(
+                                f"Slurm rejected {identity.comment}, but durable rejection evidence "
+                                "cannot be observed; invocation remains owned"
+                            ) from read_error
+                        if persisted_rejection == rejection_text:
+                            raise SubmissionRejected(
+                                outcome.stderr.strip() or outcome.stdout.strip() or "sbatch rejected the request"
+                            ) from rejection_error
+                        if persisted_rejection is not None:
+                            raise SubmissionUncertain(
+                                f"Slurm rejected {identity.comment}, but its rejection path contains "
+                                "conflicting evidence; invocation remains owned"
+                            ) from rejection_error
+                        # No rejection bytes and a definitive scheduler response
+                        # prove no job exists. Clear only this caller's exact
+                        # invocation marker; if compare-clear loses a race, keep
+                        # the claim and fail uncertain rather than risk a duplicate.
+                        invocation_text = canonical_json(invocation)
+                        if not self.backend.compare_and_swap_text(
+                            invocation_path,
+                            invocation_text,
+                            None,
+                        ):
+                            raise SubmissionUncertain(
+                                f"Slurm rejected {identity.comment}, but its exact invocation marker "
+                                "could not be recovered"
+                            ) from rejection_error
+                        raise RuntimeError(
+                            f"Slurm rejected {identity.comment}, but rejection evidence publication "
+                            "failed before becoming durable; retry this same attempt"
+                        ) from rejection_error
                     raise SubmissionRejected(
                         outcome.stderr.strip() or outcome.stdout.strip() or "sbatch rejected the request"
                     )

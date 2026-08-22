@@ -447,6 +447,70 @@ def test_rejection_replay_retires_original_owner_after_lost_release() -> None:
     assert not backend.lifecycle_claims
 
 
+def test_failed_rejection_publication_recovers_exact_invocation_for_same_attempt() -> None:
+    """A pre-create rejection write failure cannot permanently poison the run."""
+
+    class FailFirstRejectionWrite(ConcurrentBackend):
+        """Raise before publishing the first definitive-rejection receipt."""
+
+        failed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if "/submission-rejections/compute/attempt-001.json" in path and not self.failed:
+                self.failed = True
+                raise OSError("injected rejection write failure")
+            return super().write_immutable_text(path, text)
+
+    backend = FailFirstRejectionWrite()
+    backend.outcomes.append(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="invalid qos"))
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+
+    with pytest.raises(RuntimeError, match="retry this same attempt"):
+        engine.submit_stage(plan, "compute")
+
+    assert not any("submission-invocations/compute/attempt-001" in path for path in backend.files)
+    assert not backend.lifecycle_claims
+
+    recovered = engine.submit_stage(plan, "compute")
+
+    assert recovered.record.identity.attempt == 1
+    assert recovered.record.job_id == "9000"
+    assert len(backend.requests) == 2
+    assert len(backend.jobs) == 1
+    assert not backend.lifecycle_claims
+
+
+def test_lost_rejection_write_response_preserves_durable_rejection() -> None:
+    """An exception after create must not make a rejected attempt reusable."""
+
+    class LoseFirstRejectionResponse(ConcurrentBackend):
+        """Publish exact rejection bytes, then lose the creator's response."""
+
+        failed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            created = super().write_immutable_text(path, text)
+            if "/submission-rejections/compute/attempt-001.json" in path and not self.failed:
+                self.failed = True
+                raise OSError("injected lost rejection response")
+            return created
+
+    backend = LoseFirstRejectionResponse()
+    backend.outcomes.append(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="invalid qos"))
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+
+    with pytest.raises(SubmissionRejected, match="invalid qos"):
+        engine.submit_stage(plan, "compute")
+    with pytest.raises(SubmissionRejected, match="definitively rejected"):
+        engine.submit_stage(plan, "compute")
+
+    assert len(backend.requests) == 1
+    assert not backend.jobs
+    assert not backend.lifecycle_claims
+
+
 def test_run_root_is_immutably_bound_to_one_complete_plan() -> None:
     """Disjoint stage paths cannot let a second plan reuse a registered run."""
 
