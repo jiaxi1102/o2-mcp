@@ -107,6 +107,7 @@ async def test_register_wires_all_runorg_tools(tmp_path):
         "o2_run_classify",
         "o2_run_promote",
         "o2_run_archive",
+        "o2_run_transition_recover",
         "o2_run_gc",
     }
     assert tl["o2_run_archive"].annotations.destructiveHint is True
@@ -137,7 +138,7 @@ def test_classify_tool_defaults_to_grouped_layout():
 @pytest.mark.anyio
 async def test_transition_ok_reflects_started():
     """promote/archive report ok from plan.started for real runs; dry-run is always ok."""
-    from o2mcp.runorg.executor import TransitionPlan
+    from o2mcp.runorg.transition_executor import TransitionPlan
 
     class _Plans:
         def __init__(self, started):

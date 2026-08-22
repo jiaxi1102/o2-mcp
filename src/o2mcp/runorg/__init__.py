@@ -14,7 +14,30 @@ dependency) and are registered by a consumer onto its own FastMCP server.
 
 from __future__ import annotations
 
-from o2mcp.runorg.executor import O2Runs, TransitionPlan
+from o2mcp.runorg.execution_backend import ExecutionBackend, O2ExecutionBackend
+from o2mcp.runorg.execution_engine import ExecutionEngine, RegistrySynchronizer
+from o2mcp.runorg.execution_models import (
+    ACCEPTED,
+    DEFINITELY_NOT_INVOKED,
+    DEFINITELY_REJECTED,
+    INVOKED_OUTCOME_UNKNOWN,
+    DuplicateSubmissionError,
+    ReceiptObservation,
+    ReconcileResult,
+    RegistryUpdate,
+    SlurmJob,
+    SlurmTaskState,
+    SubmissionIdentity,
+    SubmissionRecord,
+    SubmissionRejected,
+    SubmissionRejectionRecord,
+    SubmissionRequest,
+    SubmissionResult,
+    SubmissionUncertain,
+    SubmitOutcome,
+    TaskAttemptReceipt,
+)
+from o2mcp.runorg.executor import O2RunRegistrySynchronizer, O2Runs, RunPreparationError
 from o2mcp.runorg.plans import (
     DEPENDENCY_MODES,
     EXECUTION_PLAN_SCHEMA_VERSION,
@@ -36,6 +59,7 @@ from o2mcp.runorg.policy import (
     GENERIC_POLICY,
     RunPolicy,
 )
+from o2mcp.runorg.prepared import PreparedRunIdentity
 from o2mcp.runorg.runs import (
     RETENTION_AUTO,
     RETENTION_KEEP,
@@ -60,10 +84,37 @@ from o2mcp.runorg.runs import (
     registry_line,
     variant_of,
 )
+from o2mcp.runorg.transition_executor import TransitionPlan
 
 __all__ = [
+    "ACCEPTED",
+    "DEFINITELY_NOT_INVOKED",
+    "DEFINITELY_REJECTED",
+    "INVOKED_OUTCOME_UNKNOWN",
     "O2Runs",
+    "O2RunRegistrySynchronizer",
+    "RunPreparationError",
     "TransitionPlan",
+    "PreparedRunIdentity",
+    "ExecutionEngine",
+    "ExecutionBackend",
+    "O2ExecutionBackend",
+    "RegistrySynchronizer",
+    "SubmissionIdentity",
+    "SubmissionRequest",
+    "SubmissionRecord",
+    "SubmissionRejectionRecord",
+    "SubmissionRejected",
+    "SubmissionResult",
+    "SubmitOutcome",
+    "SubmissionUncertain",
+    "DuplicateSubmissionError",
+    "TaskAttemptReceipt",
+    "ReceiptObservation",
+    "SlurmJob",
+    "SlurmTaskState",
+    "ReconcileResult",
+    "RegistryUpdate",
     "ExecutionPlan",
     "DatasetIdentity",
     "CanonicalPaths",
