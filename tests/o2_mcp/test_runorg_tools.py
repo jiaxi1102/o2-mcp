@@ -107,6 +107,7 @@ async def test_register_wires_all_runorg_tools(tmp_path):
         "o2_run_classify",
         "o2_run_promote",
         "o2_run_archive",
+        "o2_run_transition_recover",
         "o2_run_gc",
     }
     assert tl["o2_run_archive"].annotations.destructiveHint is True
