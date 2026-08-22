@@ -191,6 +191,42 @@ for a macOS Unix socket; the default satisfies those constraints.
 | `o2_workspace_gc` | Prune regenerable + redundant disk (detached, dry-run default) | **destructive** |
 | `o2_place` | Resolve the canonical output path for a kind (+project) per tier | read-only |
 
+## Authenticated execution-plan contract
+
+`o2mcp.runorg` includes a project-neutral, immutable `ExecutionPlan` contract for
+pipelines that need stronger provenance than a standalone `sbatch` script.  A
+plan binds:
+
+- project, campaign, pipeline, registered run, source-commit, and source-bundle
+  identities;
+- dataset IDs, reviewed manifest digests, and optional independently generated
+  storage-binding digests;
+- absolute run/work/results/receipt/log/promotion paths;
+- an acyclic stage graph, signed `afterok`/`afterany` dependency semantics,
+  optional stable array tasks, and exact per-stage or per-task argv vectors;
+- absolute executables and working directories plus authenticated runtime
+  fingerprints and a clean environment containing only explicit non-secret
+  values;
+- bounded Slurm resources and retry policies; and
+- every stage- and task-level receipt expected below the run's canonical receipt
+  tree.
+
+Plans are frozen dataclass object graphs.  `ExecutionPlan.to_json()` writes a
+self-checksummed envelope whose `plan_sha256` is derived from compact, canonical
+JSON; `ExecutionPlan.from_json()` rejects digest drift, duplicate JSON members,
+unsupported fields, malformed paths, unbounded retries, duplicate receipts, and
+cyclic or incomplete dependencies.  Supplying the independently reviewed digest
+as `expected_plan_sha256` authenticates the plan at a submission boundary; the
+unkeyed digest embedded in the file is only an integrity check. Set-like
+collections are canonicalized before hashing, so renderer insertion order cannot
+change the idempotency key.
+
+This contract is intentionally execution-only: GEM, clock, and future pipeline
+repositories still render their scientific commands and define their own QC and
+release criteria.  The initial contract does not migrate or submit any existing
+pipeline; idempotent Slurm submission and receipt reconciliation build on this
+authenticated plan in the next run-organization layer.
+
 ### Non-blocking transfers
 
 `o2_push_async` / `o2_pull_async` launch a detached rsync and return a `transfer_id` right
