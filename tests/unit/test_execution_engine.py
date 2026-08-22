@@ -39,6 +39,7 @@ from o2mcp.runorg.execution_models import (
     RECONCILE_RETRY_SUBMITTED,
 )
 from o2mcp.runorg.execution_paths import pending_registry_path
+from o2mcp.runorg.lifecycle_coordination import new_claim_id
 
 CAMPAIGN = "execution-canary"
 RUN_ID = f"RUN_20260822T010203Z_{CAMPAIGN}__fault-test"
@@ -57,6 +58,8 @@ class FakeExecutionBackend:
         self.hide_next_submitted_job = False
         self.intent_present_at_submit: list[bool] = []
         self.lifecycle_claims: set[str] = set()
+        self.lifecycle_release_attempts: list[str] = []
+        self.fail_lifecycle_release_once = False
         self.transition_marked = False
 
     def find_jobs(self, comment: str):
@@ -148,18 +151,23 @@ class FakeExecutionBackend:
             self.files[path] = replacement
         return True
 
-    def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> bool:
-        """Model the sibling transition/claim exclusion used in production."""
+    def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> str | None:
+        """Model one distinct holder claim per concurrent engine caller."""
 
         if self.transition_marked:
-            return False
-        self.lifecycle_claims.add(operation_id)
-        return True
+            return None
+        claim_id = new_claim_id(operation_id)
+        self.lifecycle_claims.add(claim_id)
+        return claim_id
 
-    def release_lifecycle_claim(self, _run_root: str, operation_id: str) -> None:
-        """Release exactly one converged operation claim."""
+    def release_lifecycle_claim(self, _run_root: str, claim_id: str) -> None:
+        """Release exactly one converged holder claim."""
 
-        self.lifecycle_claims.discard(operation_id)
+        self.lifecycle_release_attempts.append(claim_id)
+        if self.fail_lifecycle_release_once:
+            self.fail_lifecycle_release_once = False
+            raise RuntimeError("injected lifecycle release failure")
+        self.lifecycle_claims.discard(claim_id)
 
 
 @dataclass
@@ -326,18 +334,68 @@ def test_lost_response_with_accounting_delay_keeps_replays_query_only() -> None:
     with pytest.raises(RuntimeError, match="no matching job is visible"):
         engine.submit_stage(plan, "analyze")
     assert len(backend.jobs) == 1 and len(backend.requests) == 1
+    assert len(backend.lifecycle_claims) == 1
 
     # The second call sees the pre-submit intent and performs only the scheduler
     # query.  It must not call sbatch while accounting visibility is delayed.
     with pytest.raises(RuntimeError, match="query again"):
         engine.submit_stage(plan, "analyze")
     assert len(backend.jobs) == 1 and len(backend.requests) == 1
+    # The observer never crossed sbatch, so only the invocation owner's holder
+    # remains while scheduler visibility is delayed.
+    assert len(backend.lifecycle_claims) == 1
 
     backend.reveal_jobs()
     recovered = engine.submit_stage(plan, "analyze")
     assert recovered.record.recovered is True
     assert recovered.record.job_id == "8000"
     assert len(backend.jobs) == 1 and len(backend.requests) == 1
+    assert not backend.lifecycle_claims
+
+
+def test_accepted_job_record_failure_retains_owner_until_replay_converges() -> None:
+    """Post-sbatch evidence failure cannot expose transition or leak its owner."""
+
+    class FailFirstRecord(FakeExecutionBackend):
+        failed = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if "/submissions/" in path and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected canonical record failure")
+            return super().write_immutable_text(path, text)
+
+    backend = FailFirstRecord()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    with pytest.raises(RuntimeError, match="canonical record failure"):
+        engine.submit_stage(plan, "analyze")
+    assert len(backend.jobs) == 1 and len(backend.lifecycle_claims) == 1
+
+    recovered = engine.submit_stage(plan, "analyze")
+    assert recovered.record.job_id == "8000"
+    assert len(backend.requests) == 1
+    assert not backend.lifecycle_claims
+
+
+def test_lost_invocation_marker_write_response_retains_actual_owner_claim() -> None:
+    """A successful marker create with a lost response is not a losing caller."""
+
+    class LoseMarkerResponse(FakeExecutionBackend):
+        lost = False
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            created = super().write_immutable_text(path, text)
+            if created and "/submission-invocations/" in path and not self.lost:
+                self.lost = True
+                raise RuntimeError("lost invocation-marker create response")
+            return created
+
+    backend = LoseMarkerResponse()
+    with pytest.raises(SubmissionUncertain, match="already owned"):
+        ExecutionEngine(backend).submit_stage(_plan(), "analyze")
+    assert not backend.requests and not backend.jobs
+    assert len(backend.lifecycle_claims) == 1
 
 
 def test_zero_based_array_and_comment_are_rendered_exactly() -> None:
@@ -508,6 +566,31 @@ def test_registry_write_failure_reconciles_without_resubmission() -> None:
     assert len(backend.jobs) == 1
 
 
+def test_immediate_sync_release_failure_keeps_outbox_until_claim_is_repaired() -> None:
+    """Outbox bytes survive until exact lifecycle-owner retirement succeeds."""
+
+    backend = FakeExecutionBackend()
+    backend.fail_lifecycle_release_once = True
+    registry = FakeRegistry()
+    engine = ExecutionEngine(backend, registry)
+    plan = _plan()
+
+    submitted = engine.submit_stage(plan, "analyze")
+    pending_path = pending_registry_path(plan, "analyze", 1)
+    assert not submitted.registry_synced
+    assert pending_path in backend.files
+    assert len(backend.lifecycle_claims) == 1
+    original_claim = next(iter(backend.lifecycle_claims))
+    assert backend.lifecycle_release_attempts.count(original_claim) == 1
+
+    assert engine.reconcile_registry(plan)
+    assert pending_path not in backend.files
+    assert not backend.lifecycle_claims
+    # Exactly one failed immediate release and one repaired release occurred;
+    # the submit caller never performed a second unconditional release.
+    assert backend.lifecycle_release_attempts.count(original_claim) == 2
+
+
 def test_retry_bound_and_nonretryable_failure_fail_closed() -> None:
     """The engine neither exceeds max_attempts nor retries unsigned failures."""
 
@@ -550,6 +633,33 @@ def test_retry_bound_and_nonretryable_failure_fail_closed() -> None:
     failed = second_engine.reconcile_stage(second_plan, "analyze")
     assert failed.decision == RECONCILE_FAILED
     assert len(second_backend.jobs) == 1
+
+
+def test_uncertain_retry_submission_does_not_leak_reconcile_holder() -> None:
+    """Only the nested invocation owner survives a lost retry submission reply."""
+
+    backend = FakeExecutionBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+    first = engine.submit_stage(plan, "analyze").record
+    backend.set_states(
+        first.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        *(SlurmTaskState(index, "NODE_FAIL", 1) for index in range(3)),
+    )
+    backend.lose_next_submit_response = True
+    backend.hide_next_submitted_job = True
+
+    with pytest.raises(SubmissionUncertain):
+        engine.reconcile_stage(plan, "analyze")
+    # The reconciliation wrapper is metadata-only. Its claim is released while
+    # the nested retry invocation owner alone guards the uncertain scheduler job.
+    assert len(backend.lifecycle_claims) == 1
+
+    backend.reveal_jobs()
+    recovered = engine.reconcile_stage(plan, "analyze")
+    assert recovered.decision == RECONCILE_RETRY_SUBMITTED
+    assert not backend.lifecycle_claims
 
 
 def test_duplicate_scheduler_identity_fails_before_receipt_write() -> None:

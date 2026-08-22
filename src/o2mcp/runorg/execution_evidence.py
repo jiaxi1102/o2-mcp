@@ -7,6 +7,9 @@ from accidentally treating malformed, foreign, or incomplete files as proof.
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 from o2mcp.runorg.execution_backend import ExecutionBackend, receipt_matches
 from o2mcp.runorg.execution_models import (
     RECONCILE_RETRY,
@@ -20,12 +23,15 @@ from o2mcp.runorg.execution_models import (
 from o2mcp.runorg.execution_paths import (
     reconciler_followup_path,
     reconciliation_path,
+    submission_intent_path,
+    submission_invocation_path,
     submission_record_path,
     submission_rejection_path,
     task_attempt_path,
 )
 from o2mcp.runorg.execution_reconcile import is_retryable
 from o2mcp.runorg.execution_rendering import select_tasks
+from o2mcp.runorg.lifecycle_coordination import claim_name
 from o2mcp.runorg.plan_stages import StageSpec
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.reconciliation_receipts import ReconciliationReceipt
@@ -149,6 +155,65 @@ def read_submission_rejection(backend: ExecutionBackend, path: str) -> Submissio
         return SubmissionRejectionRecord.from_dict(value)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid immutable submission rejection: {path}") from exc
+
+
+def read_submission_invocation_claim_id(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    expected_identity: SubmissionIdentity,
+) -> str | None:
+    """Authenticate an invocation marker and return its exact holder claim.
+
+    The marker is the durable bridge between an uncertain ``sbatch`` call and a
+    later scheduler recovery. Carrying its holder identity into the registry
+    outbox lets that recovery retire the original caller's claim without ever
+    touching a concurrent caller's distinct ownership.
+    """
+
+    path = submission_invocation_path(plan, expected_identity)
+    text = backend.read_text(path)
+    if text is None:
+        return None
+    value = strict_json_object(text, "submission invocation")
+    expected = {
+        "attempt",
+        "comment",
+        "intent_sha256",
+        "lifecycle_claim_id",
+        "plan_sha256",
+        "schema_version",
+        "stage_id",
+    }
+    if set(value) != expected:
+        raise ValueError("submission invocation has unsupported fields")
+    claim_id = value["lifecycle_claim_id"]
+    intent_text = backend.read_text(submission_intent_path(plan, expected_identity))
+    expected_operation = (
+        f"submit:{expected_identity.plan_sha256}:{expected_identity.stage_id}:{expected_identity.attempt}"
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["attempt"]) is not int
+        or value["attempt"] != expected_identity.attempt
+        or value["comment"] != expected_identity.comment
+        or value["plan_sha256"] != expected_identity.plan_sha256
+        or value["stage_id"] != expected_identity.stage_id
+        or type(value["intent_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["intent_sha256"]) is None
+        or intent_text is None
+        or value["intent_sha256"] != hashlib.sha256(intent_text.encode()).hexdigest()
+        or type(claim_id) is not str
+    ):
+        raise ValueError("submission invocation is malformed or foreign")
+    # Empty claim IDs are retained solely for lightweight test backends that do
+    # not implement lifecycle coordination. Production IDs must pass the same
+    # filename validator used by acquire/release commands.
+    if claim_id:
+        claim_name(claim_id)
+        if not claim_id.startswith(hashlib.sha256(expected_operation.encode()).hexdigest() + "-"):
+            raise ValueError("submission invocation claim belongs to another operation")
+    return claim_id
 
 
 def read_strict_json(backend: ExecutionBackend, path: str, label: str) -> dict[str, object]:

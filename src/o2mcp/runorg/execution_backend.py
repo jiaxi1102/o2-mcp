@@ -30,7 +30,7 @@ from o2mcp.runorg.execution_models import (
     SubmitOutcome,
 )
 from o2mcp.runorg.execution_remote_fs import remote_fs_command
-from o2mcp.runorg.lifecycle_coordination import coordination_command
+from o2mcp.runorg.lifecycle_coordination import coordination_command, new_claim_id
 from o2mcp.runorg.plan_components import ReceiptSpec
 from o2mcp.runorg.strict_json import strict_json_object
 from o2mcp.slurm import O2Slurm
@@ -72,11 +72,11 @@ class ExecutionBackend(Protocol):
     def compare_and_swap_text(self, path: str, expected: str | None, replacement: str | None) -> bool:
         """Atomically replace/remove ``path`` only when exact current bytes match."""
 
-    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> bool:
-        """Exclude lifecycle transition marking before a control mutation."""
+    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> str | None:
+        """Return an exact holder claim, or ``None`` when transition has won."""
 
-    def release_lifecycle_claim(self, run_root: str, operation_id: str) -> None:
-        """Release an exact claim after its durable boundary is complete."""
+    def release_lifecycle_claim(self, run_root: str, claim_id: str) -> None:
+        """Release one exact holder claim after durable convergence."""
 
 
 class O2ExecutionBackend:
@@ -401,21 +401,22 @@ print(json.dumps(response, sort_keys=True))
             raise RuntimeError(f"mutable CAS returned invalid result for {path}: {outcome!r}")
         return outcome == "SWAPPED"
 
-    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> bool:
-        """Atomically claim mutation rights unless a transition is marked."""
+    def acquire_lifecycle_claim(self, run_root: str, operation_id: str) -> str | None:
+        """Atomically create distinct holder ownership unless transition won."""
 
-        result = self.connection.run(coordination_command("acquire", run_root, operation_id), timeout=60)
+        claim_id = new_claim_id(operation_id)
+        result = self.connection.run(coordination_command("acquire", run_root, claim_id), timeout=60)
         if not result.ok:
             raise RuntimeError(f"lifecycle claim failed: {result.stderr.strip()}")
         outcome = result.stdout.strip()
         if outcome not in {"ACQUIRED", "TRANSITION"}:
             raise RuntimeError(f"invalid lifecycle claim response: {outcome!r}")
-        return outcome == "ACQUIRED"
+        return claim_id if outcome == "ACQUIRED" else None
 
-    def release_lifecycle_claim(self, run_root: str, operation_id: str) -> None:
-        """Remove the exact operation claim under the shared coordination lock."""
+    def release_lifecycle_claim(self, run_root: str, claim_id: str) -> None:
+        """Remove only the exact holder claim named by its ownership token."""
 
-        result = self.connection.run(coordination_command("release", run_root, operation_id), timeout=60)
+        result = self.connection.run(coordination_command("release", run_root, claim_id), timeout=60)
         if not result.ok or result.stdout.strip() != "RELEASED":
             raise RuntimeError(f"lifecycle claim release failed: {result.stderr.strip()}")
 

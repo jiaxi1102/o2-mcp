@@ -31,6 +31,7 @@ from o2mcp.runorg import (
 from o2mcp.runorg.execution_models import ACCEPTED, PlannedTask, SubmissionRequest, TaskAttemptReceipt, canonical_json
 from o2mcp.runorg.execution_paths import pending_registry_path, submission_record_path, task_attempt_path
 from o2mcp.runorg.execution_rendering import render_dispatcher
+from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_outbox import merge_registry_updates
 
 RUN_ID = "RUN_20260822T010203Z_hardening__canary"
@@ -45,6 +46,7 @@ class Backend:
         self.jobs: dict[str, dict[str, object]] = {}
         self.requests: list[SubmissionRequest] = []
         self.next_job = 7100
+        self.lifecycle_claims: set[str] = set()
 
     def find_jobs(self, comment: str):
         return tuple(
@@ -100,6 +102,18 @@ class Backend:
         else:
             self.files[path] = replacement
         return True
+
+    def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> str | None:
+        """Return one holder ID for this single-threaded backend."""
+
+        claim_id = new_claim_id(operation_id)
+        self.lifecycle_claims.add(claim_id)
+        return claim_id
+
+    def release_lifecycle_claim(self, _run_root: str, claim_id: str) -> None:
+        """Release only the holder ID supplied by the engine."""
+
+        self.lifecycle_claims.discard(claim_id)
 
 
 @dataclass

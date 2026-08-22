@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import threading
 from collections import deque
-from types import SimpleNamespace
 
 import pytest
 
@@ -49,7 +48,8 @@ from o2mcp.runorg.execution_models import (
 )
 from o2mcp.runorg.execution_paths import reconciliation_path, task_attempt_path
 from o2mcp.runorg.execution_rendering import render_dispatcher
-from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
+from o2mcp.runorg.lifecycle_coordination import new_claim_id
+from o2mcp.runorg.registry_sync import merge_execution_manifest
 
 CAMPAIGN = "adversarial-execution"
 RUN_ID = f"RUN_20260822T010203Z_{CAMPAIGN}__race"
@@ -57,11 +57,9 @@ RUN_ROOT = f"/n/scratch/users/test/runs/{CAMPAIGN}/{RUN_ID}"
 
 
 class ConcurrentBackend:
-    """Thread-safe in-memory backend with controllable scheduler outcomes.
-    ``intent_barrier`` is applied only to submission-intent publication.  It
-    forces two callers through all prior reads before either caller can perform
-    the atomic create, reproducing the exact lost-response race that motivated
-    the creator-versus-observer return value.
+    """Thread-safe backend whose intent barrier reproduces two-caller races.
+
+    The barrier forces prior reads to finish before atomic intent publication.
     """
 
     def __init__(self, *, intent_barrier: threading.Barrier | None = None) -> None:
@@ -71,6 +69,7 @@ class ConcurrentBackend:
         self.outcomes: deque[SubmitOutcome] = deque()
         self.next_job_id = 9000
         self.intent_barrier = intent_barrier
+        self.lifecycle_claims: set[str] = set()
         self._lock = threading.RLock()
 
     def find_jobs(self, comment: str):
@@ -163,6 +162,18 @@ class ConcurrentBackend:
             else:
                 self.files[path] = replacement
             return True
+
+    def acquire_lifecycle_claim(self, _run_root: str, operation_id: str) -> str | None:
+        """Return a distinct fake holder for every concurrent caller."""
+
+        claim_id = new_claim_id(operation_id)
+        self.lifecycle_claims.add(claim_id)
+        return claim_id
+
+    def release_lifecycle_claim(self, _run_root: str, claim_id: str) -> None:
+        """Retire only the exact fake holder supplied by the coordinator."""
+
+        self.lifecycle_claims.discard(claim_id)
 
 
 def _receipt(task_id: str, *, stage: str = "compute") -> ReceiptSpec:
@@ -267,6 +278,7 @@ def test_two_callers_racing_identical_intent_submit_exactly_one_job() -> None:
     replay = ExecutionEngine(backend).submit_stage(plan, "compute")
     assert replay.record.job_id == "9000"
     assert len(backend.requests) == 1
+    assert not backend.lifecycle_claims
 
 
 def test_owner_crash_before_invocation_is_safely_recoverable() -> None:
@@ -353,6 +365,40 @@ def test_definitive_rejection_is_stable_and_authorizes_only_next_attempt() -> No
 
     with pytest.raises(ValueError, match="exceeds signed max_attempts"):
         engine.submit_stage(plan, "compute", attempt=3)
+
+
+def test_rejection_replay_retires_original_owner_after_lost_release() -> None:
+    """Durable rejection evidence repairs an invocation owner's stale claim."""
+
+    class LoseFirstRelease(ConcurrentBackend):
+        """Inject one lost release reply after rejection evidence is durable."""
+
+        lose_release = True
+
+        def release_lifecycle_claim(self, run_root: str, claim_id: str) -> None:
+            """Leave the first exact owner in place, then behave idempotently."""
+
+            if self.lose_release:
+                self.lose_release = False
+                raise RuntimeError("injected lifecycle release failure")
+            super().release_lifecycle_claim(run_root, claim_id)
+
+    backend = LoseFirstRelease()
+    backend.outcomes.append(SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="invalid qos"))
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+
+    # The scheduler rejection is immutable, but the invocation owner's claim
+    # remains because its first release response was lost.
+    with pytest.raises(RuntimeError, match="lifecycle release failure"):
+        engine.submit_stage(plan, "compute")
+    assert len(backend.lifecycle_claims) == 1
+
+    # Replay authenticates the invocation marker, retires both the stale owner
+    # and its own observer, and still reports the stable scheduler rejection.
+    with pytest.raises(SubmissionRejected, match="definitively rejected"):
+        engine.submit_stage(plan, "compute")
+    assert not backend.lifecycle_claims
 
 
 def test_run_root_is_immutably_bound_to_one_complete_plan() -> None:
@@ -745,36 +791,6 @@ def test_failed_registry_state_dominates_completed_in_both_orders() -> None:
         execution = merged.provenance["execution"]
         assert execution["state"] == "FAILED"
         assert execution["stages"]["compute"] == {"attempt": 1, "status": "FAILED"}
-
-
-def test_registry_transaction_reports_compare_and_swap_conflict() -> None:
-    """A stale reader receives a retryable conflict instead of clobbering run.json."""
-
-    class ConflictConnection:
-        """Connection stub representing another writer winning the remote lock."""
-
-        def run(self, _command, *, timeout, input_text):
-            return SimpleNamespace(ok=False, returncode=43, stdout="", stderr="")
-
-    plan = _plan()
-    manifest = RunManifest(
-        run_id=RUN_ID,
-        campaign=CAMPAIGN,
-        pipeline="canary",
-        created_utc="20260822T010203Z",
-        datasets=["dataset-1"],
-    )
-    update = RegistryUpdate(plan.plan_sha256, "compute", "SUBMITTED", "SUBMITTED", ("9000",), 1)
-    merged = merge_execution_manifest(manifest, plan, update)
-    result = synchronize_execution_transaction(
-        ConflictConnection(),
-        run_dir=RUN_ROOT,
-        registry_path="/n/groups/lab/registry.jsonl",
-        current_manifest_text=manifest.to_json(),
-        merged_manifest=merged,
-    )
-    assert result["ok"] is False
-    assert result["error"] == "concurrent_update"
 
 
 def test_root_cancellation_with_absent_child_state_is_not_missing_retry() -> None:

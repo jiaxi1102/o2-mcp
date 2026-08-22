@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -12,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 from o2mcp.runorg.execution_backend import O2ExecutionBackend
-from o2mcp.runorg.execution_models import SubmissionRecord
-from o2mcp.runorg.lifecycle_coordination import coordination_root
+from o2mcp.runorg.execution_models import RegistryUpdate, SubmissionRecord
+from o2mcp.runorg.lifecycle_coordination import claim_name, coordination_root
 from o2mcp.runorg.registry_outbox import decode_registry_update
 from o2mcp.runorg.runs import RunManifest
 from o2mcp.runorg.strict_json import strict_json_object
@@ -93,6 +94,10 @@ def test_control_record_exact_types_reject_bool_float_and_string_coercion() -> N
     with pytest.raises(ValueError, match="schema_version"):
         RunManifest.from_json(json.dumps(manifest))
 
+    claim_id = "a" * 64 + "-" + "b" * 64
+    with pytest.raises(ValueError, match="cannot contain duplicates"):
+        RegistryUpdate("c" * 64, "stage", "SUBMITTED", "SUBMITTED", ("1",), 1, (claim_id, claim_id))
+
 
 def test_remote_control_fs_rejects_symlink_ancestors_and_nonregular_leaves(tmp_path) -> None:
     """No-follow/nonblocking checks prevent redirection and FIFO hangs."""
@@ -154,11 +159,52 @@ def test_submission_claim_and_transition_marker_have_one_atomic_winner(tmp_path)
         except ValueError:
             transition_result = None
 
-    assert (claim_result, transition_result is not None) in {(True, False), (False, True)}
-    if claim_result:
-        backend.release_lifecycle_claim(run_root, "submit:stage:1")
+    assert (claim_result is not None, transition_result is not None) in {(True, False), (False, True)}
+    if claim_result is not None:
+        backend.release_lifecycle_claim(run_root, claim_result)
     else:
         rollback_transition(connection, run_root, token)
+
+
+def test_identical_operations_hold_distinct_claims_until_each_owner_releases(tmp_path) -> None:
+    """One caller cannot expose transition while an identical caller is active."""
+
+    connection = LocalConnection()
+    backend = O2ExecutionBackend(connection)
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_same__operation")
+    os.makedirs(os.path.join(run_root, "receipts", "execution"))
+
+    first = backend.acquire_lifecycle_claim(run_root, "reconcile:plan:stage")
+    second = backend.acquire_lifecycle_claim(run_root, "reconcile:plan:stage")
+    assert first is not None and second is not None and first != second
+
+    backend.release_lifecycle_claim(run_root, first)
+    with pytest.raises(ValueError, match="execution mutation claims are still active"):
+        begin_transition(connection, run_root, "a" * 64)
+
+    backend.release_lifecycle_claim(run_root, second)
+    boundary = begin_transition(connection, run_root, "b" * 64)
+    assert boundary.job_ids == ()
+    rollback_transition(connection, run_root, "b" * 64)
+
+
+def test_claim_release_rejects_duplicate_key_ownership_evidence(tmp_path) -> None:
+    """Tampered claim JSON cannot collapse duplicate ownership keys on release."""
+
+    backend = O2ExecutionBackend(LocalConnection())
+    run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_claim__strict")
+    claim_id = backend.acquire_lifecycle_claim(run_root, "submit:plan:stage:1")
+    assert claim_id is not None
+    path = os.path.join(coordination_root(run_root), claim_name(claim_id))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f'{{"claim_id":"foreign","claim_id":"{claim_id}"}}')
+
+    with pytest.raises(RuntimeError, match="duplicate claim key"):
+        backend.release_lifecycle_claim(run_root, claim_id)
+
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"claim_id": claim_id}, handle, sort_keys=True)
+    backend.release_lifecycle_claim(run_root, claim_id)
 
 
 def test_unresolved_invocation_blocks_transition_even_without_registry_job_id(tmp_path) -> None:
@@ -168,8 +214,22 @@ def test_unresolved_invocation_blocks_transition_even_without_registry_job_id(tm
     run_root = str(tmp_path / "campaign" / "RUN_20260822T010203Z_orphan__one")
     invocation_dir = os.path.join(run_root, "receipts", "execution", "submission-invocations", "stage")
     os.makedirs(invocation_dir)
+    plan_sha256 = "a" * 64
+    operation = f"submit:{plan_sha256}:stage:1"
+    claim_id = hashlib.sha256(operation.encode()).hexdigest() + "-" + "b" * 64
     with open(os.path.join(invocation_dir, "attempt-001.json"), "w", encoding="utf-8") as handle:
-        json.dump({"comment": f"o2plan:v1:{'a' * 64}:stage:a001"}, handle)
+        json.dump(
+            {
+                "attempt": 1,
+                "comment": f"o2plan:v1:{plan_sha256}:stage:a001",
+                "intent_sha256": "c" * 64,
+                "lifecycle_claim_id": claim_id,
+                "plan_sha256": plan_sha256,
+                "schema_version": 1,
+                "stage_id": "stage",
+            },
+            handle,
+        )
 
     with pytest.raises(ValueError, match="unresolved sbatch invocation"):
         begin_transition(connection, run_root, "e" * 64)

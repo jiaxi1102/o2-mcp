@@ -38,12 +38,18 @@ def decode_registry_update(text: str, *, label: str = "pending registry update")
         "attempt",
         "execution_status",
         "job_ids",
+        "lifecycle_claim_ids",
         "plan_sha256",
         "stage_id",
         "stage_status",
     }
+    # Accept pre-ownership outboxes during a rolling upgrade, but continue to
+    # reject every unknown field rather than silently weakening the wire schema.
+    if "lifecycle_claim_ids" not in value:
+        expected.remove("lifecycle_claim_ids")
     exact_object(value, expected, label)
     jobs = exact_list(value["job_ids"], f"{label} job_ids")
+    claims = exact_list(value.get("lifecycle_claim_ids", []), f"{label} lifecycle_claim_ids")
     return RegistryUpdate(
         plan_sha256=exact_str(value["plan_sha256"], f"{label} plan_sha256"),
         stage_id=exact_str(value["stage_id"], f"{label} stage_id"),
@@ -51,6 +57,7 @@ def decode_registry_update(text: str, *, label: str = "pending registry update")
         execution_status=exact_str(value["execution_status"], f"{label} execution_status"),
         job_ids=tuple(exact_str(item, f"{label} job_id") for item in jobs),
         attempt=exact_int(value["attempt"], f"{label} attempt"),
+        lifecycle_claim_ids=tuple(exact_str(item, f"{label} lifecycle claim_id") for item in claims),
     )
 
 
@@ -79,6 +86,7 @@ def merge_registry_updates(current: RegistryUpdate | None, incoming: RegistryUpd
         # byte-deterministic across processes regardless of Python set order.
         job_ids=tuple(sorted(set(current.job_ids) | set(incoming.job_ids), key=int)),
         attempt=incoming.attempt,
+        lifecycle_claim_ids=tuple(sorted(set(current.lifecycle_claim_ids) | set(incoming.lifecycle_claim_ids))),
     )
 
 

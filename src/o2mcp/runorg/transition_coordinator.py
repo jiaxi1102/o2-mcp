@@ -26,7 +26,7 @@ class TransitionBoundary:
 
 
 _BEGIN_PROGRAM = r"""
-import fcntl, glob, json, os, stat, sys, tempfile
+import fcntl, glob, hashlib, json, os, stat, sys, tempfile
 run_root, coordination, lock_path, token = sys.argv[1:5]
 os.makedirs(os.path.dirname(coordination), exist_ok=True)
 lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -92,8 +92,30 @@ try:
             raise SystemExit('invalid rejection evidence')
         rejections.add(comment)
     for path in glob.glob(os.path.join(execution, 'submission-invocations', '*', 'attempt-*.json')):
-        value = strict(path); comment = value.get('comment')
-        if type(comment) is not str: raise SystemExit('invalid invocation evidence')
+        value = strict(path); comment = value.get('comment'); claim_id = value.get('lifecycle_claim_id')
+        expected = {
+            'attempt', 'comment', 'intent_sha256', 'lifecycle_claim_id',
+            'plan_sha256', 'schema_version', 'stage_id',
+        }
+        operation = f"submit:{value.get('plan_sha256')}:{value.get('stage_id')}:{value.get('attempt')}"
+        claim_prefix = hashlib.sha256(operation.encode()).hexdigest() + '-'
+        expected_comment = (
+            f"o2plan:v1:{value.get('plan_sha256')}:{value.get('stage_id')}:"
+            f"a{value.get('attempt', 0):03d}"
+        )
+        if (
+            set(value) != expected
+            or type(comment) is not str
+            or comment != expected_comment
+            or type(value.get('schema_version')) is not int or value['schema_version'] != 1
+            or type(value.get('attempt')) is not int or value['attempt'] < 1
+            or type(value.get('plan_sha256')) is not str or len(value['plan_sha256']) != 64
+            or type(value.get('stage_id')) is not str
+            or type(value.get('intent_sha256')) is not str or len(value['intent_sha256']) != 64
+            or any(char not in '0123456789abcdef' for char in value['plan_sha256'] + value['intent_sha256'])
+            or type(claim_id) is not str or len(claim_id) != 129 or not claim_id.startswith(claim_prefix)
+            or any(char not in '0123456789abcdef-' for char in claim_id)
+        ): raise SystemExit('invalid invocation evidence')
         invocations.add(comment)
     unresolved = invocations - set(records) - rejections
     if unresolved: raise SystemExit('unresolved sbatch invocation blocks transition')

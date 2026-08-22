@@ -28,6 +28,7 @@ from o2mcp.runorg.execution_evidence import (
     latest_reconciliation_receipt,
     read_plan_submission_records,
     read_strict_json,
+    read_submission_invocation_claim_id,
     read_submission_rejection,
 )
 from o2mcp.runorg.execution_models import (
@@ -101,29 +102,27 @@ class ExecutionEngine(ExecutionRegistryMixin):
         attempt: int = 1,
         task_ids: Sequence[str] | None = None,
     ) -> SubmissionResult:
-        """Coordinate one mutation claim around an exact submission attempt.
-
-        Uncertain invocation and unsynchronized accepted-job outcomes retain the
-        claim so transition cannot delete their evidence.  Every proven
-        pre-invocation or definitive-rejection failure releases it immediately.
-        """
+        """Retain ownership after uncertain calls; release proven safe failures."""
 
         operation_id = f"submit:{plan.plan_sha256}:{stage_id}:{attempt}"
-        self._acquire_lifecycle(plan, operation_id)
+        claim_id = self._acquire_lifecycle(plan, operation_id)
         try:
             result = self._submit_stage_claimed(
                 plan,
                 stage_id,
                 attempt=attempt,
                 task_ids=task_ids,
+                claim_id=claim_id,
             )
+        except SubmissionRejected:
+            self._release_lifecycle(plan, claim_id)
+            raise
         except SubmissionUncertain:
             raise
         except Exception:
-            self._release_lifecycle(plan, operation_id)
+            identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
+            self._release_if_not_invocation_owner(plan, identity, claim_id)
             raise
-        if result.registry_synced:
-            self._release_lifecycle(plan, operation_id)
         return result
 
     def _submit_stage_claimed(
@@ -133,15 +132,9 @@ class ExecutionEngine(ExecutionRegistryMixin):
         *,
         attempt: int = 1,
         task_ids: Sequence[str] | None = None,
+        claim_id: str = "",
     ) -> SubmissionResult:
-        """Submit one exact stage attempt, recovering uncertain submissions.
-
-        Replaying this method with identical arguments returns the immutable
-        submission record.  It does not call ``sbatch`` again.  When ``sbatch``
-        may have accepted a job but the response was lost, the method searches
-        by the exact Slurm comment before deciding whether the outcome remains
-        uncertain.
-        """
+        """Submit once, or recover by exact comment without marker takeover."""
 
         self._bind_plan(plan)
         stage = stage_by_id(plan, stage_id)
@@ -203,13 +196,20 @@ class ExecutionEngine(ExecutionRegistryMixin):
                 job_ids=self._all_recorded_job_ids(plan),
                 attempt=attempt,
             )
-            synced = self._sync_registry(plan, update)
+            invocation_claim_id = read_submission_invocation_claim_id(
+                self.backend,
+                plan,
+                existing_record.identity,
+            )
+            synced = self._sync_registry(plan, update, tuple(filter(None, (claim_id, invocation_claim_id))))
             return SubmissionResult(existing_record, submitted=False, registry_synced=synced)
 
         rejection = read_submission_rejection(self.backend, submission_rejection_path(plan, identity))
         if rejection is not None:
             if rejection.identity != identity or rejection.task_ids != expected_task_ids:
                 raise ValueError("submission rejection path contains mismatched immutable evidence")
+            # Rejection proves that any prior invocation owner is now repairable.
+            self._release_rejected_invocation_owner(plan, identity, claim_id)
             raise SubmissionRejected(
                 f"Slurm definitively rejected {identity.comment}; use bounded attempt {attempt + 1} when authorized"
             )
@@ -225,8 +225,18 @@ class ExecutionEngine(ExecutionRegistryMixin):
         self.backend.write_immutable_text(intent_path, intent_text)
 
         found = self._unique_existing_job(identity)
+        invocation_path = submission_invocation_path(plan, identity)
+        invocation_claim_id = read_submission_invocation_claim_id(self.backend, plan, identity)
         submitted_now = False
         if found is None:
+            if invocation_claim_id is not None:
+                # Another holder owns the only permissible scheduler call. This
+                # caller provably did not invoke, so release only its own claim.
+                self._release_lifecycle(plan, claim_id)
+                raise SubmissionUncertain(
+                    f"sbatch invocation for {identity.comment} is already owned but no matching job is visible; "
+                    "query again and do not resubmit"
+                )
             preparation = self.backend.prepare_submission(request)
             if preparation is not None:
                 if preparation.status != DEFINITELY_NOT_INVOKED:
@@ -238,18 +248,20 @@ class ExecutionEngine(ExecutionRegistryMixin):
                 "attempt": identity.attempt,
                 "comment": identity.comment,
                 "intent_sha256": text_sha256(intent_text),
+                "lifecycle_claim_id": claim_id,
                 "plan_sha256": plan.plan_sha256,
                 "schema_version": 1,
                 "stage_id": stage_id,
             }
-            invocation_created = self.backend.write_immutable_text(
-                submission_invocation_path(plan, identity),
-                canonical_json(invocation),
-            )
+            try:
+                invocation_created = self.backend.write_immutable_text(invocation_path, canonical_json(invocation))
+            except RuntimeError:
+                invocation_created = False
             if not invocation_created:
-                # The invocation owner may have reached sbatch while scheduler
-                # visibility is delayed.  There is intentionally no time-based
-                # takeover: only an exact comment lookup can resolve this state.
+                invocation_claim_id = read_submission_invocation_claim_id(self.backend, plan, identity)
+                # A lost create response can leave this caller as the durable
+                # invocation owner. Release only a distinct losing observer.
+                self._release_if_not_invocation_owner(plan, identity, claim_id)
                 raise SubmissionUncertain(
                     f"sbatch invocation for {identity.comment} is already owned but no matching job is visible; "
                     "query again and do not resubmit"
@@ -342,7 +354,11 @@ class ExecutionEngine(ExecutionRegistryMixin):
             job_ids=self._all_recorded_job_ids(plan),
             attempt=attempt,
         )
-        registry_synced = self._sync_registry(plan, update)
+        registry_synced = self._sync_registry(
+            plan,
+            update,
+            tuple(filter(None, (claim_id, invocation_claim_id))),
+        )
         return SubmissionResult(record, submitted=submitted_now, registry_synced=registry_synced)
 
     def submit_afterany_reconciler(
@@ -352,17 +368,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
         *,
         attempt: int = 1,
     ) -> SubmissionResult:
-        """Submit an explicit dependency-bound reconciler stage from the plan.
-
-        A scientific adapter represents reconciliation as an ordinary signed,
-        non-array :class:`StageSpec` whose ``dependency_mode`` is ``afterany``
-        and whose dependencies are the compute stages it audits.  This method
-        rejects any other shape and delegates to :meth:`submit_stage`, which
-        renders ``--dependency=afterany:<latest-job-ids>``.  The reconciler's
-        signed command is responsible for invoking files-as-truth validation;
-        the workstation may also call :meth:`reconcile_stage` as a recovery and
-        observability path, but polling is not the dependency mechanism.
-        """
+        """Submit signed ``afterany`` audit; workstation checks are recovery only."""
 
         stage = stage_by_id(plan, stage_id)
         if stage.dependency_mode != "afterany" or not stage.depends_on:
@@ -381,16 +387,17 @@ class ExecutionEngine(ExecutionRegistryMixin):
         """Coordinate lifecycle exclusion around stage reconciliation writes."""
 
         operation_id = f"reconcile:{plan.plan_sha256}:{stage_id}"
-        self._acquire_lifecycle(plan, operation_id)
+        claim_id = self._acquire_lifecycle(plan, operation_id)
         try:
-            result = self._reconcile_stage_claimed(plan, stage_id, submit_retry=submit_retry)
+            result = self._reconcile_stage_claimed(plan, stage_id, submit_retry=submit_retry, claim_id=claim_id)
         except SubmissionUncertain:
+            # The nested submit claim guards Slurm; this metadata-only holder
+            # must not become an unrelated permanent transition blocker.
+            self._release_lifecycle(plan, claim_id)
             raise
         except Exception:
-            self._release_lifecycle(plan, operation_id)
+            self._release_lifecycle(plan, claim_id)
             raise
-        if result.registry_synced:
-            self._release_lifecycle(plan, operation_id)
         return result
 
     def _reconcile_stage_claimed(
@@ -399,6 +406,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
         stage_id: str,
         *,
         submit_retry: bool = True,
+        claim_id: str = "",
     ) -> ReconcileResult:
         """Reconcile task states and optionally launch a bounded missing-only retry.
 
@@ -521,7 +529,7 @@ class ExecutionEngine(ExecutionRegistryMixin):
             job_ids=self._all_recorded_job_ids(plan),
             attempt=(retry_submission.identity.attempt if retry_submission is not None else current_attempt),
         )
-        registry_synced = self._sync_registry(plan, update)
+        registry_synced = self._sync_registry(plan, update, (claim_id,))
         return ReconcileResult(
             decision=decision,
             stage_id=stage_id,

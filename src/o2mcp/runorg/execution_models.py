@@ -663,7 +663,7 @@ class TaskAttemptReceipt:
 
 @dataclass(frozen=True)
 class RegistryUpdate:
-    """A coalescible current-state update for ``run.json`` and its registry row."""
+    """A coalescible registry update plus exact claims its outbox can repair."""
 
     plan_sha256: str
     stage_id: str
@@ -671,6 +671,7 @@ class RegistryUpdate:
     execution_status: str
     job_ids: tuple[str, ...]
     attempt: int
+    lifecycle_claim_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate current-state metadata before it can rewrite run.json."""
@@ -696,7 +697,14 @@ class RegistryUpdate:
             raise ValueError("registry job_ids cannot contain duplicates")
         if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 1:
             raise ValueError("registry attempt must be a positive integer")
+        if not isinstance(self.lifecycle_claim_ids, tuple) or any(
+            re.fullmatch(r"[0-9a-f]{64}-[0-9a-f]{64}", item) is None for item in self.lifecycle_claim_ids
+        ):
+            raise ValueError("registry lifecycle_claim_ids must contain exact holder identities")
+        if len(set(self.lifecycle_claim_ids)) != len(self.lifecycle_claim_ids):
+            raise ValueError("registry lifecycle_claim_ids cannot contain duplicates")
         object.__setattr__(self, "job_ids", tuple(sorted(self.job_ids, key=int)))
+        object.__setattr__(self, "lifecycle_claim_ids", tuple(sorted(set(self.lifecycle_claim_ids))))
 
     def to_dict(self) -> dict[str, Any]:
         """Return a deterministic registry update payload."""
@@ -705,6 +713,7 @@ class RegistryUpdate:
             "attempt": self.attempt,
             "execution_status": self.execution_status,
             "job_ids": list(self.job_ids),
+            "lifecycle_claim_ids": list(self.lifecycle_claim_ids),
             "plan_sha256": self.plan_sha256,
             "stage_id": self.stage_id,
             "stage_status": self.stage_status,
