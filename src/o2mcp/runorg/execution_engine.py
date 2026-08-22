@@ -83,17 +83,6 @@ class RegistrySynchronizer(Protocol):
         """Persist ``update`` and return whether both registry surfaces agree."""
 
 
-def _is_explicit_afterany_reconciler(stage: StageSpec) -> bool:
-    """Return whether ``stage`` is the engine's non-array audit/fan-in shape.
-
-    Task-bearing compute arrays may themselves use ``afterany`` to wait for an
-    upstream stage.  They still need downstream audit generations after their
-    own retries, so dependency mode alone cannot identify a reconciler.
-    """
-
-    return stage.dependency_mode == "afterany" and bool(stage.depends_on) and not stage.tasks
-
-
 class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
     """Coordinate exact plan attempts over a fakeable scheduler boundary."""
 
@@ -220,7 +209,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             self._enqueue_registry_update(plan, update, claim_ids)
             # Replay converges the follow-up only after the accepted compute job
             # and its lifecycle holders have a durable registry repair pointer.
-            if attempt > 1 and not _is_explicit_afterany_reconciler(stage):
+            if attempt > 1:
                 self._ensure_reconciler_followups(plan, stage_id, existing_record)
             synced = self._sync_registry(
                 plan,
@@ -421,7 +410,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         )
         claim_ids = self._submission_claim_ids(plan, record.identity, claim_id, invocation_claim_id)
         self._enqueue_registry_update(plan, update, claim_ids)
-        if attempt > 1 and not _is_explicit_afterany_reconciler(stage):
+        if attempt > 1:
             self._ensure_reconciler_followups(plan, stage_id, record)
         registry_synced = self._sync_registry(
             plan,
@@ -512,7 +501,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # any later reconciliation repairs a retry record whose follow-up audit
         # submission was interrupted after the compute job had been accepted.
         for record in records:
-            if record.identity.attempt > 1 and not _is_explicit_afterany_reconciler(stage):
+            if record.identity.attempt > 1:
                 self._ensure_reconciler_followups(plan, stage_id, record)
         generation_start = latest_followup_attempt(self.backend, plan, stage)
         if generation_start is not None:

@@ -53,6 +53,7 @@ from o2mcp.runorg.execution_paths import (
     reconciliation_path,
     task_attempt_path,
 )
+from o2mcp.runorg.execution_reconcile import signed_attempt_bound
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_sync import merge_execution_manifest
@@ -728,6 +729,56 @@ def test_task_bearing_afterany_stage_rebinds_after_upstream_retry() -> None:
     assert compute_requests[1].dependency_job_ids == (retry.job_id,)
     assert tuple(task.task_id for task in compute_requests[1].tasks) == tuple(
         task.task_id for task in base_compute.tasks
+    )
+
+
+def test_afterany_retry_generation_propagates_through_nested_chain() -> None:
+    """A replacement generation must rebind every transitive afterany child."""
+
+    first = StageSpec(
+        stage_id="first",
+        command=_command("first"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="first"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    middle = StageSpec(
+        stage_id="middle",
+        command=_command("middle"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="middle"),),
+        depends_on=("first",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    last = StageSpec(
+        stage_id="last",
+        command=_command("last"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="last"),),
+        depends_on=("middle",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    plan = _plan(stages=(first, middle, last))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    first_submission = engine.submit_stage(plan, "first").record
+    engine.submit_afterany_reconciler(plan, "middle")
+    engine.submit_afterany_reconciler(plan, "last")
+    backend.set_states(first_submission.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+
+    retry = engine.reconcile_stage(plan, "first").retry_submission
+
+    assert retry is not None and retry.identity.attempt == 2
+    assert signed_attempt_bound(plan, middle) == 2
+    assert signed_attempt_bound(plan, last) == 2
+    middle_requests = [request for request in backend.requests if request.identity.stage_id == "middle"]
+    last_requests = [request for request in backend.requests if request.identity.stage_id == "last"]
+    assert [request.identity.attempt for request in middle_requests] == [1, 2]
+    assert [request.identity.attempt for request in last_requests] == [1, 2]
+    assert last_requests[1].dependency_job_ids == (
+        next(job_id for job_id, job in backend.jobs.items() if job["comment"] == middle_requests[1].comment),
     )
 
 
