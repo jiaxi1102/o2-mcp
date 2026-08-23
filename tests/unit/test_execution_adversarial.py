@@ -1549,40 +1549,49 @@ def test_rejected_ordinary_attempt_does_not_inherit_a_losing_followup(
     assert third.dependency_job_ids != (preflight_two.job_id,)
 
 
-def test_receipt_probe_refuses_symlinked_evidence(tmp_path) -> None:
-    """Only a regular file at its own path may certify a receipt.
+def test_receipt_probe_refuses_symlinks_at_any_depth(tmp_path) -> None:
+    """Only a real regular file below the run root may certify a receipt.
 
-    ``isfile``/``open`` follow symlinks, so a task could point an expected
-    receipt at bytes outside the run tree.  Promotion and archive preserve the
-    link rather than those bytes, so the run would be released as certified
-    against a target that can change or become unavailable afterwards.
+    ``lstat`` declines to follow just the final name, so a task that replaces an
+    intermediate directory with a link to an external tree would still have its
+    target hashed.  Promotion and archive preserve the link rather than those
+    bytes, so the run would be released as certified against data that can
+    change or disappear afterwards.
     """
 
-    outside = tmp_path / "outside.json"
-    outside.write_text("secret\n")
-    regular = tmp_path / "regular.json"
-    regular.write_text("ok\n")
-    linked = tmp_path / "linked.json"
-    linked.symlink_to(outside)
-    dangling = tmp_path / "dangling.json"
-    dangling.symlink_to(tmp_path / "absent.json")
-    directory = tmp_path / "directory.json"
-    directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "result.json").write_text("planted\n")
 
-    def probe(path) -> dict:
+    root = tmp_path / "run"
+    (root / "receipts" / "task").mkdir(parents=True)
+    (root / "receipts" / "task" / "result.json").write_text("ok\n")
+    (root / "receipts" / "linked.json").symlink_to(outside / "result.json")
+    (root / "swapped").mkdir()
+    (root / "swapped" / "task").symlink_to(outside)
+
+    def probe(relative: str) -> dict:
         result = subprocess.run(
-            [sys.executable, "-c", RECEIPT_PROBE_PROGRAM, str(path)],
+            [sys.executable, "-c", RECEIPT_PROBE_PROGRAM, str(root), relative],
             capture_output=True,
             text=True,
             check=True,
         )
         return json.loads(result.stdout)
 
-    certified = probe(regular)
+    certified = probe("receipts/task/result.json")
     assert certified["exists"] is True
     assert certified["sha256"] == hashlib.sha256(b"ok\n").hexdigest()
-    for refused in (linked, dangling, directory, tmp_path / "missing.json"):
-        assert probe(refused) == {"exists": False, "sha256": None}
+
+    refused = (
+        "swapped/task/result.json",  # symlinked ancestor directory
+        "receipts/linked.json",  # symlinked leaf
+        "receipts/task",  # a directory is not receipt bytes
+        "receipts/task/absent.json",  # nothing there
+        "receipts/../../escape.json",  # traversal out of the run root
+    )
+    for relative in refused:
+        assert probe(relative) == {"exists": False, "sha256": None}, relative
 
 
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:

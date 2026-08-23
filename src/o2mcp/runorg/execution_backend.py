@@ -94,19 +94,47 @@ class ExecutionBackend(Protocol):
         """Return every durable holder for one exact mutation operation."""
 
 
-# A receipt leaf is evidence only when it is a regular file at its own path.
-# ``os.path.isfile``/``open`` both follow symlinks, so a task could point an
-# expected receipt at bytes outside the run tree: certification would hash the
-# target while promotion and archive preserve only the link, leaving a run
-# released as certified against bytes that can change or vanish. ``lstat`` plus
-# an explicit regular-file test refuses the link itself without following it.
-RECEIPT_PROBE_PROGRAM = (
-    "import hashlib,json,os,stat,sys;"
-    "p=sys.argv[1];"
-    "e=os.path.lexists(p) and stat.S_ISREG(os.lstat(p).st_mode);"
-    "h=hashlib.sha256(open(p,'rb').read()).hexdigest() if e else None;"
-    "print(json.dumps({'exists':e,'sha256':h},sort_keys=True))"
-)
+# A receipt is evidence only when every component below the authenticated run
+# root is real: ``lstat`` declines to follow just the final name, so a task that
+# replaces an intermediate directory with a link to an external tree would still
+# have its target hashed.  Promotion and archive preserve the link rather than
+# those bytes, releasing a run as certified against data that can change or
+# vanish.  The walk therefore refuses a link at any depth below the root, and
+# ``O_NOFOLLOW`` closes the window between the check and the read.  Components
+# of the run root itself are not walked: that path is the authenticated boundary
+# and legitimately traverses site symlinks on the cluster.
+RECEIPT_PROBE_PROGRAM = """
+import hashlib, json, os, stat, sys
+
+root, relative = sys.argv[1], sys.argv[2]
+parts = [part for part in relative.split('/') if part not in ('', '.')]
+valid = bool(parts) and '..' not in parts
+current = root
+if valid:
+    for depth, part in enumerate(parts):
+        current = os.path.join(current, part)
+        try:
+            mode = os.lstat(current).st_mode
+        except OSError:
+            valid = False
+            break
+        expected = stat.S_ISDIR if depth < len(parts) - 1 else stat.S_ISREG
+        if not expected(mode):
+            valid = False
+            break
+
+digest = None
+if valid:
+    try:
+        handle = os.open(current, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        valid = False
+    else:
+        with os.fdopen(handle, 'rb') as stream:
+            digest = hashlib.sha256(stream.read()).hexdigest()
+
+print(json.dumps({'exists': valid, 'sha256': digest}, sort_keys=True))
+"""
 
 
 class O2ExecutionBackend:
@@ -314,9 +342,15 @@ print(json.dumps(response, sort_keys=True))
     def observe_receipt(self, run_root: str, receipt: ReceiptSpec) -> ReceiptObservation:
         """Hash an expected receipt without trusting shell formatting."""
 
-        path = posixpath.join(run_root, receipt.path)
         result = self.connection.run(
-            f"python3 -c {shlex.quote(RECEIPT_PROBE_PROGRAM)} {shlex.quote(path)}",
+            " ".join(
+                (
+                    "python3 -c",
+                    shlex.quote(RECEIPT_PROBE_PROGRAM),
+                    shlex.quote(run_root),
+                    shlex.quote(receipt.path),
+                )
+            ),
             timeout=120,
         )
         if not result.ok:
