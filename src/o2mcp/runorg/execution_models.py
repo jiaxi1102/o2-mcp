@@ -209,7 +209,11 @@ class SubmissionRequest:
 
         args = [
             f"--comment={self.comment}",
-            f"--job-name=o2p-{self.identity.plan_sha256[:10]}-{self.identity.stage_id}-a{self.identity.attempt:03d}",
+            # Stage-scoped rather than attempt-scoped so Slurm's ``singleton``
+            # dependency below can serialize every generation of this stage.
+            # Attempt identity is carried by ``--comment``, which is what job
+            # discovery matches on, so nothing depends on the name.
+            f"--job-name=o2p-{self.identity.plan_sha256[:10]}-{self.identity.stage_id}",
             f"--partition={self.resources.partition}",
             f"--cpus-per-task={self.resources.cpus}",
             f"--mem={self.resources.memory_mb}M",
@@ -227,6 +231,15 @@ class SubmissionRequest:
             # Slurm ANDs comma-separated clauses, so a prior generation gates
             # this one without weakening the signed DAG relation above.
             clauses.append(f"afterany:{':'.join(self.ordering_job_ids)}")
+        if self.identity.attempt > 1:
+            # Ordering IDs only cover generations whose records are already
+            # published.  A coordinator cannot observe an attempt that is
+            # between sbatch and its record, and no check it performs can be
+            # made indivisible with another coordinator's launch.  ``singleton``
+            # delegates that serialization to the scheduler: this job waits for
+            # every previously launched job of the same name, whether or not
+            # this process ever knew about it.
+            clauses.append("singleton")
         if clauses:
             args.append(f"--dependency={','.join(clauses)}")
         if self.begin_delay_seconds:

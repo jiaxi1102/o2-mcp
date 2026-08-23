@@ -2389,7 +2389,24 @@ def test_replacement_generation_is_ordered_after_the_prior_one() -> None:
     replacement = audit_request(2)
     assert replacement.dependency_job_ids == (compute_two.job_id,)
     assert replacement.ordering_job_ids == (audit_one.job_id,)
-    assert f"--dependency=afterany:{compute_two.job_id},afterany:{audit_one.job_id}" in replacement.sbatch_args()
+    # Explicit ordering covers the generation this coordinator can see, and
+    # ``singleton`` covers any it cannot: an attempt between sbatch and its
+    # record is invisible to every check a coordinator could perform, so the
+    # scheduler enforces the exclusion instead.
+    assert (
+        f"--dependency=afterany:{compute_two.job_id},afterany:{audit_one.job_id},singleton" in replacement.sbatch_args()
+    )
+
+    def job_names(request: SubmissionRequest) -> list:
+        """Return the rendered job-name options for one request."""
+
+        return [argument for argument in request.sbatch_args() if argument.startswith("--job-name=")]
+
+    # The name is stage-scoped, so singleton spans every generation of it.
+    assert job_names(replacement) == [f"--job-name=o2p-{plan.plan_sha256[:10]}-audit"]
+    assert job_names(audit_request(1)) == job_names(replacement)
+    # A first generation has nothing to serialize against.
+    assert not [argument for argument in audit_request(1).sbatch_args() if argument.endswith(",singleton")]
 
 
 def test_never_launched_afterany_child_keeps_its_ordinary_first_attempt() -> None:
