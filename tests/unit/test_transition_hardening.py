@@ -417,6 +417,64 @@ def test_transition_refuses_certified_run_with_live_slurm_job(tmp_path) -> None:
         runs.promote(run_dir, dry_run=True)
 
 
+def test_transition_refuses_a_manifest_that_changed_after_review(tmp_path) -> None:
+    """The launched script embeds the run.json that was actually reviewed.
+
+    A registry update can land between the preview that rendered the script and
+    the lock that marks the transition.  Publishing the reviewed bytes anyway
+    would drop the newly certified attempt, job IDs, or terminal state from the
+    durable destination, so a changed manifest fails closed instead.
+    """
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    reviewed = RunManifest(
+        run_id="RUN_20260822T010203Z_transition__drift",
+        campaign="transition",
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset"],
+        slurm_job_ids=["12345"],
+        result={"status": "COMPLETED"},
+    )
+    # The same run after one more accepted job was recorded.
+    updated = RunManifest.from_json(reviewed.to_json())
+    updated.slurm_job_ids = ["12345", "12346"]
+
+    class Connection:
+        """Serve the reviewed manifest first, then the newer one."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def run(self, command, *, timeout, input_text=None, **_kwargs):
+            del timeout
+            if command.startswith("cat ") and "run.json" in command:
+                self.reads += 1
+                body = reviewed if self.reads == 1 else updated
+                return SimpleNamespace(ok=True, stdout=body.to_json(), stderr="")
+            if input_text == "{}":
+                # The safe control-file reader; this run has no execution plan.
+                return SimpleNamespace(ok=True, stdout='{"payload": null, "state": "MISSING"}', stderr="")
+            if command.startswith("python3 -c"):
+                payload = '{"already_marked": false, "job_ids": []}'
+                return SimpleNamespace(ok=True, stdout=payload, stderr="")
+            return SimpleNamespace(ok=True, stdout="", stderr="")
+
+    runs = object.__new__(O2Runs)
+    runs.conn = Connection()
+    runs.layout = layout
+    runs.policy = SimpleNamespace(archive_excludes=())
+    run_dir = layout.run_dir("active", reviewed.campaign, reviewed.run_id)
+
+    with pytest.raises(ValueError, match="changed after review"):
+        runs.promote(run_dir, dry_run=False)
+
+
 def test_post_digest_injection_recreates_source_but_is_not_deleted(tmp_path) -> None:
     """A write after source freeze survives while only quarantine is deleted."""
 

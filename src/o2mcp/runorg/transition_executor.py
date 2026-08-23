@@ -346,6 +346,13 @@ class TransitionExecutorMixin:
         boundary = begin_transition(self.conn, run_dir, transition_id)
         try:
             manifest = self._transition_source_manifest(run_dir, action)
+            if self._transition_id(manifest, action) != transition_id:
+                # The rendered script embeds the run.json that was reviewed. A
+                # registry update landing between preview and marking would
+                # otherwise publish those older bytes to the durable
+                # destination, dropping the newly certified attempt, job IDs, or
+                # terminal state. Fail closed and let the caller re-preview.
+                raise ValueError(f"{action} source manifest changed after review; re-run the transition")
             require_certified_terminal_execution(manifest, action)
             expected_source = self.layout.run_dir(manifest.status, manifest.campaign, manifest.run_id)
             if run_dir != expected_source:
