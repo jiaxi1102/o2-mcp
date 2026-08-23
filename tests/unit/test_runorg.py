@@ -755,6 +755,44 @@ def test_historical_run_id_keeps_its_transition_path(tmp_path):
     assert promote.started is False and "rsync" in promote.script
 
 
+def test_prepare_rejects_a_mismatched_run_id_before_allocating(tmp_path):
+    """A bad caller identity must fail before any durable side effect.
+
+    ``PreparedRunIdentity`` rejects a run ID whose encoded campaign differs, but
+    it is constructed after ``_register()`` has created the run tree and
+    appended its registry row -- and recovery reaches the same constructor, so
+    the prepared run would be stranded rather than merely refused.
+    """
+
+    calls: list[str] = []
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        calls.append(command)
+        if command.startswith("date -u +"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    with pytest.raises(ValueError, match="campaign encoded in run_id"):
+        runs.prepare_execution_run(
+            project="proj",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id="RUN_20260101T000000Z_other__v1",
+        )
+    with pytest.raises(ValueError, match="prepared run_id must match"):
+        runs.prepare_execution_run(
+            project="proj",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id="RUN_20260101T00_camp__v1",
+        )
+    assert not any("mkdir" in command or "run.json" in command for command in calls)
+
+
 def test_manifest_less_kept_run_can_still_be_archived(tmp_path):
     """The legacy path must cover both tiers the public flow accepts.
 

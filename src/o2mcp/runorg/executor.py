@@ -24,6 +24,7 @@ from o2mcp.runorg.prepared import PreparedRunIdentity
 from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
 from o2mcp.runorg.runs import (
     STATUS_ACTIVE,
+    STRICT_RUN_ID_RE,
     RunLayout,
     RunManifest,
     campaign_of,
@@ -292,6 +293,15 @@ class O2Runs(TransitionExecutorMixin):
             _validate_identifier(dataset, "datasets[]")
         if len(set(datasets)) != len(datasets):
             raise ValueError("execution datasets cannot contain duplicates")
+        # A caller-supplied identity is checked against the exact rules the
+        # returned PreparedRunIdentity applies.  Deferring them would allocate
+        # the run tree and append its registry row before raising, and recovery
+        # reaches the same constructor, so the prepared run would be stranded.
+        if run_id is not None:
+            if not STRICT_RUN_ID_RE.fullmatch(run_id):
+                raise ValueError("prepared run_id must match RUN_<UTCtimestamp>Z_<slug>")
+            if campaign_of(run_id) != campaign:
+                raise ValueError("prepared campaign must match the campaign encoded in run_id")
 
         result, manifest = self._register(
             campaign=campaign,
