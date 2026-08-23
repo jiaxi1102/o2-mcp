@@ -222,7 +222,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 identity,
                 selected,
                 authorized_dependencies,
-                self._prior_generation_jobs(plan, stage, attempt),
+                self._committed_ordering_jobs(plan, stage, identity),
             )
             expected_intent = canonical_json(submission_intent(replay_request))
             recorded_intent = self.backend.read_text(submission_intent_path(plan, identity))
@@ -841,6 +841,43 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 "afterok dependencies lack authenticated COMPLETED reconciliation receipts: "
                 + ", ".join(sorted(incomplete))
             )
+
+    def _committed_ordering_jobs(
+        self,
+        plan: ExecutionPlan,
+        stage: StageSpec,
+        identity: SubmissionIdentity,
+    ) -> tuple[str, ...]:
+        """Return the ordering tuple this attempt's own intent committed to.
+
+        A coordinator cannot observe an attempt between ``sbatch`` and its
+        record, so a legitimate intent may omit it and rely on the scheduler's
+        ``singleton`` dependency for exclusion.  Recomputing the tuple from
+        records that have since advanced would reject the attempt's own intent
+        and strand its recovery: it could never rebuild its registry outbox or
+        retire its lifecycle claim, and transitions refuse every outstanding
+        claim.  The committed tuple is therefore authenticated as earlier
+        generation jobs of this stage and then retained.
+
+        Authentication is stable over time because submission records only
+        accumulate: a job admissible when the intent was written is still
+        admissible now.  An omission cannot weaken exclusion, which ``singleton``
+        enforces at the scheduler regardless of what this tuple records.
+        """
+
+        text = self.backend.read_text(submission_intent_path(plan, identity))
+        if text is None:
+            return self._prior_generation_jobs(plan, stage, identity.attempt)
+        value = strict_json_object(text, "submission intent")
+        committed = value.get("ordering_job_ids", [])
+        if type(committed) is not list or any(type(job) is not str for job in committed):
+            raise ValueError("submission intent ordering job IDs are malformed")
+        if len(set(committed)) != len(committed):
+            raise ValueError("submission intent ordering job IDs contain duplicates")
+        admissible = set(self._prior_generation_jobs(plan, stage, identity.attempt))
+        if not admissible.issuperset(committed):
+            raise ValueError("submission intent orders against a job that is not an earlier generation")
+        return tuple(committed)
 
     def _prior_generation_jobs(
         self,
