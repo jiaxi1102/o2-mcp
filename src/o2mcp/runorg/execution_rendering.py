@@ -47,6 +47,7 @@ def build_submission_request(
     identity: SubmissionIdentity,
     tasks: tuple[PlannedTask, ...],
     dependency_job_ids: tuple[str, ...],
+    ordering_job_ids: tuple[str, ...] = (),
 ) -> SubmissionRequest:
     """Render one deterministic dispatcher and its typed scheduler request."""
 
@@ -62,6 +63,7 @@ def build_submission_request(
         resources=stage.resources,
         dependency_mode=stage.dependency_mode,
         dependency_job_ids=dependency_job_ids,
+        ordering_job_ids=ordering_job_ids,
         script_path=script_path,
         script_text=render_dispatcher(tasks, run_root=plan.paths.run_root),
         stdout_pattern=posixpath.join(stage_logs, suffix + ".out"),
@@ -138,6 +140,7 @@ def submission_intent(request: SubmissionRequest) -> dict[str, object]:
         "comment": request.comment,
         "dependency_job_ids": list(request.dependency_job_ids),
         "dependency_mode": request.dependency_mode,
+        "ordering_job_ids": list(request.ordering_job_ids),
         "plan_sha256": request.identity.plan_sha256,
         "sbatch_args": list(request.sbatch_args()),
         "schema_version": 1,

@@ -174,7 +174,14 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         expected_task_ids = tuple(task.task_id for task in selected)
         expected_task_indices = tuple(task.array_index for task in selected if task.array_index is not None)
         if existing_record is not None:
-            replay_request = build_submission_request(plan, stage, identity, selected, authorized_dependencies)
+            replay_request = build_submission_request(
+                plan,
+                stage,
+                identity,
+                selected,
+                authorized_dependencies,
+                self._prior_generation_jobs(plan, stage, attempt),
+            )
             expected_intent = canonical_json(submission_intent(replay_request))
             recorded_intent = self.backend.read_text(submission_intent_path(plan, identity))
             if recorded_intent != expected_intent:
@@ -232,7 +239,14 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 f"Slurm definitively rejected {identity.comment}; use bounded attempt {attempt + 1} when authorized"
             )
 
-        request = build_submission_request(plan, stage, identity, selected, authorized_dependencies)
+        request = build_submission_request(
+            plan,
+            stage,
+            identity,
+            selected,
+            authorized_dependencies,
+            self._prior_generation_jobs(plan, stage, attempt),
+        )
 
         # Intent records the exact scheduler request but does not itself grant
         # submission ownership.  Separating it from the invocation marker lets a
@@ -779,6 +793,23 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 "afterok dependencies lack authenticated COMPLETED reconciliation receipts: "
                 + ", ".join(sorted(incomplete))
             )
+
+    def _prior_generation_jobs(
+        self,
+        plan: ExecutionPlan,
+        stage: StageSpec,
+        attempt: int,
+    ) -> tuple[str, ...]:
+        """Return this stage's earlier generation jobs in attempt order.
+
+        Only strictly earlier attempts are included, which keeps the value
+        immutable for a given identity: later attempts cannot appear below one
+        that already exists, so a replay renders byte-identical intent.
+        """
+
+        return tuple(
+            record.job_id for record in self._submission_records(plan, stage) if record.identity.attempt < attempt
+        )
 
     def _validate_afterok_dependency_jobs(
         self,

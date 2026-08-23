@@ -149,6 +149,13 @@ class SubmissionRequest:
     stdout_pattern: str
     stderr_pattern: str
     begin_delay_seconds: int = 0
+    # Earlier generations of this same stage.  They are ordering-only: a
+    # replacement runs the same signed commands in the same working directory
+    # and writes the same receipt and output paths, so it must not start while a
+    # prior attempt is still queued or running.  They are deliberately NOT part
+    # of ``dependency_job_ids``, which is the signed DAG tuple whose cardinality
+    # is authenticated against ``depends_on`` throughout the evidence readers.
+    ordering_job_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate scheduler-facing values before submission can occur."""
@@ -213,8 +220,15 @@ class SubmissionRequest:
         if self.task_indices:
             indices = ",".join(str(index) for index in self.task_indices)
             args.append(f"--array={indices}%{min(self.resources.array_parallelism, len(self.task_indices))}")
+        clauses = []
         if self.dependency_job_ids:
-            args.append(f"--dependency={self.dependency_mode}:{':'.join(self.dependency_job_ids)}")
+            clauses.append(f"{self.dependency_mode}:{':'.join(self.dependency_job_ids)}")
+        if self.ordering_job_ids:
+            # Slurm ANDs comma-separated clauses, so a prior generation gates
+            # this one without weakening the signed DAG relation above.
+            clauses.append(f"afterany:{':'.join(self.ordering_job_ids)}")
+        if clauses:
+            args.append(f"--dependency={','.join(clauses)}")
         if self.begin_delay_seconds:
             args.append(f"--begin=now+{self.begin_delay_seconds}seconds")
         if self.resources.gpus:

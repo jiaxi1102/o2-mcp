@@ -2337,6 +2337,61 @@ def test_lost_arbitration_reuses_a_covering_authorization() -> None:
     assert replayed[0].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
 
 
+def test_replacement_generation_is_ordered_after_the_prior_one() -> None:
+    """Two generations of one stage must never be able to write concurrently.
+
+    A replacement runs the same signed commands in the same working directory
+    and writes the same receipt and output paths.  Slurm ANDs comma-separated
+    dependency clauses, so the earlier generation gates the replacement without
+    entering the signed DAG tuple whose cardinality is authenticated elsewhere.
+    """
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    compute_one = engine.submit_stage(plan, "compute").record
+    audit_one = engine.submit_afterany_reconciler(plan, "audit").record
+
+    def audit_request(attempt: int) -> SubmissionRequest:
+        """Return the exact scheduler request one audit attempt presented."""
+
+        return next(
+            request
+            for request in backend.requests
+            if request.identity.stage_id == "audit" and request.identity.attempt == attempt
+        )
+
+    # The first generation has nothing to wait behind.
+    assert audit_request(1).ordering_job_ids == ()
+    assert f"--dependency=afterany:{compute_one.job_id}" in audit_request(1).sbatch_args()
+
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    compute_two = engine.reconcile_stage(plan, "compute").retry_submission
+    assert compute_two is not None
+
+    replacement = audit_request(2)
+    assert replacement.dependency_job_ids == (compute_two.job_id,)
+    assert replacement.ordering_job_ids == (audit_one.job_id,)
+    assert f"--dependency=afterany:{compute_two.job_id},afterany:{audit_one.job_id}" in replacement.sbatch_args()
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
