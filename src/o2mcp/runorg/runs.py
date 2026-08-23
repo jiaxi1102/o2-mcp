@@ -646,9 +646,7 @@ def plan_archive_script(
             f'printf \'%s  %s\\n\' "$archive_sha" {shlex.quote(tarball)} > "$staging/archive.sha256"',
             'test -s "$staging/archive.tar.zst"',
             'zstd -t "$staging/archive.tar.zst"',
-            f'cat > "$staging/run.json" {_heredoc(manifest_json)}',
-            f'test "$(sha256sum "$staging/run.json" | cut -d\' \' -f1)" = '
-            f"{shlex.quote(hashlib.sha256((manifest_json + chr(10)).encode()).hexdigest())}",
+            *_publish_manifest_lines('"$staging/run.json"', manifest_json),
             # Freeze and authenticate the exact source tree before exposing any
             # archive artifact.  The rollback trap restores this quarantine if
             # publication itself fails, so neither tier looks committed.
@@ -717,9 +715,6 @@ def _render_transfer_script(
     rsync = f'rsync -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")
     verify_forward = f'rsync -nric --delete -a {exclude} {src_slash} "$staging/"'.replace("   ", " ")
     verify_reverse = f'rsync -nric --delete -a {exclude} "$staging/" {src_slash}'.replace("   ", " ")
-    # ``_heredoc`` terminates the final JSON line with LF; authenticate the
-    # actual published bytes rather than the pre-heredoc Python string.
-    manifest_sha = hashlib.sha256((manifest_json + "\n").encode()).hexdigest()
     staging_template = posixpath.join(
         dest_parent,
         "." + posixpath.basename(dest_dir) + ".promote.XXXXXX",
@@ -749,8 +744,7 @@ def _render_transfer_script(
         f'if ! {verify_reverse} >"$verify_output"; then cat "$verify_output" >&2; exit 74; fi',
         'if test -s "$verify_output"; then cat "$verify_output" >&2; exit 75; fi',
         'rm -f "$verify_output"',
-        f'cat > "$staging/{manifest_rel}" {_heredoc(manifest_json)}',
-        f'test "$(sha256sum "$staging/{manifest_rel}" | cut -d\' \' -f1)" = {shlex.quote(manifest_sha)}',
+        *_publish_manifest_lines(f'"$staging/{manifest_rel}"', manifest_json),
         # The canonical kept directory is a commit marker.  Freeze and prove
         # the source first so an exit 77/78 can only expose private staging.
         *_freeze_source_before_publication_lines(source_dir, transition_id),
@@ -763,6 +757,29 @@ def _render_transfer_script(
     if free_source:
         lines += _delete_frozen_source_lines(source_dir, transition_id)
     return "\n".join(lines)
+
+
+def _publish_manifest_lines(path: str, manifest_json: str) -> list[str]:
+    """Return lines replacing one staged manifest leaf with authenticated bytes.
+
+    ``rsync -a`` copies a symlinked ``run.json`` as a symlink, and a shell
+    redirection follows it: the durable tree would keep the link while the
+    manifest bytes landed on its external target, and ``sha256sum`` follows it
+    too, so verification passed and the source was deleted anyway.  Unlinking
+    first makes the redirection create a regular file, and the type assertions
+    prove that is what was published.
+    """
+
+    # ``_heredoc`` terminates the final JSON line with LF; authenticate the
+    # actual published bytes rather than the pre-heredoc Python string.
+    digest = hashlib.sha256((manifest_json + "\n").encode()).hexdigest()
+    return [
+        f"rm -f -- {path}",
+        f"cat > {path} {_heredoc(manifest_json)}",
+        f"test ! -L {path}",
+        f"test -f {path}",
+        f"test \"$(sha256sum {path} | cut -d' ' -f1)\" = {shlex.quote(digest)}",
+    ]
 
 
 def _default_transition_id(manifest: RunManifest, action: str) -> str:

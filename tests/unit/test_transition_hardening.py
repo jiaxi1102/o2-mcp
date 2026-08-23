@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -11,7 +13,13 @@ import pytest
 
 from o2mcp.runorg.executor import O2Runs
 from o2mcp.runorg.lifecycle_coordination import coordination_lock, coordination_root
-from o2mcp.runorg.runs import RunLayout, RunManifest, plan_archive_script, plan_promote_script
+from o2mcp.runorg.runs import (
+    RunLayout,
+    RunManifest,
+    _publish_manifest_lines,
+    plan_archive_script,
+    plan_promote_script,
+)
 from o2mcp.runorg.transition_coordinator import _BEGIN_PROGRAM
 from o2mcp.runorg.transition_guards import live_jobs_command, require_certified_terminal_execution
 
@@ -326,6 +334,40 @@ def test_queue_query_survives_purged_job_ids(tmp_path) -> None:
     generated = live_jobs_command(["9000", "9001"])
     assert " -j " not in generated
     assert "-u " in generated
+
+
+@pytest.mark.skipif(shutil.which("sha256sum") is None, reason="needs coreutils sha256sum")
+def test_staged_manifest_replaces_a_symlink_instead_of_following_it(tmp_path) -> None:
+    """Publication must write manifest bytes, not follow a copied link.
+
+    ``rsync -a`` preserves a symlinked ``run.json`` in staging, and a shell
+    redirection would follow it: the durable tree would keep the link while the
+    bytes landed on its external target, and ``sha256sum`` follows it too, so
+    verification passed and the source was deleted anyway.
+    """
+
+    external = tmp_path / "external.json"
+    external.write_text("planted\n")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "run.json").symlink_to(external)
+
+    manifest_json = '{"run_id": "RUN_20260101T000000Z_camp__v1"}'
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"staging={shlex.quote(str(staging))}",
+            *_publish_manifest_lines('"$staging/run.json"', manifest_json),
+        ]
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    published = staging / "run.json"
+    assert not published.is_symlink()
+    assert published.read_text() == manifest_json + "\n"
+    # The link's former target keeps its own bytes.
+    assert external.read_text() == "planted\n"
 
 
 def test_transition_requires_matching_certified_terminal_state() -> None:
