@@ -2077,6 +2077,83 @@ def test_superseded_replay_does_not_spend_a_signed_attempt(tmp_path) -> None:
     assert audit_records[-1].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
 
 
+def test_superseded_replay_reuses_an_authorized_but_unsubmitted_generation() -> None:
+    """A covering generation counts before it is submitted, not only after.
+
+    A crash between writing the second dependency's authorization and
+    publishing its intent leaves a generation that already binds every current
+    job but has no record.  Replaying the first trigger must carry that
+    generation rather than allocate another identity the bound cannot fund.
+    """
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    plan = _plan(stages=(compute_a, compute_b, audit))
+    assert signed_attempt_bound(plan, stage_by_id(plan, "audit")) == 3
+
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def make_retryable(job_id: str, prefix: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    def authorize(attempt: int, dependency_jobs: list, trigger_job: str, trigger_stage: str) -> None:
+        """Publish one follow-up authorization without submitting it."""
+
+        backend.write_immutable_text(
+            reconciler_followup_path(plan, "audit", attempt),
+            canonical_json(
+                {
+                    "attempt": attempt,
+                    "dependency_job_ids": dependency_jobs,
+                    "plan_sha256": plan.plan_sha256,
+                    "schema_version": 1,
+                    "stage_id": "audit",
+                    "trigger_job_id": trigger_job,
+                    "trigger_stage_id": trigger_stage,
+                }
+            ),
+        )
+
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    make_retryable(first_a.job_id, "a")
+    retry_a = engine.reconcile_stage(plan, "compute-a").retry_submission
+    assert retry_a is not None
+    authorize(2, [retry_a.job_id, first_b.job_id], retry_a.job_id, "compute-a")
+
+    make_retryable(first_b.job_id, "b")
+    retry_b = engine.reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+    # The coordinator dies here: generation three is authorized but never sent.
+    authorize(3, [retry_a.job_id, retry_b.job_id], retry_b.job_id, "compute-b")
+
+    replayed = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute-a", retry_a)
+    assert [record.identity.attempt for record in replayed] == [3]
+    assert replayed[0].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
+    assert replayed[0].task_ids == ("audit",)
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
@@ -2403,6 +2480,41 @@ def test_a_newer_generation_recovers_a_failed_run_without_reviving_stale_ones() 
     assert merged.provenance["execution"]["stages"]["audit"] == {"attempt": 2, "status": "COMPLETED"}
     assert merged.provenance["execution"]["state"] == "COMPLETED"
     assert merged.result["status"] == "COMPLETED"
+
+
+def test_a_replacement_generation_reopens_a_completed_run() -> None:
+    """A completed run must not keep advertising completion while work runs.
+
+    Sticky completion exists to stop a delayed callback from reporting a
+    terminal run as merely active.  An accepted higher attempt is the opposite:
+    it is a replacement generation actually starting, and the registry and
+    status consumers have to see that.
+    """
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    completed = RegistryUpdate(plan.plan_sha256, "compute", "COMPLETED", "COMPLETED", ("9000",), 1)
+    replacement = RegistryUpdate(plan.plan_sha256, "compute", "RETRYING", "RETRYING", ("9000", "9002"), 2)
+    stale_completion = RegistryUpdate(plan.plan_sha256, "compute", "COMPLETED", "COMPLETED", ("9000",), 1)
+
+    merged = merge_execution_manifest(manifest, plan, completed)
+    assert merged.provenance["execution"]["state"] == "COMPLETED"
+
+    merged = merge_execution_manifest(merged, plan, replacement)
+    assert merged.provenance["execution"]["stages"]["compute"] == {"attempt": 2, "status": "RETRYING"}
+    assert merged.provenance["execution"]["state"] == "RETRYING"
+    assert merged.result["status"] == "RETRYING"
+
+    # The superseded callback still cannot move the run back to completed.
+    merged = merge_execution_manifest(merged, plan, stale_completion)
+    assert merged.provenance["execution"]["state"] == "RETRYING"
+    assert merged.result["status"] == "RETRYING"
 
 
 def test_one_recovered_stage_does_not_clear_another_stages_failure() -> None:

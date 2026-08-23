@@ -25,6 +25,35 @@ from o2mcp.runorg.plans import ExecutionPlan
 class ExecutionFollowupMixin:
     """Generate and recover dependency-bound reconciler submissions."""
 
+    def _covering_generation(
+        self,
+        plan,
+        reconciler,
+        records,
+        occupied_generations: list,
+        after: int,
+        dependency_jobs: tuple,
+    ):
+        """Return the newest generation above ``after`` bound to those jobs.
+
+        An authorization counts even before it is submitted: a crash between
+        writing it and publishing its intent must not make a later replay
+        allocate a second identity for work that generation already covers.
+        """
+
+        candidates = [record.identity.attempt for record in records if record.dependency_job_ids == dependency_jobs]
+        for attempt in occupied_generations:
+            if not followup_owns_attempt(self.backend, plan, reconciler, attempt):
+                continue
+            if not self._followup_binds(plan, reconciler, attempt, dependency_jobs):
+                continue
+            identity = SubmissionIdentity(plan.plan_sha256, reconciler.stage_id, attempt)
+            if read_submission_rejection(self.backend, submission_rejection_path(plan, identity)) is not None:
+                continue
+            candidates.append(attempt)
+        newer = [attempt for attempt in candidates if attempt > after]
+        return max(newer) if newer else None
+
     def _followup_binds(self, plan, reconciler, attempt: int, dependency_jobs: tuple) -> bool:
         """Report whether one authorization still names the current jobs."""
 
@@ -142,14 +171,29 @@ class ExecutionFollowupMixin:
                     # submitted.  Replaying it would bind that stale dependency
                     # tuple, which submission rejects against the now-current
                     # jobs, wedging every later reconciliation of this stage.
-                    if any(
-                        record.identity.attempt > existing_generation and record.dependency_job_ids == current_jobs
-                        for record in records
-                    ):
-                        # That newer generation is already submitted against
-                        # every current dependency job, so it satisfies this
-                        # trigger too.  Allocating another identity would spend
-                        # a signed attempt the derived bound may not have.
+                    covering = self._covering_generation(
+                        plan,
+                        reconciler,
+                        records,
+                        occupied_generations,
+                        existing_generation,
+                        current_jobs,
+                    )
+                    if covering is not None:
+                        # A newer generation already binds every current
+                        # dependency job, so it satisfies this trigger too.
+                        # Allocating another identity would spend a signed
+                        # attempt the derived bound may not have.  Replay it if
+                        # a crash left it authorized but never submitted.
+                        if any(record.identity.attempt == covering for record in records):
+                            continue
+                        submitted.append(
+                            self.submit_dependency_followup(
+                                plan,
+                                reconciler.stage_id,
+                                attempt=covering,
+                            ).record
+                        )
                         continue
                     next_attempt = existing_generation + 1
                 else:

@@ -85,6 +85,9 @@ def merge_execution_manifest(
     if not accept_stage_update and previous_state:
         # A stale or losing callback carries a stale plan-level status too, so it
         # may not move the run at all; the merged stage map below still decides.
+        # This is also what keeps a terminal run terminal: only an accepted newer
+        # attempt may reopen it, which is exactly a replacement generation
+        # starting real work.
         execution_state = previous_state
     # Failure is sticky against stale and same-generation callbacks, but an
     # authenticated newer generation may recover the run.  The stage map is
@@ -93,8 +96,6 @@ def merge_execution_manifest(
     unrecovered_failure = any(isinstance(entry, dict) and entry.get("status") == "FAILED" for entry in stages.values())
     if unrecovered_failure or execution_state == "FAILED":
         execution_state = "FAILED"
-    elif previous_state == "COMPLETED":
-        execution_state = "COMPLETED"
 
     provenance["execution"] = {
         **previous_execution,
