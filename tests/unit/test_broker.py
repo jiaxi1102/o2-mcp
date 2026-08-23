@@ -8,6 +8,7 @@ Duo access.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
+from o2mcp import broker as broker_module
 from o2mcp.broker import (
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_LAUNCH_BYTES,
@@ -41,6 +43,7 @@ from o2mcp.broker import (
     O2BrokerError,
     O2BrokerUnavailableError,
     _read_launch_fd,
+    _read_state,
     _receipt_number,
     _receipt_returncode,
     prepare_broker_directory,
@@ -1190,6 +1193,87 @@ def test_receipt_keeps_ordinary_remote_measurements():
     assert _receipt_number(2) == 2.0
     assert _receipt_returncode(0) == 0
     assert _receipt_returncode(-1) == -1
+
+
+def test_remote_write_failure_after_acknowledgement_is_still_attributed(tmp_path, broker_root):
+    """A command that dies between acknowledgement and execution must be named.
+
+    The caller has already been told `dispatched`, so it can only report an
+    unknown outcome and is directed at the receipt. The receipt must therefore
+    name the command whose outcome is unknown.
+    """
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    # A helper that completes the protocol hello and then never drains stdin, so
+    # the remote frame write stalls only after the caller was acknowledged.
+    stalling_helper = (
+        "import base64,sys,time;"
+        "sys.stdout.buffer.write(base64.b64decode(sys.argv[1]));"
+        "sys.stdout.buffer.flush();"
+        "time.sleep(30)"
+    )
+    hello = base64.b64encode(encode_frame({"type": "hello", "protocol": PROTOCOL_VERSION})).decode()
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", stalling_helper, hello],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        remote_write_timeout=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="stalled-write-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        with pytest.raises(O2BrokerError, match="dispatched but its result was lost"):
+            client.execute("cat", timeout=5, input_text="x" * (256 * 1024))
+
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+        state = _read_state(paths)
+        assert state["status"] == "failed"
+        assert state["in_flight"]["command"]["preview"] == "cat"
+    finally:
+        if server.transport is not None and server.transport.poll() is None:
+            server.transport.kill()
+            server.transport.wait(timeout=2)
+        thread.join(timeout=5)
+
+
+def test_receipt_write_failure_does_not_abort_a_running_command(tmp_path, broker_root, monkeypatch):
+    """A transient filesystem failure must not tear down the shared channel.
+
+    ``_atomic_json_write`` raises a raw ``OSError``, so guarding only against
+    ``O2BrokerError`` would let a full disk kill an already-dispatched command.
+    """
+
+    real_write = broker_module._atomic_json_write
+    failures = {"armed": False, "raised": 0}
+
+    def flaky_write(path, payload):
+        if failures["armed"]:
+            failures["armed"] = False
+            failures["raised"] += 1
+            raise OSError(28, "No space left on device")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(broker_module, "_atomic_json_write", flaky_write)
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        failures["armed"] = True
+        assert client.execute("printf survived", timeout=5).stdout == "survived"
+        assert failures["raised"] == 1
+        # The channel and its receipt must both still work afterwards.
+        assert client.execute("printf again", timeout=5).stdout == "again"
+        assert client.local_status()["last_command"]["command"]["preview"] == "printf again"
+    finally:
+        _stop_local_broker(thread, client)
 
 
 def test_held_lock_explanation_names_a_busy_command():

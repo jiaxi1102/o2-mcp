@@ -1159,6 +1159,20 @@ class BrokerServer:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})
                     except (OSError, BrokerProtocolError):
                         return
+                    # The acknowledgement is also where this command starts
+                    # owning the channel, and the remote frame write below can
+                    # take seconds for a large stdin. Record it in memory here,
+                    # with no receipt I/O under the policy mutex, so measured
+                    # occupancy covers that write and a write that fails after
+                    # acknowledgement is still attributed to this command.
+                    dispatched_at = self.clock()
+                    in_flight = {
+                        "request_id": request_id,
+                        "command": _command_fingerprint(request["command"]),
+                        "timeout_seconds": request_timeout,
+                        "dispatched_at": dispatched_at,
+                    }
+                    self._in_flight = in_flight
                     self._write_remote_frame_with_deadline(remote_in, remote_request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
@@ -1166,23 +1180,14 @@ class BrokerServer:
                 return
             except (OSError, BrokerProtocolError) as exc:
                 raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
-            # Publish the dispatched command before waiting for its result. No
-            # ping can be answered until this command finishes, so the receipt is
-            # the only local evidence of what the channel is doing -- and a
-            # terminal write retains it if the daemon dies here, which is exactly
-            # when an operator needs to know what was running.
-            dispatched_at = self.clock()
-            in_flight = {
-                "request_id": request_id,
-                "command": _command_fingerprint(request["command"]),
-                "timeout_seconds": request_timeout,
-                "dispatched_at": dispatched_at,
-            }
-            self._in_flight = in_flight
-            # The receipt is diagnostic, so a transient write failure must not
-            # abort a command that the channel is otherwise ready to run. The
-            # in-memory record still reaches any later terminal write.
-            with suppress(O2BrokerError):
+            # Publish the dispatched command. No ping can be answered until it
+            # finishes, so this receipt is the only local evidence of what the
+            # channel is doing. Publishing is diagnostic, so a transient
+            # filesystem failure must not abort a command that is already
+            # running remotely; a directory that no longer validates as
+            # owner-only is a security condition, not a diagnostic one, and is
+            # deliberately left to fail closed.
+            with suppress(OSError):
                 self._write_state("ready", in_flight=in_flight)
             response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
             if response.get("id") != request.get("id"):
@@ -1192,25 +1197,26 @@ class BrokerServer:
             # ``_write_state`` accumulates keys across writes, so the in-flight
             # record must be cleared explicitly rather than left to expire.
             self._in_flight = None
-            self._write_state(
-                "ready",
-                last_command_at=completed_at,
-                in_flight=None,
-                last_command={
-                    **in_flight,
-                    "completed_at": completed_at,
-                    # Broker-observed occupancy: how long this command held the
-                    # sole serialized channel, which is what starves other
-                    # callers. The remote helper's own measurement is recorded
-                    # beside it rather than in place of it.
-                    "duration_seconds": max(0.0, completed_at - dispatched_at),
-                    "remote_duration_seconds": _receipt_number(response.get("duration_seconds")),
-                    "returncode": _receipt_returncode(response.get("returncode")),
-                    "timed_out": bool(response.get("timed_out", False)),
-                    "stdout_truncated": bool(response.get("stdout_truncated", False)),
-                    "stderr_truncated": bool(response.get("stderr_truncated", False)),
-                },
-            )
+            with suppress(OSError):
+                self._write_state(
+                    "ready",
+                    last_command_at=completed_at,
+                    in_flight=None,
+                    last_command={
+                        **in_flight,
+                        "completed_at": completed_at,
+                        # Broker-observed occupancy: how long this command held the
+                        # sole serialized channel, which is what starves other
+                        # callers. The remote helper's own measurement is recorded
+                        # beside it rather than in place of it.
+                        "duration_seconds": max(0.0, completed_at - dispatched_at),
+                        "remote_duration_seconds": _receipt_number(response.get("duration_seconds")),
+                        "returncode": _receipt_returncode(response.get("returncode")),
+                        "timed_out": bool(response.get("timed_out", False)),
+                        "stdout_truncated": bool(response.get("stdout_truncated", False)),
+                        "stderr_truncated": bool(response.get("stderr_truncated", False)),
+                    },
+                )
             # A caller may time out or close while its remote command continues.
             # The result has already been drained, so losing only the local reply
             # must not tear down the healthy shared channel.
@@ -1261,7 +1267,7 @@ class BrokerServer:
                     # The primary startup failure remains in the broker receipt;
                     # a concurrent repair/disable must not be overwritten.
                     pass
-            with suppress(O2BrokerError):
+            with suppress(O2BrokerError, OSError):
                 self._write_state("failed", error=failure, in_flight=self._in_flight)
             return 1
         finally:
