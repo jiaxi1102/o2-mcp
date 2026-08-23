@@ -18,7 +18,14 @@ from o2mcp.runorg.execution_backend import O2ExecutionBackend
 from o2mcp.runorg.execution_models import ReceiptObservation
 from o2mcp.runorg.plan_components import ReceiptSpec
 from o2mcp.runorg.plans import ExecutionPlan
-from o2mcp.runorg.runs import STATUS_ACTIVE, STATUS_KEPT, RunManifest, plan_archive_script, plan_promote_script
+from o2mcp.runorg.runs import (
+    STATUS_ACTIVE,
+    STATUS_KEPT,
+    VALID_STATUSES,
+    RunManifest,
+    plan_archive_script,
+    plan_promote_script,
+)
 from o2mcp.runorg.transition_coordinator import (
     TransitionRecovery,
     begin_transition,
@@ -237,9 +244,26 @@ class TransitionExecutorMixin:
         if self._execution_plan_present(run_dir):
             raise ValueError(f"{action} requires an existing strict run.json")
         legacy = self.read_manifest(run_dir) or self._synthesize_manifest(run_dir)
+        # Synthesis cannot know which tier it read from and hardcodes "active",
+        # so a pre-manifest run already under the kept root would fail the
+        # canonical-path check below and lose its archive path.  Adopt only a
+        # tier that makes the supplied directory canonical for this exact run,
+        # which cannot move a run out of a non-canonical location; the status
+        # allowlist still decides whether that tier may transition at all.
+        inferred = self._infer_source_tier(run_dir, legacy)
+        if inferred is not None:
+            legacy.status = inferred
         if legacy.validate():
             raise ValueError(f"{action} requires an existing strict run.json")
         return legacy
+
+    def _infer_source_tier(self, run_dir: str, manifest: RunManifest) -> str | None:
+        """Return the tier whose canonical path is exactly ``run_dir``."""
+
+        for status in VALID_STATUSES:
+            if self.layout.run_dir(status, manifest.campaign, manifest.run_id) == run_dir:
+                return status
+        return None
 
     def _validated_transition_source(
         self, run_dir: str, *, action: str, allowed_statuses: tuple[str, ...]

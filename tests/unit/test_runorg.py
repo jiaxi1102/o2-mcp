@@ -718,6 +718,30 @@ def test_manifest_less_legacy_run_keeps_its_transition_path(tmp_path):
     assert archive.started is False
 
 
+def test_manifest_less_kept_run_can_still_be_archived(tmp_path):
+    """The legacy path must cover both tiers the public flow accepts.
+
+    Synthesis cannot know which tier it read from and hardcodes ``active``, so a
+    pre-manifest run already promoted to the durable root would fail the
+    canonical-path check and lose its only route to standby storage.
+    """
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    kept_dir = runs.layout.run_dir("kept", "camp", "RUN_20260101T000000Z_camp__v1")
+    archive = runs.archive(kept_dir, dry_run=True)
+    assert archive.started is False and archive.run_id == "RUN_20260101T000000Z_camp__v1"
+
+
 def test_execution_run_without_a_strict_manifest_is_not_synthesized(tmp_path):
     """Legacy synthesis must not become a bypass for engine-owned runs."""
 
