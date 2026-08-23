@@ -1286,6 +1286,93 @@ def test_rejected_first_dependent_attempt_reruns_against_the_current_generation(
     assert compute_two.dependency_job_ids == (preflight_two.job_id,)
 
 
+def test_followup_published_during_an_ordinary_retry_does_not_invalidate_it() -> None:
+    """The pre-submit intent, not a later authorization, settles one attempt.
+
+    A pending missing-only retry and dependency propagation can target the same
+    attempt identity.  If the follow-up authorization lands between the retry's
+    authorization read and its intent write, the retry still owns the attempt.
+    Its record must stay readable, and the replacement generation must move to
+    the next attempt instead of silently vanishing.
+    """
+
+    class PublishFollowupAtIntent(ConcurrentBackend):
+        """Land a legitimate follow-up exactly before the retry writes intent."""
+
+        pending_authorization: tuple[str, str] | None = None
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if self.pending_authorization is not None and "/submission-intents/compute/" in path:
+                target, payload = self.pending_authorization
+                self.pending_authorization = None
+                super().write_immutable_text(target, payload)
+            return super().write_immutable_text(path, text)
+
+    plan = _dependent_plan()
+    compute = stage_by_id(plan, "compute")
+    backend = PublishFollowupAtIntent()
+    engine = ExecutionEngine(backend)
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    compute_one = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    assert engine.reconcile_stage(plan, "compute", submit_retry=False).decision == "RETRY_MISSING_ONLY"
+
+    # Accept the prerequisite retry, holding its child propagation so the
+    # follow-up can be published at the exact racing instant below.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_two = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_two is not None
+    backend.pending_authorization = (
+        reconciler_followup_path(plan, "compute", 2),
+        canonical_json(
+            {
+                "attempt": 2,
+                "dependency_job_ids": [preflight_two.job_id],
+                "plan_sha256": plan.plan_sha256,
+                "schema_version": 1,
+                "stage_id": "compute",
+                "trigger_job_id": preflight_two.job_id,
+                "trigger_stage_id": "preflight",
+            }
+        ),
+    )
+
+    winner = (
+        ExecutionEngine(backend)
+        .submit_stage(
+            plan,
+            "compute",
+            attempt=2,
+            task_ids=("movie-1",),
+        )
+        .record
+    )
+    assert backend.read_text(reconciler_followup_path(plan, "compute", 2)) is not None
+
+    # The winning ordinary attempt stays authenticated evidence rather than
+    # failing strict validation against the authorization that lost the race.
+    records = read_plan_submission_records(backend, plan, compute)
+    assert [record.identity.attempt for record in records] == [1, 2]
+    assert records[-1].task_ids == winner.task_ids == ("movie-1",)
+    assert records[-1].dependency_job_ids == (preflight_one.job_id,)
+
+    # The replacement generation is not lost: propagation opens the next attempt
+    # with every signed task bound to the new prerequisite.
+    replacement = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "preflight", preflight_two)
+    assert [record.identity.attempt for record in replacement] == [3]
+    assert replacement[0].task_ids == ("movie-0", "movie-1", "movie-2")
+    assert replacement[0].dependency_job_ids == (preflight_two.job_id,)
+
+
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
     """Persist accepted retry metadata before a fallible final audit launch.
 

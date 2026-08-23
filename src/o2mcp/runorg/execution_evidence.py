@@ -184,7 +184,7 @@ def next_unrejected_attempt(
         )
         if rejection is None:
             break
-        authorized = _record_task_authorization(backend, plan, stage, attempt)
+        authorized, _followup_dependencies = _committed_attempt_contract(backend, plan, stage, attempt)
         if rejection.identity != identity or rejection.task_ids != expected_task_ids or authorized != expected_task_ids:
             raise ValueError("submission rejection differs from its signed retry authorization")
         rejected.append(identity)
@@ -358,7 +358,7 @@ def read_plan_submission_records(
         path = submission_record_path(plan, identity)
         if backend.read_text(path) is None:
             continue
-        task_ids = _record_task_authorization(backend, plan, stage, attempt)
+        task_ids, followup_dependencies = _committed_attempt_contract(backend, plan, stage, attempt)
         tasks = select_tasks(stage, task_ids)
         task_indices = tuple(task.array_index for task in tasks if task.array_index is not None)
         record = read_submission_record(
@@ -370,47 +370,137 @@ def read_plan_submission_records(
             expected_dependency_mode=stage.dependency_mode,
         )
         assert record is not None
-        _validate_record_dependencies(backend, plan, stage, record)
+        _validate_record_dependencies(backend, plan, stage, record, followup_dependencies)
         records.append(record)
     return tuple(records)
 
 
-def _record_task_authorization(
+def _committed_attempt_contract(
     backend: ExecutionBackend,
     plan: ExecutionPlan,
     stage: StageSpec,
     attempt: int,
-) -> tuple[str, ...]:
-    """Derive the task contract for one existing record."""
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """Return the task contract this attempt's immutable intent committed to.
+
+    Two coordinators can legitimately disagree about one attempt: an ordinary
+    missing-only retry may still be deriving its preserved subset while
+    dependency propagation publishes a full-task follow-up for the same attempt.
+    The pre-submit intent is the single atomic arbitration point, so this reader
+    authenticates every authorization the plan allows and then accepts the one
+    the winning intent actually committed.  Re-deriving a preference here would
+    permanently invalidate the winner's own record.
+
+    The second element is the follow-up dependency tuple when the committed
+    contract is a replacement generation, and ``None`` for an ordinary attempt.
+    """
 
     all_task_ids = tuple(task.task_id for task in select_tasks(stage, None))
-    followup_authorized = (
-        attempt > 1
-        and stage.depends_on
-        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
-    )
-    if followup_authorized:
-        dependency_values = authenticate_followup_authorization(backend, plan, stage, attempt)
-        task_ids = all_task_ids
-        if len(dependency_values) != len(stage.depends_on):
+    followup_dependencies = None
+    if attempt > 1 and stage.depends_on and _followup_exists(backend, plan, stage, attempt):
+        followup_dependencies = authenticate_followup_authorization(backend, plan, stage, attempt)
+        if len(followup_dependencies) != len(stage.depends_on):
             raise ValueError("follow-up dependency cardinality differs from the signed DAG")
-    else:
-        if attempt == 1:
-            task_ids = all_task_ids
-        else:
-            previous = read_reconciliation_receipt(backend, plan, stage, attempt - 1)
-            if previous is not None and previous.decision == RECONCILE_RETRY:
-                task_ids = previous.retry_task_ids
-            else:
-                previous_identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt - 1)
-                rejection = read_submission_rejection(
-                    backend,
-                    submission_rejection_path(plan, previous_identity),
-                )
-                if rejection is None or rejection.identity != previous_identity:
-                    raise ValueError("submission record lacks its signed retry authorization")
-                task_ids = rejection.task_ids
-    return tuple(task_ids)
+    ordinary_task_ids = all_task_ids if attempt == 1 else _ordinary_retry_task_ids(backend, plan, stage, attempt)
+    if followup_dependencies is None and ordinary_task_ids is None:
+        raise ValueError("submission record lacks its signed retry authorization")
+
+    intent = _intent_contract(backend, plan, stage, attempt)
+    if intent is None:
+        # Evidence predating its own intent can only be read through the single
+        # preferred authorization, exactly as before intents arbitrated.
+        if followup_dependencies is not None:
+            return all_task_ids, followup_dependencies
+        assert ordinary_task_ids is not None
+        return ordinary_task_ids, None
+    intent_task_ids, intent_dependency_job_ids = intent
+    if (
+        followup_dependencies is not None
+        and intent_task_ids == all_task_ids
+        and intent_dependency_job_ids == followup_dependencies
+    ):
+        return all_task_ids, followup_dependencies
+    if ordinary_task_ids is not None and intent_task_ids == ordinary_task_ids:
+        return ordinary_task_ids, None
+    raise ValueError("submission intent matches no authorization signed for this attempt")
+
+
+def followup_owns_attempt(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    attempt: int,
+) -> bool:
+    """Report whether a follow-up still owns one attempt identity.
+
+    An ordinary retry and a dependency follow-up can both target the same
+    attempt; the pre-submit intent arbitrates between them.  A follow-up whose
+    authorization lost that race never became a generation, so propagation must
+    open the next attempt rather than replay the winner's unrelated submission.
+    An attempt with no intent yet is still the follow-up's to submit.
+    """
+
+    if _intent_contract(backend, plan, stage, attempt) is None:
+        return True
+    return _committed_attempt_contract(backend, plan, stage, attempt)[1] is not None
+
+
+def _followup_exists(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    attempt: int,
+) -> bool:
+    """Report whether a dependency follow-up authorization occupies an attempt."""
+
+    return backend.read_text(reconciler_followup_path(plan, stage.stage_id, attempt)) is not None
+
+
+def _ordinary_retry_task_ids(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    attempt: int,
+) -> tuple[str, ...] | None:
+    """Return the preceding retry/rejection subset, or ``None`` when unsigned."""
+
+    previous = read_reconciliation_receipt(backend, plan, stage, attempt - 1)
+    if previous is not None and previous.decision == RECONCILE_RETRY:
+        return tuple(previous.retry_task_ids)
+    previous_identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt - 1)
+    rejection = read_submission_rejection(backend, submission_rejection_path(plan, previous_identity))
+    if rejection is None or rejection.identity != previous_identity:
+        return None
+    return tuple(rejection.task_ids)
+
+
+def _intent_contract(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage: StageSpec,
+    attempt: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Return the exact task and dependency tuple one intent committed."""
+
+    identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt)
+    path = submission_intent_path(plan, identity)
+    if backend.read_text(path) is None:
+        return None
+    value = read_strict_json(backend, path, "submission intent")
+    task_ids = value.get("task_ids")
+    dependency_job_ids = value.get("dependency_job_ids")
+    if (
+        value.get("schema_version") != 1
+        or value.get("plan_sha256") != plan.plan_sha256
+        or value.get("stage_id") != stage.stage_id
+        or value.get("attempt") != attempt
+        or type(task_ids) is not list
+        or any(type(item) is not str for item in task_ids)
+        or type(dependency_job_ids) is not list
+        or any(type(item) is not str for item in dependency_job_ids)
+    ):
+        raise ValueError(f"submission intent is malformed or foreign: {path}")
+    return tuple(task_ids), tuple(dependency_job_ids)
 
 
 def _validate_record_dependencies(
@@ -418,6 +508,7 @@ def _validate_record_dependencies(
     plan: ExecutionPlan,
     stage: StageSpec,
     record: SubmissionRecord,
+    followup_dependencies: tuple[str, ...] | None = None,
 ) -> None:
     """Prove each recorded dependency is a job of its signed prerequisite.
 
@@ -435,20 +526,11 @@ def _validate_record_dependencies(
         authorized_jobs = {item.job_id for item in dependency_records}
         if job_id not in authorized_jobs:
             raise ValueError(f"submission dependency job {job_id} is not authenticated evidence for stage {dependency}")
-    followup_authorized = (
-        record.identity.attempt > 1
-        and stage.depends_on
-        and backend.read_text(reconciler_followup_path(plan, stage.stage_id, record.identity.attempt)) is not None
-    )
-    if followup_authorized:
-        dependency_values = authenticate_followup_authorization(
-            backend,
-            plan,
-            stage,
-            record.identity.attempt,
-        )
-        if dependency_values != record.dependency_job_ids:
-            raise ValueError("submission record differs from its exact follow-up dependency authorization")
+    if followup_dependencies is not None and followup_dependencies != record.dependency_job_ids:
+        # Only the arbitrated replacement generation is held to the follow-up
+        # tuple.  A follow-up that lost the intent race for this attempt governs
+        # a later generation and must not invalidate the winner's record.
+        raise ValueError("submission record differs from its exact follow-up dependency authorization")
     if stage.depends_on and not record.dependency_job_ids:
         # Keep this explicit even though cardinality catches it: this is the
         # dangerous dependency-bypass shape the contract exists to prevent.

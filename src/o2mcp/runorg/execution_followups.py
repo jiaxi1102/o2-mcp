@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from o2mcp.runorg.execution_evidence import (
     authenticate_followup_authorization,
+    followup_owns_attempt,
     latest_reconciliation_receipt,
     next_unrejected_attempt,
     read_strict_json,
@@ -103,6 +104,17 @@ class ExecutionFollowupMixin:
                     and authorization.get("trigger_stage_id") == retried_stage_id
                 ):
                     existing_generation = candidate
+            if existing_generation is not None and not followup_owns_attempt(
+                self.backend,
+                plan,
+                reconciler,
+                existing_generation,
+            ):
+                # An ordinary retry won this attempt identity's intent, so this
+                # authorization never became a generation.  Replaying it would
+                # return the winner's unrelated submission and silently drop the
+                # replacement generation, so open the next attempt instead.
+                existing_generation = None
             if existing_generation is not None:
                 identity = SubmissionIdentity(plan.plan_sha256, reconciler.stage_id, existing_generation)
                 rejection = read_submission_rejection(
