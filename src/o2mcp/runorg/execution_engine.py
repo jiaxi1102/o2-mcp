@@ -122,7 +122,7 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         # replay distinction that governs certification is available here too,
         # and the claimed path rechecks it.
         self._bind_plan(plan)
-        if not any(record.identity.attempt == attempt for record in self._submission_records(plan, stage)):
+        if not self._attempt_has_durable_evidence(plan, stage, attempt):
             self._validate_afterok_dependencies(plan, stage)
         identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
         operation_id = f"submit:{identity.plan_sha256}:{identity.stage_id}:{identity.attempt}"
@@ -144,6 +144,21 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             self._release_if_not_invocation_owner(plan, identity, claim_id)
             raise
         return result
+
+    def _attempt_has_durable_evidence(self, plan: ExecutionPlan, stage: StageSpec, attempt: int) -> bool:
+        """Report whether this attempt already crossed the scheduler boundary.
+
+        A submission record and a definitive rejection are both durable outcomes
+        of one attempt, so replaying either is recovery rather than a new launch.
+        Certification must not gate that recovery: a rejected attempt still has
+        to reach the branch that retires its stale invocation owner, and an
+        outstanding claim blocks promote and archive forever.
+        """
+
+        if any(record.identity.attempt == attempt for record in self._submission_records(plan, stage)):
+            return True
+        identity = SubmissionIdentity(plan.plan_sha256, stage.stage_id, attempt)
+        return read_submission_rejection(self.backend, submission_rejection_path(plan, identity)) is not None
 
     def _submit_stage_claimed(
         self,
@@ -173,7 +188,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             # state would make an interrupted submission unreplayable as soon as
             # a prerequisite advances, stranding its registry outbox and
             # lifecycle claim.
-            self._validate_afterok_dependencies(plan, stage)
+            if not self._attempt_has_durable_evidence(plan, stage, attempt):
+                self._validate_afterok_dependencies(plan, stage)
             authorized_task_ids, authorized_dependencies = derive_attempt_authorization(
                 self.backend,
                 plan,
@@ -184,7 +200,8 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             # Another coordinator can accept a replacement prerequisite between
             # the stage gate above and this resolution, so certification is
             # bound to the exact jobs about to enter the intent.
-            self._validate_afterok_dependency_jobs(plan, stage, authorized_dependencies)
+            if not self._attempt_has_durable_evidence(plan, stage, attempt):
+                self._validate_afterok_dependency_jobs(plan, stage, authorized_dependencies)
         else:
             # The strict record reader already proved each historical dependency
             # job belongs to the corresponding signed prerequisite.  Preserve

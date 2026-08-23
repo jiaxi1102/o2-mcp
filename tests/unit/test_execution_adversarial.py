@@ -2753,6 +2753,75 @@ def test_uncertified_afterok_submission_never_acquires_a_claim() -> None:
     assert not backend.lifecycle_claims
 
 
+def test_rejected_afterok_attempt_replays_to_retire_its_claim() -> None:
+    """Readiness must not gate the recovery of a rejected attempt.
+
+    A definitive rejection is a durable outcome, and its replay exists to retire
+    the original invocation owner's claim.  Refusing that replay because the
+    prerequisite has since advanced leaves a claim nothing can retire -- the
+    attempt has no submission record to reconcile through -- and every
+    transition refuses an outstanding claim, so the run is stranded.
+    """
+
+    class RejectAudit(ConcurrentBackend):
+        """Refuse the audit launch durably."""
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "audit":
+                return SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="audit qos rejected")
+            return super().invoke_submission(request)
+
+    root = StageSpec(
+        stage_id="root",
+        command=_command("root"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="root"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        depends_on=("root",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("preflight",),
+        dependency_mode="afterok",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(root, preflight, audit))
+    backend = RejectAudit()
+    engine = ExecutionEngine(backend)
+
+    root_one = engine.submit_stage(plan, "root").record
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="preflight"))
+    assert engine.reconcile_stage(plan, "preflight").decision == "COMPLETED"
+
+    with pytest.raises(SubmissionRejected, match="audit qos rejected"):
+        engine.submit_stage(plan, "audit")
+
+    # The prerequisite advances to a generation that has not reconciled, so a
+    # *new* audit launch is now correctly refused.
+    backend.set_states(root_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    assert engine.reconcile_stage(plan, "root").retry_submission is not None
+    with pytest.raises(ValueError, match="afterok dependencies lack"):
+        ExecutionEngine(backend).submit_stage(plan, "audit", attempt=2)
+
+    # Replaying the rejected attempt must still reach its rejection branch.
+    with pytest.raises(SubmissionRejected, match="definitively rejected"):
+        ExecutionEngine(backend).submit_stage(plan, "audit")
+    assert not backend.lifecycle_claims
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
