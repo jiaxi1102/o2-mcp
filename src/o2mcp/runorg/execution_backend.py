@@ -94,6 +94,21 @@ class ExecutionBackend(Protocol):
         """Return every durable holder for one exact mutation operation."""
 
 
+# A receipt leaf is evidence only when it is a regular file at its own path.
+# ``os.path.isfile``/``open`` both follow symlinks, so a task could point an
+# expected receipt at bytes outside the run tree: certification would hash the
+# target while promotion and archive preserve only the link, leaving a run
+# released as certified against bytes that can change or vanish. ``lstat`` plus
+# an explicit regular-file test refuses the link itself without following it.
+RECEIPT_PROBE_PROGRAM = (
+    "import hashlib,json,os,stat,sys;"
+    "p=sys.argv[1];"
+    "e=os.path.lexists(p) and stat.S_ISREG(os.lstat(p).st_mode);"
+    "h=hashlib.sha256(open(p,'rb').read()).hexdigest() if e else None;"
+    "print(json.dumps({'exists':e,'sha256':h},sort_keys=True))"
+)
+
+
 class O2ExecutionBackend:
     """Production execution boundary using one established O2 connection.
 
@@ -300,14 +315,8 @@ print(json.dumps(response, sort_keys=True))
         """Hash an expected receipt without trusting shell formatting."""
 
         path = posixpath.join(run_root, receipt.path)
-        program = (
-            "import hashlib,json,os,sys;"
-            "p=sys.argv[1];e=os.path.isfile(p);"
-            "h=hashlib.sha256(open(p,'rb').read()).hexdigest() if e else None;"
-            "print(json.dumps({'exists':e,'sha256':h},sort_keys=True))"
-        )
         result = self.connection.run(
-            f"python3 -c {shlex.quote(program)} {shlex.quote(path)}",
+            f"python3 -c {shlex.quote(RECEIPT_PROBE_PROGRAM)} {shlex.quote(path)}",
             timeout=120,
         )
         if not result.ok:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from o2mcp.runorg.execution_backend import ExecutionBackend
 from o2mcp.runorg.execution_evidence import (
     authenticate_followup_authorization,
+    followup_owns_attempt,
     read_plan_submission_records,
     read_reconciliation_receipt,
     read_submission_rejection,
@@ -108,6 +109,12 @@ def _ordinary_retry_dependencies(
     latest_followup_dependencies: tuple[str, ...] | None = None
     for candidate in range(attempt - 1, 1, -1):
         if backend.read_text(reconciler_followup_path(plan, stage.stage_id, candidate)) is None:
+            continue
+        if not followup_owns_attempt(backend, plan, stage, candidate):
+            # An ordinary attempt won this identity's intent, so the
+            # authorization never became a generation.  Treating it as the
+            # newest dependency authority would bind a preserved subset from
+            # the old generation to replacement dependency jobs.
             continue
         latest_followup_attempt = candidate
         latest_followup_dependencies = authenticate_followup_authorization(

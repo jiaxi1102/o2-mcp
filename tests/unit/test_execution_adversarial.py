@@ -13,6 +13,7 @@ import json
 import posixpath
 import shutil
 import subprocess
+import sys
 import threading
 from collections import deque
 
@@ -38,6 +39,7 @@ from o2mcp.runorg import (
     SubmitOutcome,
     TaskSpec,
 )
+from o2mcp.runorg.execution_backend import RECEIPT_PROBE_PROGRAM
 from o2mcp.runorg.execution_evidence import (
     latest_reconciliation_receipt,
     read_plan_submission_records,
@@ -1472,6 +1474,115 @@ def test_promote_refuses_a_child_completed_against_a_superseded_generation() -> 
     backend.put_receipt(_receipt("done", stage="audit"))
     assert ExecutionEngine(backend).reconcile_stage(plan, "audit").decision == "COMPLETED"
     require_current_terminal_evidence(backend, plan, "promote")
+
+
+def test_rejected_ordinary_attempt_does_not_inherit_a_losing_followup(
+    tmp_path,
+) -> None:
+    """A losing authorization is never the newest dependency authority.
+
+    An ordinary missing-only attempt can win an attempt's intent and still be
+    definitively rejected by Slurm.  The next rejection retry carries that
+    preserved subset, so adopting the losing authorization's dependencies would
+    bind successes produced against the old prerequisite to a replacement one.
+    """
+
+    class RejectComputeRetry(ConcurrentBackend):
+        """Land the authorization at intent time, then refuse the winner."""
+
+        pending_authorization: tuple[str, str] | None = None
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if self.pending_authorization is not None and "/submission-intents/compute/" in path:
+                target, payload = self.pending_authorization
+                self.pending_authorization = None
+                super().write_immutable_text(target, payload)
+            return super().write_immutable_text(path, text)
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "compute" and request.identity.attempt == 2:
+                return SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="compute qos rejected")
+            return super().invoke_submission(request)
+
+    plan = _dependent_plan()
+    backend = RejectComputeRetry()
+    engine = ExecutionEngine(backend)
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    compute_one = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    assert engine.reconcile_stage(plan, "compute", submit_retry=False).decision == "RETRY_MISSING_ONLY"
+
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_two = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_two is not None
+    backend.pending_authorization = (
+        reconciler_followup_path(plan, "compute", 2),
+        canonical_json(
+            {
+                "attempt": 2,
+                "dependency_job_ids": [preflight_two.job_id],
+                "plan_sha256": plan.plan_sha256,
+                "schema_version": 1,
+                "stage_id": "compute",
+                "trigger_job_id": preflight_two.job_id,
+                "trigger_stage_id": "preflight",
+            }
+        ),
+    )
+
+    # The ordinary retry owns attempt two's intent and is then rejected.
+    with pytest.raises(SubmissionRejected, match="compute qos rejected"):
+        ExecutionEngine(backend).submit_stage(plan, "compute", attempt=2, task_ids=("movie-1",))
+
+    third = ExecutionEngine(backend).submit_stage(plan, "compute", attempt=3, task_ids=("movie-1",)).record
+    assert third.task_ids == ("movie-1",)
+    assert third.dependency_job_ids == (preflight_one.job_id,)
+    assert third.dependency_job_ids != (preflight_two.job_id,)
+
+
+def test_receipt_probe_refuses_symlinked_evidence(tmp_path) -> None:
+    """Only a regular file at its own path may certify a receipt.
+
+    ``isfile``/``open`` follow symlinks, so a task could point an expected
+    receipt at bytes outside the run tree.  Promotion and archive preserve the
+    link rather than those bytes, so the run would be released as certified
+    against a target that can change or become unavailable afterwards.
+    """
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("secret\n")
+    regular = tmp_path / "regular.json"
+    regular.write_text("ok\n")
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(outside)
+    dangling = tmp_path / "dangling.json"
+    dangling.symlink_to(tmp_path / "absent.json")
+    directory = tmp_path / "directory.json"
+    directory.mkdir()
+
+    def probe(path) -> dict:
+        result = subprocess.run(
+            [sys.executable, "-c", RECEIPT_PROBE_PROGRAM, str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    certified = probe(regular)
+    assert certified["exists"] is True
+    assert certified["sha256"] == hashlib.sha256(b"ok\n").hexdigest()
+    for refused in (linked, dangling, directory, tmp_path / "missing.json"):
+        assert probe(refused) == {"exists": False, "sha256": None}
 
 
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
