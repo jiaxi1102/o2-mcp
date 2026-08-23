@@ -211,14 +211,42 @@ class TransitionExecutorMixin:
             broker_role="transfer",
         )
 
+    def _execution_plan_present(self, run_dir: str) -> bool:
+        """Report whether this directory holds an execution plan on disk."""
+
+        probe = self._run(
+            f"test -f {shlex.quote(posixpath.join(run_dir, 'receipts', 'execution', 'execution-plan.json'))}",
+            timeout=60,
+        )
+        return probe.ok
+
+    def _transition_source_manifest(self, run_dir: str, action: str) -> RunManifest:
+        """Return strict metadata, or legacy metadata for a pre-manifest run.
+
+        Destructive transitions must never act on guessed metadata for a run the
+        execution engine owns.  Runs that predate ``run.json`` have no other way
+        out of scratch storage, though, and ``promote``/``archive`` served them
+        through the policy's legacy reader before the engine existed.  The plan
+        file is the discriminator: without one this is not an engine run, so the
+        legacy reader and synthesis remain available exactly as before.
+        """
+
+        manifest = self._read_strict_manifest(run_dir)
+        if manifest is not None:
+            return manifest
+        if self._execution_plan_present(run_dir):
+            raise ValueError(f"{action} requires an existing strict run.json")
+        legacy = self.read_manifest(run_dir) or self._synthesize_manifest(run_dir)
+        if legacy.validate():
+            raise ValueError(f"{action} requires an existing strict run.json")
+        return legacy
+
     def _validated_transition_source(
         self, run_dir: str, *, action: str, allowed_statuses: tuple[str, ...]
     ) -> RunManifest:
         """Require a strict manifest at its exact canonical tier."""
 
-        manifest = self._read_strict_manifest(run_dir)
-        if manifest is None:
-            raise ValueError(f"{action} requires an existing strict run.json")
+        manifest = self._transition_source_manifest(run_dir, action)
         if manifest.status not in allowed_statuses:
             raise ValueError(f"{action} does not accept run status {manifest.status!r}")
         expected = self.layout.run_dir(manifest.status, manifest.campaign, manifest.run_id)
@@ -293,9 +321,7 @@ class TransitionExecutorMixin:
             return TransitionPlan(run_id, action, script, started=False, message="dry_run: script not executed")
         boundary = begin_transition(self.conn, run_dir, transition_id)
         try:
-            manifest = self._read_strict_manifest(run_dir)
-            if manifest is None:
-                raise ValueError(f"{action} source disappeared after transition marking")
+            manifest = self._transition_source_manifest(run_dir, action)
             require_certified_terminal_execution(manifest, action)
             expected_source = self.layout.run_dir(manifest.status, manifest.campaign, manifest.run_id)
             if run_dir != expected_source:

@@ -692,6 +692,52 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
     assert archive.started is False and f"--exclude={archive.run_id}/source_views" in archive.script
 
 
+def test_manifest_less_legacy_run_keeps_its_transition_path(tmp_path):
+    """Pre-manifest runs must still be able to leave scratch storage.
+
+    ``promote``/``archive`` served these runs through the policy's legacy reader
+    and built-in synthesis before the execution engine existed.  Requiring a
+    strict ``run.json`` for every transition would strand them permanently.
+    """
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
+    promote = runs.promote(rd, dry_run=True)
+    assert promote.started is False and "rsync" in promote.script
+    archive = runs.archive(rd, dry_run=True)
+    assert archive.started is False
+
+
+def test_execution_run_without_a_strict_manifest_is_not_synthesized(tmp_path):
+    """Legacy synthesis must not become a bypass for engine-owned runs."""
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 0)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
+    for action in (runs.promote, runs.archive):
+        with pytest.raises(ValueError, match="requires an existing strict run.json"):
+            action(rd, dry_run=True)
+
+
 def test_live_transition_uses_persistent_transfer_broker(tmp_path, monkeypatch):
     """A detached promotion is framed through the role-specific transfer session."""
 
