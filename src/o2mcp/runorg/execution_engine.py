@@ -113,6 +113,17 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         bound = signed_attempt_bound(plan, stage)
         if attempt > bound:
             raise ValueError(f"stage {stage_id} attempt {attempt} exceeds signed max_attempts bound={bound}")
+        # Creating a generation for an uncertified afterok prerequisite is also
+        # refusable, and a prerequisite that later fails makes it permanently so,
+        # which would strand the claim and block archive.  Binding the plan first
+        # keeps the run-identity check ahead of any evidence read; it publishes
+        # the same immutable bytes on every call, so unlike a claim it cannot be
+        # orphaned.  Reading records is side-effect free, so the create-versus-
+        # replay distinction that governs certification is available here too,
+        # and the claimed path rechecks it.
+        self._bind_plan(plan)
+        if not any(record.identity.attempt == attempt for record in self._submission_records(plan, stage)):
+            self._validate_afterok_dependencies(plan, stage)
         identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
         operation_id = f"submit:{identity.plan_sha256}:{identity.stage_id}:{identity.attempt}"
         claim_id = self._acquire_lifecycle(plan, operation_id)
@@ -234,7 +245,13 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             self._enqueue_registry_update(plan, update, claim_ids)
             # Replay converges the follow-up only after the accepted compute job
             # and its lifecycle holders have a durable registry repair pointer.
-            if attempt > 1:
+            # Only the latest accepted generation may propagate: replaying an
+            # older one would pair its trigger job with the current dependency
+            # tuple, and that authorization is internally inconsistent, so it is
+            # rejected on write and again by every later scan of the immutable
+            # file, leaving the run unable to converge.
+            latest_accepted = self._submission_records(plan, stage)[-1]
+            if attempt > 1 and latest_accepted.identity.attempt == attempt:
                 self._ensure_reconciler_followups(plan, stage_id, existing_record)
             synced = self._sync_registry(
                 plan,

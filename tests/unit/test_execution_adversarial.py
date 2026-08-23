@@ -2652,6 +2652,107 @@ def test_invalid_submission_never_acquires_a_lifecycle_claim() -> None:
     assert backend.acquisitions == 1
 
 
+def test_replaying_a_stale_generation_does_not_propagate() -> None:
+    """Only the latest accepted generation may create follow-ups on replay.
+
+    Propagating an older record pairs its trigger job with the *current*
+    dependency tuple.  That authorization is internally inconsistent, so it is
+    rejected on write and again by every later scan of the immutable file it
+    already created, leaving the run unable to converge.
+    """
+
+    compute = _compute_stage(max_attempts=3)
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    plan = _plan(stages=(compute, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    first = engine.submit_stage(plan, "compute").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def fail_middle_task(job_id: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt("movie-0"))
+        backend.put_receipt(_receipt("movie-2"))
+
+    # The child's propagation is held while the parent advances twice.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    fail_middle_task(first.job_id)
+    second = engine.reconcile_stage(plan, "compute").retry_submission
+    assert second is not None
+    fail_middle_task(second.job_id)
+    third = engine.reconcile_stage(plan, "compute").retry_submission
+    assert third is not None and third.identity.attempt == 3
+
+    # Replaying the superseded generation must converge, not authorize.
+    replay = ExecutionEngine(backend).submit_stage(plan, "compute", attempt=2, task_ids=("movie-1",))
+    assert replay.record.job_id == second.job_id
+    assert backend.read_text(reconciler_followup_path(plan, "audit", 2)) is None
+
+    # The latest generation still propagates normally.
+    propagated = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute", third)
+    assert [record.identity.attempt for record in propagated] == [2]
+    assert propagated[0].dependency_job_ids == (third.job_id,)
+
+
+def test_uncertified_afterok_submission_never_acquires_a_claim() -> None:
+    """A refusable afterok launch must not strand a claim either.
+
+    If the prerequisite later fails, the child can never validly submit, so the
+    claim can never be retired through invocation evidence -- and archive, which
+    would otherwise permit that unscheduled failure-blocked descendant, is
+    blocked by the outstanding claim instead.
+    """
+
+    class CountingBackend(ConcurrentBackend):
+        """Count acquisitions so a released claim is not mistaken for none."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquisitions = 0
+
+        def acquire_lifecycle_claim(self, run_root: str, operation_id: str):
+            self.acquisitions += 1
+            return super().acquire_lifecycle_claim(run_root, operation_id)
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterok",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = CountingBackend()
+    engine = ExecutionEngine(backend)
+
+    engine.submit_stage(plan, "compute")
+    acquired_for_compute = backend.acquisitions
+
+    with pytest.raises(ValueError, match="afterok dependencies lack"):
+        engine.submit_stage(plan, "audit")
+
+    assert backend.acquisitions == acquired_for_compute
+    assert not backend.lifecycle_claims
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
