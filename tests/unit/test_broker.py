@@ -8,6 +8,7 @@ Duo access.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -32,6 +33,7 @@ from o2mcp.broker import (
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_LAUNCH_BYTES,
     MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
+    MAX_STATE_COMMAND_PREVIEW_CHARS,
     MAX_UNIX_SOCKET_PATH_BYTES,
     BrokerClient,
     BrokerExecutionResult,
@@ -39,6 +41,8 @@ from o2mcp.broker import (
     O2BrokerError,
     O2BrokerUnavailableError,
     _read_launch_fd,
+    _receipt_number,
+    _receipt_returncode,
     prepare_broker_directory,
 )
 from o2mcp.broker_protocol import (
@@ -55,6 +59,7 @@ from o2mcp.broker_protocol import (
     remote_helper_source,
     write_frame,
 )
+from o2mcp.connection import _held_lock_explanation
 from o2mcp.policy import DEFAULT_LOGIN_COOLDOWN_SECONDS, O2PolicyDeniedError, O2PolicyStore
 
 
@@ -1048,6 +1053,172 @@ def test_broker_state_is_json_serializable(tmp_path, broker_root):
         assert json.loads(json.dumps(state))["status"] == "ready"
     finally:
         _stop_local_broker(thread, client)
+
+
+def test_completed_command_receipt_records_channel_occupancy(tmp_path, broker_root):
+    """Every finished command must leave measurable evidence of what it cost."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        assert client.execute("sleep 0.2; printf done", timeout=5).stdout == "done"
+
+        state = client.local_status()
+        last = state["last_command"]
+        assert state["in_flight"] is None
+        assert state["busy"] is False
+        assert last["command"]["preview"] == "sleep 0.2; printf done"
+        assert last["command"]["preview_truncated"] is False
+        assert last["returncode"] == 0
+        assert last["timed_out"] is False
+        assert last["completed_at"] >= last["dispatched_at"]
+        # Broker-observed occupancy is what starves other callers, so it is
+        # recorded beside the remote helper's own measurement, not replaced by it.
+        assert last["duration_seconds"] >= 0.1
+        assert last["remote_duration_seconds"] >= 0.1
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_busy_receipt_names_the_command_holding_the_serialized_channel(tmp_path, broker_root):
+    """An unanswered ping must still identify the command that owns the channel."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "channel-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "channel-occupant"}
+
+        deadline = time.monotonic() + 5
+        status = client.local_status()
+        while status.get("busy") is not True and time.monotonic() < deadline:
+            status = client.local_status()
+
+        # The daemon is healthy but serialized, so it cannot answer a ping while
+        # this command runs. Without the receipt that is indistinguishable from a
+        # daemon that has stopped serving entirely.
+        assert status["busy"] is True
+        assert status["responsive"] is False
+        assert status["in_flight"]["request_id"] == "channel-occupant"
+        assert status["in_flight"]["command"]["preview"] == "sleep 3; printf occupied"
+        assert status["busy_for_seconds"] >= 0
+        # Busy is not un-ready: the receipt must still authorize queued reuse.
+        assert status["status"] == "ready"
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        assert client.local_status()["busy"] is False
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_terminal_receipt_retains_the_command_that_was_in_flight(tmp_path, broker_root):
+    """A daemon that dies mid-command must still name what it was running."""
+
+    _policy, _server, thread, client = _start_local_broker(
+        tmp_path,
+        broker_root,
+        remote_response_grace=0.05,
+    )
+    try:
+        with pytest.raises(O2BrokerError, match="dispatched but its result was lost"):
+            client.execute("kill -STOP $PPID", timeout=0.05)
+
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+        state = client.local_status()
+        assert state["status"] == "failed"
+        assert state["in_flight"]["command"]["preview"] == "kill -STOP $PPID"
+        # The forensic record survives, but a terminal receipt is never busy.
+        assert state["busy"] is False
+    finally:
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_receipt_bounds_the_command_preview_and_records_a_digest(tmp_path, broker_root):
+    """A long command is identified by digest without being copied into the receipt."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        marker = "x" * (MAX_STATE_COMMAND_PREVIEW_CHARS * 3)
+        command = f"printf '%s' {marker} > /dev/null"
+        assert client.execute(command, timeout=5).returncode == 0
+
+        fingerprint = client.local_status()["last_command"]["command"]
+        assert fingerprint["sha256"] == hashlib.sha256(command.encode("utf-8")).hexdigest()
+        assert fingerprint["bytes"] == len(command.encode("utf-8"))
+        assert len(fingerprint["preview"]) == MAX_STATE_COMMAND_PREVIEW_CHARS
+        assert fingerprint["preview_truncated"] is True
+    finally:
+        _stop_local_broker(thread, client)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "12", None, True, 10**400])
+def test_receipt_rejects_an_unusable_remote_duration(value):
+    """A result frame is only as trustworthy as the remote helper that wrote it."""
+
+    assert _receipt_number(value) is None
+
+
+@pytest.mark.parametrize("value", [True, 2**31, -(2**31) - 1, "0", 1.0, None])
+def test_receipt_rejects_an_implausible_remote_returncode(value):
+    """Only a plausibly sized integer exit status is retained in the receipt."""
+
+    assert _receipt_returncode(value) is None
+
+
+def test_receipt_keeps_ordinary_remote_measurements():
+    """Sanitizing hostile values must not discard the normal ones."""
+
+    assert _receipt_number(1.5) == 1.5
+    assert _receipt_number(2) == 2.0
+    assert _receipt_returncode(0) == 0
+    assert _receipt_returncode(-1) == -1
+
+
+def test_held_lock_explanation_names_a_busy_command():
+    """A held lock plus a silent ping must distinguish busy from wedged."""
+
+    busy = _held_lock_explanation(
+        {
+            "busy": True,
+            "busy_for_seconds": 42.4,
+            "in_flight": {"command": {"preview": "du -sb /n/groups/tabin"}},
+        }
+    )
+    assert busy == "It has been serving a command for 42s: 'du -sb /n/groups/tabin'."
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"busy": False},
+        {},
+        {"busy": True, "in_flight": None},
+        {"busy": True, "in_flight": {"command": "not-an-object"}},
+    ],
+)
+def test_held_lock_explanation_falls_back_without_a_usable_receipt(status):
+    """A missing or malformed in-flight record must not crash the start path."""
+
+    explanation = _held_lock_explanation(status)
+    assert explanation.startswith("It ") and explanation.endswith(".")
 
 
 def test_launch_capability_is_an_inherited_one_shot_descriptor(broker_root):

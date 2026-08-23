@@ -192,6 +192,27 @@ def _guarded_default_runner(
     )
 
 
+def _held_lock_explanation(status: dict[str, object]) -> str:
+    """Explain a held lifetime lock that did not answer the short local ping.
+
+    The daemon serializes local clients, so an ordinary command slower than the
+    ping deadline produces exactly the same silence as a wedged or Duo-blocked
+    daemon. When the receipt names an in-flight command, say so: the difference
+    decides whether an operator should wait or intervene.
+    """
+
+    if not status.get("busy"):
+        return "It may be busy, awaiting Duo, or failing."
+    in_flight = status.get("in_flight")
+    command = in_flight.get("command") if isinstance(in_flight, dict) else None
+    preview = command.get("preview") if isinstance(command, dict) else None
+    elapsed = status.get("busy_for_seconds")
+    held = f" for {elapsed:.0f}s" if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else ""
+    if isinstance(preview, str) and preview:
+        return f"It has been serving a command{held}: {preview!r}."
+    return f"It has been serving a command{held}."
+
+
 class O2Connection:
     """Manage role-specific command brokers and rsync masters under one policy."""
 
@@ -573,7 +594,8 @@ class O2Connection:
             lifecycle = str(status.get("status") or "unknown")
             raise O2BrokerStartupError(
                 f"An O2 broker daemon already owns the lifetime lock (receipt status: {lifecycle}) but did not "
-                "answer the short local ping. It may be busy, awaiting Duo, or failing; do not start a second session."
+                f"answer the short local ping. {_held_lock_explanation(status)} "
+                "Do not start a second session."
             )
         auto_grant_id: str | None = None
         if not grant_id:

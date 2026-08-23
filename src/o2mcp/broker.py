@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -94,6 +95,12 @@ DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS = 5.0
 # throughput floor supplies a separate absolute transfer budget.
 MIN_REMOTE_RESPONSE_BYTES_PER_SECOND = 64 * 1024
 MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYTES_PER_SECOND
+# One bounded command preview is retained in the owner-only receipt so an
+# operator can name the command occupying the serialized channel. The bound is
+# in characters, not bytes, so truncation cannot split a UTF-8 code point, and
+# the full command stays out of the receipt: the digest identifies a repeat
+# offender without copying arguments that may embed sensitive paths.
+MAX_STATE_COMMAND_PREVIEW_CHARS = 200
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -112,6 +119,43 @@ def _is_bounded_positive_timeout(value: Any) -> bool:
         return math.isfinite(value) and 0 < value <= MAX_TIMEOUT_SECONDS
     except OverflowError:
         return False
+
+
+def _command_fingerprint(command: str) -> dict[str, Any]:
+    """Summarize one command for the receipt without copying it in full."""
+
+    encoded = command.encode("utf-8")
+    preview = command[:MAX_STATE_COMMAND_PREVIEW_CHARS]
+    return {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "preview": preview,
+        "preview_truncated": len(preview) != len(command),
+    }
+
+
+def _receipt_number(value: Any) -> float | None:
+    """Return one finite number for the receipt, or None for anything else.
+
+    Result frames cross the SSH channel, so their fields are only as trustworthy
+    as the remote helper. Filtering here keeps a non-finite or non-numeric value
+    out of a file that every later reader must still be able to parse.
+    """
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _receipt_returncode(value: Any) -> int | None:
+    """Return one plausibly sized remote exit status, or None."""
+
+    if type(value) is not int or not -(2**31) <= value < 2**31:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -509,15 +553,37 @@ class BrokerClient:
             raise O2BrokerUnavailableError(f"unexpected local broker status response: {response!r}")
         return response
 
+    @staticmethod
+    def _busy_summary(state: dict[str, Any]) -> dict[str, Any]:
+        """Describe an in-flight command so an unanswered ping stays diagnosable.
+
+        The daemon serializes local clients, so it cannot answer a ping while a
+        command occupies the one channel. Any command slower than the ping
+        deadline therefore makes a healthy broker look unresponsive. Reporting
+        the dispatched command and its elapsed time separates that ordinary busy
+        state from a daemon that has actually stopped serving. A terminal
+        receipt keeps its in-flight record for forensics but is never busy.
+        """
+
+        in_flight = state.get("in_flight")
+        if state.get("status") != "ready" or not isinstance(in_flight, dict):
+            return {"busy": False}
+        summary: dict[str, Any] = {"busy": True}
+        dispatched_at = _receipt_number(in_flight.get("dispatched_at"))
+        if dispatched_at is not None:
+            summary["busy_for_seconds"] = max(0.0, time.time() - dispatched_at)
+        return summary
+
     def local_status(self) -> dict[str, Any]:
         """Return receipt plus local responsiveness without contacting O2."""
 
         state = _read_state(self.paths)
+        busy = self._busy_summary(state)
         try:
             pong = self.ping(timeout=0.25)
         except O2BrokerError as exc:
-            return {**state, "responsive": False, "local_error": str(exc)}
-        return {**state, "responsive": True, "daemon": pong}
+            return {**state, **busy, "responsive": False, "local_error": str(exc)}
+        return {**state, **busy, "responsive": True, "daemon": pong}
 
     def launch_in_progress(self) -> bool:
         """Return whether a daemon holds the lifetime lock, without signaling it."""
@@ -656,6 +722,7 @@ class BrokerServer:
         self.listener: socket.socket | None = None
         self._stop_requested = False
         self._commands_completed = 0
+        self._in_flight: dict[str, Any] | None = None
         self._state: dict[str, Any] = {}
         self._lock_handle: BinaryIO | None = None
 
@@ -1099,11 +1166,51 @@ class BrokerServer:
                 return
             except (OSError, BrokerProtocolError) as exc:
                 raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
+            # Publish the dispatched command before waiting for its result. No
+            # ping can be answered until this command finishes, so the receipt is
+            # the only local evidence of what the channel is doing -- and a
+            # terminal write retains it if the daemon dies here, which is exactly
+            # when an operator needs to know what was running.
+            dispatched_at = self.clock()
+            in_flight = {
+                "request_id": request_id,
+                "command": _command_fingerprint(request["command"]),
+                "timeout_seconds": request_timeout,
+                "dispatched_at": dispatched_at,
+            }
+            self._in_flight = in_flight
+            # The receipt is diagnostic, so a transient write failure must not
+            # abort a command that the channel is otherwise ready to run. The
+            # in-memory record still reaches any later terminal write.
+            with suppress(O2BrokerError):
+                self._write_state("ready", in_flight=in_flight)
             response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
             if response.get("id") != request.get("id"):
                 raise _O2BrokerTransportError("remote response id does not match the serialized request")
             self._commands_completed += 1
-            self._write_state("ready", last_command_at=self.clock())
+            completed_at = self.clock()
+            # ``_write_state`` accumulates keys across writes, so the in-flight
+            # record must be cleared explicitly rather than left to expire.
+            self._in_flight = None
+            self._write_state(
+                "ready",
+                last_command_at=completed_at,
+                in_flight=None,
+                last_command={
+                    **in_flight,
+                    "completed_at": completed_at,
+                    # Broker-observed occupancy: how long this command held the
+                    # sole serialized channel, which is what starves other
+                    # callers. The remote helper's own measurement is recorded
+                    # beside it rather than in place of it.
+                    "duration_seconds": max(0.0, completed_at - dispatched_at),
+                    "remote_duration_seconds": _receipt_number(response.get("duration_seconds")),
+                    "returncode": _receipt_returncode(response.get("returncode")),
+                    "timed_out": bool(response.get("timed_out", False)),
+                    "stdout_truncated": bool(response.get("stdout_truncated", False)),
+                    "stderr_truncated": bool(response.get("stderr_truncated", False)),
+                },
+            )
             # A caller may time out or close while its remote command continues.
             # The result has already been drained, so losing only the local reply
             # must not tear down the healthy shared channel.
@@ -1155,7 +1262,7 @@ class BrokerServer:
                     # a concurrent repair/disable must not be overwritten.
                     pass
             with suppress(O2BrokerError):
-                self._write_state("failed", error=failure)
+                self._write_state("failed", error=failure, in_flight=self._in_flight)
             return 1
         finally:
             if self.listener is not None:
@@ -1166,7 +1273,7 @@ class BrokerServer:
             if self._lock_handle is not None:
                 self._lock_handle.close()
 
-        self._write_state(outcome, stopped_at=self.clock(), error=failure)
+        self._write_state(outcome, stopped_at=self.clock(), error=failure, in_flight=self._in_flight)
         return 0 if outcome == "stopped" else 1
 
 

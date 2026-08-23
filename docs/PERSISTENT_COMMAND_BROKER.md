@@ -148,6 +148,39 @@ automatic retry.
 - `o2_local_status` may read the receipt and ping the Unix socket, but it never
   sends a frame to O2.
 
+### Command observability
+
+The daemon serializes local clients over one channel, so it cannot answer a
+ping while a command is running. Any command slower than the ping deadline
+therefore makes a healthy broker report `responsive: false`, which on its own
+is indistinguishable from a daemon that has stopped serving. The receipt
+carries the missing half of that picture:
+
+- `in_flight` names the command currently holding the channel (`request_id`,
+  bounded command fingerprint, requested `timeout_seconds`, `dispatched_at`)
+  and is `null` whenever the channel is idle. It is written before the daemon
+  waits for a result and is retained by the terminal receipt, so a daemon that
+  dies mid-command still records what it was running.
+- `last_command` records the completed command plus `duration_seconds` — the
+  broker-observed channel occupancy, which is what starves other callers —
+  alongside the helper's own `remote_duration_seconds`, `returncode`,
+  `timed_out`, and truncation flags. Remote-reported numbers are filtered to
+  finite, plausibly sized values before they reach a file later readers must
+  still parse.
+- `local_status` derives `busy` and `busy_for_seconds` from that record, so an
+  unanswered ping reports which command is responsible instead of only that no
+  answer arrived. A terminal receipt keeps its `in_flight` record for forensics
+  but is never reported as busy.
+- Busy is not un-ready. `status` stays `ready` while a command runs, because a
+  busy broker is still a reusable broker: later clients queue behind the
+  in-flight command rather than being refused for lacking a ready receipt.
+- The command fingerprint is a SHA-256 digest, a UTF-8 byte length, and a
+  preview bounded to the first 200 characters. The full command is deliberately
+  not copied into the receipt, so a repeat offender stays identifiable without
+  retaining arguments that may embed sensitive paths.
+- The dispatch-time receipt write is best effort. It is diagnostic, so a
+  transient failure must not abort a command the channel is ready to run.
+
 ## MVP boundaries
 
 `o2_exec`, Slurm tools, workspace tools, and keepalive reach the login broker
