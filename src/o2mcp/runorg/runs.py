@@ -67,7 +67,12 @@ REQUIRED_FOR_REGISTER = ("campaign", "pipeline", "datasets")
 
 # Marker word-lists, view-suffixes and the heavy-suffix threshold are project-specific
 # and come from a RunPolicy (see o2mcp.runorg.policy); the generic engine holds none.
-_RUN_ID_RE = re.compile(r"^RUN_(?P<ts>\d{8}T\d{6}Z)_(?P<slug>.+)$")
+# The shared matcher stays as permissive as the identities already stored on the
+# cluster: historical runs such as ``RUN_20240101T12_campaign`` predate the
+# six-digit convention and must keep their promote/archive path. New
+# execution-plan identities are held to the exact form instead.
+_RUN_ID_RE = re.compile(r"^RUN_(?P<ts>\d{8}T\d{0,6}Z?)_(?P<slug>.+)$")
+STRICT_RUN_ID_RE = re.compile(r"^RUN_(?P<ts>\d{8}T\d{6}Z)_(?P<slug>.+)$")
 
 
 # --- layout ------------------------------------------------------------------
@@ -162,7 +167,11 @@ class RunManifest:
     def validate(self, *, for_register: bool = False) -> list[str]:
         """Return a list of human-readable problems (empty == valid)."""
         problems: list[str] = []
-        if not _RUN_ID_RE.match(self.run_id):
+        # A new identity must use the exact timestamp form.  Identities already
+        # stored on the cluster predate that convention, so reading one for its
+        # lifecycle keeps the historical matcher rather than stranding the run.
+        pattern = STRICT_RUN_ID_RE if for_register else _RUN_ID_RE
+        if not pattern.match(self.run_id):
             problems.append(f"run_id {self.run_id!r} does not match RUN_<UTCtimestamp>Z_<slug>")
         if self.status not in VALID_STATUSES:
             problems.append(f"status {self.status!r} not in {VALID_STATUSES}")

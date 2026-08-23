@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from o2mcp.runorg.plan_components import CanonicalPaths, DatasetIdentity, _validate_identifier
 from o2mcp.runorg.plan_stages import StageSpec
 from o2mcp.runorg.plans import ExecutionPlan
-from o2mcp.runorg.runs import _RUN_ID_RE, campaign_of
+from o2mcp.runorg.runs import STRICT_RUN_ID_RE, campaign_of
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class PreparedRunIdentity:
 
         for field_name in ("project", "campaign", "pipeline"):
             _validate_identifier(getattr(self, field_name), field_name)
-        if not _RUN_ID_RE.fullmatch(self.run_id):
+        if not STRICT_RUN_ID_RE.fullmatch(self.run_id):
             raise ValueError("prepared run_id must match RUN_<UTCtimestamp>Z_<slug>")
         if campaign_of(self.run_id) != self.campaign:
             raise ValueError("prepared campaign must match the campaign encoded in run_id")

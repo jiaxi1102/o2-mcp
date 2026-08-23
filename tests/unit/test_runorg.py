@@ -168,6 +168,9 @@ def test_run_id_and_campaign_components_fail_closed():
         datasets=["ds1"],
     )
     assert any("does not match" in problem for problem in loose.validate(for_register=True))
+    # The same identity, already stored on the cluster, keeps its lifecycle path:
+    # promote/archive read it through validate() without for_register.
+    assert loose.validate() == []
     assert _safe(".") == "uncategorized"
     assert _safe("..") == "uncategorized"
 
@@ -716,6 +719,40 @@ def test_manifest_less_legacy_run_keeps_its_transition_path(tmp_path):
     assert promote.started is False and "rsync" in promote.script
     archive = runs.archive(rd, dry_run=True)
     assert archive.started is False
+
+
+def test_historical_run_id_keeps_its_transition_path(tmp_path):
+    """A pre-convention identity must not lose promote/archive.
+
+    Identities such as ``RUN_20240101T12_camp`` were accepted by the earlier
+    matcher and are already stored on the cluster.  Holding the lifecycle read
+    to the new exact form would strand them with otherwise valid metadata.
+    """
+
+    manifest_json = json.dumps(
+        {
+            "run_id": "RUN_20240101T12_camp__v1",
+            "campaign": "camp",
+            "pipeline": "grid",
+            "created_utc": "20240101T120000Z",
+            "status": "active",
+            "datasets": ["d"],
+            "result": {"status": "COMPLETED"},
+        }
+    )
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return (manifest_json, "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20240101T12_camp__v1")
+    promote = runs.promote(rd, dry_run=True)
+    assert promote.started is False and "rsync" in promote.script
 
 
 def test_manifest_less_kept_run_can_still_be_archived(tmp_path):

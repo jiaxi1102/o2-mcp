@@ -44,7 +44,7 @@ from o2mcp.runorg.plan_components import (
     _validate_sha256,
 )
 from o2mcp.runorg.plan_stages import CommandSpec, StageSpec, TaskSpec
-from o2mcp.runorg.runs import _RUN_ID_RE, campaign_of
+from o2mcp.runorg.runs import STRICT_RUN_ID_RE, campaign_of
 from o2mcp.runorg.strict_json import strict_json_value
 
 
@@ -82,7 +82,7 @@ class ExecutionPlan:
             raise ValueError(f"schema_version must be {EXECUTION_PLAN_SCHEMA_VERSION}, got {self.schema_version}")
         for field_name in ("project", "campaign", "pipeline", "run_id"):
             _validate_identifier(getattr(self, field_name), field_name)
-        if not _RUN_ID_RE.fullmatch(self.run_id):
+        if not STRICT_RUN_ID_RE.fullmatch(self.run_id):
             raise ValueError("run_id must match the registered RUN_<UTCtimestamp>Z_<slug> convention")
         if campaign_of(self.run_id) != self.campaign:
             raise ValueError("campaign must match the campaign encoded in run_id")

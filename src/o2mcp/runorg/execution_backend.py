@@ -95,45 +95,53 @@ class ExecutionBackend(Protocol):
 
 
 # A receipt is evidence only when every component below the authenticated run
-# root is real: ``lstat`` declines to follow just the final name, so a task that
-# replaces an intermediate directory with a link to an external tree would still
-# have its target hashed.  Promotion and archive preserve the link rather than
-# those bytes, releasing a run as certified against data that can change or
-# vanish.  The walk therefore refuses a link at any depth below the root, and
-# ``O_NOFOLLOW`` closes the window between the check and the read.  Components
-# of the run root itself are not walked: that path is the authenticated boundary
-# and legitimately traverses site symlinks on the cluster.
+# root is real.  Re-resolving the assembled pathname would reopen the race it is
+# meant to close: a directory that passed its check can be swapped for a link to
+# an external tree before the read, and ``O_NOFOLLOW`` then protects only the
+# leaf.  Each component is therefore opened relative to the descriptor of the
+# component already verified, and the leaf is hashed through its own descriptor,
+# so the bytes read are the bytes checked.  Components of the run root itself are
+# not walked: that path is the authenticated boundary and legitimately traverses
+# site symlinks on the cluster.
 RECEIPT_PROBE_PROGRAM = """
 import hashlib, json, os, stat, sys
 
 root, relative = sys.argv[1], sys.argv[2]
 parts = [part for part in relative.split('/') if part not in ('', '.')]
 valid = bool(parts) and '..' not in parts
-current = root
-if valid:
+digest = None
+handles = []
+try:
+    if valid:
+        handles.append(os.open(root, os.O_RDONLY))
     for depth, part in enumerate(parts):
-        current = os.path.join(current, part)
+        if not valid:
+            break
+        final = depth == len(parts) - 1
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+        if not final:
+            flags |= getattr(os, 'O_DIRECTORY', 0)
         try:
-            mode = os.lstat(current).st_mode
+            handle = os.open(part, flags, dir_fd=handles[-1])
         except OSError:
             valid = False
             break
-        expected = stat.S_ISDIR if depth < len(parts) - 1 else stat.S_ISREG
-        if not expected(mode):
+        handles.append(handle)
+        mode = os.fstat(handle).st_mode
+        if not (stat.S_ISREG(mode) if final else stat.S_ISDIR(mode)):
             valid = False
             break
-
-digest = None
-if valid:
-    try:
-        handle = os.open(current, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-    except OSError:
-        valid = False
-    else:
-        with os.fdopen(handle, 'rb') as stream:
+    if valid:
+        with os.fdopen(os.dup(handles[-1]), 'rb') as stream:
             digest = hashlib.sha256(stream.read()).hexdigest()
+finally:
+    for handle in handles:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
 
-print(json.dumps({'exists': valid, 'sha256': digest}, sort_keys=True))
+print(json.dumps({'exists': valid, 'sha256': digest if valid else None}, sort_keys=True))
 """
 
 
