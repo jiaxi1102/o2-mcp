@@ -147,8 +147,32 @@ class ExecutionFollowupMixin:
                 # An ordinary retry won this attempt identity's intent, so this
                 # authorization never became a generation.  Replaying it would
                 # return the winner's unrelated submission and silently drop the
-                # replacement generation, so open the next attempt instead.
+                # replacement generation, so open the next attempt instead --
+                # unless a newer generation already covers the current
+                # dependency tuple, in which case allocating another would race
+                # two full-task jobs over the same outputs.
+                lost_arbitration = existing_generation
                 existing_generation = None
+                current_jobs = self._dependency_jobs(plan, reconciler)
+                covering = self._covering_generation(
+                    plan,
+                    reconciler,
+                    records,
+                    occupied_generations,
+                    lost_arbitration,
+                    current_jobs,
+                )
+                if covering is not None:
+                    if any(record.identity.attempt == covering for record in records):
+                        continue
+                    submitted.append(
+                        self.submit_dependency_followup(
+                            plan,
+                            reconciler.stage_id,
+                            attempt=covering,
+                        ).record
+                    )
+                    continue
             if existing_generation is not None:
                 identity = SubmissionIdentity(plan.plan_sha256, reconciler.stage_id, existing_generation)
                 rejection = read_submission_rejection(

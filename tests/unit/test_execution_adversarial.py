@@ -2154,6 +2154,189 @@ def test_superseded_replay_reuses_an_authorized_but_unsubmitted_generation() -> 
     assert replayed[0].task_ids == ("audit",)
 
 
+def test_afterok_certification_binds_to_the_resolved_dependency_job() -> None:
+    """Stage-level completion is not enough to release an afterok child.
+
+    A prerequisite can accept a replacement job that has not reconciled yet.
+    Depending on that job would let Slurm release this stage on a zero exit
+    while its required receipts are absent -- exactly what the gate exists to
+    prevent -- so certification is bound to the resolved job, not the stage.
+    """
+
+    root = StageSpec(
+        stage_id="root",
+        command=_command("root"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="root"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        depends_on=("root",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("preflight",),
+        dependency_mode="afterok",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(root, preflight, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    root_one = engine.submit_stage(plan, "root").record
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="preflight"))
+    assert engine.reconcile_stage(plan, "preflight").decision == "COMPLETED"
+
+    # The certified generation may release the child.
+    engine._validate_afterok_dependency_jobs(plan, stage_by_id(plan, "audit"), (preflight_one.job_id,))
+
+    # And the check is on the submission path, receiving the resolved tuple
+    # rather than only the stage, so a replacement accepted after the early
+    # gate cannot slip into the published intent.
+    checked: list[tuple[str, tuple[str, ...]]] = []
+
+    class SpyEngine(ExecutionEngine):
+        """Record the exact dependency tuple certification received."""
+
+        def _validate_afterok_dependency_jobs(self, plan, stage, dependency_jobs):
+            checked.append((stage.stage_id, dependency_jobs))
+            return super()._validate_afterok_dependency_jobs(plan, stage, dependency_jobs)
+
+    SpyEngine(backend).submit_stage(plan, "audit")
+    assert ("audit", (preflight_one.job_id,)) in checked
+
+    # The prerequisite accepts a replacement that has not reconciled.
+    backend.set_states(root_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    assert engine.reconcile_stage(plan, "root").retry_submission is not None
+    preflight_two = read_plan_submission_records(backend, plan, stage_by_id(plan, "preflight"))[-1]
+    assert preflight_two.identity.attempt == 2
+
+    with pytest.raises(ValueError, match="without authenticated COMPLETED reconciliation"):
+        engine._validate_afterok_dependency_jobs(
+            plan,
+            stage_by_id(plan, "audit"),
+            (preflight_two.job_id,),
+        )
+
+
+def test_lost_arbitration_reuses_a_covering_authorization() -> None:
+    """Losing an attempt must not allocate a generation that already exists.
+
+    An authorization can lose its attempt to an ordinary retry while another
+    dependency has already authorized a generation covering the current
+    dependency tuple.  Allocating a further identity would leave two full-task
+    jobs racing over the same outputs once the other trigger is replayed.
+    """
+
+    class PublishFollowupAtIntent(ConcurrentBackend):
+        """Land an authorization exactly as the ordinary retry writes intent."""
+
+        pending_authorization: tuple[str, str] | None = None
+
+        def write_immutable_text(self, path: str, text: str) -> bool:
+            if self.pending_authorization is not None and "/submission-intents/compute/" in path:
+                target, payload = self.pending_authorization
+                self.pending_authorization = None
+                super().write_immutable_text(target, payload)
+            return super().write_immutable_text(path, text)
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    base = _compute_stage()
+    compute = StageSpec(
+        stage_id=base.stage_id,
+        resources=base.resources,
+        expected_receipts=base.expected_receipts,
+        tasks=base.tasks,
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=base.retry_policy,
+    )
+    plan = _plan(stages=(compute_a, compute_b, compute))
+    backend = PublishFollowupAtIntent()
+    engine = ExecutionEngine(backend)
+
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    compute_one = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    assert engine.reconcile_stage(plan, "compute", submit_retry=False).decision == "RETRY_MISSING_ONLY"
+
+    def make_retryable(job_id: str, prefix: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    def authorization(attempt: int, jobs: list, trigger_job: str, trigger_stage: str) -> tuple[str, str]:
+        """Return the exact authorization bytes propagation would publish."""
+
+        return (
+            reconciler_followup_path(plan, "compute", attempt),
+            canonical_json(
+                {
+                    "attempt": attempt,
+                    "dependency_job_ids": jobs,
+                    "plan_sha256": plan.plan_sha256,
+                    "schema_version": 1,
+                    "stage_id": "compute",
+                    "trigger_job_id": trigger_job,
+                    "trigger_stage_id": trigger_stage,
+                }
+            ),
+        )
+
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    make_retryable(first_a.job_id, "a")
+    retry_a = engine.reconcile_stage(plan, "compute-a").retry_submission
+    assert retry_a is not None
+
+    # A's authorization loses attempt two to compute's own ordinary retry.
+    backend.pending_authorization = authorization(2, [retry_a.job_id, first_b.job_id], retry_a.job_id, "compute-a")
+    winner = ExecutionEngine(backend).submit_stage(plan, "compute", attempt=2, task_ids=("movie-1",)).record
+    assert winner.dependency_job_ids == (first_a.job_id, first_b.job_id)
+
+    # B then authorizes the covering generation but dies before submitting it.
+    make_retryable(first_b.job_id, "b")
+    retry_b = engine.reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+    target, payload = authorization(3, [retry_a.job_id, retry_b.job_id], retry_b.job_id, "compute-b")
+    backend.write_immutable_text(target, payload)
+    assert not [
+        record
+        for record in read_plan_submission_records(backend, plan, stage_by_id(plan, "compute"))
+        if record.identity.attempt == 3
+    ]
+
+    replayed = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute-a", retry_a)
+    assert [record.identity.attempt for record in replayed] == [3]
+    assert replayed[0].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 

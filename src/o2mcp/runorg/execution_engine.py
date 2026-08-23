@@ -165,6 +165,10 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         requested_task_ids = authorized_task_ids if task_ids is None else tuple(task_ids)
         if requested_task_ids != authorized_task_ids:
             raise ValueError("requested task set differs from the signed attempt authorization")
+        # The early gate certified the stage, but another coordinator can accept a
+        # replacement prerequisite between that check and this resolution.  Bind
+        # certification to the exact jobs about to be written into the intent.
+        self._validate_afterok_dependency_jobs(plan, stage, authorized_dependencies)
         selected = select_tasks(stage, authorized_task_ids)
         record_path = submission_record_path(plan, identity)
         expected_task_ids = tuple(task.task_id for task in selected)
@@ -774,6 +778,44 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             raise ValueError(
                 "afterok dependencies lack authenticated COMPLETED reconciliation receipts: "
                 + ", ".join(sorted(incomplete))
+            )
+
+    def _validate_afterok_dependency_jobs(
+        self,
+        plan: ExecutionPlan,
+        stage: StageSpec,
+        dependency_jobs: tuple[str, ...],
+    ) -> None:
+        """Require the exact resolved prerequisite jobs to be certified complete.
+
+        Stage-level certification is not enough: a prerequisite can accept a
+        replacement job that has not reconciled yet, and ``afterok`` against that
+        job would release this stage on a zero exit while its required receipts
+        are absent or corrupt -- the condition the gate exists to prevent.
+        """
+
+        if stage.dependency_mode != "afterok":
+            return
+        uncertified = []
+        for dependency, job_id in zip(stage.depends_on, dependency_jobs):
+            dependency_stage = stage_by_id(plan, dependency)
+            receipt = latest_reconciliation_receipt(self.backend, plan, dependency_stage)
+            certified = next(
+                (record for record in self._submission_records(plan, dependency_stage) if record.job_id == job_id),
+                None,
+            )
+            if (
+                receipt is None
+                or receipt.decision != RECONCILE_COMPLETE
+                or certified is None
+                or receipt.attempt != certified.identity.attempt
+                or not self._has_completed_reconciliation(plan, dependency_stage)
+            ):
+                uncertified.append(f"{dependency}:{job_id}")
+        if uncertified:
+            raise ValueError(
+                "afterok dependencies resolve to jobs without authenticated COMPLETED reconciliation: "
+                + ", ".join(sorted(uncertified))
             )
 
     def _unique_existing_job(self, identity: SubmissionIdentity) -> str | None:
