@@ -1173,6 +1173,12 @@ class BrokerServer:
                     # occupancy covers that write and a write that fails after
                     # acknowledgement is still attributed to this command.
                     dispatched_at = self.clock()
+                    # Epoch timestamps are what an operator reads, but they are
+                    # not a safe basis for a duration: an NTP or manual step
+                    # during a long command would inflate the occupancy metric
+                    # or collapse it to zero. Measure elapsed time the way every
+                    # other deadline in this daemon does.
+                    dispatched_monotonic = time.monotonic()
                     in_flight = {
                         "request_id": request_id,
                         "command": _command_fingerprint(request["command"]),
@@ -1189,11 +1195,23 @@ class BrokerServer:
                 raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
             # Publish the dispatched command. No ping can be answered until it
             # finishes, so this receipt is the only local evidence of what the
-            # channel is doing. Publishing is diagnostic, so a transient
-            # filesystem failure must not abort a command that is already
-            # running remotely; a directory that no longer validates as
-            # owner-only is a security condition, not a diagnostic one, and is
-            # deliberately left to fail closed.
+            # channel is doing.
+            #
+            # This lands after the remote frame write, so another process still
+            # reads `busy: false` for the duration of that write. Moving it
+            # earlier would put an unbounded fsync inside
+            # ``serialize_reuse_launch``, whose contract excludes unrelated
+            # preparation and whose hold time is deliberately bounded by
+            # explicit deadlines so an incident disable stays responsive. The
+            # window is bounded by the write deadline, a write that fails inside
+            # it is still attributed by the terminal receipt, and the occupancy
+            # metric already covers it because timing starts at the
+            # acknowledgement above.
+            #
+            # Publishing is diagnostic, so a transient filesystem failure must
+            # not abort a command that is already running remotely; a directory
+            # that no longer validates as owner-only is a security condition,
+            # not a diagnostic one, and is deliberately left to fail closed.
             with suppress(OSError):
                 self._write_state("ready", in_flight=in_flight)
             response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
@@ -1216,7 +1234,7 @@ class BrokerServer:
                         # sole serialized channel, which is what starves other
                         # callers. The remote helper's own measurement is recorded
                         # beside it rather than in place of it.
-                        "duration_seconds": max(0.0, completed_at - dispatched_at),
+                        "duration_seconds": max(0.0, time.monotonic() - dispatched_monotonic),
                         "remote_duration_seconds": _receipt_number(response.get("duration_seconds")),
                         "returncode": _receipt_returncode(response.get("returncode")),
                         "timed_out": bool(response.get("timed_out", False)),

@@ -1195,6 +1195,47 @@ def test_receipt_keeps_ordinary_remote_measurements():
     assert _receipt_returncode(-1) == -1
 
 
+def test_occupancy_survives_a_wall_clock_step(tmp_path, broker_root):
+    """An NTP or manual clock correction must not corrupt the occupancy metric."""
+
+    stepped = {"offset": 0.0}
+
+    def stepping_clock() -> float:
+        return time.time() + stepped["offset"]
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        clock=stepping_clock,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="stepped-clock-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Step the wall clock an hour backwards while the command is running.
+        # Subtracting epoch timestamps would clamp the result to 0.0 via ``max``.
+        stepper = threading.Timer(0.2, lambda: stepped.__setitem__("offset", -3600.0))
+        stepper.start()
+        try:
+            assert client.execute("sleep 0.5; printf stepped", timeout=10).stdout == "stepped"
+        finally:
+            stepper.cancel()
+
+        assert client.local_status()["last_command"]["duration_seconds"] >= 0.3
+    finally:
+        client.stop(reason="stepped clock test complete")
+        thread.join(timeout=5)
+
+
 def test_a_pong_retires_an_in_flight_record_left_by_a_failed_write(tmp_path, broker_root, monkeypatch):
     """A daemon that answers a ping is proof the channel is idle.
 

@@ -175,6 +175,17 @@ carries the missing half of that picture:
   the channel, and it retires an `in_flight` entry that a suppressed
   best-effort write would otherwise leave standing. A terminal receipt keeps
   its `in_flight` record for forensics but is never reported as busy.
+- `duration_seconds` is measured with `time.monotonic()`, like every other
+  deadline in the daemon, so an NTP or manual wall-clock step during a long
+  command cannot inflate the metric or collapse it to zero. The epoch
+  timestamps beside it are for operator reading, not arithmetic.
+- The in-flight receipt is published after the remote frame write, so another
+  process reads `busy: false` for that write's duration. Publishing earlier
+  would place an unbounded fsync inside the policy mutex, whose hold time is
+  deliberately bounded so an incident disable stays responsive. The window is
+  bounded by the write deadline, a write that fails inside it is still named by
+  the terminal receipt, and occupancy already covers it because timing starts at
+  the acknowledgement.
 - The record is best effort, not a ledger. Consecutive suppressed writes can
   leave it naming an earlier command than the one actually running; it is a
   diagnostic aid, and the pong remains the authority on whether the channel is
