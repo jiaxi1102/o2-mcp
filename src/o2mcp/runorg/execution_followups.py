@@ -25,6 +25,11 @@ from o2mcp.runorg.plans import ExecutionPlan
 class ExecutionFollowupMixin:
     """Generate and recover dependency-bound reconciler submissions."""
 
+    def _followup_binds(self, plan, reconciler, attempt: int, dependency_jobs: tuple) -> bool:
+        """Report whether one authorization still names the current jobs."""
+
+        return authenticate_followup_authorization(self.backend, plan, reconciler, attempt) == dependency_jobs
+
     def _ensure_reconciler_followups(
         self,
         plan: ExecutionPlan,
@@ -122,24 +127,37 @@ class ExecutionFollowupMixin:
                     submission_rejection_path(plan, identity),
                 )
                 if rejection is None:
-                    submitted.append(
-                        self.submit_dependency_followup(
-                            plan,
-                            reconciler.stage_id,
-                            attempt=existing_generation,
-                        ).record
+                    if self._followup_binds(
+                        plan,
+                        reconciler,
+                        existing_generation,
+                        self._dependency_jobs(plan, reconciler),
+                    ):
+                        submitted.append(
+                            self.submit_dependency_followup(
+                                plan,
+                                reconciler.stage_id,
+                                attempt=existing_generation,
+                            ).record
+                        )
+                        continue
+                    # Another dependency's retry allocated a newer generation
+                    # after this authorization was published but before it was
+                    # submitted.  Replaying it would bind that stale dependency
+                    # tuple, which submission rejects against the now-current
+                    # jobs, wedging every later reconciliation of this stage.
+                    next_attempt = existing_generation + 1
+                else:
+                    expected_task_ids = tuple(task.task_id for task in select_tasks(reconciler, None))
+                    next_attempt, rejected = next_unrejected_attempt(
+                        self.backend,
+                        plan,
+                        reconciler,
+                        existing_generation - 1,
+                        expected_task_ids,
                     )
-                    continue
-                expected_task_ids = tuple(task.task_id for task in select_tasks(reconciler, None))
-                next_attempt, rejected = next_unrejected_attempt(
-                    self.backend,
-                    plan,
-                    reconciler,
-                    existing_generation - 1,
-                    expected_task_ids,
-                )
-                for rejected_identity in rejected:
-                    self._release_rejected_invocation_owner(plan, rejected_identity, "")
+                    for rejected_identity in rejected:
+                        self._release_rejected_invocation_owner(plan, rejected_identity, "")
             else:
                 next_attempt = 1
             next_attempt = max(

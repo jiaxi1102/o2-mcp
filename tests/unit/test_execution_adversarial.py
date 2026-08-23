@@ -1802,6 +1802,83 @@ def test_rejected_followup_generation_advances_without_replaying_sbatch() -> Non
     assert not backend.lifecycle_claims
 
 
+def test_stale_unsubmitted_followup_is_superseded_instead_of_replayed() -> None:
+    """A superseded authorization must not wedge every later reconciliation.
+
+    With two dependencies, a coordinator can die after publishing one parent's
+    follow-up authorization but before its submission intent.  A retry of the
+    other parent then allocates a newer generation bound to both current jobs.
+    Replaying the first authorization would bind its stale dependency tuple,
+    which submission rejects against the now-current jobs, and reconciliation
+    invokes propagation before publishing terminal receipts -- so the stage
+    could never converge or archive again.
+    """
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(compute_a, compute_b, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def make_retryable(job_id: str, prefix: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    # A retries, and the coordinator dies after publishing audit's authorization
+    # but before its submission intent exists.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    make_retryable(first_a.job_id, "a")
+    retry_a = engine.reconcile_stage(plan, "compute-a").retry_submission
+    assert retry_a is not None
+    backend.write_immutable_text(
+        reconciler_followup_path(plan, "audit", 2),
+        canonical_json(
+            {
+                "attempt": 2,
+                "dependency_job_ids": [retry_a.job_id, first_b.job_id],
+                "plan_sha256": plan.plan_sha256,
+                "schema_version": 1,
+                "stage_id": "audit",
+                "trigger_job_id": retry_a.job_id,
+                "trigger_stage_id": "compute-a",
+            }
+        ),
+    )
+
+    # B retries and allocates a newer generation bound to both current jobs.
+    make_retryable(first_b.job_id, "b")
+    retry_b = ExecutionEngine(backend).reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+
+    # Replaying A's propagation must supersede the stale authorization rather
+    # than resubmit it against dependency jobs that have since moved.
+    replayed = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute-a", retry_a)
+    assert [record.identity.attempt for record in replayed] == [4]
+    assert replayed[0].dependency_job_ids == (retry_a.job_id, retry_b.job_id)
+    assert replayed[0].task_ids == ("audit",)
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
