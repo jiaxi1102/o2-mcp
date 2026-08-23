@@ -104,7 +104,13 @@ class ExecutionBackend(Protocol):
 # not walked: that path is the authenticated boundary and legitimately traverses
 # site symlinks on the cluster.
 RECEIPT_PROBE_PROGRAM = """
-import hashlib, json, os, stat, sys
+import errno, hashlib, json, os, stat, sys
+
+# Definitive answers about the path itself.  ELOOP is how O_NOFOLLOW reports the
+# symlink this probe intentionally refuses, and ENOTDIR how it reports a
+# non-directory component.  Every other errno is an operational failure and must
+# not be reported as a trustworthy absence.
+ABSENT = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG)
 
 root, relative = sys.argv[1], sys.argv[2]
 parts = [part for part in relative.split('/') if part not in ('', '.')]
@@ -123,7 +129,9 @@ try:
             flags |= getattr(os, 'O_DIRECTORY', 0)
         try:
             handle = os.open(part, flags, dir_fd=handles[-1])
-        except OSError:
+        except OSError as error:
+            if error.errno not in ABSENT:
+                raise
             valid = False
             break
         handles.append(handle)

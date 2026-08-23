@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import posixpath
 import shutil
 import subprocess
@@ -1592,6 +1593,25 @@ def test_receipt_probe_refuses_symlinks_at_any_depth(tmp_path) -> None:
     )
     for relative in refused:
         assert probe(relative) == {"exists": False, "sha256": None}, relative
+
+    # An operational failure is not evidence of absence: the probe must fail so
+    # the observation is untrustworthy and reconciliation waits, rather than
+    # durably classifying a valid task as missing.
+    if os.geteuid() != 0:
+        locked = root / "locked"
+        locked.mkdir()
+        (locked / "result.json").write_text("value\n")
+        locked.chmod(0o000)
+        try:
+            unreadable = subprocess.run(
+                [sys.executable, "-c", RECEIPT_PROBE_PROGRAM, str(root), "locked/result.json"],
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            locked.chmod(0o755)
+        assert unreadable.returncode != 0
+        assert unreadable.stdout.strip() == ""
 
 
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
