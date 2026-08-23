@@ -89,7 +89,12 @@ class CommandSpec:
             "environment": sorted(self.environment),
             "environment_mode": self.environment_mode,
             "runtime_fingerprint_sha256": self.runtime_fingerprint_sha256,
-            "runtime_fingerprint_path": self.runtime_fingerprint_path,
+            # ``runtime_fingerprint_path`` is deliberately absent: it is
+            # validated to equal ``argv[0]`` and therefore carries nothing the
+            # digest does not already cover.  Emitting it would rewrite the
+            # canonical form of every schema-version-1 plan written before the
+            # field existed, so their stored digests would no longer verify and
+            # their execution evidence could not be replayed.
             "working_directory": self.working_directory,
         }
 

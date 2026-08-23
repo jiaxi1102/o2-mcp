@@ -150,6 +150,34 @@ def test_plan_round_trip_authenticates_canonical_bytes() -> None:
     assert manifest.validate(for_register=True) == []
 
 
+def test_runtime_fingerprint_path_stays_out_of_the_version_one_digest() -> None:
+    """Adding an input alias must not rewrite stored plans' canonical bytes.
+
+    ``runtime_fingerprint_path`` is validated to equal ``argv[0]``, so it adds
+    nothing the digest does not already cover.  Emitting it would change the
+    canonical form of every schema-version-1 plan written before the field
+    existed, and those stored digests would stop verifying while the schema
+    version still claimed compatibility.
+    """
+
+    plan = _plan()
+    body = json.loads(plan.to_json())
+    commands = [task["command"] for stage in body["execution_plan"]["stages"] for task in stage.get("tasks", [])] + [
+        stage["command"] for stage in body["execution_plan"]["stages"] if stage.get("command")
+    ]
+    assert commands
+    assert not any("runtime_fingerprint_path" in command for command in commands)
+
+    # An envelope written before the field existed still verifies.
+    assert ExecutionPlan.from_json(json.dumps(body), expected_plan_sha256=plan.plan_sha256) == plan
+
+    # And one that does carry it decodes to the same digest.
+    for command in commands:
+        command["runtime_fingerprint_path"] = command["argv"][0]
+    carried = ExecutionPlan.from_json(json.dumps(body), expected_plan_sha256=plan.plan_sha256)
+    assert carried.plan_sha256 == plan.plan_sha256
+
+
 def test_digest_is_independent_of_set_like_input_order() -> None:
     """Dataset, stage, task, dependency, and receipt ordering must hash stably."""
 
