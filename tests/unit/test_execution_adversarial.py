@@ -38,7 +38,10 @@ from o2mcp.runorg import (
     SubmitOutcome,
     TaskSpec,
 )
-from o2mcp.runorg.execution_evidence import latest_reconciliation_receipt
+from o2mcp.runorg.execution_evidence import (
+    latest_reconciliation_receipt,
+    read_plan_submission_records,
+)
 from o2mcp.runorg.execution_models import (
     ACCEPTED,
     DEFINITELY_REJECTED,
@@ -53,7 +56,7 @@ from o2mcp.runorg.execution_paths import (
     reconciliation_path,
     task_attempt_path,
 )
-from o2mcp.runorg.execution_reconcile import signed_attempt_bound
+from o2mcp.runorg.execution_reconcile import signed_attempt_bound, stage_by_id
 from o2mcp.runorg.execution_rendering import render_dispatcher
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_sync import merge_execution_manifest
@@ -264,6 +267,29 @@ def _plan(*, stages: tuple[StageSpec, ...] | None = None, source_commit: str = "
         ),
         stages=stages or (_compute_stage(),),
     )
+
+
+def _dependent_plan(*, preflight_attempts: int = 2) -> ExecutionPlan:
+    """Build one ``afterany`` array behind a single retryable prerequisite."""
+
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        retry_policy=RetryPolicy(max_attempts=preflight_attempts, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    base_compute = _compute_stage()
+    compute = StageSpec(
+        stage_id=base_compute.stage_id,
+        resources=base_compute.resources,
+        expected_receipts=base_compute.expected_receipts,
+        tasks=base_compute.tasks,
+        depends_on=("preflight",),
+        dependency_mode="afterany",
+        retry_policy=base_compute.retry_policy,
+    )
+    return _plan(stages=(preflight, compute))
 
 
 def test_two_callers_racing_identical_intent_submit_exactly_one_job() -> None:
@@ -1106,6 +1132,158 @@ def test_afterany_reconciler_uses_its_own_retry_policy_without_followup_authoriz
         2,
     ]
     assert backend.read_text(reconciler_followup_path(plan, "audit", 2)) is None
+
+
+def test_missing_only_retry_preserves_dependency_generation_after_coordinator_crash() -> None:
+    """A delayed ordinary retry cannot mix successes with a newer prerequisite.
+
+    This models a coordinator dying after the dependent array's reconciliation
+    receipt and the prerequisite retry record are durable, but before follow-up
+    propagation runs.  Replaying the dependent retry must keep its successful
+    tasks and dependency job from generation one together.
+    """
+
+    plan = _dependent_plan()
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    compute_one = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    decision = engine.reconcile_stage(plan, "compute", submit_retry=False)
+    assert decision.decision == "RETRY_MISSING_ONLY"
+
+    # Suppress only this call's automatic child propagation to reproduce the
+    # exact post-acceptance crash window. A fresh coordinator will recover from
+    # the immutable records below.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_two = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_two is not None
+
+    compute_two = (
+        ExecutionEngine(backend)
+        .submit_stage(
+            plan,
+            "compute",
+            attempt=2,
+            task_ids=("movie-1",),
+        )
+        .record
+    )
+
+    assert compute_two.task_ids == ("movie-1",)
+    assert compute_two.dependency_job_ids == (preflight_one.job_id,)
+    assert compute_two.dependency_job_ids != (preflight_two.job_id,)
+
+
+def test_rejected_dependency_followup_still_binds_its_own_retry_generation() -> None:
+    """A rejected follow-up, not a newer prerequisite, authorizes its retry.
+
+    An immutable follow-up authorization opens a replacement generation even when
+    the scheduler refuses that exact call.  Retrying the rejected generation must
+    reuse the follow-up's dependency tuple; resolving the DAG again would silently
+    skip to a prerequisite generation that no authorization covers.
+    """
+
+    class RejectFirstComputeFollowup(ConcurrentBackend):
+        """Refuse only the first dependency-triggered compute generation."""
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "compute" and request.identity.attempt == 2:
+                return SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="compute qos rejected")
+            return super().invoke_submission(request)
+
+    plan = _dependent_plan(preflight_attempts=3)
+    preflight = stage_by_id(plan, "preflight")
+    backend = RejectFirstComputeFollowup()
+    engine = ExecutionEngine(backend)
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    engine.submit_stage(plan, "compute")
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    with pytest.raises(SubmissionRejected, match="compute qos rejected"):
+        engine.reconcile_stage(plan, "preflight")
+    preflight_two = read_plan_submission_records(backend, plan, preflight)[-1]
+    assert preflight_two.identity.attempt == 2
+
+    # Crash before the next propagation so a third prerequisite generation is
+    # accepted without ever writing compute's follow-up authorization for it.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    backend.set_states(preflight_two.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_three = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_three is not None
+
+    compute_three = (
+        ExecutionEngine(backend)
+        .submit_stage(
+            plan,
+            "compute",
+            attempt=3,
+            task_ids=("movie-0", "movie-1", "movie-2"),
+        )
+        .record
+    )
+
+    assert compute_three.task_ids == ("movie-0", "movie-1", "movie-2")
+    assert compute_three.dependency_job_ids == (preflight_two.job_id,)
+    assert compute_three.dependency_job_ids != (preflight_three.job_id,)
+
+
+def test_rejected_first_dependent_attempt_reruns_against_the_current_generation() -> None:
+    """Without preserved successes a full rerun may adopt the latest prerequisite.
+
+    Pinning exists to stop a preserved task from pairing with a newer dependency
+    job.  A dependent stage whose only prior call was rejected has no accepted
+    outputs at all, so binding its full-task retry to the currently authenticated
+    prerequisite mixes nothing.
+    """
+
+    class RejectFirstCompute(ConcurrentBackend):
+        """Refuse only the dependent stage's initial submission."""
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "compute" and request.identity.attempt == 1:
+                return SubmitOutcome(DEFINITELY_REJECTED, returncode=1, stderr="compute qos rejected")
+            return super().invoke_submission(request)
+
+    plan = _dependent_plan()
+    compute = stage_by_id(plan, "compute")
+    backend = RejectFirstCompute()
+    engine = ExecutionEngine(backend)
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    with pytest.raises(SubmissionRejected, match="compute qos rejected"):
+        engine.submit_stage(plan, "compute")
+    assert not read_plan_submission_records(backend, plan, compute)
+
+    # Suppress propagation so the retry travels the ordinary rejection path
+    # rather than a dependency follow-up authorization.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_two = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_two is not None
+
+    compute_two = (
+        ExecutionEngine(backend)
+        .submit_stage(
+            plan,
+            "compute",
+            attempt=2,
+            task_ids=("movie-0", "movie-1", "movie-2"),
+        )
+        .record
+    )
+
+    assert compute_two.task_ids == ("movie-0", "movie-1", "movie-2")
+    assert compute_two.dependency_job_ids == (preflight_two.job_id,)
 
 
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
