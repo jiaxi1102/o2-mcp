@@ -13,7 +13,7 @@ from o2mcp.runorg.executor import O2Runs
 from o2mcp.runorg.lifecycle_coordination import coordination_lock, coordination_root
 from o2mcp.runorg.runs import RunLayout, RunManifest, plan_archive_script, plan_promote_script
 from o2mcp.runorg.transition_coordinator import _BEGIN_PROGRAM
-from o2mcp.runorg.transition_guards import require_certified_terminal_execution
+from o2mcp.runorg.transition_guards import live_jobs_command, require_certified_terminal_execution
 
 
 def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> str:
@@ -279,6 +279,55 @@ def test_marking_refuses_a_source_that_vanished_before_the_lock(tmp_path) -> Non
     assert os.path.exists(os.path.join(coordination_root(run_root), "transition.json"))
 
 
+def test_queue_query_survives_purged_job_ids(tmp_path) -> None:
+    """A historical run must be able to prove nothing of its is still live.
+
+    ``squeue -j`` exits nonzero once every named job has aged out of the
+    controller, which is indistinguishable from a failed query, so certified
+    historical runs could never leave scratch storage.  Reading the caller's own
+    queue separates "nothing matched" from "could not ask".
+    """
+
+    def query(squeue_body: str, job_ids=("9000", "9001")) -> subprocess.CompletedProcess:
+        """Run the generated query against one fake scheduler."""
+
+        tools = tmp_path / f"tools-{abs(hash(squeue_body))}"
+        tools.mkdir()
+        _write_tool(tools, "squeue", squeue_body)
+        return subprocess.run(
+            ["sh", "-c", live_jobs_command(list(job_ids))],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+        )
+
+    # Nothing of this run is queued any more: proceed rather than fail closed.
+    purged = query("#!/bin/sh\nexit 0\n")
+    assert purged.returncode == 0 and purged.stdout.strip() == ""
+
+    # Another user's or another run's job must not block this transition.
+    unrelated = query("#!/bin/sh\nprintf '9999|RUNNING\\n'\n")
+    assert unrelated.returncode == 0 and unrelated.stdout.strip() == ""
+
+    # A live job of this run, including one array element, still refuses it.
+    live = query("#!/bin/sh\nprintf '9001|RUNNING\\n9999|PENDING\\n'\n")
+    assert live.returncode == 0 and live.stdout.strip() == "9001|RUNNING"
+    element = query("#!/bin/sh\nprintf '9000_3|RUNNING\\n'\n")
+    assert element.returncode == 0 and element.stdout.strip() == "9000_3|RUNNING"
+
+    # An actual query failure stays fatal.
+    unreachable = query("#!/bin/sh\necho 'slurm_load_jobs error' >&2\nexit 1\n")
+    assert unreachable.returncode != 0
+
+    # The cases above exercise the generated command against fake schedulers;
+    # they cannot reproduce real squeue's "Invalid job id specified" exit, which
+    # is the behaviour that made purged runs unpromotable.  Pin the structural
+    # contract instead: the query must never name job IDs to squeue.
+    generated = live_jobs_command(["9000", "9001"])
+    assert " -j " not in generated
+    assert "-u " in generated
+
+
 def test_transition_requires_matching_certified_terminal_state() -> None:
     """Planning cannot delete an inconsistently certified execution run.
 
@@ -353,7 +402,9 @@ def test_transition_refuses_certified_run_with_live_slurm_job(tmp_path) -> None:
             del timeout, input_text
             if command.startswith("cat "):
                 return SimpleNamespace(ok=True, stdout=manifest.to_json(), stderr="")
-            if command.startswith("squeue "):
+            # The query is now a small shell pipeline rather than a bare
+            # squeue call, so match the tool anywhere in the command.
+            if "squeue" in command:
                 return SimpleNamespace(ok=True, stdout="12345|RUNNING\n", stderr="")
             return SimpleNamespace(ok=True, stdout="", stderr="")
 

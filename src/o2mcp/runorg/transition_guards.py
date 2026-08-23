@@ -59,14 +59,25 @@ def require_certified_terminal_execution(manifest: RunManifest, action: str) -> 
 
 
 def live_jobs_command(job_ids: list[str]) -> str:
-    """Return a fail-closed squeue query for the manifest's exact numeric jobs."""
+    """Return a fail-closed queue query that survives purged job IDs.
+
+    ``squeue -j`` exits nonzero with "Invalid job id specified" once every named
+    job has aged out of the controller's active state, which a caller cannot
+    distinguish from a failed query.  Certified historical runs would therefore
+    never be able to prove termination and could never leave scratch storage.
+    Reading the caller's own queue and filtering it here keeps a genuine query
+    failure fatal while letting long-finished jobs report cleanly as absent.
+    """
 
     if any(not isinstance(job_id, str) or not job_id.isdigit() for job_id in job_ids):
         raise ValueError("transition manifest contains a nonnumeric Slurm job ID")
     if not job_ids:
         return "printf ''"
-    joined = ",".join(job_ids)
-    return f"squeue -h -j {shlex.quote(joined)} -o '%i|%T'"
+    # Array elements render as ``<job>_<index>``, so the base ID is matched with
+    # an optional element suffix up to the format's literal separator.
+    pattern = "^(" + "|".join(job_ids) + ")(_[^|]*)?\\|"
+    query = "queue=$(squeue -h -u \"$(id -un)\" -o '%i|%T') || exit 1"
+    return f"{query}; printf '%s\\n' \"$queue\" | grep -E {shlex.quote(pattern)} || true"
 
 
 def require_current_terminal_evidence(backend: ExecutionBackend, plan: ExecutionPlan, action: str) -> None:
