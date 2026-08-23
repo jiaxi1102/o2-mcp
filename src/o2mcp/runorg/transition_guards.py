@@ -5,7 +5,11 @@ from __future__ import annotations
 import shlex
 
 from o2mcp.runorg.execution_backend import ExecutionBackend, receipt_matches
-from o2mcp.runorg.execution_evidence import current_task_receipts_valid, latest_reconciliation_receipt
+from o2mcp.runorg.execution_evidence import (
+    current_task_receipts_valid,
+    latest_reconciliation_receipt,
+    read_plan_submission_records,
+)
 from o2mcp.runorg.execution_models import RECONCILE_COMPLETE, RECONCILE_FAILED
 from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.runs import RunManifest
@@ -107,6 +111,51 @@ def require_current_terminal_evidence(backend: ExecutionBackend, plan: Execution
             receipt_matches(spec, item) for spec, item in zip(stage.expected_receipts, observations)
         ):
             raise ValueError(f"{action} stage {stage.stage_id} current stage receipts are missing or changed")
+        superseded = _superseded_dependency_generations(backend, plan, stage, stages, failed)
+        if superseded:
+            raise ValueError(
+                f"{action} stage {stage.stage_id} completed against superseded dependency generations: "
+                + ", ".join(sorted(superseded))
+            )
+
+
+def _superseded_dependency_generations(
+    backend: ExecutionBackend,
+    plan: ExecutionPlan,
+    stage,
+    stages: dict,
+    failed: set,
+) -> set:
+    """Return prerequisites whose current job this stage never consumed.
+
+    A completed downstream receipt stays terminal after an upstream replacement
+    generation is accepted, so terminal decisions alone cannot prove the run is
+    settled.  Reconciliation publishes the upstream completion before it can
+    publish the child's replacement authorization, and a crash can end the run
+    permanently inside that window, so exclusion around those two writes is not
+    sufficient either.  Comparing consumed against current dependency jobs is
+    timing-independent and refuses deletion whenever a rerun is still owed.
+
+    A failed prerequisite is exempt: that run is being archived for audit, and
+    its descendants are not expected to rerun.
+    """
+
+    if not stage.depends_on:
+        return set()
+    records = read_plan_submission_records(backend, plan, stage)
+    if not records:
+        return set()
+    consumed = dict(zip(stage.depends_on, records[-1].dependency_job_ids))
+    superseded = set()
+    for dependency_id in stage.depends_on:
+        if dependency_id in failed:
+            continue
+        dependency_records = read_plan_submission_records(backend, plan, stages[dependency_id])
+        if not dependency_records:
+            continue
+        if consumed.get(dependency_id) != dependency_records[-1].job_id:
+            superseded.add(dependency_id)
+    return superseded
 
 
 __all__ = ["live_jobs_command", "require_certified_terminal_execution", "require_current_terminal_evidence"]

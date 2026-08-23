@@ -1373,6 +1373,100 @@ def test_followup_published_during_an_ordinary_retry_does_not_invalidate_it() ->
     assert replacement[0].dependency_job_ids == (preflight_two.job_id,)
 
 
+def test_promote_refuses_a_child_completed_against_a_superseded_generation() -> None:
+    """Terminal receipts alone cannot prove a dependent run is settled.
+
+    An upstream replacement generation completes before its downstream
+    replacement authorization can be published, and a crash can end the run
+    permanently inside that window.  A promote that only saw two COMPLETED
+    receipts would delete the source while the child still owes a rerun against
+    the newer prerequisite, so the guard compares consumed against current
+    dependency jobs instead of trusting the decisions.
+    """
+
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    base_compute = _compute_stage()
+    compute = StageSpec(
+        stage_id=base_compute.stage_id,
+        resources=base_compute.resources,
+        expected_receipts=base_compute.expected_receipts,
+        tasks=base_compute.tasks,
+        depends_on=("preflight",),
+        dependency_mode="afterany",
+        retry_policy=base_compute.retry_policy,
+    )
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterok",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(preflight, compute, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    def complete_compute(record) -> None:
+        backend.set_states(
+            record.job_id,
+            SlurmTaskState(None, "COMPLETED", 0),
+            *(SlurmTaskState(index, "COMPLETED", 0) for index in range(3)),
+        )
+        for index in range(3):
+            backend.put_receipt(_receipt(f"movie-{index}"))
+
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    compute_one = engine.submit_stage(plan, "compute").record
+    complete_compute(compute_one)
+    assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
+
+    audit_one = engine.submit_stage(plan, "audit").record
+    backend.set_states(audit_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="audit"))
+    assert engine.reconcile_stage(plan, "audit").decision == "COMPLETED"
+    assert audit_one.dependency_job_ids == (compute_one.job_id,)
+
+    # The prerequisite retries and its replacement completes, which rebinds and
+    # reruns compute but leaves audit on the superseded generation.
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    preflight_two = engine.reconcile_stage(plan, "preflight").retry_submission
+    assert preflight_two is not None
+    backend.set_states(preflight_two.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="preflight"))
+    assert engine.reconcile_stage(plan, "preflight").decision == "COMPLETED"
+
+    compute_two = read_plan_submission_records(backend, plan, compute)[-1]
+    assert compute_two.identity.attempt == 2
+    assert compute_two.dependency_job_ids == (preflight_two.job_id,)
+    complete_compute(compute_two)
+
+    # Model the window: compute's completion is durable before audit's
+    # replacement authorization can be published.
+    engine._ensure_reconciler_followups = lambda *_args, **_kwargs: ()  # type: ignore[method-assign]
+    assert engine.reconcile_stage(plan, "compute").decision == "COMPLETED"
+
+    with pytest.raises(ValueError, match="superseded dependency generations: compute"):
+        require_current_terminal_evidence(backend, plan, "promote")
+
+    # Once the owed rerun lands against the current generation, promote clears.
+    replacement = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute", compute_two)
+    assert [record.identity.attempt for record in replacement] == [2]
+    audit_two = replacement[0]
+    assert audit_two.dependency_job_ids == (compute_two.job_id,)
+    backend.set_states(audit_two.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="audit"))
+    assert ExecutionEngine(backend).reconcile_stage(plan, "audit").decision == "COMPLETED"
+    require_current_terminal_evidence(backend, plan, "promote")
+
+
 def test_accepted_compute_retry_is_repairable_when_final_audit_followup_is_rejected() -> None:
     """Persist accepted retry metadata before a fallible final audit launch.
 
