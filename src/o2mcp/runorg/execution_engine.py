@@ -139,7 +139,6 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
 
         self._bind_plan(plan)
         stage = stage_by_id(plan, stage_id)
-        self._validate_afterok_dependencies(plan, stage)
         attempt_bound = signed_attempt_bound(plan, stage)
         if attempt > attempt_bound:
             raise ValueError(f"stage {stage_id} attempt {attempt} exceeds signed max_attempts bound={attempt_bound}")
@@ -149,6 +148,13 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
             None,
         )
         if existing_record is None:
+            # Certification applies to creating a generation, not to recovering
+            # one.  A recorded attempt is authenticated against its historical
+            # intent and dependencies below; re-certifying it against current
+            # state would make an interrupted submission unreplayable as soon as
+            # a prerequisite advances, stranding its registry outbox and
+            # lifecycle claim.
+            self._validate_afterok_dependencies(plan, stage)
             authorized_task_ids, authorized_dependencies = derive_attempt_authorization(
                 self.backend,
                 plan,
@@ -156,6 +162,10 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
                 attempt,
                 self._dependency_jobs(plan, stage),
             )
+            # Another coordinator can accept a replacement prerequisite between
+            # the stage gate above and this resolution, so certification is
+            # bound to the exact jobs about to enter the intent.
+            self._validate_afterok_dependency_jobs(plan, stage, authorized_dependencies)
         else:
             # The strict record reader already proved each historical dependency
             # job belongs to the corresponding signed prerequisite.  Preserve
@@ -165,10 +175,6 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
         requested_task_ids = authorized_task_ids if task_ids is None else tuple(task_ids)
         if requested_task_ids != authorized_task_ids:
             raise ValueError("requested task set differs from the signed attempt authorization")
-        # The early gate certified the stage, but another coordinator can accept a
-        # replacement prerequisite between that check and this resolution.  Bind
-        # certification to the exact jobs about to be written into the intent.
-        self._validate_afterok_dependency_jobs(plan, stage, authorized_dependencies)
         selected = select_tasks(stage, authorized_task_ids)
         record_path = submission_record_path(plan, identity)
         expected_task_ids = tuple(task.task_id for task in selected)

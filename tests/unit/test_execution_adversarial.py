@@ -2551,6 +2551,69 @@ def test_allocation_waits_for_an_earlier_attempt_to_publish_its_record() -> None
     ]
 
 
+def test_recorded_afterok_attempt_replays_after_its_prerequisite_advances() -> None:
+    """Certification governs creating a generation, not recovering one.
+
+    A coordinator can crash after an afterok record is published but before its
+    registry outbox exists.  If a prerequisite then accepts a replacement,
+    re-certifying the replay against current state would reject it forever,
+    leaving the outbox unreconstructable and the original invocation owner's
+    lifecycle claim held, which blocks promotion and archive.
+    """
+
+    root = StageSpec(
+        stage_id="root",
+        command=_command("root"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="root"),),
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    preflight = StageSpec(
+        stage_id="preflight",
+        command=_command("preflight"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="preflight"),),
+        depends_on=("root",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2, retryable_slurm_states=("NODE_FAIL",)),
+    )
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("preflight",),
+        dependency_mode="afterok",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(root, preflight, audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    root_one = engine.submit_stage(plan, "root").record
+    preflight_one = engine.submit_stage(plan, "preflight").record
+    backend.set_states(preflight_one.job_id, SlurmTaskState(None, "COMPLETED", 0))
+    backend.put_receipt(_receipt("done", stage="preflight"))
+    assert engine.reconcile_stage(plan, "preflight").decision == "COMPLETED"
+    audit_one = engine.submit_stage(plan, "audit").record
+    assert audit_one.dependency_job_ids == (preflight_one.job_id,)
+
+    # The prerequisite accepts a replacement that has not reconciled.
+    backend.set_states(root_one.job_id, SlurmTaskState(None, "NODE_FAIL", 1))
+    assert engine.reconcile_stage(plan, "root").retry_submission is not None
+    preflight_two = read_plan_submission_records(backend, plan, stage_by_id(plan, "preflight"))[-1]
+    assert preflight_two.identity.attempt == 2
+
+    # Replaying the recorded attempt recovers it against its own history.
+    replayed = ExecutionEngine(backend).submit_stage(plan, "audit").record
+    assert replayed.job_id == audit_one.job_id
+    assert replayed.dependency_job_ids == (preflight_one.job_id,)
+
+    # Creating a new generation is still certified against the current one.
+    with pytest.raises(ValueError, match="afterok dependencies"):
+        ExecutionEngine(backend).submit_stage(plan, "audit", attempt=2)
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
