@@ -104,7 +104,15 @@ class ExecutionEngine(ExecutionRegistryMixin, ExecutionFollowupMixin):
 
         # Validate the caller-controlled identity before creating a durable
         # lifecycle holder. Invalid operations have no evidence path through
-        # which a later replay could safely retire an abandoned claim.
+        # which a later replay could safely retire an abandoned claim, and every
+        # outstanding claim blocks promote and archive, so an unknown stage or an
+        # attempt above the signed bound must be refused before acquisition
+        # rather than inside it. Only pure checks are hoisted; binding the plan
+        # publishes durable evidence and stays behind the claim.
+        stage = stage_by_id(plan, stage_id)
+        bound = signed_attempt_bound(plan, stage)
+        if attempt > bound:
+            raise ValueError(f"stage {stage_id} attempt {attempt} exceeds signed max_attempts bound={bound}")
         identity = SubmissionIdentity(plan.plan_sha256, stage_id, attempt)
         operation_id = f"submit:{identity.plan_sha256}:{identity.stage_id}:{identity.attempt}"
         claim_id = self._acquire_lifecycle(plan, operation_id)

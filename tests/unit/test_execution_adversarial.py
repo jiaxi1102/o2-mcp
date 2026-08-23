@@ -2614,6 +2614,44 @@ def test_recorded_afterok_attempt_replays_after_its_prerequisite_advances() -> N
         ExecutionEngine(backend).submit_stage(plan, "audit", attempt=2)
 
 
+def test_invalid_submission_never_acquires_a_lifecycle_claim() -> None:
+    """A refusable operation must not be able to orphan a claim at all.
+
+    Releasing the claim on the error path is not enough: a coordinator that
+    exits after acquisition, or loses the release response, leaves a claim that
+    no replay can retire, because the invalid operation can never reach
+    invocation-marker publication.  ``begin_transition()`` refuses every
+    outstanding claim, so the run could then never be promoted or archived.
+    """
+
+    class CountingBackend(ConcurrentBackend):
+        """Count acquisitions so a released claim is not mistaken for none."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquisitions = 0
+
+        def acquire_lifecycle_claim(self, run_root: str, operation_id: str):
+            self.acquisitions += 1
+            return super().acquire_lifecycle_claim(run_root, operation_id)
+
+    backend = CountingBackend()
+    engine = ExecutionEngine(backend)
+    plan = _plan()
+
+    with pytest.raises(ValueError, match="unknown stage_id"):
+        engine.submit_stage(plan, "not-a-stage")
+    with pytest.raises(ValueError, match="exceeds signed max_attempts bound"):
+        engine.submit_stage(plan, "compute", attempt=99)
+
+    assert backend.acquisitions == 0
+    assert not backend.lifecycle_claims
+
+    # A valid submission still takes exactly one claim and releases nothing.
+    engine.submit_stage(plan, "compute")
+    assert backend.acquisitions == 1
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 
