@@ -127,12 +127,8 @@ class ExecutionFollowupMixin:
                     submission_rejection_path(plan, identity),
                 )
                 if rejection is None:
-                    if self._followup_binds(
-                        plan,
-                        reconciler,
-                        existing_generation,
-                        self._dependency_jobs(plan, reconciler),
-                    ):
+                    current_jobs = self._dependency_jobs(plan, reconciler)
+                    if self._followup_binds(plan, reconciler, existing_generation, current_jobs):
                         submitted.append(
                             self.submit_dependency_followup(
                                 plan,
@@ -146,6 +142,15 @@ class ExecutionFollowupMixin:
                     # submitted.  Replaying it would bind that stale dependency
                     # tuple, which submission rejects against the now-current
                     # jobs, wedging every later reconciliation of this stage.
+                    if any(
+                        record.identity.attempt > existing_generation and record.dependency_job_ids == current_jobs
+                        for record in records
+                    ):
+                        # That newer generation is already submitted against
+                        # every current dependency job, so it satisfies this
+                        # trigger too.  Allocating another identity would spend
+                        # a signed attempt the derived bound may not have.
+                        continue
                     next_attempt = existing_generation + 1
                 else:
                     expected_task_ids = tuple(task.task_id for task in select_tasks(reconciler, None))
