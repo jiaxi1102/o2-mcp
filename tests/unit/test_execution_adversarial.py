@@ -51,16 +51,25 @@ from o2mcp.runorg.execution_models import (
     INVOKED_OUTCOME_UNKNOWN,
     PlannedTask,
     RegistryUpdate,
+    SubmissionIdentity,
+    SubmissionRecord,
     canonical_json,
 )
 from o2mcp.runorg.execution_paths import (
     pending_registry_path,
     reconciler_followup_path,
     reconciliation_path,
+    submission_intent_path,
+    submission_record_path,
     task_attempt_path,
 )
 from o2mcp.runorg.execution_reconcile import signed_attempt_bound, stage_by_id
-from o2mcp.runorg.execution_rendering import render_dispatcher
+from o2mcp.runorg.execution_rendering import (
+    build_submission_request,
+    render_dispatcher,
+    select_tasks,
+    submission_intent,
+)
 from o2mcp.runorg.lifecycle_coordination import new_claim_id
 from o2mcp.runorg.registry_sync import merge_execution_manifest
 from o2mcp.runorg.transition_guards import require_current_terminal_evidence
@@ -2820,6 +2829,110 @@ def test_rejected_afterok_attempt_replays_to_retire_its_claim() -> None:
     with pytest.raises(SubmissionRejected, match="definitively rejected"):
         ExecutionEngine(backend).submit_stage(plan, "audit")
     assert not backend.lifecycle_claims
+
+
+def test_replay_keeps_the_ordering_tuple_its_own_intent_committed() -> None:
+    """Replay must authenticate the committed ordering tuple, not recompute it.
+
+    A coordinator cannot observe an attempt between ``sbatch`` and its record,
+    so a legitimate intent may omit it and rely on ``singleton`` for exclusion.
+    Recomputing from records that have since accumulated would reject the
+    attempt's own intent, so it could never rebuild its registry outbox or
+    retire its lifecycle claim, and transitions refuse an outstanding claim.
+    """
+
+    plan = _plan(stages=(_compute_stage(max_attempts=3),))
+    stage = stage_by_id(plan, "compute")
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    first = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        first.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+    second = engine.reconcile_stage(plan, "compute").retry_submission
+    assert second is not None
+
+    # Attempt three's intent was written while attempt two had no record yet, so
+    # it legitimately orders against attempt one alone.
+    third = SubmissionIdentity(plan.plan_sha256, "compute", 3)
+    committed = (first.job_id,)
+    request = build_submission_request(
+        plan,
+        stage,
+        third,
+        select_tasks(stage, ("movie-1",)),
+        (),
+        committed,
+    )
+    backend.write_immutable_text(
+        submission_intent_path(plan, third),
+        canonical_json(submission_intent(request)),
+    )
+
+    # Both attempts are recorded now, so recomputation and the commitment differ.
+    assert engine._prior_generation_jobs(plan, stage, 3) == (first.job_id, second.job_id)
+    assert engine._committed_ordering_jobs(plan, stage, third) == committed
+
+    # And the replay path itself must accept that intent.  Seal attempt two so
+    # attempt three is derivable, then publish the record its coordinator wrote
+    # before it crashed short of the registry repair.
+    backend.set_states(
+        second.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(1, "NODE_FAIL", 1),
+    )
+    assert engine.reconcile_stage(plan, "compute", submit_retry=False).decision == "RETRY_MISSING_ONLY"
+    backend.write_immutable_text(
+        submission_record_path(plan, third),
+        canonical_json(
+            SubmissionRecord(
+                identity=third,
+                job_id="9500",
+                task_ids=("movie-1",),
+                task_indices=(1,),
+                recovered=True,
+                dependency_mode=stage.dependency_mode,
+                dependency_job_ids=(),
+            ).to_dict()
+        ),
+    )
+
+    replayed = ExecutionEngine(backend).submit_stage(plan, "compute", attempt=3, task_ids=("movie-1",))
+    assert replayed.record.job_id == "9500"
+    assert replayed.submitted is False
+
+
+def test_replay_refuses_an_ordering_tuple_naming_a_foreign_job() -> None:
+    """Retaining the committed tuple must still authenticate what it names."""
+
+    plan = _plan(stages=(_compute_stage(max_attempts=3),))
+    stage = stage_by_id(plan, "compute")
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+    engine.submit_stage(plan, "compute")
+
+    second = SubmissionIdentity(plan.plan_sha256, "compute", 2)
+    request = build_submission_request(
+        plan,
+        stage,
+        second,
+        select_tasks(stage, ("movie-1",)),
+        (),
+        ("9999",),
+    )
+    backend.write_immutable_text(
+        submission_intent_path(plan, second),
+        canonical_json(submission_intent(request)),
+    )
+
+    with pytest.raises(ValueError, match="not an earlier generation"):
+        engine._committed_ordering_jobs(plan, stage, second)
 
 
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
