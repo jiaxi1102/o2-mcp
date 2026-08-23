@@ -240,6 +240,41 @@ class TransitionExecutorMixin:
 
         return hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
 
+    def _require_certified_plan_evidence(
+        self,
+        action: str,
+        manifest: RunManifest,
+        run_dir: str,
+        backend: O2ExecutionBackend,
+        plan_text: str | None,
+        expected_sha: object,
+    ) -> None:
+        """Recertify one execution-plan run against files-as-truth."""
+
+        if type(expected_sha) is not str:
+            raise ValueError(f"{action} manifest lacks an authenticated execution plan digest")
+        plan = ExecutionPlan.from_json(plan_text or "", expected_plan_sha256=expected_sha)
+        # A kept run contains a byte-identical copy of the plan registered in
+        # scratch.  Permit that one canonical relocation without weakening
+        # any of the plan's signed identity fields or rewriting its digest.
+        allowed_plan_roots = {run_dir}
+        if manifest.status == STATUS_KEPT:
+            allowed_plan_roots.add(self.layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id))
+        if (
+            plan.paths.run_root not in allowed_plan_roots
+            or plan.run_id != manifest.run_id
+            or plan.campaign != manifest.campaign
+            or plan.pipeline != manifest.pipeline
+            or sorted(item.dataset_id for item in plan.datasets) != sorted(manifest.datasets)
+        ):
+            raise ValueError(f"{action} execution plan identity differs from the marked source run")
+        evidence_backend = (
+            backend
+            if plan.paths.run_root == run_dir
+            else _RelocatedEvidenceBackend(backend, plan.paths.run_root, run_dir)
+        )
+        require_current_terminal_evidence(evidence_backend, plan, action)
+
     def _transition(
         self,
         run_id: str,
@@ -266,31 +301,22 @@ class TransitionExecutorMixin:
                 raise ValueError(f"{action} source identity changed after transition marking")
             execution = (manifest.provenance or {}).get("execution", {})
             expected_sha = execution.get("plan_sha256") if isinstance(execution, dict) else None
-            if type(expected_sha) is not str:
-                raise ValueError(f"{action} manifest lacks an authenticated execution plan digest")
             backend = O2ExecutionBackend(self.conn)
             plan_text = backend.read_text(posixpath.join(run_dir, "receipts", "execution", "execution-plan.json"))
-            plan = ExecutionPlan.from_json(plan_text or "", expected_plan_sha256=expected_sha)
-            # A kept run contains a byte-identical copy of the plan registered in
-            # scratch.  Permit that one canonical relocation without weakening
-            # any of the plan's signed identity fields or rewriting its digest.
-            allowed_plan_roots = {run_dir}
-            if manifest.status == STATUS_KEPT:
-                allowed_plan_roots.add(self.layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id))
-            if (
-                plan.paths.run_root not in allowed_plan_roots
-                or plan.run_id != manifest.run_id
-                or plan.campaign != manifest.campaign
-                or plan.pipeline != manifest.pipeline
-                or sorted(item.dataset_id for item in plan.datasets) != sorted(manifest.datasets)
-            ):
-                raise ValueError(f"{action} execution plan identity differs from the marked source run")
-            evidence_backend = (
-                backend
-                if plan.paths.run_root == run_dir
-                else _RelocatedEvidenceBackend(backend, plan.paths.run_root, run_dir)
-            )
-            require_current_terminal_evidence(evidence_backend, plan, action)
+            # A run registered outside the execution engine has neither signal
+            # and keeps the shared live-job criteria below rather than losing
+            # its lifecycle path to an engine-only gate.  Either signal alone
+            # proves an execution-plan run, so a manifest that lost its
+            # provenance still fails closed here.
+            if plan_text is not None or expected_sha is not None:
+                self._require_certified_plan_evidence(
+                    action,
+                    manifest,
+                    run_dir,
+                    backend,
+                    plan_text,
+                    expected_sha,
+                )
             jobs = sorted(set(manifest.slurm_job_ids) | set(boundary.job_ids), key=int)
             live = self._run(live_jobs_command(jobs), timeout=60)
             if not live.ok:

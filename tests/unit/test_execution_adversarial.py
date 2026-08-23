@@ -1365,6 +1365,13 @@ def test_followup_published_during_an_ordinary_retry_does_not_invalidate_it() ->
     assert records[-1].task_ids == winner.task_ids == ("movie-1",)
     assert records[-1].dependency_job_ids == (preflight_one.job_id,)
 
+    # The losing authorization must not be reported as the current generation
+    # either: filtering records to it would discard the successes this retry
+    # deliberately preserved and seal a spurious failure.
+    backend.set_states(winner.job_id, SlurmTaskState(None, "COMPLETED", 0), SlurmTaskState(1, "COMPLETED", 0))
+    backend.put_receipt(_receipt("movie-1"))
+    assert ExecutionEngine(backend).reconcile_stage(plan, "compute").decision == "COMPLETED"
+
     # The replacement generation is not lost: propagation opens the next attempt
     # with every signed task bound to the new prerequisite.
     replacement = ExecutionEngine(backend)._ensure_reconciler_followups(plan, "preflight", preflight_two)

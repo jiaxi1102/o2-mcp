@@ -331,6 +331,12 @@ def latest_followup_attempt(
         if backend.read_text(path) is None:
             continue
         authenticate_followup_authorization(backend, plan, stage, attempt)
+        if not followup_owns_attempt(backend, plan, stage, attempt):
+            # An ordinary retry won this attempt's intent arbitration, so the
+            # authorization never became a generation.  Reporting it as current
+            # would discard the earlier successes that retry deliberately
+            # preserved and publish a spurious failure receipt.
+            continue
         return attempt
     return None
 

@@ -236,7 +236,13 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
 
 
 def test_transition_requires_matching_certified_terminal_state() -> None:
-    """Planning cannot delete an active or inconsistently certified run."""
+    """Planning cannot delete an inconsistently certified execution run.
+
+    Runs registered outside the execution engine carry no execution provenance
+    at all and keep their own release criteria; refusing them here would delete
+    the lifecycle path of every ``o2_run_register`` run. A run that does carry
+    execution provenance must still be certified terminal and self-consistent.
+    """
 
     manifest = RunManifest(
         run_id="RUN_20260822T010203Z_transition__guard",
@@ -245,8 +251,25 @@ def test_transition_requires_matching_certified_terminal_state() -> None:
         created_utc="20260822T010203Z",
         datasets=["dataset"],
     )
+    require_certified_terminal_execution(manifest, "promote")
+    require_certified_terminal_execution(manifest, "archive")
+
+    manifest.provenance = {"execution": {"state": "ACTIVE"}}
+    manifest.result = {"status": "ACTIVE"}
     with pytest.raises(ValueError, match="certified terminal"):
         require_certified_terminal_execution(manifest, "promote")
+
+    # Present-but-inconsistent execution provenance still fails closed.
+    manifest.provenance = {"execution": {"state": "COMPLETED"}}
+    manifest.result = {"status": "FAILED"}
+    with pytest.raises(ValueError, match="certified terminal"):
+        require_certified_terminal_execution(manifest, "promote")
+
+    manifest.provenance = {"execution": {}}
+    manifest.result = {"status": "COMPLETED"}
+    with pytest.raises(ValueError, match="certified terminal"):
+        require_certified_terminal_execution(manifest, "promote")
+
     manifest.provenance = {"execution": {"state": "COMPLETED"}}
     manifest.result = {"status": "COMPLETED"}
     require_certified_terminal_execution(manifest, "promote")

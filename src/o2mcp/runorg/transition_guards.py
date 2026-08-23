@@ -23,7 +23,14 @@ def require_certified_terminal_execution(manifest: RunManifest, action: str) -> 
     manifest surfaces must agree with authenticated execution provenance.
     """
 
-    execution = (manifest.provenance or {}).get("execution", {})
+    provenance = manifest.provenance or {}
+    if "execution" not in provenance:
+        # Runs registered outside the execution engine never carry execution
+        # provenance and keep their own release criteria.  Anything that does
+        # carry it, or that still has a plan on disk, is certified here and
+        # again against files-as-truth before its source can be deleted.
+        return
+    execution = provenance.get("execution", {})
     execution_state = execution.get("state") if isinstance(execution, dict) else None
     result_state = (manifest.result or {}).get("status")
     allowed = {"COMPLETED"} if action == "promote" else {"COMPLETED", "FAILED"}
