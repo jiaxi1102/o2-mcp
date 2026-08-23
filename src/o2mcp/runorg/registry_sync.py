@@ -82,7 +82,16 @@ def merge_execution_manifest(
     if type(previous_state) is not str:
         raise ValueError("run.json execution state must be a string")
     execution_state = update.execution_status
-    if previous_state == "FAILED" or execution_state == "FAILED":
+    if not accept_stage_update and previous_state:
+        # A stale or losing callback carries a stale plan-level status too, so it
+        # may not move the run at all; the merged stage map below still decides.
+        execution_state = previous_state
+    # Failure is sticky against stale and same-generation callbacks, but an
+    # authenticated newer generation may recover the run.  The stage map is
+    # attempt-monotonic, so a failure it no longer records was replaced by a
+    # later accepted attempt and must not block promotion forever.
+    unrecovered_failure = any(isinstance(entry, dict) and entry.get("status") == "FAILED" for entry in stages.values())
+    if unrecovered_failure or execution_state == "FAILED":
         execution_state = "FAILED"
     elif previous_state == "COMPLETED":
         execution_state = "COMPLETED"

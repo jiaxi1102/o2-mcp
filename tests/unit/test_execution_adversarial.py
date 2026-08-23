@@ -2085,6 +2085,65 @@ def test_manifest_merge_is_monotonic_for_attempts_and_terminal_state() -> None:
     assert merged.extra["future"] == {"preserved": True}
 
 
+def test_a_newer_generation_recovers_a_failed_run_without_reviving_stale_ones() -> None:
+    """Sticky failure must not outlive the generation that caused it.
+
+    An ``afterany`` descendant can fail against one dependency generation and
+    then succeed against an authenticated replacement.  Pinning the plan-level
+    state to that superseded failure would block promotion of a recovered run
+    forever, while a genuinely stale callback must still be unable to resurrect
+    the failure.
+    """
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    failed = RegistryUpdate(plan.plan_sha256, "audit", "FAILED", "FAILED", ("9000",), 1)
+    recovered = RegistryUpdate(plan.plan_sha256, "audit", "COMPLETED", "COMPLETED", ("9000", "9002"), 2)
+    stale_failure = RegistryUpdate(plan.plan_sha256, "audit", "FAILED", "FAILED", ("9000",), 1)
+
+    merged = merge_execution_manifest(manifest, plan, failed)
+    assert merged.provenance["execution"]["state"] == "FAILED"
+    assert merged.result["status"] == "FAILED"
+
+    merged = merge_execution_manifest(merged, plan, recovered)
+    assert merged.provenance["execution"]["stages"]["audit"] == {"attempt": 2, "status": "COMPLETED"}
+    assert merged.provenance["execution"]["state"] == "COMPLETED"
+    assert merged.result["status"] == "COMPLETED"
+
+    # The superseded callback is still refused, so recovery is not a hole.
+    merged = merge_execution_manifest(merged, plan, stale_failure)
+    assert merged.provenance["execution"]["stages"]["audit"] == {"attempt": 2, "status": "COMPLETED"}
+    assert merged.provenance["execution"]["state"] == "COMPLETED"
+    assert merged.result["status"] == "COMPLETED"
+
+
+def test_one_recovered_stage_does_not_clear_another_stages_failure() -> None:
+    """Recovery is per generation, not a blanket reset of the run."""
+
+    plan = _plan()
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        campaign=CAMPAIGN,
+        pipeline="canary",
+        created_utc="20260822T010203Z",
+        datasets=["dataset-1"],
+    )
+    compute_failed = RegistryUpdate(plan.plan_sha256, "compute", "FAILED", "FAILED", ("9000",), 1)
+    audit_recovered = RegistryUpdate(plan.plan_sha256, "audit", "COMPLETED", "COMPLETED", ("9002",), 2)
+
+    merged = merge_execution_manifest(manifest, plan, compute_failed)
+    merged = merge_execution_manifest(merged, plan, audit_recovered)
+    assert merged.provenance["execution"]["stages"]["compute"] == {"attempt": 1, "status": "FAILED"}
+    assert merged.provenance["execution"]["state"] == "FAILED"
+    assert merged.result["status"] == "FAILED"
+
+
 def test_failed_registry_state_dominates_completed_in_both_orders() -> None:
     """Terminal registry meaning is deterministic under callback reordering."""
 
