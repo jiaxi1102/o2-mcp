@@ -2392,6 +2392,52 @@ def test_replacement_generation_is_ordered_after_the_prior_one() -> None:
     assert f"--dependency=afterany:{compute_two.job_id},afterany:{audit_one.job_id}" in replacement.sbatch_args()
 
 
+def test_never_launched_afterany_child_keeps_its_ordinary_first_attempt() -> None:
+    """Propagation must not authorize attempt one for a child that never ran.
+
+    A dependency follow-up may never occupy attempt one, so allocating one for a
+    child with no prior submission raises on the parent's reconciliation and on
+    every replay, even though that parent retry is already durably accepted.
+    The child's ordinary attempt one resolves the latest dependency job itself.
+    """
+
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute",),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(_compute_stage(), audit))
+    backend = ConcurrentBackend()
+    engine = ExecutionEngine(backend)
+
+    # The audit is deliberately never submitted before the parent retries.
+    compute_one = engine.submit_stage(plan, "compute").record
+    backend.set_states(
+        compute_one.job_id,
+        SlurmTaskState(None, "NODE_FAIL", 1),
+        SlurmTaskState(0, "COMPLETED", 0),
+        SlurmTaskState(2, "COMPLETED", 0),
+    )
+    backend.put_receipt(_receipt("movie-0"))
+    backend.put_receipt(_receipt("movie-2"))
+
+    compute_two = engine.reconcile_stage(plan, "compute").retry_submission
+    assert compute_two is not None
+    assert backend.read_text(reconciler_followup_path(plan, "audit", 1)) is None
+    assert not read_plan_submission_records(backend, plan, stage_by_id(plan, "audit"))
+
+    # Replay stays convergent rather than raising on an immutable attempt one.
+    ExecutionEngine(backend)._ensure_reconciler_followups(plan, "compute", compute_two)
+
+    ordinary = ExecutionEngine(backend).submit_afterany_reconciler(plan, "audit").record
+    assert ordinary.identity.attempt == 1
+    assert ordinary.dependency_job_ids == (compute_two.job_id,)
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 

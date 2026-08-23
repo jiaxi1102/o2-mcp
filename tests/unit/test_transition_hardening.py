@@ -10,7 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from o2mcp.runorg.executor import O2Runs
+from o2mcp.runorg.lifecycle_coordination import coordination_lock, coordination_root
 from o2mcp.runorg.runs import RunLayout, RunManifest, plan_archive_script, plan_promote_script
+from o2mcp.runorg.transition_coordinator import _BEGIN_PROGRAM
 from o2mcp.runorg.transition_guards import require_certified_terminal_execution
 
 
@@ -233,6 +235,48 @@ print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
     assert not os.path.exists(checksum)
     assert not os.path.exists(archived_manifest)
     assert not os.path.exists(marker)
+
+
+def test_marking_refuses_a_source_that_vanished_before_the_lock(tmp_path) -> None:
+    """A marker must never be published for a source that no longer exists.
+
+    Preview validation happens before the coordination lock, so a concurrent
+    transition can relocate the source in between.  Marking anyway strands the
+    run: the launched script cannot lock a missing source, its rollback trap
+    keeps the marker, and recovery reports a manual blocker.
+    """
+
+    campaign = tmp_path / "camp"
+    campaign.mkdir()
+    run_root = str(campaign / "RUN_20260101T000000Z_camp__v1")
+
+    def mark() -> subprocess.CompletedProcess:
+        """Run the real marking program exactly as the coordinator does."""
+
+        return subprocess.run(
+            [
+                "python3",
+                "-c",
+                _BEGIN_PROGRAM,
+                run_root,
+                coordination_root(run_root),
+                coordination_lock(run_root),
+                "a" * 64,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    vanished = mark()
+    assert vanished.returncode != 0
+    assert "transition source is missing" in vanished.stderr
+    assert not os.path.exists(os.path.join(coordination_root(run_root), "transition.json"))
+
+    # The same call succeeds once the source is a real directory.
+    os.makedirs(run_root)
+    marked = mark()
+    assert marked.returncode == 0, marked.stderr
+    assert os.path.exists(os.path.join(coordination_root(run_root), "transition.json"))
 
 
 def test_transition_requires_matching_certified_terminal_state() -> None:

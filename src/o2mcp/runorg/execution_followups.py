@@ -83,12 +83,14 @@ class ExecutionFollowupMixin:
             if retried_stage_id not in reconciler.depends_on:
                 continue
             records = self._submission_records(plan, reconciler)
+            if not records:
+                # A child that never ran has no stale generation to replace, in
+                # either dependency mode.  Its ordinary attempt one resolves the
+                # latest dependency job on its own; allocating a follow-up here
+                # would authorize attempt one, which a dependency follow-up may
+                # never occupy, and then raise on every replay.
+                continue
             if reconciler.dependency_mode == "afterok":
-                if not records:
-                    # An afterok child that never ran has no stale generation to
-                    # replace. Its ordinary attempt one remains the correct
-                    # launch once every prerequisite is certified.
-                    continue
                 prerequisite_completions = tuple(
                     latest_reconciliation_receipt(
                         self.backend,

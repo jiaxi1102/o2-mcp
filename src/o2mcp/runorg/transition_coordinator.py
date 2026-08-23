@@ -54,6 +54,14 @@ try:
     try:
         marker_fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
+        # Preview validation happened before this lock.  A concurrent transition
+        # can relocate the source in between, and publishing a marker for a path
+        # that no longer exists strands it: the launched script fails to lock a
+        # missing source, its rollback trap keeps the marker, and recovery
+        # classifies the result as a manual blocker.
+        try: source_mode = os.lstat(run_root).st_mode
+        except OSError: raise SystemExit('transition source is missing')
+        if not stat.S_ISDIR(source_mode): raise SystemExit('transition source is not a canonical directory')
         fd, temporary = tempfile.mkstemp(prefix='.transition-', dir=coordination)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             handle.write(token); handle.flush(); os.fsync(handle.fileno())
