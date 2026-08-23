@@ -1195,6 +1195,43 @@ def test_receipt_keeps_ordinary_remote_measurements():
     assert _receipt_returncode(-1) == -1
 
 
+def test_a_pong_retires_an_in_flight_record_left_by_a_failed_write(tmp_path, broker_root, monkeypatch):
+    """A daemon that answers a ping is proof the channel is idle.
+
+    Receipt writes are best effort, so a suppressed completion write can leave a
+    finished command recorded as in flight. The record cannot retire itself; the
+    pong must, or a responsive broker reports itself busy indefinitely.
+    """
+
+    real_write = broker_module._atomic_json_write
+    failures = {"armed": False, "raised": 0}
+
+    def flaky_completion_write(path, payload):
+        completing = payload.get("last_command") is not None and payload.get("in_flight") is None
+        if failures["armed"] and completing:
+            failures["armed"] = False
+            failures["raised"] += 1
+            raise OSError(28, "No space left on device")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(broker_module, "_atomic_json_write", flaky_completion_write)
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        failures["armed"] = True
+        assert client.execute("printf stale", timeout=5).stdout == "stale"
+        assert failures["raised"] == 1
+
+        # The durable receipt is genuinely stale: it still names a command that
+        # has already finished.
+        assert _read_state(client.paths)["in_flight"]["command"]["preview"] == "printf stale"
+
+        status = client.local_status()
+        assert status["responsive"] is True
+        assert status["busy"] is False
+    finally:
+        _stop_local_broker(thread, client)
+
+
 def test_remote_write_failure_after_acknowledgement_is_still_attributed(tmp_path, broker_root):
     """A command that dies between acknowledgement and execution must be named.
 

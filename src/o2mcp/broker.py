@@ -563,6 +563,10 @@ class BrokerClient:
         the dispatched command and its elapsed time separates that ordinary busy
         state from a daemon that has actually stopped serving. A terminal
         receipt keeps its in-flight record for forensics but is never busy.
+
+        Only consult this when the ping went unanswered. Because receipt writes
+        are best effort, a suppressed completion write can leave a finished
+        command recorded as in flight, and the record alone cannot retire it.
         """
 
         in_flight = state.get("in_flight")
@@ -578,12 +582,15 @@ class BrokerClient:
         """Return receipt plus local responsiveness without contacting O2."""
 
         state = _read_state(self.paths)
-        busy = self._busy_summary(state)
         try:
             pong = self.ping(timeout=0.25)
         except O2BrokerError as exc:
-            return {**state, **busy, "responsive": False, "local_error": str(exc)}
-        return {**state, **busy, "responsive": True, "daemon": pong}
+            return {**state, **self._busy_summary(state), "responsive": False, "local_error": str(exc)}
+        # A serialized daemon can only answer between commands, so a pong is
+        # positive proof that nothing occupies the channel. That evidence
+        # outranks the receipt and retires an in-flight record that a suppressed
+        # best-effort completion write would otherwise leave standing forever.
+        return {**state, "busy": False, "responsive": True, "daemon": pong}
 
     def launch_in_progress(self) -> bool:
         """Return whether a daemon holds the lifetime lock, without signaling it."""

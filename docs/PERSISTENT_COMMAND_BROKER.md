@@ -167,10 +167,18 @@ carries the missing half of that picture:
   `timed_out`, and truncation flags. Remote-reported numbers are filtered to
   finite, plausibly sized values before they reach a file later readers must
   still parse.
-- `local_status` derives `busy` and `busy_for_seconds` from that record, so an
-  unanswered ping reports which command is responsible instead of only that no
-  answer arrived. A terminal receipt keeps its `in_flight` record for forensics
-  but is never reported as busy.
+- `local_status` consults that record only when the ping went unanswered, and
+  then reports `busy` and `busy_for_seconds` so the caller learns which command
+  is responsible instead of only that no answer arrived. A successful pong
+  reports `busy: false` regardless of the record: a serialized daemon can only
+  answer between commands, so a pong is positive proof that nothing occupies
+  the channel, and it retires an `in_flight` entry that a suppressed
+  best-effort write would otherwise leave standing. A terminal receipt keeps
+  its `in_flight` record for forensics but is never reported as busy.
+- The record is best effort, not a ledger. Consecutive suppressed writes can
+  leave it naming an earlier command than the one actually running; it is a
+  diagnostic aid, and the pong remains the authority on whether the channel is
+  free.
 - Busy is not un-ready. `status` stays `ready` while a command runs, because a
   busy broker is still a reusable broker: later clients queue behind the
   in-flight command rather than being refused for lacking a ready receipt.
