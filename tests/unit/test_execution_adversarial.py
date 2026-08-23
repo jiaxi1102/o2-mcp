@@ -2438,6 +2438,82 @@ def test_never_launched_afterany_child_keeps_its_ordinary_first_attempt() -> Non
     assert ordinary.dependency_job_ids == (compute_two.job_id,)
 
 
+def test_allocation_waits_for_an_earlier_attempt_to_publish_its_record() -> None:
+    """The ordering fence is built from records, so allocation must wait for them.
+
+    An attempt that crossed ``sbatch`` but has not published its record yet is
+    invisible to the fence.  Allocating the next generation past that window
+    would omit a live job from its dependency list, leaving two replacements
+    running the same signed commands against the same output and receipt paths.
+    """
+
+    class UncertainSecondAudit(ConcurrentBackend):
+        """Lose audit attempt two's outcome after it owns its invocation.
+
+        No job is materialized, so scheduler lookup cannot resolve the call and
+        the attempt stays invocation-owned with no record -- the exact window
+        the ordering fence cannot see.
+        """
+
+        def invoke_submission(self, request: SubmissionRequest) -> SubmitOutcome:
+            if request.identity.stage_id == "audit" and request.identity.attempt == 2:
+                with self._lock:
+                    self.requests.append(request)
+                return SubmitOutcome(INVOKED_OUTCOME_UNKNOWN, returncode=0)
+            return super().invoke_submission(request)
+
+    compute_a = _compute_stage(stage_id="compute-a", task_prefix="a")
+    compute_b = _compute_stage(stage_id="compute-b", task_prefix="b")
+    audit = StageSpec(
+        stage_id="audit",
+        command=_command("audit"),
+        resources=_resources(1),
+        expected_receipts=(_receipt("done", stage="audit"),),
+        depends_on=("compute-a", "compute-b"),
+        dependency_mode="afterany",
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+    plan = _plan(stages=(compute_a, compute_b, audit))
+    backend = UncertainSecondAudit()
+    engine = ExecutionEngine(backend)
+
+    first_a = engine.submit_stage(plan, "compute-a").record
+    first_b = engine.submit_stage(plan, "compute-b").record
+    engine.submit_afterany_reconciler(plan, "audit")
+
+    def make_retryable(job_id: str, prefix: str) -> None:
+        """Leave only the middle task eligible for retry."""
+
+        backend.set_states(
+            job_id,
+            SlurmTaskState(None, "NODE_FAIL", 1),
+            SlurmTaskState(0, "COMPLETED", 0),
+            SlurmTaskState(2, "COMPLETED", 0),
+        )
+        backend.put_receipt(_receipt(f"{prefix}-0"))
+        backend.put_receipt(_receipt(f"{prefix}-2"))
+
+    # A's retry launches audit attempt two, which owns its invocation but never
+    # publishes a record.
+    make_retryable(first_a.job_id, "a")
+    with pytest.raises(SubmissionUncertain):
+        engine.reconcile_stage(plan, "compute-a")
+    audit_records = read_plan_submission_records(backend, plan, stage_by_id(plan, "audit"))
+    assert [record.identity.attempt for record in audit_records] == [1]
+    assert backend.read_text(reconciler_followup_path(plan, "audit", 2)) is not None
+
+    # B's retry must not allocate past that window.
+    make_retryable(first_b.job_id, "b")
+    retry_b = ExecutionEngine(backend).reconcile_stage(plan, "compute-b").retry_submission
+    assert retry_b is not None
+    assert backend.read_text(reconciler_followup_path(plan, "audit", 3)) is None
+    assert not [
+        request
+        for request in backend.requests
+        if request.identity.stage_id == "audit" and request.identity.attempt == 3
+    ]
+
+
 def test_distinct_dependency_retry_skips_rejected_occupied_followup() -> None:
     """Another dependency cannot overwrite a rejected generation's authorization."""
 

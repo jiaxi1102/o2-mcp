@@ -13,6 +13,7 @@ from o2mcp.runorg.execution_evidence import (
     latest_reconciliation_receipt,
     next_unrejected_attempt,
     read_strict_json,
+    read_submission_invocation_claim_id,
     read_submission_rejection,
 )
 from o2mcp.runorg.execution_models import RECONCILE_COMPLETE, SubmissionIdentity, SubmissionRecord, canonical_json
@@ -24,6 +25,29 @@ from o2mcp.runorg.plans import ExecutionPlan
 
 class ExecutionFollowupMixin:
     """Generate and recover dependency-bound reconciler submissions."""
+
+    def _earlier_generation_is_mid_submission(self, plan, reconciler, attempt: int) -> bool:
+        """Report whether an earlier attempt owns an invocation without a record.
+
+        The ordering fence is built from published records, so an attempt that
+        crossed ``sbatch`` but has not published its record yet is invisible to
+        it.  Allocating past that window would leave two replacements running
+        the same signed commands against the same output and receipt paths.
+        An attempt with a durable rejection never produced a job and does not
+        hold the window open; an uncertain one deliberately does, because its
+        job may be live.
+        """
+
+        recorded = {record.identity.attempt for record in self._submission_records(plan, reconciler)}
+        for candidate in range(1, attempt):
+            if candidate in recorded:
+                continue
+            identity = SubmissionIdentity(plan.plan_sha256, reconciler.stage_id, candidate)
+            if read_submission_rejection(self.backend, submission_rejection_path(plan, identity)) is not None:
+                continue
+            if read_submission_invocation_claim_id(self.backend, plan, identity) is not None:
+                return True
+        return False
 
     def _covering_generation(
         self,
@@ -167,6 +191,8 @@ class ExecutionFollowupMixin:
                 if covering is not None:
                     if any(record.identity.attempt == covering for record in records):
                         continue
+                    if self._earlier_generation_is_mid_submission(plan, reconciler, covering):
+                        continue
                     submitted.append(
                         self.submit_dependency_followup(
                             plan,
@@ -213,6 +239,8 @@ class ExecutionFollowupMixin:
                         # a crash left it authorized but never submitted.
                         if any(record.identity.attempt == covering for record in records):
                             continue
+                        if self._earlier_generation_is_mid_submission(plan, reconciler, covering):
+                            continue
                         submitted.append(
                             self.submit_dependency_followup(
                                 plan,
@@ -248,6 +276,11 @@ class ExecutionFollowupMixin:
                     f"afterany reconciler {reconciler.stage_id} exhausted its signed attempt bound "
                     f"while rebinding retry job {retry_record.job_id}"
                 )
+            if self._earlier_generation_is_mid_submission(plan, reconciler, next_attempt):
+                # A later reconciliation allocates this generation once the
+                # earlier attempt publishes its record; propagation is
+                # convergent, so waiting costs a poll rather than a run.
+                continue
             dependency_job_ids = self._dependency_jobs(plan, reconciler)
             authorization = {
                 "attempt": next_attempt,
