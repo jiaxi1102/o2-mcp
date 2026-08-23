@@ -1,7 +1,8 @@
 """MCP tool wrappers for the run-organization engine (registered by a consumer).
 
 :func:`register` attaches the run-org tools (``o2_submit_run`` plus
-``o2_run_register``/``list``/``show``/``classify``/``promote``/``archive``/``gc``)
+``o2_run_register``/``list``/``show``/``classify``/``promote``/``archive``/
+``transition_recover``/``gc``)
 to a consumer's FastMCP server. The consumer supplies two things:
 
 - ``runs_factory()`` → a fresh :class:`~o2mcp.runorg.executor.O2Runs` per call (its own
@@ -19,11 +20,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from o2mcp.runorg.executor import O2Runs, TransitionPlan
+from o2mcp.runorg.executor import O2Runs
+from o2mcp.runorg.transition_executor import TransitionPlan
 
 RunsFactory = Callable[[], O2Runs]
 RunToolWrapper = Callable[[Callable[[], dict]], Awaitable[str]]
@@ -97,6 +99,18 @@ class RunTransitionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     run_dir: str = Field(..., description="Absolute path of the run directory to move.", min_length=1)
     dry_run: bool = Field(default=True, description="When true, return the generated script without executing it.")
+
+
+class RunTransitionRecoveryInput(BaseModel):
+    """Request a state-inspected recovery of one retained transition marker."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    run_dir: str = Field(..., description="Canonical source run directory whose marker is retained.", min_length=1)
+    action: Literal["promote", "archive"] = Field(..., description="Exact transition type encoded by the marker.")
+    dry_run: bool = Field(
+        default=True,
+        description="Inspect only by default; false clears the marker only when every clean-rollback check passes.",
+    )
 
 
 class RunGcInput(BaseModel):
@@ -268,6 +282,41 @@ def register(mcp, runs_factory: RunsFactory, run_tool: RunToolWrapper) -> None:
             # dry_run intentionally returns the script unexecuted (started=False); only a
             # real archive that fails to launch is an error.
             return {"ok": params.dry_run or plan.started, **_plan_payload(plan)}
+
+        return await run_tool(work)
+
+    @mcp.tool(
+        name="o2_run_transition_recover",
+        annotations={
+            "title": "Inspect or recover a retained run transition",
+            "readOnlyHint": False,
+            "openWorldHint": True,
+        },
+    )
+    async def o2_run_transition_recover(params: RunTransitionRecoveryInput) -> str:
+        """Inspect a retained marker and clear it only from a proven clean state.
+
+        The default dry run reports active transition PIDs and partial-state
+        blockers. With ``dry_run=false``, the lifecycle lock is held while the
+        same checks run and a cleanly abandoned marker is durably removed.
+        Partial transitions remain fenced for manual recovery.
+        """
+
+        def work() -> dict[str, Any]:
+            recovery = runs_factory().recover_transition(
+                params.run_dir,
+                params.action,
+                dry_run=params.dry_run,
+            )
+            return {
+                "ok": recovery.status in {"cleared", "marker_absent", "recoverable"},
+                "status": recovery.status,
+                "marker_present": recovery.marker_present,
+                "cleared": recovery.cleared,
+                "active_pids": list(recovery.active_pids),
+                "blockers": list(recovery.blockers),
+                "dry_run": params.dry_run,
+            }
 
         return await run_tool(work)
 

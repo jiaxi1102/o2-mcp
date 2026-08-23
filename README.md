@@ -204,9 +204,9 @@ plan binds:
 - absolute run/work/results/receipt/log/promotion paths;
 - an acyclic stage graph, signed `afterok`/`afterany` dependency semantics,
   optional stable array tasks, and exact per-stage or per-task argv vectors;
-- absolute executables and working directories plus authenticated runtime
-  fingerprints and a clean environment containing only explicit non-secret
-  values;
+- absolute executables and working directories plus a fingerprint of the exact
+  executable (normally an immutable environment-validating wrapper), and a clean
+  environment containing only explicit non-secret values;
 - bounded structured Slurm resources (including GPU model, constraints,
   exclusions, and licenses) and retry policies; and
 - every stage- and task-level receipt expected below the run's canonical receipt
@@ -224,9 +224,56 @@ change the idempotency key.
 
 This contract is intentionally execution-only: GEM, clock, and future pipeline
 repositories still render their scientific commands and define their own QC and
-release criteria.  The initial contract does not migrate or submit any existing
-pipeline; idempotent Slurm submission and receipt reconciliation build on this
-authenticated plan in the next run-organization layer.
+release criteria.
+
+### Idempotent execution and reconciliation
+
+`PreparedRunIdentity` allocates the run ID/root and dataset scope before those
+values are sealed into an `ExecutionPlan`. `ExecutionEngine` then submits stages
+through a fakeable `ExecutionBackend` with these guarantees:
+
+- production execution authenticates the plan against the prepared active
+  `run.json`—including project and exact canonical path—before writing the plan
+  binding or contacting Slurm;
+- before calling `sbatch`, it writes an immutable submission intent containing
+  the plan SHA, stage, attempt, selected stable tasks, script SHA, resources, and
+  dependency arguments, then atomically publishes a separate invocation marker;
+- Slurm receives a reversible
+  `o2plan:v1:<plan-sha>:<stage>:a<attempt>` comment. Repeated calls and lost
+  responses query this identity. An intent whose creator died before invocation
+  is safely recoverable by the invocation-marker winner. Once invocation is
+  owned, calls remain query-only until the original job becomes visible; there
+  is deliberately no timeout-based takeover that could duplicate a late job;
+- successful array tasks receive immutable per-attempt receipts and are excluded
+  from bounded missing-only retries. An explicitly terminal `CANCELLED`,
+  `TIMEOUT`, or `FAILED` task is not reinterpreted as missing simply because its
+  output is absent; it retries only when the signed state/exit policy permits it;
+- receipt probes distinguish authoritative absence from transport/parser
+  failure. Untrustworthy observations remain transient and cannot authorize a
+  retry or be frozen into task evidence;
+- current execution state is synchronized to `run.json` and the JSONL registry.
+  A registry outage leaves a coalesced pending update that can be replayed
+  without touching Slurm; and
+- scheduler options are rendered from typed plan fields. Arbitrary arguments
+  cannot override the plan SHA comment, array selection, dependency, resources,
+  working directory, or logs.
+
+Dependency-bound reconciliation is explicit in the signed DAG. A pipeline adds
+a non-array reconciler `StageSpec` whose dependencies are the compute stages and
+whose `dependency_mode` is `afterany`; its signed command performs the pipeline's
+files-as-truth validation. `ExecutionEngine.submit_afterany_reconciler()` then
+submits that command with `--dependency=afterany:<latest-job-ids>`, so it runs
+after every prerequisite reaches a terminal state even when an array is partial.
+`reconcile_stage()` is also available for workstation recovery/observability and
+for launching policy-bounded missing-only attempts, but caller polling is not the
+dependency mechanism.
+
+Reconciliation JSON is decoded as a strict plan/stage/attempt contract and must
+cover the exact task set with matching immutable task-attempt evidence before it
+can release an `afterok` stage. Each accepted missing-only retry also creates a
+durable follow-up outbox authorization. Replaying the accepted retry or any later
+reconciliation converges the same `afterany` generation after a coordinator
+crash, without resubmitting completed compute work.
 
 ### Non-blocking transfers
 

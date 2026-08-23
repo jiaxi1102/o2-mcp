@@ -38,6 +38,7 @@ class CommandSpec:
     argv: tuple[str, ...]
     working_directory: str
     runtime_fingerprint_sha256: str
+    runtime_fingerprint_path: str | None = None
     environment: tuple[str, ...] = ()
     environment_mode: str = "clean"
 
@@ -54,6 +55,15 @@ class CommandSpec:
         _validate_absolute_path(self.argv[0], "command executable")
         _validate_absolute_path(self.working_directory, "command working_directory")
         _validate_sha256(self.runtime_fingerprint_sha256, "command runtime_fingerprint_sha256")
+        runtime_path = self.runtime_fingerprint_path or self.argv[0]
+        _validate_absolute_path(runtime_path, "command runtime_fingerprint_path")
+        # Hashing an unrelated lock file does not authenticate the executable.
+        # Pipelines that need to bind a larger environment must make argv[0] an
+        # immutable wrapper whose own bytes are hashed here; that wrapper can then
+        # validate a signed environment manifest before launching scientific code.
+        if runtime_path != self.argv[0]:
+            raise ValueError("command runtime_fingerprint_path must equal argv[0]")
+        object.__setattr__(self, "runtime_fingerprint_path", runtime_path)
         if self.environment_mode != "clean":
             raise ValueError("command environment_mode must be 'clean'")
 
@@ -79,6 +89,12 @@ class CommandSpec:
             "environment": sorted(self.environment),
             "environment_mode": self.environment_mode,
             "runtime_fingerprint_sha256": self.runtime_fingerprint_sha256,
+            # ``runtime_fingerprint_path`` is deliberately absent: it is
+            # validated to equal ``argv[0]`` and therefore carries nothing the
+            # digest does not already cover.  Emitting it would rewrite the
+            # canonical form of every schema-version-1 plan written before the
+            # field existed, so their stored digests would no longer verify and
+            # their execution evidence could not be replayed.
             "working_directory": self.working_directory,
         }
 
@@ -89,7 +105,14 @@ class CommandSpec:
         data = _require_mapping(value, "command")
         _reject_unknown_keys(
             data,
-            {"argv", "working_directory", "runtime_fingerprint_sha256", "environment", "environment_mode"},
+            {
+                "argv",
+                "working_directory",
+                "runtime_fingerprint_sha256",
+                "runtime_fingerprint_path",
+                "environment",
+                "environment_mode",
+            },
             "command",
         )
         argv = _require_sequence(data.get("argv"), "command.argv")
@@ -100,6 +123,11 @@ class CommandSpec:
             runtime_fingerprint_sha256=_require_str(
                 data.get("runtime_fingerprint_sha256"),
                 "command.runtime_fingerprint_sha256",
+            ),
+            runtime_fingerprint_path=(
+                _require_str(data["runtime_fingerprint_path"], "command.runtime_fingerprint_path")
+                if data.get("runtime_fingerprint_path") is not None
+                else None
             ),
             environment=tuple(_require_str(item, "command.environment[]") for item in environment),
             environment_mode=_require_str(data.get("environment_mode", "clean"), "command.environment_mode"),

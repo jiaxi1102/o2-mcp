@@ -1,12 +1,8 @@
 """Executor for the run-organization lifecycle over an :class:`O2Connection`.
 
-:class:`O2Runs` is the orchestrator the MCP tools call. It keeps light, fast
-metadata operations (register / list / show / classify / registry sync / gc audit)
-on the login node, and launches the heavy, large-IO tier transitions (promote
-rsync, archive tar+zstd) **detached on the O2 transfer node** — standby is writable
-only there, and the transfers take hours, so the call returns immediately with a
-pid + log path. Every transition has a ``dry_run`` that returns the exact script
-without touching anything; the script always verifies before it frees any scratch.
+:class:`O2Runs` keeps metadata operations on the login node and launches large-IO
+tier transitions detached on the transfer node.  Every transition exposes its
+exact dry-run script and verifies the destination before freeing scratch.
 
 The pure conventions live in :mod:`o2mcp.runorg.runs`; this module only wires them
 to the connection. Python 3.9, no third-party deps.
@@ -15,14 +11,20 @@ to the connection. Python 3.9, no third-party deps.
 from __future__ import annotations
 
 import posixpath
+import secrets
 import shlex
-from dataclasses import dataclass
 from typing import Any
 
 from o2mcp.connection import CommandResult, O2Connection
+from o2mcp.runorg.execution_models import RegistryUpdate
+from o2mcp.runorg.plan_components import _validate_identifier
+from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.policy import RunPolicy
+from o2mcp.runorg.prepared import PreparedRunIdentity
+from o2mcp.runorg.registry_sync import merge_execution_manifest, synchronize_execution_transaction
 from o2mcp.runorg.runs import (
     STATUS_ACTIVE,
+    STRICT_RUN_ID_RE,
     RunLayout,
     RunManifest,
     campaign_of,
@@ -30,29 +32,44 @@ from o2mcp.runorg.runs import (
     merge_status_json,
     parse_registry,
     parse_submission_env,
-    plan_archive_script,
     plan_gc_candidates_command,
-    plan_promote_script,
     plan_register_commands,
     plan_write_manifest_command,
     registry_line,
     sort_job_ids,
     variant_of,
 )
+from o2mcp.runorg.transition_executor import TransitionExecutorMixin
 from o2mcp.slurm import O2Slurm
 
 
-@dataclass
-class TransitionPlan:
-    """The outcome of a promote/archive request (dry-run or launched)."""
+class RunPreparationError(RuntimeError):
+    """A run allocation failed, possibly after its directory was prepared.
 
-    run_id: str
-    action: str
-    script: str
-    started: bool = False
-    pid: str | None = None
-    log_path: str | None = None
-    message: str = ""
+    ``details`` preserves the run ID/root returned by the allocator so callers
+    can repair a registry-only failure rather than allocating a duplicate run.
+    """
+
+    def __init__(self, message: str, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.details = dict(details)
+
+
+class O2RunRegistrySynchronizer:
+    """Adapt :class:`O2Runs` metadata writes to the execution-engine protocol."""
+
+    def __init__(self, runs: O2Runs) -> None:
+        self.runs = runs
+
+    def validate_plan(self, plan: ExecutionPlan) -> bool:
+        """Authenticate the prepared active run before the engine can call Slurm."""
+
+        return bool(self.runs.validate_execution_plan(plan).get("ok"))
+
+    def synchronize(self, plan: ExecutionPlan, update: RegistryUpdate) -> bool:
+        """Return true only when both run.json and the registry row were written."""
+
+        return bool(self.runs.synchronize_execution(plan, update).get("ok"))
 
 
 # Remote gather for the status board: emits one JSON line with the dataset list,
@@ -62,7 +79,7 @@ class TransitionPlan:
 # status file degrades to empty, never an exception.
 
 
-class O2Runs:
+class O2Runs(TransitionExecutorMixin):
     """Run-lifecycle operations over an established O2 connection."""
 
     def __init__(self, connection: O2Connection, policy: RunPolicy, layout: RunLayout | None = None) -> None:
@@ -88,8 +105,7 @@ class O2Runs:
         base = root or self.layout.scratch_runs_root
         depth = 2 if depth_grouped else 1
         res = self._run(
-            f"find {shlex.quote(base)} -mindepth {depth} -maxdepth {depth} "
-            f"-type d -name 'RUN_*' 2>/dev/null | sort",
+            f"find {shlex.quote(base)} -mindepth {depth} -maxdepth {depth} -type d -name 'RUN_*' 2>/dev/null | sort",
             timeout=120,
         )
         return [line for line in res.stdout.splitlines() if line.strip()]
@@ -97,10 +113,8 @@ class O2Runs:
     def read_manifest(self, run_dir: str) -> RunManifest | None:
         """Return the run.json manifest; else the policy's legacy reader; else built-in synthesis.
 
-        When run.json is missing/unparsable, a project may supply a
-        ``policy.legacy_manifest_reader(run_dir, *, read)`` to synthesize one from its own
-        legacy metadata (``read`` runs a remote command); otherwise a minimal manifest is
-        built from the run-id + policy.
+        A policy legacy reader may synthesize project metadata; otherwise a
+        minimal manifest is built from the run ID and policy.
         """
         cat = self._run(f"cat {shlex.quote(posixpath.join(run_dir, 'run.json'))} 2>/dev/null", timeout=60)
         if cat.ok and cat.stdout.strip():
@@ -187,6 +201,7 @@ class O2Runs:
         variant: str = "",
         derived_from: str | None = None,
         run_id: str | None = None,
+        execution_project: str | None = None,
     ) -> tuple[dict[str, Any], RunManifest | None]:
         """Register backend that also returns the built manifest object.
 
@@ -195,8 +210,13 @@ class O2Runs:
         needs no read-back of the just-written run.json.
         """
         ts = self.utc_now()
+        if not ts:
+            return {"ok": False, "problems": ["could not allocate a UTC run timestamp"], "run_id": run_id or ""}, None
         slug_variant = variant or "run"
-        rid = run_id or f"RUN_{ts}_{_safe_slug(campaign)}__{_safe_slug(slug_variant)}"
+        # The random suffix prevents two preparations in the same second from
+        # resolving to the same scientific identity.  The run-root creation is
+        # also exclusive, so a caller-supplied collision fails closed.
+        rid = run_id or (f"RUN_{ts}_{_safe_slug(campaign)}__{_safe_slug(slug_variant)}-{secrets.token_hex(4)}")
         manifest = RunManifest(
             run_id=rid,
             campaign=campaign,
@@ -206,6 +226,9 @@ class O2Runs:
             status=STATUS_ACTIVE,
             datasets=list(datasets),
             source_view={"derived_from": derived_from, "materialized": False} if derived_from else {},
+            provenance=(
+                {"execution_preparation": {"project": execution_project}} if execution_project is not None else {}
+            ),
         )
         problems = manifest.validate(for_register=True)
         if problems:
@@ -214,9 +237,133 @@ class O2Runs:
         for command in plan_register_commands(self.layout, manifest, self.policy.run_subdirs):
             res = self._run(command, timeout=60)
             if not res.ok:
-                return {"ok": False, "problems": [res.stderr.strip() or "register command failed"], "run_id": rid}, None
-        self.append_registry(manifest)
+                # The transaction removes every pre-manifest partial tree.  If
+                # the transport lost a successful response after run.json was
+                # committed, this identity is sufficient for the caller to use
+                # recover_prepared_execution_run() instead of allocating a
+                # duplicate run.
+                return {
+                    "ok": False,
+                    "error": "run_initialization_failed_or_uncertain",
+                    "run_id": rid,
+                    "run_dir": run_dir,
+                    "recovery": "validate_with_recover_prepared_execution_run",
+                    "problems": [res.stderr.strip() or "register command failed or response was lost"],
+                }, None
+        registry = self.append_registry(manifest)
+        if not registry.ok:
+            return {
+                "ok": False,
+                "error": "registry_write_failed",
+                "prepared": True,
+                "run_id": rid,
+                "run_dir": run_dir,
+                "problems": [registry.stderr.strip() or "registry append failed"],
+            }, manifest
         return {"ok": True, "run_id": rid, "run_dir": run_dir, "problems": []}, manifest
+
+    def prepare_execution_run(
+        self,
+        *,
+        project: str,
+        campaign: str,
+        pipeline: str,
+        datasets: list[str],
+        variant: str = "",
+        derived_from: str | None = None,
+        run_id: str | None = None,
+    ) -> PreparedRunIdentity:
+        """Register a run and return the identity an adapter must seal into its plan.
+
+        Allocation and registry synchronization complete before this method
+        returns.  A failure raises instead of returning a half-authoritative
+        identity; when the registry write alone failed, callers can repair that
+        prepared directory explicitly rather than allocating another run.
+        """
+
+        # Validate the plan-compatible identity before remote allocation.  In
+        # particular, general run registration historically slugifies campaign
+        # labels; execution plans cannot discover that mismatch after a run
+        # directory has already been created.
+        for field_name, value in (("project", project), ("campaign", campaign), ("pipeline", pipeline)):
+            _validate_identifier(value, field_name)
+        if _safe_slug(campaign) != campaign:
+            raise ValueError("execution campaign must already be its canonical lowercase slug")
+        for dataset in datasets:
+            _validate_identifier(dataset, "datasets[]")
+        if len(set(datasets)) != len(datasets):
+            raise ValueError("execution datasets cannot contain duplicates")
+        # A caller-supplied identity is checked against the exact rules the
+        # returned PreparedRunIdentity applies.  Deferring them would allocate
+        # the run tree and append its registry row before raising, and recovery
+        # reaches the same constructor, so the prepared run would be stranded.
+        if run_id is not None:
+            if not STRICT_RUN_ID_RE.fullmatch(run_id):
+                raise ValueError("prepared run_id must match RUN_<UTCtimestamp>Z_<slug>")
+            if campaign_of(run_id) != campaign:
+                raise ValueError("prepared campaign must match the campaign encoded in run_id")
+
+        result, manifest = self._register(
+            campaign=campaign,
+            pipeline=pipeline,
+            datasets=datasets,
+            variant=variant,
+            derived_from=derived_from,
+            run_id=run_id,
+            execution_project=project,
+        )
+        if not result.get("ok") or manifest is None:
+            problems = "; ".join(result.get("problems", [])) or "run preparation failed"
+            raise RunPreparationError(problems, result)
+        return PreparedRunIdentity(
+            project=project,
+            campaign=manifest.campaign,
+            pipeline=manifest.pipeline,
+            run_id=manifest.run_id,
+            run_root=result["run_dir"],
+            created_utc=manifest.created_utc,
+            dataset_ids=tuple(manifest.datasets),
+        )
+
+    def recover_prepared_execution_run(self, *, project: str, run_dir: str) -> PreparedRunIdentity:
+        """Repair registry-only preparation failure without allocating a new run.
+
+        The existing directory must be the exact active path implied by its
+        strict manifest.  This method only appends the missing registry row; it
+        never rewrites scientific payloads or creates another run identity.
+        """
+
+        _validate_identifier(project, "project")
+        manifest = self._read_strict_manifest(run_dir)
+        if manifest is None:
+            raise RunPreparationError("no valid prepared run.json at the supplied path", {"run_dir": run_dir})
+        expected = self.layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
+        if run_dir != expected:
+            raise RunPreparationError(
+                "prepared run path does not match its active registry identity",
+                {"run_dir": run_dir, "expected_run_dir": expected, "run_id": manifest.run_id},
+            )
+        prepared_project = (manifest.provenance or {}).get("execution_preparation", {}).get("project")
+        if prepared_project != project:
+            raise RunPreparationError(
+                "prepared run project does not match the persisted execution identity",
+                {"run_dir": run_dir, "run_id": manifest.run_id, "expected_project": prepared_project},
+            )
+        registry = self.append_registry(manifest)
+        if not registry.ok:
+            raise RunPreparationError(
+                registry.stderr.strip() or "registry append failed",
+                {"run_dir": run_dir, "run_id": manifest.run_id, "prepared": True},
+            )
+        return PreparedRunIdentity(
+            project=project,
+            campaign=manifest.campaign,
+            pipeline=manifest.pipeline,
+            run_id=manifest.run_id,
+            run_root=run_dir,
+            created_utc=manifest.created_utc,
+            dataset_ids=tuple(manifest.datasets),
+        )
 
     # -- record a submitted job onto an existing run ---------------------------
     def record_job(
@@ -256,7 +403,16 @@ class O2Runs:
                 "problems": [write.stderr.strip() or "manifest write failed"],
                 "run_id": manifest.run_id,
             }
-        self.append_registry(manifest)
+        registry = self.append_registry(manifest)
+        if not registry.ok:
+            return {
+                "ok": False,
+                "error": "registry_write_failed",
+                "problems": [registry.stderr.strip() or "registry append failed"],
+                "run_id": manifest.run_id,
+                "slurm_job_ids": list(manifest.slurm_job_ids),
+                "manifest_written": True,
+            }
         return {"ok": True, "run_id": manifest.run_id, "slurm_job_ids": list(manifest.slurm_job_ids)}
 
     # -- submit (register-or-attach + sbatch + record) -------------------------
@@ -285,6 +441,15 @@ class O2Runs:
         into the run dir by default. Returns
         ``{ok, run_id, run_dir, registered, submitted, job_id, record, ...}``.
         """
+        # Validate the payload before registration.  Otherwise a malformed call
+        # leaves an empty authoritative run behind (issue #3).
+        if script_text is None and not remote_script_path:
+            return {
+                "ok": False,
+                "error": "bad_input",
+                "message": "Provide remote_script_path or script_text (with optional remote_path).",
+            }
+
         # 1. Resolve the run: attach to an existing dir, or register a fresh one.
         registered = False
         if run_dir:
@@ -297,6 +462,20 @@ class O2Runs:
             manifest = self.read_manifest(run_dir)
             if manifest is None or manifest.validate():
                 return {"ok": False, "error": "unknown_run", "message": f"no valid run manifest under {run_dir}"}
+            # Execution-plan runs are coordinated by ExecutionEngine's
+            # lifecycle claims, invocation evidence, and idempotent scheduler
+            # identity.  The legacy convenience path has none of those
+            # guarantees, so allowing it to attach would reopen a submit-versus-
+            # promote race at the destructive transition boundary.
+            provenance = manifest.provenance or {}
+            if isinstance(provenance, dict) and "execution_preparation" in provenance:
+                return {
+                    "ok": False,
+                    "error": "execution_plan_submission_required",
+                    "message": "prepared execution-plan runs must be submitted through the execution engine",
+                    "run_id": manifest.run_id,
+                    "run_dir": run_dir,
+                }
             run_id = manifest.run_id
         elif campaign and pipeline and datasets:
             reg, manifest = self._register(
@@ -328,15 +507,8 @@ class O2Runs:
             submit = slurm.submit_text(_fill(script_text) or "", dest, sbatch_args=sbatch_args)
         elif remote_script_path:
             submit = slurm.submit(_fill(remote_script_path) or remote_script_path, sbatch_args=sbatch_args)
-        else:
-            return {
-                "ok": False,
-                "error": "bad_input",
-                "message": "Provide remote_script_path or script_text (with optional remote_path).",
-                "run_id": run_id,
-                "run_dir": run_dir,
-                "registered": registered,
-            }
+        else:  # pragma: no cover - guarded before registration above
+            raise AssertionError("submission payload validation drifted")
 
         payload: dict[str, Any] = {
             "ok": submit.submitted,
@@ -364,6 +536,107 @@ class O2Runs:
                     f"run.json failed ({'; '.join(record.get('problems', []))}); re-record it later."
                 )
         return payload
+
+    # -- execution-plan registry synchronization -----------------------------
+    def validate_execution_plan(self, plan: ExecutionPlan) -> dict[str, Any]:
+        """Fail closed unless ``plan`` matches the exact prepared active run."""
+
+        run_dir = plan.paths.run_root
+        expected = self.layout.run_dir(STATUS_ACTIVE, plan.campaign, plan.run_id)
+        strict = self._read_strict_manifest(run_dir) if run_dir == expected else None
+        if strict is None:
+            return {"ok": False, "error": "unregistered_execution_run"}
+        prepared = (strict.provenance or {}).get("execution_preparation", {})
+        matches = (
+            prepared.get("project") == plan.project
+            and strict.status == STATUS_ACTIVE
+            and strict.run_id == plan.run_id
+            and strict.campaign == plan.campaign
+            and strict.pipeline == plan.pipeline
+            and sorted(strict.datasets) == sorted(item.dataset_id for item in plan.datasets)
+        )
+        return {"ok": matches, "error": None if matches else "execution_identity_mismatch"}
+
+    def synchronize_execution(self, plan: ExecutionPlan, update: RegistryUpdate) -> dict[str, Any]:
+        """Synchronize one plan update to ``run.json`` and the JSONL registry.
+
+        The Slurm submission is already authoritative when this method runs, so
+        registry failure is reported separately and can be reconciled later.  No
+        scheduler operation occurs here.  Identity checks prevent a caller from
+        annotating one run with another run's plan or dataset scope.
+        """
+
+        if update.plan_sha256 != plan.plan_sha256:
+            return {"ok": False, "error": "plan_mismatch", "problems": ["registry update plan SHA mismatch"]}
+        run_dir = plan.paths.run_root
+        expected_dir = self.layout.run_dir(STATUS_ACTIVE, plan.campaign, plan.run_id)
+        if run_dir != expected_dir:
+            return {
+                "ok": False,
+                "error": "path_mismatch",
+                "problems": [f"plan run root {run_dir} is not the registered active path {expected_dir}"],
+            }
+        strict = self._read_strict_manifest_with_text(run_dir)
+        if strict is None:
+            return {"ok": False, "error": "unknown_run", "problems": [f"no valid run.json under {run_dir}"]}
+        manifest, manifest_text = strict
+        planned_datasets = sorted(dataset.dataset_id for dataset in plan.datasets)
+        identity_problems: list[str] = []
+        prepared_project = (manifest.provenance or {}).get("execution_preparation", {}).get("project")
+        if manifest.status != STATUS_ACTIVE:
+            identity_problems.append(f"run status is {manifest.status!r}, not active")
+        if prepared_project != plan.project:
+            identity_problems.append("project differs")
+        if manifest.run_id != plan.run_id:
+            identity_problems.append("run_id differs")
+        if manifest.campaign != plan.campaign:
+            identity_problems.append("campaign differs")
+        if manifest.pipeline != plan.pipeline:
+            identity_problems.append("pipeline differs")
+        if sorted(manifest.datasets) != planned_datasets:
+            identity_problems.append("dataset scope differs")
+        if identity_problems:
+            return {
+                "ok": False,
+                "error": "identity_mismatch",
+                "problems": ["execution plan cannot update this run: " + ", ".join(identity_problems)],
+            }
+
+        try:
+            merged = merge_execution_manifest(manifest, plan, update)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error": "execution_state_conflict",
+                "problems": [str(exc)],
+            }
+        return synchronize_execution_transaction(
+            self.conn,
+            run_dir=run_dir,
+            registry_path=self.layout.registry_path,
+            current_manifest_text=manifest_text,
+            merged_manifest=merged,
+        )
+
+    def _read_strict_manifest(self, run_dir: str) -> RunManifest | None:
+        """Read an existing run.json without legacy synthesis or path guessing."""
+
+        strict = self._read_strict_manifest_with_text(run_dir)
+        return strict[0] if strict is not None else None
+
+    def _read_strict_manifest_with_text(self, run_dir: str) -> tuple[RunManifest, str] | None:
+        """Read strict metadata together with the exact bytes used for remote CAS."""
+
+        if not self._dir_exists(run_dir):
+            return None
+        cat = self._run(f"cat {shlex.quote(posixpath.join(run_dir, 'run.json'))} 2>/dev/null", timeout=60)
+        if not cat.ok or not cat.stdout.strip():
+            return None
+        try:
+            manifest = RunManifest.from_json(cat.stdout)
+        except (TypeError, ValueError):
+            return None
+        return (manifest, cat.stdout) if not manifest.validate() else None
 
     # -- classify --------------------------------------------------------------
     def classify(self, root: str | None = None, *, depth_grouped: bool = True) -> list[dict[str, Any]]:
@@ -404,62 +677,6 @@ class O2Runs:
                 }
             )
         return sorted(rows, key=lambda r: (r["campaign"], r["run_id"]))
-
-    # -- tier transitions (run detached on the transfer node) ------------------
-    # Standby is writable only from the O2 transfer node (login/compute nodes
-    # cannot write it), and a tar+zstd of a large run takes hours, so transitions
-    # are launched DETACHED on the transfer node and return immediately. The script
-    # verifies (checksum / rsync-itemize) before it frees any scratch source.
-    def promote(self, run_dir: str, *, dry_run: bool = True, run_remote: bool = True) -> TransitionPlan:
-        manifest = self.read_manifest(run_dir) or self._synthesize_manifest(run_dir)
-        script = plan_promote_script(self.layout, manifest, source_dir=run_dir)
-        return self._transition(manifest.run_id, "promote", script, dry_run=dry_run, run_remote=run_remote)
-
-    def archive(self, run_dir: str, *, dry_run: bool = True, run_remote: bool = True) -> TransitionPlan:
-        manifest = self.read_manifest(run_dir) or self._synthesize_manifest(run_dir)
-        script = plan_archive_script(
-            self.layout, manifest, source_dir=run_dir, archive_excludes=self.policy.archive_excludes
-        )
-        return self._transition(manifest.run_id, "archive", script, dry_run=dry_run, run_remote=run_remote)
-
-    def _transition(self, run_id: str, action: str, script: str, *, dry_run: bool, run_remote: bool) -> TransitionPlan:
-        if dry_run or not run_remote:
-            return TransitionPlan(run_id, action, script, started=False, message="dry_run: script not executed")
-        script_path = posixpath.join(self.layout.scratch_runs_root, ".jobs", f"{action}_{run_id}.sh")
-        log_path = script_path + ".log"
-        self._run(f"mkdir -p {shlex.quote(posixpath.dirname(script_path))}", timeout=60)
-        # stage the script body verbatim via stdin (cat writes exactly what it reads)
-        stage = self.conn.run(f"cat > {shlex.quote(script_path)}", timeout=60, input_text=script)
-        if not stage.ok:
-            return TransitionPlan(
-                run_id, action, script, started=False, message=stage.stderr.strip() or "staging failed"
-            )
-        launch = f"nohup bash {shlex.quote(script_path)} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo PID $!"
-        # Reuse the transfer master through the same authentication-disabled path
-        # as ordinary commands. Centralizing argv construction in O2Connection
-        # prevents this detached lifecycle operation from becoming an accidental
-        # cold-login escape hatch.
-        # The explicit role keeps transfer launches on their separately granted
-        # broker even when an installation maps both roles to the same SSH alias.
-        res = self.conn.run(
-            launch,
-            timeout=60,
-            alias=self.conn.config.transfer_alias,
-            broker_role="transfer",
-        )
-        pid = ""
-        for token in res.stdout.split():
-            if token.isdigit():
-                pid = token
-        return TransitionPlan(
-            run_id,
-            action,
-            script,
-            started=res.ok and bool(pid),
-            pid=pid or None,
-            log_path=log_path,
-            message=f"launched on transfer node (pid {pid}); tail {log_path}" if pid else res.stderr.strip(),
-        )
 
     # -- registry --------------------------------------------------------------
     def append_registry(self, manifest: RunManifest) -> CommandResult:

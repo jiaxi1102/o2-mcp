@@ -6,7 +6,16 @@ an injected runner (no network). Everything is parameterized by a synthetic RunP
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from o2mcp import CommandResult, O2Config
 from o2mcp import O2Connection as _ProductionO2Connection
@@ -14,20 +23,38 @@ from o2mcp.broker import BrokerExecutionResult
 from o2mcp.runorg import (
     RETENTION_KEEP,
     RETENTION_SWEEP,
+    STATUS_ACTIVE,
     STATUS_KEPT,
     O2Runs,
+    RegistryUpdate,
     RunLayout,
     RunManifest,
     RunPolicy,
+    RunPreparationError,
     campaign_of,
     classify_run,
     is_regenerable_intermediate,
     migration_target,
     plan_archive_script,
+    plan_promote_script,
     plan_register_commands,
     variant_of,
 )
 from o2mcp.runorg.executor import _infer_pipeline
+from o2mcp.runorg.runs import _REGISTER_PROGRAM, _safe
+from o2mcp.runorg.transition_coordinator import TransitionBoundary
+
+
+def _seed_transition_marker(source: str, manifest: RunManifest, action: str) -> str:
+    """Create and return the marker normally established before launch."""
+
+    token = hashlib.sha256(f"{action}\0{manifest.run_id}\0{manifest.to_json()}".encode()).hexdigest()
+    root = os.path.join(os.path.dirname(source), f".{manifest.run_id}.execution-coordination")
+    os.makedirs(root, exist_ok=True)
+    marker = os.path.join(root, "transition.json")
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    return marker
 
 
 class O2Connection(_ProductionO2Connection):
@@ -87,10 +114,7 @@ def _cfg(tmp_path):
     policy_file.chmod(0o600)
     ssh_config = tmp_path / "ssh_config"
     ssh_config.write_text(
-        "Host o2 o2-transfer\n"
-        "  HostName o2.hms.harvard.edu\n"
-        "  User jiz947\n"
-        "  ControlPath /tmp/%n-control.sock\n"
+        "Host o2 o2-transfer\n  HostName o2.hms.harvard.edu\n  User jiz947\n  ControlPath /tmp/%n-control.sock\n"
     )
     return O2Config(
         host_alias="o2",
@@ -116,6 +140,39 @@ def test_manifest_round_trip_and_validation():
     )
     assert m.validate(for_register=True) == []
     assert RunManifest.from_json(m.to_json()).run_id == m.run_id
+
+
+def test_manifest_rewrite_preserves_unknown_future_fields():
+    """Execution reconciliation must not truncate fields from a newer schema."""
+
+    payload = {
+        "run_id": "RUN_20260605T110309Z_camp__v1",
+        "campaign": "camp",
+        "pipeline": "grid",
+        "created_utc": "20260605T110309Z",
+        "datasets": ["ds1"],
+        "future_release_binding": {"sha256": "a" * 64, "accepted": True},
+    }
+    restored = json.loads(RunManifest.from_dict(payload).to_json())
+    assert restored["future_release_binding"] == payload["future_release_binding"]
+
+
+def test_run_id_and_campaign_components_fail_closed():
+    """Loose timestamps and dot traversal components cannot identify new runs."""
+
+    loose = RunManifest(
+        run_id="RUN_20260605T_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260605T000000Z",
+        datasets=["ds1"],
+    )
+    assert any("does not match" in problem for problem in loose.validate(for_register=True))
+    # The same identity, already stored on the cluster, keeps its lifecycle path:
+    # promote/archive read it through validate() without for_register.
+    assert loose.validate() == []
+    assert _safe(".") == "uncategorized"
+    assert _safe("..") == "uncategorized"
 
 
 def test_classify_keep_sweep_via_policy():
@@ -150,7 +207,12 @@ def test_regenerable_and_migration_via_policy():
 
 # --- planners (policy-driven) ------------------------------------------------
 def test_plan_register_includes_policy_subdirs(tmp_path):
-    layout = RunLayout.from_config(_cfg(tmp_path))
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
     m = RunManifest(
         run_id="RUN_20260101T000000Z_camp__v1",
         campaign="camp",
@@ -160,10 +222,132 @@ def test_plan_register_includes_policy_subdirs(tmp_path):
     )
     cmds = plan_register_commands(layout, m, TEST_POLICY.run_subdirs)
     assert any("logs" in c and "views" in c for c in cmds)  # mkdir creates the policy subdirs
+    assert ".prepare." in cmds[0]
+    assert "RENAME_NOREPLACE" in cmds[0]
+    assert layout.run_dir(STATUS_ACTIVE, m.campaign, m.run_id) in cmds[0]
+
+
+def test_plan_register_crash_leaves_only_hidden_complete_tree(tmp_path):
+    """An uncatchable pre-publication exit never creates the canonical run root."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
+    parent = os.path.dirname(run_dir)
+    prefix = f".{manifest.run_id}.prepare."
+    # Replace only the atomic publication call in a subprocess copy. os._exit
+    # bypasses finally exactly as SIGKILL/host loss would, leaving diagnostic
+    # staging bytes while proving the canonical identity remains untouched.
+    crash_program = _REGISTER_PROGRAM.replace(
+        "rename_noreplace(staging, run_dir)",
+        "os._exit(99)",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            crash_program,
+            parent,
+            run_dir,
+            prefix,
+            json.dumps(list(TEST_POLICY.run_subdirs)),
+            base64.b64encode(manifest.to_json().encode()).decode("ascii"),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 99
+    assert not os.path.exists(run_dir)
+    staging = list(Path(parent).glob(f"{prefix}*"))
+    assert len(staging) == 1
+    assert RunManifest.from_json((staging[0] / "run.json").read_text(encoding="utf-8")) == manifest
+
+
+def test_plan_register_commits_complete_recoverable_manifest(tmp_path):
+    """Successful initialization leaves the exact manifest as commit marker."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    command = plan_register_commands(layout, manifest, TEST_POLICY.run_subdirs)[0]
+    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+
+    run_dir = layout.run_dir(STATUS_ACTIVE, manifest.campaign, manifest.run_id)
+    assert result.returncode == 0
+    assert result.stdout.strip() == run_dir
+    assert RunManifest.from_json(Path(run_dir, "run.json").read_text(encoding="utf-8")) == manifest
+    assert os.path.isdir(os.path.join(run_dir, "logs"))
+    assert os.path.isdir(os.path.join(run_dir, "views"))
+
+    # The platform primitive is no-replace rather than a check-then-rename.
+    # Replaying the allocator cannot overwrite the complete identity, and its
+    # losing hidden tree is cleaned without touching the winner.
+    replay = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+    assert replay.returncode != 0
+    assert RunManifest.from_json(Path(run_dir, "run.json").read_text(encoding="utf-8")) == manifest
+    assert list(Path(run_dir).parent.glob(f".{manifest.run_id}.prepare.*")) == []
+
+
+def test_prepare_execution_run_returns_identity_after_uncertain_initialization(tmp_path):
+    """A lost transaction response tells callers exactly what to recover."""
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command == "date -u +%Y%m%dT%H%M%SZ":
+            return ("20260101T000000Z\n", "", 0)
+        if "rename_noreplace" in command:
+            # Model a transport that lost the response after the remote shell
+            # may have committed run.json.  The executor cannot safely infer
+            # either outcome and must surface the deterministic recovery path.
+            return ("", "transport response lost", 1)
+        return ("", "", 0)
+
+    run_id = "RUN_20260101T000000Z_camp__v1"
+    with pytest.raises(RunPreparationError) as raised:
+        _runs(tmp_path, responder).prepare_execution_run(
+            project="example-project",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id=run_id,
+        )
+
+    details = raised.value.details
+    assert details["error"] == "run_initialization_failed_or_uncertain"
+    assert details["run_id"] == run_id
+    assert details["run_dir"].endswith(f"/camp/{run_id}")
+    assert details["recovery"] == "validate_with_recover_prepared_execution_run"
 
 
 def test_plan_archive_uses_policy_excludes(tmp_path):
-    layout = RunLayout.from_config(_cfg(tmp_path))
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
     m = RunManifest(
         run_id="RUN_20260101T000000Z_camp__v1",
         campaign="camp",
@@ -178,7 +362,105 @@ def test_plan_archive_uses_policy_excludes(tmp_path):
         source_dir="/scratch/runs/camp/RUN_20260101T000000Z_camp__v1",
         archive_excludes=TEST_POLICY.archive_excludes,
     )
-    assert "--exclude=source_views" in script and "zstd" in script
+    assert f"--exclude={m.run_id}/source_views" in script and "zstd" in script
+    assert f"--exclude={m.run_id}/.execution-source.lock" in script
+
+
+def _transition_test_environment(tmp_path):
+    """Provide a no-op flock on macOS for pre-publication shell regressions."""
+
+    tools = tmp_path / "tools"
+    tools.mkdir(exist_ok=True)
+    flock = tools / "flock"
+    flock.write_text("#!/bin/sh\nexit 0\n")
+    flock.chmod(0o755)
+    return {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+
+
+def test_promotion_refuses_existing_destination_without_deleting_source(tmp_path):
+    """A stale durable tree cannot be merged with a clean source then promoted."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    source = layout.run_dir("active", manifest.campaign, manifest.run_id)
+    destination = layout.run_dir("kept", manifest.campaign, manifest.run_id)
+    os.makedirs(source)
+    os.makedirs(destination)
+    with open(os.path.join(source, "clean.txt"), "w", encoding="utf-8") as handle:
+        handle.write("clean\n")
+    with open(os.path.join(destination, "stale.txt"), "w", encoding="utf-8") as handle:
+        handle.write("stale\n")
+
+    script = plan_promote_script(layout, manifest, source_dir=source)
+    marker = _seed_transition_marker(source, manifest, "promote")
+    assert "rsync -nric --delete" in script and "mv --no-clobber -T" in script
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env=_transition_test_environment(tmp_path),
+        check=False,
+    )
+    assert result.returncode == 76
+    assert os.path.exists(os.path.join(source, "clean.txt"))
+    assert os.path.exists(os.path.join(destination, "stale.txt"))
+    assert not os.path.exists(marker)
+
+
+def test_archive_refuses_partial_destination_without_clobbering_source(tmp_path):
+    """Interrupted or existing archive artifacts require explicit inspection."""
+
+    layout = RunLayout(
+        str(tmp_path / "scratch"),
+        str(tmp_path / "group"),
+        str(tmp_path / "standby"),
+        str(tmp_path / "registry.jsonl"),
+    )
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+    source = layout.run_dir("active", manifest.campaign, manifest.run_id)
+    os.makedirs(source)
+    with open(os.path.join(source, "clean.txt"), "w", encoding="utf-8") as handle:
+        handle.write("clean\n")
+    tarball = layout.archive_tarball(manifest.campaign, manifest.run_id)
+    os.makedirs(os.path.dirname(tarball), exist_ok=True)
+    with open(tarball, "wb") as handle:
+        handle.write(b"existing archive bytes")
+
+    script = plan_archive_script(layout, manifest, source_dir=source)
+    marker = _seed_transition_marker(source, manifest, "archive")
+    assert script.count("mv --no-clobber") == 3
+    assert script.index('archive.sha256"') < script.index('run.json"')
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env=_transition_test_environment(tmp_path),
+        check=False,
+    )
+    assert result.returncode == 76
+    with open(tarball, "rb") as handle:
+        assert handle.read() == b"existing archive bytes"
+    assert os.path.exists(os.path.join(source, "clean.txt"))
+    assert not os.path.exists(marker)
 
 
 # --- executor (injected runner) ----------------------------------------------
@@ -195,10 +477,208 @@ def test_register_runs_commands_and_appends_registry(tmp_path):
     assert any("registry" in c for c in seen)  # appended a registry row
 
 
+def test_register_surfaces_registry_append_failure(tmp_path):
+    """A prepared directory is not reported as fully registered if JSONL is stale."""
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if "date -u" in cmd:
+            return ("20260101T000000Z", "", 0)
+        if "registry" in cmd:
+            return ("", "registry is read-only", 1)
+        return ("", "", 0)
+
+    result = _runs(tmp_path, responder).register(
+        campaign="camp",
+        pipeline="grid",
+        datasets=["d"],
+        variant="v1",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "registry_write_failed"
+    assert result["prepared"] is True
+    assert "registry is read-only" in result["problems"]
+
+
+def test_submit_validates_script_before_allocating_run(tmp_path):
+    """A malformed submit request cannot orphan a registered run directory."""
+
+    seen: list[str] = []
+
+    def responder(argv, _inp):
+        seen.append(argv[-1])
+        return ("", "", 0)
+
+    result = _runs(tmp_path, responder).submit_run(campaign="camp", pipeline="grid", datasets=["d"])
+    assert result["ok"] is False and result["error"] == "bad_input"
+    assert not any("date -u" in command or "mkdir" in command for command in seen)
+
+
+def test_legacy_submit_rejects_prepared_execution_plan_run(tmp_path):
+    """The convenience submit path cannot bypass execution lifecycle claims."""
+
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+        provenance={"execution_preparation": {"project": "example-project"}},
+    )
+    submitted = False
+
+    def responder(argv, _inp):
+        nonlocal submitted
+        command = argv[-1]
+        if command.startswith("test -d "):
+            return ("", "", 0)
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest.to_json(), "", 0)
+        if "sbatch" in command:
+            submitted = True
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    run_dir = runs.layout.run_dir("active", manifest.campaign, manifest.run_id)
+    result = runs.submit_run(run_dir=run_dir, script_text="#!/bin/sh\ntrue\n")
+
+    assert result["ok"] is False
+    assert result["error"] == "execution_plan_submission_required"
+    assert submitted is False
+
+
+def test_record_job_surfaces_registry_failure_after_manifest_write(tmp_path):
+    """Callers can distinguish a live job from its pending registry annotation."""
+
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+    )
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if "registry" in command:
+            return ("", "registry unavailable", 1)
+        return ("", "", 0)
+
+    result = _runs(tmp_path, responder).record_job(
+        "/scratch/runs/camp/RUN_20260101T000000Z_camp__v1",
+        "12345",
+        manifest=manifest,
+    )
+    assert result["ok"] is False
+    assert result["manifest_written"] is True
+    assert result["slurm_job_ids"] == ["12345"]
+
+
+def test_recover_prepared_execution_run_repairs_registry_without_reallocation(tmp_path):
+    """A registry-only preparation failure reuses the exact existing run ID/root."""
+
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+        provenance={"execution_preparation": {"project": "example-project"}},
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        calls.append((command, _inp))
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest.to_json(), "", 0)
+        if command.startswith("python3 -c") and _inp:
+            return ('{"ok": true}\n', "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    run_dir = runs.layout.run_dir("active", manifest.campaign, manifest.run_id)
+    identity = runs.recover_prepared_execution_run(project="example-project", run_dir=run_dir)
+
+    assert identity.run_id == manifest.run_id
+    assert identity.run_root == run_dir
+    assert any("registry" in command for command, _ in calls)
+    assert not any("date -u" in command or ("mkdir" in command and "registry" not in command) for command, _ in calls)
+
+
+def test_execution_sync_updates_manifest_and_registry_from_same_state(tmp_path):
+    """Automatic synchronization binds plan provenance, jobs, and registry status."""
+
+    manifest = RunManifest(
+        run_id="RUN_20260101T000000Z_camp__v1",
+        campaign="camp",
+        pipeline="grid",
+        created_utc="20260101T000000Z",
+        datasets=["d"],
+        provenance={"execution_preparation": {"project": "example-project"}},
+        extra={"future_field": {"preserve": True}},
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        calls.append((command, _inp))
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest.to_json(), "", 0)
+        if command.startswith("python3 -c") and _inp:
+            return ('{"ok": true}\n', "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    run_dir = runs.layout.run_dir("active", manifest.campaign, manifest.run_id)
+    plan = SimpleNamespace(
+        plan_sha256="a" * 64,
+        paths=SimpleNamespace(run_root=run_dir),
+        campaign=manifest.campaign,
+        run_id=manifest.run_id,
+        pipeline=manifest.pipeline,
+        datasets=[SimpleNamespace(dataset_id="d")],
+        project="example-project",
+        source_bundle_sha256="b" * 64,
+        source_commit="c" * 40,
+    )
+    update = RegistryUpdate(
+        plan_sha256=plan.plan_sha256,
+        stage_id="analyze",
+        stage_status="SUBMITTED",
+        execution_status="SUBMITTED",
+        job_ids=("12345",),
+        attempt=1,
+    )
+
+    assert runs.validate_execution_plan(plan)["ok"] is True
+    manifest.status = STATUS_KEPT
+    assert runs.validate_execution_plan(plan)["ok"] is False
+    assert runs.synchronize_execution(plan, update)["ok"] is False
+    manifest.status = "active"
+    plan.project = "wrong-project"
+    assert runs.validate_execution_plan(plan)["ok"] is False
+    plan.project = "example-project"
+    result = runs.synchronize_execution(plan, update)
+
+    assert result["ok"] is True
+    transaction_input = next(
+        input_text for command, input_text in calls if command.startswith("python3 -c") and input_text
+    )
+    transaction = json.loads(transaction_input)
+    merged_manifest = json.loads(transaction["manifest_text"])
+    registry_row = json.loads(transaction["registry_line"])
+    assert merged_manifest["provenance"]["execution"]["plan_sha256"] == plan.plan_sha256
+    assert merged_manifest["future_field"] == {"preserve": True}
+    assert merged_manifest["slurm_job_ids"] == ["12345"]
+    assert registry_row["result_status"] == "SUBMITTED"
+
+
 def test_promote_archive_dry_run_return_scripts(tmp_path):
     manifest_json = (
         '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
-        '"created_utc":"20260101T000000Z","status":"active","datasets":["d"]}'
+        '"created_utc":"20260101T000000Z","status":"active","datasets":["d"],'
+        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED"}}}'
     )
 
     def responder(argv, _inp):
@@ -208,19 +688,163 @@ def test_promote_archive_dry_run_return_scripts(tmp_path):
         return ("", "", 0)
 
     runs = _runs(tmp_path, responder)
-    rd = "/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"
+    rd = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
     promote = runs.promote(rd, dry_run=True)
     assert promote.started is False and "rsync" in promote.script
     archive = runs.archive(rd, dry_run=True)
-    assert archive.started is False and "--exclude=source_views" in archive.script  # policy excludes in script
+    assert archive.started is False and f"--exclude={archive.run_id}/source_views" in archive.script
 
 
-def test_live_transition_uses_persistent_transfer_broker(tmp_path):
+def test_manifest_less_legacy_run_keeps_its_transition_path(tmp_path):
+    """Pre-manifest runs must still be able to leave scratch storage.
+
+    ``promote``/``archive`` served these runs through the policy's legacy reader
+    and built-in synthesis before the execution engine existed.  Requiring a
+    strict ``run.json`` for every transition would strand them permanently.
+    """
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
+    promote = runs.promote(rd, dry_run=True)
+    assert promote.started is False and "rsync" in promote.script
+    archive = runs.archive(rd, dry_run=True)
+    assert archive.started is False
+
+
+def test_historical_run_id_keeps_its_transition_path(tmp_path):
+    """A pre-convention identity must not lose promote/archive.
+
+    Identities such as ``RUN_20240101T12_camp`` were accepted by the earlier
+    matcher and are already stored on the cluster.  Holding the lifecycle read
+    to the new exact form would strand them with otherwise valid metadata.
+    """
+
+    manifest_json = json.dumps(
+        {
+            "run_id": "RUN_20240101T12_camp__v1",
+            "campaign": "camp",
+            "pipeline": "grid",
+            "created_utc": "20240101T120000Z",
+            "status": "active",
+            "datasets": ["d"],
+            "result": {"status": "COMPLETED"},
+        }
+    )
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return (manifest_json, "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20240101T12_camp__v1")
+    promote = runs.promote(rd, dry_run=True)
+    assert promote.started is False and "rsync" in promote.script
+
+
+def test_prepare_rejects_a_mismatched_run_id_before_allocating(tmp_path):
+    """A bad caller identity must fail before any durable side effect.
+
+    ``PreparedRunIdentity`` rejects a run ID whose encoded campaign differs, but
+    it is constructed after ``_register()`` has created the run tree and
+    appended its registry row -- and recovery reaches the same constructor, so
+    the prepared run would be stranded rather than merely refused.
+    """
+
+    calls: list[str] = []
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        calls.append(command)
+        if command.startswith("date -u +"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    with pytest.raises(ValueError, match="campaign encoded in run_id"):
+        runs.prepare_execution_run(
+            project="proj",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id="RUN_20260101T000000Z_other__v1",
+        )
+    with pytest.raises(ValueError, match="prepared run_id must match"):
+        runs.prepare_execution_run(
+            project="proj",
+            campaign="camp",
+            pipeline="grid",
+            datasets=["d"],
+            run_id="RUN_20260101T00_camp__v1",
+        )
+    assert not any("mkdir" in command or "run.json" in command for command in calls)
+
+
+def test_manifest_less_kept_run_can_still_be_archived(tmp_path):
+    """The legacy path must cover both tiers the public flow accepts.
+
+    Synthesis cannot know which tier it read from and hardcodes ``active``, so a
+    pre-manifest run already promoted to the durable root would fail the
+    canonical-path check and lose its only route to standby storage.
+    """
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 1)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    kept_dir = runs.layout.run_dir("kept", "camp", "RUN_20260101T000000Z_camp__v1")
+    archive = runs.archive(kept_dir, dry_run=True)
+    assert archive.started is False and archive.run_id == "RUN_20260101T000000Z_camp__v1"
+
+
+def test_execution_run_without_a_strict_manifest_is_not_synthesized(tmp_path):
+    """Legacy synthesis must not become a bypass for engine-owned runs."""
+
+    def responder(argv, _inp):
+        cmd = argv[-1]
+        if cmd.startswith("test -f") and "execution-plan.json" in cmd:
+            return ("", "", 0)
+        if "run.json" in cmd and cmd.startswith("cat "):
+            return ("", "", 0)
+        if cmd.startswith("date -u -d"):
+            return ("20260101T000000Z", "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rd = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
+    for action in (runs.promote, runs.archive):
+        with pytest.raises(ValueError, match="requires an existing strict run.json"):
+            action(rd, dry_run=True)
+
+
+def test_live_transition_uses_persistent_transfer_broker(tmp_path, monkeypatch):
     """A detached promotion is framed through the role-specific transfer session."""
 
     manifest_json = (
         '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
-        '"created_utc":"20260101T000000Z","status":"active","datasets":["d"]}'
+        '"created_utc":"20260101T000000Z","status":"active","datasets":["d"],'
+        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED",'
+        '"plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}'
     )
 
     class _Broker:
@@ -249,14 +873,163 @@ def test_live_transition_uses_persistent_transfer_broker(tmp_path):
         ),
         TEST_POLICY,
     )
-    run_dir = "/scratch/runs/camp/RUN_20260101T000000Z_camp__v1"
-
+    run_dir = runs.layout.run_dir("active", "camp", "RUN_20260101T000000Z_camp__v1")
+    # This test isolates transfer-broker routing. Dedicated transition tests
+    # exercise marker creation and current receipt certification.
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.begin_transition", lambda *_args: TransitionBoundary(()))
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.read_text", lambda *_args: "{}")
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.ExecutionPlan.from_json",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            paths=SimpleNamespace(run_root=run_dir),
+            run_id="RUN_20260101T000000Z_camp__v1",
+            campaign="camp",
+            pipeline="grid",
+            datasets=(SimpleNamespace(dataset_id="d"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.require_current_terminal_evidence",
+        lambda *_args: None,
+    )
     plan = runs.promote(run_dir, dry_run=False)
 
     assert plan.started is True and plan.pid == "4321"
     assert not any(call["command"].startswith("nohup bash ") for call in login_broker.calls)
     launch = next(call for call in transfer_broker.calls if call["command"].startswith("nohup bash "))
     assert launch["timeout"] == 60.0
+
+
+def test_archive_reads_kept_evidence_without_rewriting_original_plan_root(tmp_path, monkeypatch):
+    """A promoted run archives using copied evidence under its durable path."""
+
+    run_id = "RUN_20260101T000000Z_camp__v1"
+    manifest_json = (
+        '{"run_id":"RUN_20260101T000000Z_camp__v1","campaign":"camp","pipeline":"grid",'
+        '"created_utc":"20260101T000000Z","status":"kept","datasets":["d"],'
+        '"result":{"status":"COMPLETED"},"provenance":{"execution":{"state":"COMPLETED",'
+        '"plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}'
+    )
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command.startswith("cat ") and "run.json" in command:
+            return (manifest_json, "", 0)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    active_root = runs.layout.run_dir("active", "camp", run_id)
+    kept_root = runs.layout.run_dir("kept", "camp", run_id)
+    observed_reads: list[str] = []
+    observed_roots: list[str] = []
+
+    def read_text(_backend, path):
+        observed_reads.append(path)
+        return "{}"
+
+    def observe_receipt(_backend, root, _receipt):
+        observed_roots.append(root)
+        return SimpleNamespace()
+
+    def verify_relocated(backend, plan, action):
+        assert action == "archive"
+        # Evidence readers continue deriving signed paths from the immutable
+        # active-root plan; only the backend redirects those reads to kept.
+        backend.read_text(f"{plan.paths.run_root}/receipts/execution/reconcile.json")
+        backend.observe_receipt(plan.paths.run_root, SimpleNamespace())
+
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.begin_transition", lambda *_args: TransitionBoundary(()))
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.read_text", read_text)
+    monkeypatch.setattr("o2mcp.runorg.transition_executor.O2ExecutionBackend.observe_receipt", observe_receipt)
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.ExecutionPlan.from_json",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            paths=SimpleNamespace(run_root=active_root),
+            run_id=run_id,
+            campaign="camp",
+            pipeline="grid",
+            datasets=(SimpleNamespace(dataset_id="d"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.require_current_terminal_evidence",
+        verify_relocated,
+    )
+    monkeypatch.setattr(
+        runs,
+        "_stage_and_launch_transition",
+        lambda *_args: SimpleNamespace(started=True),
+    )
+
+    result = runs.archive(kept_root, dry_run=False)
+
+    assert result.started is True
+    assert observed_reads[0] == f"{kept_root}/receipts/execution/execution-plan.json"
+    assert observed_reads[1] == f"{kept_root}/receipts/execution/reconcile.json"
+    assert observed_roots == [kept_root]
+
+
+def test_ambiguous_transition_launch_retains_coordination_marker(tmp_path, monkeypatch):
+    """A lost transfer response cannot release a possibly running transition."""
+
+    def responder(argv, _inp):
+        command = argv[-1]
+        if command.startswith("nohup bash "):
+            return ("", "transfer channel closed", 255)
+        return ("", "", 0)
+
+    runs = _runs(tmp_path, responder)
+    rolled_back: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.rollback_transition",
+        lambda _conn, run_root, transition_id: rolled_back.append((run_root, transition_id)),
+    )
+
+    result = runs._stage_and_launch_transition("RUN_test", "archive", "echo archive\n", "/run", "transition")
+
+    assert result.started is False
+    assert result.pid is None
+    assert "outcome ambiguous" in result.message
+    assert "marker retained" in result.message
+    assert rolled_back == []
+
+
+def test_transition_recovery_inspects_transfer_host_processes(tmp_path, monkeypatch):
+    """Recovery must query node-local PID evidence on the launch host."""
+
+    runs = _runs(tmp_path)
+    run_id = "RUN_20260822T010203Z_recovery-host__v1"
+    manifest = RunManifest(
+        run_id=run_id,
+        campaign="recovery-host",
+        pipeline="grid",
+        created_utc="20260822T010203Z",
+        datasets=["d"],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        runs,
+        "_validated_transition_source",
+        lambda *_args, **_kwargs: manifest,
+    )
+
+    def inspect(_connection, _run_dir, _token, **kwargs):
+        """Capture the selected broker without executing a remote helper."""
+
+        captured.update(kwargs)
+        return SimpleNamespace(status="recoverable")
+
+    monkeypatch.setattr(
+        "o2mcp.runorg.transition_executor.recover_marked_transition",
+        inspect,
+    )
+
+    result = runs.recover_transition("/canonical/source", "promote")
+
+    assert result.status == "recoverable"
+    assert captured["alias"] == runs.conn.config.transfer_alias
+    assert captured["broker_role"] == "transfer"
 
 
 def test_read_manifest_consults_policy_legacy_reader(tmp_path):
