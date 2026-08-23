@@ -15,6 +15,22 @@ from o2mcp.runorg.plans import ExecutionPlan
 from o2mcp.runorg.runs import RunManifest
 
 
+def execution_owned_manifest(manifest: RunManifest) -> bool:
+    """Report whether the execution engine owns this run's lifecycle.
+
+    ``execution`` appears once the engine has bound a plan, while a run that was
+    allocated by ``prepare_execution_run()`` carries only
+    ``execution_preparation`` until then.  Both are engine-owned: treating a
+    prepared run as legacy would let promote/archive publish or delete it before
+    any plan, job, or terminal evidence exists.
+    """
+
+    provenance = manifest.provenance or {}
+    if not isinstance(provenance, dict):
+        return False
+    return "execution" in provenance or "execution_preparation" in provenance
+
+
 def require_certified_terminal_execution(manifest: RunManifest, action: str) -> None:
     """Reject deletion-capable transitions before execution is certified terminal.
 
@@ -23,14 +39,15 @@ def require_certified_terminal_execution(manifest: RunManifest, action: str) -> 
     manifest surfaces must agree with authenticated execution provenance.
     """
 
-    provenance = manifest.provenance or {}
-    if "execution" not in provenance:
+    if not execution_owned_manifest(manifest):
         # Runs registered outside the execution engine never carry execution
         # provenance and keep their own release criteria.  Anything that does
         # carry it, or that still has a plan on disk, is certified here and
         # again against files-as-truth before its source can be deleted.
         return
-    execution = provenance.get("execution", {})
+    # A prepared run is execution-owned before its plan is bound, so it reaches
+    # the checks below with no state and is refused until it is certified.
+    execution = (manifest.provenance or {}).get("execution", {})
     execution_state = execution.get("state") if isinstance(execution, dict) else None
     result_state = (manifest.result or {}).get("status")
     allowed = {"COMPLETED"} if action == "promote" else {"COMPLETED", "FAILED"}
@@ -165,4 +182,9 @@ def _superseded_dependency_generations(
     return superseded
 
 
-__all__ = ["live_jobs_command", "require_certified_terminal_execution", "require_current_terminal_evidence"]
+__all__ = [
+    "execution_owned_manifest",
+    "live_jobs_command",
+    "require_certified_terminal_execution",
+    "require_current_terminal_evidence",
+]

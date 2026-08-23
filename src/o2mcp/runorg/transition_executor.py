@@ -28,6 +28,7 @@ from o2mcp.runorg.transition_coordinator import (
     recover_transition as recover_marked_transition,
 )
 from o2mcp.runorg.transition_guards import (
+    execution_owned_manifest,
     live_jobs_command,
     require_certified_terminal_execution,
     require_current_terminal_evidence,
@@ -308,7 +309,7 @@ class TransitionExecutorMixin:
             # its lifecycle path to an engine-only gate.  Either signal alone
             # proves an execution-plan run, so a manifest that lost its
             # provenance still fails closed here.
-            if plan_text is not None or expected_sha is not None:
+            if plan_text is not None or expected_sha is not None or execution_owned_manifest(manifest):
                 self._require_certified_plan_evidence(
                     action,
                     manifest,

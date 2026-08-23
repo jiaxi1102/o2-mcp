@@ -270,6 +270,15 @@ def test_transition_requires_matching_certified_terminal_state() -> None:
     with pytest.raises(ValueError, match="certified terminal"):
         require_certified_terminal_execution(manifest, "promote")
 
+    # A run allocated by prepare_execution_run() is engine-owned before its plan
+    # is bound, so it must not fall through to the legacy path and be published
+    # or deleted with no plan, jobs, or terminal evidence at all.
+    manifest.provenance = {"execution_preparation": {"project": "canary"}}
+    manifest.result = {}
+    for action in ("promote", "archive"):
+        with pytest.raises(ValueError, match="certified terminal"):
+            require_certified_terminal_execution(manifest, action)
+
     manifest.provenance = {"execution": {"state": "COMPLETED"}}
     manifest.result = {"status": "COMPLETED"}
     require_certified_terminal_execution(manifest, "promote")
