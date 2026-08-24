@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from o2mcp import (
     CommandResult,
     O2AsyncTransfer,
+    O2BrokerBusyError,
     O2BrokerCommandOutcomeUnknownError,
     O2BrokerError,
     O2BrokerStartupError,
@@ -108,6 +109,11 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "no_broker", "message": str(exc)}
     except O2BrokerStartupError as exc:
         payload = {"ok": False, "error": "broker_start_failed", "message": str(exc)}
+    except O2BrokerBusyError as exc:
+        # Nothing reached O2, so this is the one broker failure a caller may
+        # safely repeat. Say so explicitly: the neighbouring outcome-unknown
+        # payload carries the opposite instruction.
+        payload = {"ok": False, "error": "broker_busy", "message": str(exc), "retry_safe": True}
     except O2BrokerError as exc:
         payload = {"ok": False, "error": "broker_error", "message": str(exc)}
     except subprocess.TimeoutExpired as exc:
@@ -246,17 +252,26 @@ class ProbeInput(BaseModel):
     )
 
 
+# One command's timeout is one command's hold on a channel shared by every MCP
+# process on the workstation, and it is also the watchdog budget the daemon uses
+# before it will tear down a silent transport. An hour of either is far past the
+# point where waiting remotely should have been a submitted job, so bound both
+# with the same number.
+MAX_EXEC_TIMEOUT_SECONDS = 300.0
+
+
 class RunInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     command: str = Field(..., description="Remote shell command to run on an O2 login node.", min_length=1)
     timeout_seconds: float = Field(
         default=120.0,
         description=(
-            "Command timeout in seconds. A large value holds the shared serialized channel for that "
-            "long; poll from the caller rather than waiting inside the command."
+            "Command timeout in seconds, capped at 300. The channel is shared and serialized, so this "
+            "is how long one command may block every other caller. Work that needs longer belongs in a "
+            "submitted job polled from here, not in a single command."
         ),
         gt=0,
-        le=3600,
+        le=MAX_EXEC_TIMEOUT_SECONDS,
     )
 
 

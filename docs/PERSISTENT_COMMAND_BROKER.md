@@ -148,6 +148,24 @@ automatic retry.
 - `o2_local_status` may read the receipt and ping the Unix socket, but it never
   sends a frame to O2.
 
+### Bounding one caller's cost
+
+- A single `o2_exec` may request at most 300 seconds. That number is both how
+  long one command can block every other caller on the shared channel and the
+  watchdog budget before a silent transport is torn down. Work needing longer
+  belongs in a submitted job polled from the caller, which releases the channel
+  between checks.
+- The wait for a dispatch acknowledgement is bounded too, scaled to the caller's
+  own deadline (`max(60s, timeout_seconds)`, or 300s when no deadline was
+  given). Before dispatch nothing has been sent to O2, so ending that wait is
+  the one broker failure that is safe to retry: `o2_exec` reports it as
+  `broker_busy` with `retry_safe: true`, and the message names the command
+  occupying the channel from the in-flight receipt. Without this bound a starved
+  caller simply never returns, which is indistinguishable from a hang.
+- Abandoning the socket is also how the daemon learns to cancel a queued
+  request. It checks for a disconnected caller before forwarding, so a timed-out
+  request is dropped rather than run unobserved.
+
 ### Command observability
 
 The daemon serializes local clients over one channel, so it cannot answer a

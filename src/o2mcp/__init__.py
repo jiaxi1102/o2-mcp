@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from o2mcp.async_transfer import O2AsyncTransfer, TransferHandle, default_spawner
 from o2mcp.broker import (
+    O2BrokerBusyError,
     O2BrokerCommandOutcomeUnknownError,
     O2BrokerError,
     O2BrokerStartupError,
@@ -56,6 +57,7 @@ __all__ = [
     "O2OffVpnError",
     "O2UnsafeTransportError",
     "O2BrokerError",
+    "O2BrokerBusyError",
     "O2BrokerCommandOutcomeUnknownError",
     "O2BrokerUnavailableError",
     "O2BrokerStartupError",

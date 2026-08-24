@@ -65,6 +65,17 @@ class O2BrokerStartupError(O2BrokerError):
     """Raised when the one authorized broker launch cannot become ready."""
 
 
+class O2BrokerBusyError(O2BrokerError):
+    """Raised when a queued command was never dispatched before its deadline.
+
+    Distinct from :class:`O2BrokerUnavailableError`, because the broker is
+    healthy and simply occupied, and distinct from
+    :class:`O2BrokerCommandOutcomeUnknownError`, because nothing reached O2.
+    That distinction is the whole point: a caller that never got its dispatch
+    acknowledgement has sent nothing, so retrying is safe.
+    """
+
+
 class O2BrokerCommandOutcomeUnknownError(O2BrokerError):
     """Raised when a dispatched command loses its result and must not be retried."""
 
@@ -95,6 +106,19 @@ DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS = 5.0
 # throughput floor supplies a separate absolute transfer budget.
 MIN_REMOTE_RESPONSE_BYTES_PER_SECOND = 64 * 1024
 MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYTES_PER_SECOND
+# One caller must not be able to wait forever for a channel another caller is
+# holding. Before dispatch nothing has been sent, so ending that wait is safe to
+# retry -- unlike any failure afterwards -- and an error naming the occupying
+# command is far more useful than an MCP call that never returns. Scale the
+# budget with the caller's own deadline: waiting longer than your own command
+# would have taken is the point at which the silence, not the queue, is the
+# problem. A floor keeps short commands from failing behind ordinary traffic.
+MIN_QUEUE_WAIT_SECONDS = 60.0
+DEFAULT_QUEUE_WAIT_SECONDS = 300.0
+# ``socket.settimeout(0)`` selects non-blocking mode rather than an immediate
+# deadline, so an exhausted budget must still pass a small positive value and
+# let the read deadline report the expiry.
+_MINIMUM_SOCKET_TIMEOUT_SECONDS = 0.001
 # One bounded command preview is retained in the owner-only receipt so an
 # operator can name the command occupying the serialized channel. The bound is
 # in characters, not bytes, so truncation cannot split a UTF-8 code point, and
@@ -148,6 +172,14 @@ def _receipt_number(value: Any) -> float | None:
         return float(value) if math.isfinite(value) else None
     except OverflowError:
         return None
+
+
+def _queue_wait_seconds(timeout: float | None) -> float:
+    """Return how long a caller may wait for the channel before giving up."""
+
+    if timeout is None:
+        return DEFAULT_QUEUE_WAIT_SECONDS
+    return max(MIN_QUEUE_WAIT_SECONDS, float(timeout))
 
 
 def _interprocess_monotonic() -> float | None:
@@ -505,20 +537,29 @@ class BrokerClient:
         except BrokerProtocolError as exc:
             raise ValueError(f"encoded broker request exceeds the frame contract: {exc}") from exc
         client = self._connect(timeout=5.0)
-        # The five-second socket deadline guards only the local connect. Clear
-        # it before writing: a large valid frame can fill the Unix send buffer
-        # while this serialized broker is serving an earlier command, and its
-        # queue wait is intentionally unbounded until dispatch acknowledgement.
-        client.settimeout(None)
+        # The five-second socket deadline guards only the local connect. Queue
+        # time is not command time: the daemon acknowledges `dispatched` only
+        # once this request reaches the front and policy still permits its
+        # remote frame, and a large valid frame can fill the Unix send buffer
+        # while an earlier command is being served. Give the whole pre-dispatch
+        # phase one absolute budget rather than no budget at all -- a caller
+        # blocked here has sent nothing, so ending its wait is safe, whereas
+        # waiting forever turns a busy channel into an MCP call that never
+        # returns. Abandoning the socket also makes the daemon cancel the
+        # queued request instead of running it unobserved.
+        queue_wait = _queue_wait_seconds(timeout)
+        queue_deadline = time.monotonic() + queue_wait
         dispatched = False
         try:
             with client.makefile("rwb", buffering=0) as stream:
+                client.settimeout(max(_MINIMUM_SOCKET_TIMEOUT_SECONDS, queue_deadline - time.monotonic()))
                 write_frame(stream, request)
-                # Queue time is intentionally not command time. The daemon
-                # writes `dispatched` only after this request reaches the front
-                # and policy still permits its remote frame. If this caller
-                # disconnects first, the daemon cancels the queued request.
-                response = read_frame(stream)
+                # Reading the acknowledgement through the socket rather than the
+                # stream is what gives this one frame an absolute deadline instead
+                # of a per-recv one. Alternating with the stream below is safe only
+                # because ``makefile`` was opened unbuffered: neither side can
+                # strand bytes the other then fails to see.
+                response = read_frame(_DeadlineSocketReader(client, max(0.0, queue_deadline - time.monotonic())))
                 if response.get("type") == "error" and response.get("error") == "policy_denied":
                     raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
                 if response != {"type": "dispatched", "id": request_id}:
@@ -545,6 +586,8 @@ class BrokerClient:
                     f"O2 broker command {request_id} was dispatched but its result was lost: {exc}. "
                     "Do not retry automatically; inspect remote receipts or state first."
                 ) from exc
+            if isinstance(exc, socket.timeout):
+                raise O2BrokerBusyError(self._queue_wait_message(request_id, queue_wait)) from exc
             raise O2BrokerUnavailableError(f"The O2 broker did not dispatch the command: {exc}") from exc
         finally:
             client.close()
@@ -620,6 +663,26 @@ class BrokerClient:
         if dispatched is not None and sampled is not None:
             summary["busy_for_seconds"] = max(0.0, sampled - dispatched)
         return summary
+
+    def _queue_wait_message(self, request_id: str, waited: float) -> str:
+        """Explain an undispatched request by naming what is holding the channel."""
+
+        state = _read_state(self.paths)
+        busy = self._busy_summary(state)
+        detail = "The broker did not reach this request in time."
+        if busy.get("busy"):
+            in_flight = state.get("in_flight")
+            command = in_flight.get("command") if isinstance(in_flight, dict) else None
+            preview = command.get("preview") if isinstance(command, dict) else None
+            elapsed = busy.get("busy_for_seconds")
+            held = f" for {elapsed:.0f}s" if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else ""
+            named = f": {preview!r}" if isinstance(preview, str) and preview else ""
+            detail = f"The broker has been serving another command{held}{named}."
+        return (
+            f"O2 broker request {request_id} waited {waited:.0f}s without being dispatched. "
+            f"{detail} Nothing was sent to O2, so this request is safe to retry once the "
+            "channel frees; long remote waits belong in a submitted job, not in one command."
+        )
 
     def local_status(self) -> dict[str, Any]:
         """Return receipt plus local responsiveness without contacting O2."""

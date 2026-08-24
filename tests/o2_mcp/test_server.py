@@ -21,6 +21,7 @@ from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
+    O2BrokerBusyError,  # noqa: E402
     O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
     async_transfer,  # noqa: E402
@@ -554,6 +555,42 @@ async def test_cancel_job(monkeypatch, tmp_path):
 
 
 # --- input validation (Pydantic, via the MCP layer) --------------------------
+@pytest.mark.anyio
+async def test_a_busy_broker_is_reported_as_the_one_retry_safe_failure(monkeypatch):
+    """A caller starved before dispatch sent nothing, so it may safely repeat."""
+
+    class _Connection:
+        def run(self, *_args, **_kwargs):
+            raise O2BrokerBusyError("waited 60s without being dispatched; safe to retry")
+
+    monkeypatch.setattr(o2server, "_connection", _Connection)
+    payload = await _call("o2_exec", {"params": {"command": "squeue -u me"}})
+
+    assert payload["ok"] is False
+    assert payload["error"] == "broker_busy"
+    # The neighbouring outcome-unknown payload carries the opposite instruction,
+    # so this one must state its own explicitly rather than leave it inferred.
+    assert payload["retry_safe"] is True
+
+
+@pytest.mark.anyio
+async def test_exec_timeout_is_capped_so_one_command_cannot_hold_the_channel_for_an_hour(monkeypatch, tmp_path):
+    """The cap is the contract: long remote waits belong in a submitted job."""
+
+    _patch_connection(monkeypatch, tmp_path, master=True)
+    with pytest.raises(ToolError):
+        await o2server.mcp.call_tool(
+            "o2_exec",
+            {"params": {"command": "sleep 3000", "timeout_seconds": 3600}},
+        )
+
+    at_the_cap = await _call(
+        "o2_exec",
+        {"params": {"command": "true", "timeout_seconds": o2server.MAX_EXEC_TIMEOUT_SECONDS}},
+    )
+    assert at_the_cap["ok"] is True
+
+
 @pytest.mark.anyio
 async def test_invalid_input_is_rejected(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True)
