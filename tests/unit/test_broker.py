@@ -1225,6 +1225,69 @@ def test_the_control_endpoint_answers_a_ping_the_command_socket_cannot(tmp_path,
         _stop_local_broker(thread, client)
 
 
+def test_the_receipt_never_advertises_ready_after_a_stop_is_acknowledged(tmp_path, broker_root):
+    """A command completing after a stop must not republish a reusable broker.
+
+    Between that completion write and the terminal one, a client reading the
+    receipt would believe the broker is ready and try to use it.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    observed: list[str] = []
+    watching = threading.Event()
+
+    def watch_receipt() -> None:
+        while watching.is_set():
+            status = _read_state(client.paths).get("status")
+            if isinstance(status, str) and (not observed or observed[-1] != status):
+                observed.append(status)
+            time.sleep(0.002)
+
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "receipt-occupant",
+                "command": "sleep 1.5; printf occupied",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "receipt-occupant"}
+
+        assert client.control_stop(reason="receipt status test")["via"] == "control"
+
+        # Sample only from here: before the stop the receipt legitimately says
+        # ready, because the command was dispatched by a running broker.
+        watching.set()
+        watcher = threading.Thread(target=watch_receipt, name="receipt-watch", daemon=True)
+        watcher.start()
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        watching.clear()
+        watcher.join(timeout=2)
+
+        assert "ready" not in observed, observed
+        # Read the terminal state directly rather than from the sampler, which
+        # may have taken its last sample before the final write landed.
+        assert _read_state(client.paths)["status"] == "stopped"
+    finally:
+        watching.clear()
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
 def test_the_control_endpoint_refuses_to_run_commands(tmp_path, broker_root):
     """The boundary that makes a second socket safe: it reaches nothing remote."""
 

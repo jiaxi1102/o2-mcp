@@ -1008,18 +1008,35 @@ class BrokerServer:
         # rewrites one dict, so without this a control stop landing during a
         # command completion could interleave and persist a torn record.
         self._state_lock = threading.Lock()
-        # Held across the check-and-dispatch boundary, and by a control stop
-        # while it sets the flag. Rechecking the flag alone would only narrow
-        # the window: a request accepted before the stop is no longer queued,
-        # so nothing else prevents it starting after the operator was told the
-        # broker was stopping. The lock covers writing the remote frame, not
-        # waiting for its result, so a stop still never waits out a command.
+        # Held across check-and-acknowledge, and by a control stop while it
+        # sets the flag. Rechecking the flag alone would only narrow the
+        # window: a request accepted before the stop has left the queue the
+        # outer loop skips, so nothing else prevents it starting after the
+        # operator was told the broker was stopping.
+        #
+        # The section ends at the acknowledgement rather than the remote frame
+        # write, because past that point forwarding is obligatory -- the caller
+        # has been told it was dispatched, and refusing would leave it believing
+        # a command ran that never did. So the guarantee is that no command is
+        # *acknowledged* after a stop is, and the cost is one local socket
+        # write rather than a frame write that a large stdin can stretch to
+        # tens of seconds.
         self._dispatch_lock = threading.Lock()
         self._stop_requested = False
         self._commands_completed = 0
         self._in_flight: dict[str, Any] | None = None
         self._state: dict[str, Any] = {}
         self._lock_handle: BinaryIO | None = None
+
+    def _running_status(self) -> str:
+        """Return the status a mid-command receipt may claim.
+
+        A command completing after a stop was acknowledged must not republish
+        `ready`: between that write and the terminal one, a client reading the
+        receipt would believe the broker reusable and try to use it.
+        """
+
+        return "stopping" if self._stop_requested else "ready"
 
     def _write_state(self, status: str, **details: Any) -> None:
         """Persist an operator-readable lifecycle receipt after each transition."""
@@ -1433,12 +1450,26 @@ class BrokerServer:
                 # running command itself is still allowed to finish; abandoning
                 # it would turn a stop into an unknown remote outcome.
                 # Take the dispatch lock so this cannot land between a command
-                # thread's own stop check and its remote frame write. Waiting
-                # here is bounded by that write, never by a running command.
+                # thread's own stop check and its acknowledgement. That section
+                # is one local socket write, so waiting here is brief.
                 with self._dispatch_lock:
                     self._stop_requested = True
-                with suppress(O2BrokerError, OSError):
-                    self._write_state("stopping", stop_reason=str(request.get("reason") or "control request"))
+                # The state lock also guards the shutdown marker, so a stop
+                # arriving while the daemon publishes its terminal receipt
+                # cannot overwrite it with `stopping` and leave that standing as
+                # the final word.
+                finalizing = False
+                with self._state_lock:
+                    if self._control_stopping:
+                        finalizing = True
+                    else:
+                        with suppress(O2BrokerError, OSError):
+                            self._write_state_locked(
+                                "stopping", stop_reason=str(request.get("reason") or "control request")
+                            )
+                if finalizing:
+                    write_frame(reply, {"type": "error", "error": "shutting_down"})
+                    return
                 write_frame(reply, {"type": "stopping", "pid": os.getpid(), "via": "control"})
                 return
             # Anything else, including exec, is refused. This socket is not a
@@ -1585,52 +1616,59 @@ class BrokerServer:
             # also linearizes a concurrent disable: it either prevents this
             # command or observes a command that was already launched.
             try:
-                with self.policy.serialize_reuse_launch(), self._dispatch_lock:
-                    # This acknowledgement is the execution boundary. If a
-                    # queued caller has disconnected, do not forward its frame;
-                    # otherwise it could perform a mutation after reporting a
-                    # local timeout and invite a dangerous retry.
-                    if self._local_caller_disconnected(client):
-                        return
-                    # A stop acknowledged on the control endpoint must mean no
-                    # further work starts. This request was accepted before that
-                    # stop and so is not in the queue the outer loop skips.
-                    # Returning without a reply is the same cancellation the
-                    # disconnect check performs: every client reads it as "not
-                    # dispatched", which is exactly true.
-                    if self._stop_requested:
-                        return
-                    try:
-                        write_frame(local, {"type": "dispatched", "id": request["id"]})
-                    except (OSError, BrokerProtocolError):
-                        return
-                    # The acknowledgement is also where this command starts
-                    # owning the channel, and the remote frame write below can
-                    # take seconds for a large stdin. Record it in memory here,
-                    # with no receipt I/O under the policy mutex, so measured
-                    # occupancy covers that write and a write that fails after
-                    # acknowledgement is still attributed to this command.
-                    dispatched_at = self.clock()
-                    # Epoch timestamps are what an operator reads, but they are
-                    # not a safe basis for a duration: an NTP or manual step
-                    # during a long command would inflate the occupancy metric
-                    # or collapse it to zero. Measure elapsed time the way every
-                    # other deadline in this daemon does.
-                    # Occupancy is computed entirely inside this process, so it
-                    # uses the ordinary monotonic clock. The published reading is
-                    # subtracted by a different process and must therefore name
-                    # its clock; it is absent when that clock is unavailable.
-                    dispatched_monotonic = time.monotonic()
-                    dispatched_shared = _interprocess_monotonic()
-                    in_flight = {
-                        "request_id": request_id,
-                        "command": _command_fingerprint(request["command"]),
-                        "timeout_seconds": request_timeout,
-                        "dispatched_at": dispatched_at,
-                    }
-                    if dispatched_shared is not None:
-                        in_flight["dispatched_clock_monotonic"] = dispatched_shared
-                    self._in_flight = in_flight
+                with self.policy.serialize_reuse_launch():
+                    with self._dispatch_lock:
+                        # This acknowledgement is the execution boundary. If a
+                        # queued caller has disconnected, do not forward its
+                        # frame; otherwise it could perform a mutation after
+                        # reporting a local timeout and invite a dangerous retry.
+                        if self._local_caller_disconnected(client):
+                            return
+                        # A stop acknowledged on the control endpoint must mean
+                        # no further work starts. This request was accepted
+                        # before that stop and so is not in the queue the outer
+                        # loop skips. Returning without a reply is the same
+                        # cancellation the disconnect check performs: every
+                        # client reads it as "not dispatched", exactly true.
+                        if self._stop_requested:
+                            return
+                        try:
+                            write_frame(local, {"type": "dispatched", "id": request["id"]})
+                        except (OSError, BrokerProtocolError):
+                            return
+                        # The acknowledgement is also where this command starts
+                        # owning the channel, and the remote frame write below
+                        # can take seconds for a large stdin. Record it in
+                        # memory here, with no receipt I/O under the policy
+                        # mutex, so measured occupancy covers that write and a
+                        # write that fails after acknowledgement is still
+                        # attributed to this command.
+                        # Epoch timestamps are what an operator reads, but they
+                        # are not a safe basis for a duration: an NTP or manual
+                        # step during a long command would inflate the occupancy
+                        # metric or collapse it to zero. Measure elapsed time the
+                        # way every other deadline in this daemon does.
+                        # Occupancy is computed entirely inside this process, so
+                        # it uses the ordinary monotonic clock; the published
+                        # reading is subtracted by a different process and must
+                        # name its clock, and is absent when it is unavailable.
+                        dispatched_at = self.clock()
+                        dispatched_monotonic = time.monotonic()
+                        dispatched_shared = _interprocess_monotonic()
+                        in_flight = {
+                            "request_id": request_id,
+                            "command": _command_fingerprint(request["command"]),
+                            "timeout_seconds": request_timeout,
+                            "dispatched_at": dispatched_at,
+                        }
+                        if dispatched_shared is not None:
+                            in_flight["dispatched_clock_monotonic"] = dispatched_shared
+                        self._in_flight = in_flight
+                    # Past the acknowledgement this command is committed: the
+                    # caller has been told it was dispatched, so the frame must
+                    # be forwarded. That is why the lock ends above rather than
+                    # around this write, which a large stdin can stretch to tens
+                    # of seconds and which would otherwise delay every stop.
                     self._write_remote_frame_with_deadline(remote_in, remote_request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
@@ -1658,7 +1696,7 @@ class BrokerServer:
             # that no longer validates as owner-only is a security condition,
             # not a diagnostic one, and is deliberately left to fail closed.
             with suppress(OSError):
-                self._write_state("ready", in_flight=in_flight)
+                self._write_state(self._running_status(), in_flight=in_flight)
             response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
             if response.get("id") != request.get("id"):
                 raise _O2BrokerTransportError("remote response id does not match the serialized request")
@@ -1669,7 +1707,7 @@ class BrokerServer:
             self._in_flight = None
             with suppress(OSError):
                 self._write_state(
-                    "ready",
+                    self._running_status(),
                     last_command_at=completed_at,
                     in_flight=None,
                     last_command={
@@ -1760,14 +1798,19 @@ class BrokerServer:
             # releases the thread from accept; the flag alone would leave it
             # waiting out its timeout, and the socket file must not outlive the
             # daemon that owns it.
-            self._control_stopping = True
+            with self._state_lock:
+                self._control_stopping = True
             if self.control_listener is not None:
                 with suppress(OSError):
                     self.control_listener.close()
                 with suppress(FileNotFoundError):
                     self.paths.control_socket.unlink()
             if self._control_thread is not None:
-                self._control_thread.join(timeout=2.0)
+                # An accepted control client may still be inside its own
+                # request deadline, so wait past that rather than a shorter
+                # fixed spell. The state-lock guard above is what keeps
+                # correctness from depending on this completing.
+                self._control_thread.join(timeout=self.local_request_timeout + 1.0)
             if self.listener is not None:
                 self.listener.close()
                 with suppress(FileNotFoundError):

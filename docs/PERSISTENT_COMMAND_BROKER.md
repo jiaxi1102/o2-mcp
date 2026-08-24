@@ -199,11 +199,23 @@ automatic retry.
   mechanism: the command loop rechecks it before accepting anything else, so
   every request behind the running command is **discarded rather than run**. The
   bound falls from queue depth × per-command ceiling to a single command.
+- Once a stop is acknowledged the receipt never says `ready` again. A command
+  completing afterwards publishes `stopping`, because between that write and the
+  terminal one a client reading `ready` would believe the broker reusable and
+  try to use it.
+- A control stop arriving while the daemon is publishing its terminal receipt is
+  refused rather than served. The state lock guards both, so a late stop cannot
+  overwrite a terminal `failed` or `stopped` with `stopping` and leave that as
+  the final word.
 - Skipping the queue is not sufficient on its own. A connection the command
   thread has already accepted has left that queue, so a stop and the
-  check-and-dispatch boundary are made mutually exclusive by a lock the control
-  stop also takes. It covers writing the remote frame, never waiting for its
-  result, so a stop is still not delayed by a running command. Callers cancelled
+  check-and-acknowledge boundary are made mutually exclusive by a lock the
+  control stop also takes. It ends at the acknowledgement rather than the remote
+  frame write: past that point the caller has been told its command was
+  dispatched, so forwarding is obligatory and refusing would leave it believing
+  a command ran that never did. The guarantee is therefore that no command is
+  *acknowledged* after a stop is, and the cost is one local socket write rather
+  than a frame write a large stdin can stretch to tens of seconds. Callers cancelled
   this way are told their request was not dispatched, which is exactly true.
 - **The control endpoint carries no commands.** It answers `stop` and `ping` and
   refuses everything else, including `exec`. It is not a second route to O2 and
