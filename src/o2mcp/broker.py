@@ -242,6 +242,19 @@ class BrokerPaths:
         return self.root / "command.sock"
 
     @property
+    def control_socket(self) -> Path:
+        """Return the Unix-domain control socket path.
+
+        Separate from the command socket because it is serviced by its own
+        thread: a daemon blocked on a command's result cannot answer on the
+        command socket at all, which is what made stopping a busy broker
+        impossible. This endpoint carries no commands -- only stop and ping --
+        so widening it later is a deliberate act rather than an accident.
+        """
+
+        return self.root / "control.sock"
+
+    @property
     def state(self) -> Path:
         """Return the durable local status receipt path."""
 
@@ -319,7 +332,10 @@ def prepare_broker_directory(path: Path) -> BrokerPaths:
     """Create and validate the private broker directory for a launcher."""
 
     paths = BrokerPaths(path.expanduser())
-    socket_bytes = len(os.fsencode(paths.socket)) + 1
+    socket_bytes = max(
+        len(os.fsencode(paths.socket)) + 1,
+        len(os.fsencode(paths.control_socket)) + 1,
+    )
     if socket_bytes > MAX_UNIX_SOCKET_PATH_BYTES:
         raise O2BrokerError(
             f"broker socket path needs {socket_bytes} bytes; portable maximum is {MAX_UNIX_SOCKET_PATH_BYTES}. "
@@ -799,6 +815,67 @@ class BrokerClient:
             "Do not start another attempt; inspect o2_local_status and the broker log first."
         )
 
+    def _connect_control(self, *, timeout: float) -> socket.socket:
+        """Open the control endpoint without requiring a reusable receipt.
+
+        A stop must work when the receipt is stale, the alias has changed, or
+        the protocol has moved on -- the situations where retiring the daemon is
+        most necessary. The authority here is the same as for commands: a
+        mode-0600 socket inside a mode-0700 directory this user owns.
+        """
+
+        _validate_private_directory(self.paths.root, create=False)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        try:
+            client.connect(str(self.paths.control_socket))
+            return client
+        except OSError as exc:
+            client.close()
+            raise O2BrokerUnavailableError(f"The O2 broker control endpoint did not answer locally: {exc}") from exc
+
+    def _control_request(self, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+        """Send one control frame and read its sole reply."""
+
+        client = self._connect_control(timeout=timeout)
+        try:
+            with client.makefile("wb", buffering=0) as stream:
+                write_frame(stream, payload)
+            return read_frame(_DeadlineSocketReader(client, timeout))
+        except (OSError, BrokerProtocolError) as exc:
+            raise O2BrokerUnavailableError(f"The O2 broker control endpoint did not answer locally: {exc}") from exc
+        finally:
+            client.close()
+
+    def control_ping(self, *, timeout: float = 2.0) -> dict[str, Any]:
+        """Ask the control thread whether the daemon is alive, and whether busy.
+
+        Unlike the command-socket ping this is answerable while a command runs,
+        because the thread answering it is not the thread blocked on the result.
+        """
+
+        response = self._control_request({"type": "ping", "id": str(uuid.uuid4())}, timeout=timeout)
+        if response.get("type") != "pong" or response.get("protocol") != PROTOCOL_VERSION:
+            raise O2BrokerUnavailableError(f"unexpected broker control status response: {response!r}")
+        return response
+
+    def control_stop(self, *, reason: str, timeout: float = 5.0) -> dict[str, Any]:
+        """Retire the daemon through the endpoint that is never blocked.
+
+        The command loop rechecks the stop flag before accepting anything else,
+        so requests already queued behind the running command are skipped rather
+        than served first. The running command is still allowed to finish:
+        abandoning it would convert a stop into an unknown remote outcome.
+        """
+
+        response = self._control_request(
+            {"type": "stop", "id": str(uuid.uuid4()), "reason": reason},
+            timeout=timeout,
+        )
+        if response.get("type") != "stopping":
+            raise O2BrokerError(f"unexpected broker control stop response: {response!r}")
+        return response
+
     def stop(self, *, reason: str, timeout: float | None = None, force: bool = False) -> dict[str, Any]:
         """Ask the local daemon to close its one SSH process and exit.
 
@@ -924,6 +1001,13 @@ class BrokerServer:
         self.clock = clock
         self.transport: subprocess.Popen[bytes] | None = None
         self.listener: socket.socket | None = None
+        self.control_listener: socket.socket | None = None
+        self._control_thread: threading.Thread | None = None
+        self._control_stopping = False
+        # Two threads now publish receipts. ``_write_state`` reads, mutates and
+        # rewrites one dict, so without this a control stop landing during a
+        # command completion could interleave and persist a torn record.
+        self._state_lock = threading.Lock()
         self._stop_requested = False
         self._commands_completed = 0
         self._in_flight: dict[str, Any] | None = None
@@ -932,6 +1016,12 @@ class BrokerServer:
 
     def _write_state(self, status: str, **details: Any) -> None:
         """Persist an operator-readable lifecycle receipt after each transition."""
+
+        with self._state_lock:
+            self._write_state_locked(status, **details)
+
+    def _write_state_locked(self, status: str, **details: Any) -> None:
+        """Mutate and persist the receipt; callers must hold the state lock."""
 
         self._state.update(
             {
@@ -1257,6 +1347,93 @@ class BrokerServer:
         assert self.transport is not None
         self._write_state("ready", ssh_pid=self.transport.pid, ready_at=self.clock())
 
+    def _bind_control_listener(self) -> None:
+        """Publish the control endpoint alongside the command endpoint."""
+
+        try:
+            metadata = self.paths.control_socket.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise O2BrokerStartupError("refusing to replace an untrusted broker control socket path")
+            self.paths.control_socket.unlink()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.paths.control_socket))
+        self.control_listener = listener
+        os.chmod(self.paths.control_socket, 0o600)
+        # Control traffic is one frame per operator action, never bulk, so a
+        # small backlog is ample. The timeout is what lets this thread notice a
+        # shutdown rather than blocking in accept until a caller arrives.
+        listener.listen(8)
+        listener.settimeout(1.0)
+
+    def _serve_control(self) -> None:
+        """Answer stop and ping while the command thread is busy.
+
+        This runs on its own thread for one reason: the command loop spends its
+        time blocked on a remote result and cannot accept anything until that
+        command ends. Everything here is deliberately cheap and local -- no
+        remote frame is ever written from this thread, and no command can be
+        submitted through this socket -- so servicing it concurrently adds no
+        second path to O2.
+        """
+
+        while not self._stop_requested and not self._control_stopping:
+            listener = self.control_listener
+            if listener is None:
+                return
+            try:
+                client, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # The listener was closed underneath us during shutdown.
+                return
+            # One malformed or hostile request must not take the control
+            # thread down with it: a dead control thread is a silently
+            # unstoppable broker, which is the failure this endpoint exists to
+            # remove. Drop the request, keep serving.
+            with client, suppress(Exception):
+                self._handle_control_client(client)
+
+    def _handle_control_client(self, client: socket.socket) -> None:
+        """Handle one control request. Never forwards anything to O2."""
+
+        request = read_frame(_DeadlineSocketReader(client, self.local_request_timeout))
+        client.settimeout(self.local_request_timeout)
+        request_type = request.get("type")
+        with client.makefile("wb", buffering=0) as reply:
+            if request_type == "ping":
+                write_frame(
+                    reply,
+                    {
+                        "type": "pong",
+                        "protocol": PROTOCOL_VERSION,
+                        "pid": os.getpid(),
+                        "commands_completed": self._commands_completed,
+                        # Answerable here precisely because this thread is not
+                        # the one blocked on the command.
+                        "busy": self._in_flight is not None,
+                    },
+                )
+                return
+            if request_type == "stop":
+                # Setting the flag is the whole mechanism. The command loop
+                # rechecks it before accepting anything else, so every request
+                # already queued behind the running command is skipped rather
+                # than served first -- which is what makes this prompt. The
+                # running command itself is still allowed to finish; abandoning
+                # it would turn a stop into an unknown remote outcome.
+                self._stop_requested = True
+                with suppress(O2BrokerError, OSError):
+                    self._write_state("stopping", stop_reason=str(request.get("reason") or "control request"))
+                write_frame(reply, {"type": "stopping", "pid": os.getpid(), "via": "control"})
+                return
+            # Anything else, including exec, is refused. This socket is not a
+            # second way to reach O2 and must never become one.
+            write_frame(reply, {"type": "error", "error": "invalid_request"})
+
     @staticmethod
     def _local_caller_disconnected(client: socket.socket) -> bool:
         """Return whether a queued local caller has closed its endpoint.
@@ -1518,6 +1695,9 @@ class BrokerServer:
             self._acquire_lifetime_lock()
             remote_in, remote_out = self._start_transport()
             self._bind_listener()
+            self._bind_control_listener()
+            self._control_thread = threading.Thread(target=self._serve_control, name="o2-broker-control", daemon=True)
+            self._control_thread.start()
             # A remote protocol hello alone is not reusable authority. Clear
             # the retry cooldown only after the local socket and trusted ready
             # receipt have both been published successfully.
@@ -1557,6 +1737,18 @@ class BrokerServer:
                 self._write_state("failed", error=failure, in_flight=self._in_flight)
             return 1
         finally:
+            # Retire the control endpoint first. Closing its listener is what
+            # releases the thread from accept; the flag alone would leave it
+            # waiting out its timeout, and the socket file must not outlive the
+            # daemon that owns it.
+            self._control_stopping = True
+            if self.control_listener is not None:
+                with suppress(OSError):
+                    self.control_listener.close()
+                with suppress(FileNotFoundError):
+                    self.paths.control_socket.unlink()
+            if self._control_thread is not None:
+                self._control_thread.join(timeout=2.0)
             if self.listener is not None:
                 self.listener.close()
                 with suppress(FileNotFoundError):

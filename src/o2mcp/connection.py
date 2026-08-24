@@ -39,6 +39,7 @@ from o2mcp.broker import (
     BrokerClient,
     O2BrokerError,
     O2BrokerStartupError,
+    O2BrokerUnavailableError,
     open_private_append,
     prepare_broker_directory,
 )
@@ -722,20 +723,31 @@ class O2Connection:
     def stop_broker(self, *, reason: str, transfer: bool = False, force: bool = False) -> dict[str, object]:
         """Stop one local broker session; allowed even while policy is disabled.
 
-        An ordinary stop retires an idle broker cleanly but cannot retire a busy
-        one: it queues behind the command holding the channel, and the daemon
-        cancels a queued stop whose caller has already timed out. ``force`` marks
-        the request as one the daemon honours anyway, which is the only way to
-        retire a busy broker through the socket. It stays inside the socket's own
-        authority -- no pid is read and no signal is sent -- and never abandons a
-        running command.
+        Prefers the control endpoint, which a separate daemon thread answers
+        immediately even while a command holds the channel. The stop flag it
+        sets is rechecked by the command loop before it accepts anything else,
+        so requests already queued behind the running command are skipped rather
+        than served first. The running command is still allowed to finish;
+        abandoning it would convert a stop into an unknown remote outcome, and
+        a stop that must pre-empt even that remains a manual kill.
 
-        It is also queued, not prioritized: the daemon serves one connection at
-        a time in arrival order, so a forced stop waits out the in-flight command
-        and anything already queued ahead of it.
+        Falls back to the command socket for a daemon started before the control
+        endpoint existed. On that path a stop is queued rather than prioritized
+        -- it waits out the running command and everything already waiting ahead
+        of it -- and ``force`` marks the request as one the daemon honours even
+        after its caller has stopped waiting.
         """
 
         client = self._broker_client(transfer=transfer)
+        control_stop = getattr(client, "control_stop", None)
+        if control_stop is not None:
+            try:
+                return control_stop(reason=reason)
+            except O2BrokerUnavailableError:
+                # No control endpoint: a daemon predating it, or none running.
+                # Fall through rather than report an otherwise stoppable broker
+                # unstoppable; the command socket answers both cases correctly.
+                pass
         try:
             return client.stop(reason=reason, force=force)
         except O2BrokerError as exc:

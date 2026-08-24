@@ -192,17 +192,25 @@ automatic retry.
   broker through the socket, and it stays inside the socket's own authority: no
   pid is read and no signal is sent. An older daemon ignores the flag and
   behaves as before.
-- **A forced stop is queued, not prioritized, and that bounds how fast it can
-  act.** The daemon serves one connection at a time from a FIFO accept queue, so
-  a forced stop takes effect after the in-flight command *and any connections
-  already queued ahead of it* — a delay bounded by queue depth times the
-  per-command ceiling, not by a single command. Through `o2_exec` that is queue
-  depth × 300s; a library caller at the 3600s ceiling makes it far worse. It
-  abandons nothing and jumps nothing.
-- A stop that must act *now* still means killing the daemon by hand. The proper
-  fix is a control path that does not sit behind the command queue — a second
-  listener the daemon services independently — which is deliberately **not** in
-  this change: it is a new authority boundary and wants its own review.
+- **Stops go to the control endpoint, which is never blocked.** `control.sock`
+  is a second mode-0600 socket serviced by its own daemon thread, so it answers
+  while the command loop is blocked on a remote result — the state in which the
+  command socket cannot answer at all. Setting the stop flag there is the whole
+  mechanism: the command loop rechecks it before accepting anything else, so
+  every request already queued behind the running command is **skipped rather
+  than served first**. The bound falls from queue depth × per-command ceiling to
+  a single command.
+- **The control endpoint carries no commands.** It answers `stop` and `ping` and
+  refuses everything else, including `exec`. It is not a second route to O2 and
+  must not become one; widening it should be a deliberate act, which is why it
+  is a separate socket rather than a flag on the command socket.
+- A stop still never abandons the running command — doing so would convert a
+  stop into an unknown remote outcome. A stop that must pre-empt even the
+  running command remains a manual kill.
+- A daemon started before the control endpoint existed publishes no
+  `control.sock`, so `stop_broker` falls back to the command socket, where
+  `force: true` still applies and a stop is still queued behind everything
+  waiting.
 - Signalling the daemon by pid was tried and abandoned. A pid can only be taken
   from the receipt or from the lock file, and neither survives the gap to the
   `kill`: a receipt outlives its daemon, and a lock read proves only who held
