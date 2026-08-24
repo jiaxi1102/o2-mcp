@@ -43,6 +43,7 @@ from o2mcp.broker import (
     BrokerExecutionResult,
     BrokerServer,
     O2BrokerBusyError,
+    O2BrokerCommandOutcomeUnknownError,
     O2BrokerError,
     O2BrokerUnavailableError,
     _atomic_json_write,
@@ -1075,13 +1076,13 @@ def test_broker_state_is_json_serializable(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
-def test_a_starved_caller_fails_retry_safely_and_names_the_blocker(tmp_path, broker_root, monkeypatch):
+def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_root, monkeypatch):
     """A caller that never gets the channel must fail, not hang silently.
 
     This is the failure the shared channel actually produces: one long command
     holds it, and every other caller blocks before dispatch with nothing to show
-    for it. Because nothing has been sent to O2, ending that wait is the one
-    broker failure a caller may safely repeat.
+    for it. The point is to replace an MCP call that never returns with an error
+    that names the cause -- not to promise the request can be repeated blindly.
     """
 
     monkeypatch.setattr(broker_module, "MIN_QUEUE_WAIT_SECONDS", 0.3)
@@ -1111,9 +1112,10 @@ def test_a_starved_caller_fails_retry_safely_and_names_the_blocker(tmp_path, bro
             client.execute("printf starved", timeout=0.3)
 
         message = str(starved.value)
-        assert "safe to retry" in message
         # The diagnostic from the previous change is what makes this actionable.
         assert "sleep 3; printf occupied" in message
+        # A queue expiry is not proof nothing ran, so it must not read as one.
+        assert "cannot be proven" in message
 
         assert read_frame(occupant_stream)["stdout"] == "occupied"
         assert client.execute("printf alive", timeout=5).stdout == "alive"
@@ -1125,6 +1127,43 @@ def test_a_starved_caller_fails_retry_safely_and_names_the_blocker(tmp_path, bro
             occupant_stream.close()
         occupant.close()
         _stop_local_broker(thread, client)
+
+
+def test_a_request_recorded_as_in_flight_is_never_reported_as_merely_queued(broker_root):
+    """The receipt settles the one direction it can: this request is running.
+
+    The daemon acknowledges and forwards as one step, so a client whose budget
+    expires in that instant missed the acknowledgement for a command that is
+    executing. The receipt names the request now in flight, so when that is our
+    own request the answer is not ambiguous at all.
+    """
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(
+        paths.state,
+        {
+            "schema_version": 1,
+            "protocol": PROTOCOL_VERSION,
+            "status": "ready",
+            "alias": "offline-o2",
+            "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+            "in_flight": {
+                "request_id": "mine",
+                "command": {"preview": "sbatch job.sh", "sha256": "0" * 64, "bytes": 13},
+                "dispatched_at": time.time(),
+            },
+        },
+    )
+    client = BrokerClient(paths.root)
+
+    mine = client._undispatched_error("mine", 60.0)
+    # Exactly the base error, not the busy subclass: there is nothing uncertain
+    # about a request the broker records as the one it is running.
+    assert type(mine) is O2BrokerCommandOutcomeUnknownError
+    assert "do not retry" in str(mine).lower()
+
+    # A different request in flight leaves our own genuinely undetermined.
+    assert isinstance(client._undispatched_error("someone-else", 60.0), O2BrokerBusyError)
 
 
 @pytest.mark.parametrize(

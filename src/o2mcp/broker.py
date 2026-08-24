@@ -65,17 +65,6 @@ class O2BrokerStartupError(O2BrokerError):
     """Raised when the one authorized broker launch cannot become ready."""
 
 
-class O2BrokerBusyError(O2BrokerError):
-    """Raised when a queued command was never dispatched before its deadline.
-
-    Distinct from :class:`O2BrokerUnavailableError`, because the broker is
-    healthy and simply occupied, and distinct from
-    :class:`O2BrokerCommandOutcomeUnknownError`, because nothing reached O2.
-    That distinction is the whole point: a caller that never got its dispatch
-    acknowledgement has sent nothing, so retrying is safe.
-    """
-
-
 class O2BrokerCommandOutcomeUnknownError(O2BrokerError):
     """Raised when a dispatched command loses its result and must not be retried."""
 
@@ -172,6 +161,21 @@ def _receipt_number(value: Any) -> float | None:
         return float(value) if math.isfinite(value) else None
     except OverflowError:
         return None
+
+
+class O2BrokerBusyError(O2BrokerCommandOutcomeUnknownError):
+    """Raised when a queued command was not acknowledged before its deadline.
+
+    A subclass, not a sibling, and deliberately so. The broker is healthy and
+    merely occupied, which is worth reporting separately -- but the caller
+    cannot prove its request was never dispatched. The daemon writes the
+    acknowledgement and forwards the command as one step, so a budget expiring
+    in that instant leaves a command that is running and a client that never
+    saw it acknowledged. Inheriting the uncertain-outcome contract means every
+    handler that already refuses to auto-retry keeps refusing here, and a
+    mutating command cannot be silently duplicated by a caller that trusted an
+    optimistic classification.
+    """
 
 
 def _queue_wait_seconds(timeout: float | None) -> float:
@@ -587,7 +591,7 @@ class BrokerClient:
                     "Do not retry automatically; inspect remote receipts or state first."
                 ) from exc
             if isinstance(exc, socket.timeout):
-                raise O2BrokerBusyError(self._queue_wait_message(request_id, queue_wait)) from exc
+                raise self._undispatched_error(request_id, queue_wait) from exc
             raise O2BrokerUnavailableError(f"The O2 broker did not dispatch the command: {exc}") from exc
         finally:
             client.close()
@@ -664,24 +668,39 @@ class BrokerClient:
             summary["busy_for_seconds"] = max(0.0, sampled - dispatched)
         return summary
 
-    def _queue_wait_message(self, request_id: str, waited: float) -> str:
-        """Explain an undispatched request by naming what is holding the channel."""
+    def _undispatched_error(self, request_id: str, waited: float) -> O2BrokerCommandOutcomeUnknownError:
+        """Classify a request whose acknowledgement never arrived in time.
+
+        The receipt can settle the question in one direction: if this very
+        request is the one recorded in flight, it was dispatched and is running,
+        whatever this client failed to read. It can never settle it in the other
+        direction, because the daemon acknowledges and forwards as one step, so
+        silence is consistent with both a queued request and one dispatched in
+        the instant the budget expired.
+        """
 
         state = _read_state(self.paths)
+        in_flight = state.get("in_flight")
+        if isinstance(in_flight, dict) and in_flight.get("request_id") == request_id:
+            return O2BrokerCommandOutcomeUnknownError(
+                f"O2 broker command {request_id} was not acknowledged within {waited:.0f}s, but the broker "
+                "receipt records it as the command now running. It was dispatched; do not retry. Inspect "
+                "remote receipts or o2_local_status for its outcome."
+            )
         busy = self._busy_summary(state)
         detail = "The broker did not reach this request in time."
         if busy.get("busy"):
-            in_flight = state.get("in_flight")
             command = in_flight.get("command") if isinstance(in_flight, dict) else None
             preview = command.get("preview") if isinstance(command, dict) else None
             elapsed = busy.get("busy_for_seconds")
             held = f" for {elapsed:.0f}s" if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else ""
             named = f": {preview!r}" if isinstance(preview, str) and preview else ""
             detail = f"The broker has been serving another command{held}{named}."
-        return (
-            f"O2 broker request {request_id} waited {waited:.0f}s without being dispatched. "
-            f"{detail} Nothing was sent to O2, so this request is safe to retry once the "
-            "channel frees; long remote waits belong in a submitted job, not in one command."
+        return O2BrokerBusyError(
+            f"O2 broker request {request_id} waited {waited:.0f}s without an acknowledgement. {detail} It was "
+            "almost certainly never dispatched, but that cannot be proven: the daemon acknowledges and forwards "
+            "as one step. Repeat a read-only command freely; verify a mutating one against remote receipts "
+            "before repeating it. Long remote waits belong in a submitted job, not in one command."
         )
 
     def local_status(self) -> dict[str, Any]:

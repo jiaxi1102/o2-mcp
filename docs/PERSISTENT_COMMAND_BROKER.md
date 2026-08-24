@@ -157,11 +157,18 @@ automatic retry.
   between checks.
 - The wait for a dispatch acknowledgement is bounded too, scaled to the caller's
   own deadline (`max(60s, timeout_seconds)`, or 300s when no deadline was
-  given). Before dispatch nothing has been sent to O2, so ending that wait is
-  the one broker failure that is safe to retry: `o2_exec` reports it as
-  `broker_busy` with `retry_safe: true`, and the message names the command
-  occupying the channel from the in-flight receipt. Without this bound a starved
-  caller simply never returns, which is indistinguishable from a hang.
+  given). Without this bound a starved caller simply never returns, which is
+  indistinguishable from a hang; `o2_exec` reports it as `broker_busy` and the
+  message names the command occupying the channel from the in-flight receipt.
+- A budget expiry is **not** proof the request was never dispatched. The daemon
+  writes the acknowledgement and forwards the command as one step, so a budget
+  expiring in that instant leaves a command running and a caller that never read
+  the acknowledgement. `O2BrokerBusyError` therefore subclasses
+  `O2BrokerCommandOutcomeUnknownError` and reports `retry_safe: false`, so a
+  mutating command cannot be duplicated by a caller trusting an optimistic
+  classification. The receipt settles the one direction it can: when the request
+  recorded in flight is the caller's own, the command is known to be running and
+  the error says so outright.
 - Abandoning the socket is also how the daemon learns to cancel a queued
   request. It checks for a disconnected caller before forwarding, so a timed-out
   request is dropped rather than run unobserved.

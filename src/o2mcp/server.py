@@ -103,17 +103,18 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "off_vpn", "message": str(exc)}
     except O2UnsafeTransportError as exc:
         payload = {"ok": False, "error": "unsafe_transport", "message": str(exc)}
+    except O2BrokerBusyError as exc:
+        # A subclass of the outcome-unknown error and must be caught before it.
+        # The broker being merely occupied is worth reporting separately, but a
+        # budget that expires as the daemon acknowledges leaves a command that
+        # may already be running, so the retry instruction stays conservative.
+        payload = {"ok": False, "error": "broker_busy", "message": str(exc), "retry_safe": False}
     except O2BrokerCommandOutcomeUnknownError as exc:
         payload = {"ok": False, "error": "broker_outcome_unknown", "message": str(exc), "retry_safe": False}
     except O2BrokerUnavailableError as exc:
         payload = {"ok": False, "error": "no_broker", "message": str(exc)}
     except O2BrokerStartupError as exc:
         payload = {"ok": False, "error": "broker_start_failed", "message": str(exc)}
-    except O2BrokerBusyError as exc:
-        # Nothing reached O2, so this is the one broker failure a caller may
-        # safely repeat. Say so explicitly: the neighbouring outcome-unknown
-        # payload carries the opposite instruction.
-        payload = {"ok": False, "error": "broker_busy", "message": str(exc), "retry_safe": True}
     except O2BrokerError as exc:
         payload = {"ok": False, "error": "broker_error", "message": str(exc)}
     except subprocess.TimeoutExpired as exc:

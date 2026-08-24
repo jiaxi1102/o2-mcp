@@ -556,21 +556,33 @@ async def test_cancel_job(monkeypatch, tmp_path):
 
 # --- input validation (Pydantic, via the MCP layer) --------------------------
 @pytest.mark.anyio
-async def test_a_busy_broker_is_reported_as_the_one_retry_safe_failure(monkeypatch):
-    """A caller starved before dispatch sent nothing, so it may safely repeat."""
+async def test_a_busy_broker_is_reported_separately_but_still_fails_closed(monkeypatch):
+    """Occupied is worth naming, but a queue expiry is not proof nothing ran.
+
+    The daemon acknowledges and forwards as one step, so a budget expiring in
+    that instant leaves a command running and a caller that never saw it
+    acknowledged. `broker_busy` subclasses the uncertain-outcome error for that
+    reason, and must be caught before its base or it would report the wrong
+    error string.
+    """
 
     class _Connection:
         def run(self, *_args, **_kwargs):
-            raise O2BrokerBusyError("waited 60s without being dispatched; safe to retry")
+            raise O2BrokerBusyError("waited 60s without an acknowledgement")
 
     monkeypatch.setattr(o2server, "_connection", _Connection)
     payload = await _call("o2_exec", {"params": {"command": "squeue -u me"}})
 
     assert payload["ok"] is False
     assert payload["error"] == "broker_busy"
-    # The neighbouring outcome-unknown payload carries the opposite instruction,
-    # so this one must state its own explicitly rather than leave it inferred.
-    assert payload["retry_safe"] is True
+    # Never advertise a mutating command as safe to duplicate.
+    assert payload["retry_safe"] is False
+
+
+def test_busy_is_an_uncertain_outcome_so_existing_handlers_fail_closed():
+    """Inheritance is the guarantee: no caller can opt out of the safe default."""
+
+    assert issubclass(O2BrokerBusyError, O2BrokerCommandOutcomeUnknownError)
 
 
 @pytest.mark.anyio
