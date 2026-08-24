@@ -1351,27 +1351,24 @@ class BrokerServer:
             # keeps its previous client until restarted, and the protocol still
             # permits seven days, so the daemon -- the one component every caller
             # shares -- has to be where a workstation-wide bound actually holds.
-            # Refuse rather than clamp: silently shortening a caller's deadline
-            # would change what it asked for without telling it.
+            #
+            # Shorten the deadline rather than refuse. A refusal has no wire form
+            # an older client reads correctly: it recognizes only `policy_denied`
+            # and classifies anything else as a command that may already have
+            # run, so refusing would tell exactly the callers this guard exists
+            # for not to retry something that never left the workstation. A
+            # clamp serves the request, holds the channel no longer than the
+            # ceiling, and is reported in stderr rather than silently.
+            clamped_from: float | None = None
             if request_timeout is not None and float(request_timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
-                with suppress(OSError, BrokerProtocolError):
-                    write_frame(
-                        local,
-                        {
-                            "type": "error",
-                            "error": "timeout_too_large",
-                            "message": (
-                                f"requested {float(request_timeout):.0f}s exceeds the "
-                                f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s ceiling on how long one command may hold "
-                                "the shared serialized channel"
-                            ),
-                        },
-                    )
-                return
+                clamped_from = float(request_timeout)
+                request_timeout = MAX_COMMAND_TIMEOUT_SECONDS
             # Never forward caller-owned container structure. Rebuilding the
             # exact wire object keeps local/remote validation independent of
             # JSON parser recursion behavior across Python versions.
             remote_request = {key: request[key] for key in expected_keys}
+            if clamped_from is not None:
+                remote_request["timeout_seconds"] = MAX_COMMAND_TIMEOUT_SECONDS
 
             # The client checks policy before connecting, while this second gate
             # blocks hand-crafted local socket requests that try to bypass the
@@ -1473,6 +1470,17 @@ class BrokerServer:
                         "stderr_truncated": bool(response.get("stderr_truncated", False)),
                     },
                 )
+            if clamped_from is not None:
+                # Say it where a caller already looks for notes the broker adds,
+                # alongside the truncation notices, so the shortened deadline is
+                # visible rather than inferred from an early timeout.
+                note = (
+                    f"command deadline reduced from {clamped_from:.0f}s to "
+                    f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s by the workstation ceiling on how long one command may "
+                    "hold the shared serialized channel"
+                )
+                existing = response.get("stderr")
+                response["stderr"] = f"{existing}\n{note}" if isinstance(existing, str) and existing else note
             # A caller may time out or close while its remote command continues.
             # The result has already been drained, so losing only the local reply
             # must not tear down the healthy shared channel.

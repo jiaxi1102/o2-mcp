@@ -212,10 +212,17 @@ automatic retry.
   enforces it again** for every caller of the socket. Only the daemon can hold a
   workstation-wide bound: a client-side guard binds only the processes carrying
   it, and every already-running MCP process keeps its previous client until
-  restarted, while the protocol still permits seven days. The daemon refuses
-  rather than clamps — silently shortening a caller's deadline would change what
-  it asked for without telling it — and refuses before forwarding anything, so a
-  refusal is a rejected request rather than an uncertain outcome.
+  restarted, while the protocol still permits seven days. The daemon
+  **shortens** an over-ceiling deadline rather than refusing it, and reports the
+  reduction in `stderr` alongside the truncation notices. Refusing looks
+  cleaner but has no wire form an older client reads correctly: it recognizes
+  only `policy_denied` and classifies anything else as a command that may
+  already have run — so refusing would tell exactly the stale callers this
+  guard exists for not to retry something that never left the workstation. A
+  clamp serves the request, bounds the channel, and says so.
+- Any refusal frame the daemon does send is reported by the client as a
+  pre-dispatch rejection rather than an uncertain outcome, since nothing is
+  forwarded before one is written.
 - A forced stop must stay reachable under the contention that made it necessary,
   so its connection waits (60s) rather than failing fast, and the listen backlog
   is sized well above the number of MCP processes on a workstation. A connection

@@ -1242,42 +1242,80 @@ def test_force_is_only_recommended_for_a_confirmed_busy_broker(tmp_path):
     assert "force" not in message
 
 
-def test_the_daemon_enforces_the_timeout_ceiling_against_any_client(tmp_path, broker_root):
+def test_the_daemon_bounds_a_timeout_no_client_side_guard_would_catch(tmp_path, broker_root):
     """A client-side ceiling binds only the callers that carry it.
 
     Every already-running MCP process keeps its previous client until restarted,
-    and the protocol still permits seven days, so a bound that lives only in the
+    and the protocol still permits seven days, so a bound living only in the
     client is bypassed by exactly the processes already in flight. The daemon is
-    the one component every caller shares.
+    the one component every caller shares. It shortens rather than refuses: a
+    refusal has no wire form an older client reads as a pre-dispatch rejection.
     """
 
     _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
     raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     raw_stream = None
     try:
-        raw.settimeout(10)
+        raw.settimeout(30)
         raw.connect(str(client.paths.socket))
         raw_stream = raw.makefile("rwb", buffering=0)
-        # A request the current client would refuse locally, sent directly.
+        # A deadline the current client refuses locally, sent straight to the
+        # socket the way a stale in-process client would.
         write_frame(
             raw_stream,
             {
                 "type": "exec",
                 "protocol": PROTOCOL_VERSION,
                 "id": "seven-day-hold",
-                "command": "sleep 600000",
+                "command": "printf bounded",
                 "timeout_seconds": MAX_TIMEOUT_SECONDS,
                 "stdin": None,
             },
         )
-        response = read_frame(raw_stream)
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "seven-day-hold"}
+        result = read_frame(raw_stream)
 
-        assert response["type"] == "error"
-        assert response["error"] == "timeout_too_large"
-        assert "ceiling" in response["message"]
-        # Refused before dispatch, so the channel is untouched and still usable.
-        assert client.execute("printf alive", timeout=5).stdout == "alive"
-        assert client.ping()["commands_completed"] == 1
+        # Served, not refused -- an old client can read this normally.
+        assert result["type"] == "result"
+        assert result["stdout"] == "bounded"
+        assert result["returncode"] == 0
+        # And told, rather than left to infer it from an early timeout.
+        assert "deadline reduced" in result["stderr"]
+        assert f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s" in result["stderr"]
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
+def test_the_clamp_governs_the_daemons_own_watchdog(tmp_path, broker_root):
+    """The point of the bound is the channel, so the wait must shrink too."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(30)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "clamped-hold",
+                "command": "printf x",
+                "timeout_seconds": MAX_TIMEOUT_SECONDS,
+                "stdin": None,
+            },
+        )
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "clamped-hold"}
+        assert read_frame(raw_stream)["type"] == "result"
+
+        # The receipt records the deadline actually in force, not the request.
+        recorded = _read_state(client.paths)["last_command"]["timeout_seconds"]
+        assert recorded == MAX_COMMAND_TIMEOUT_SECONDS
     finally:
         if raw_stream is not None:
             raw_stream.close()
@@ -1286,12 +1324,12 @@ def test_the_daemon_enforces_the_timeout_ceiling_against_any_client(tmp_path, br
 
 
 def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, monkeypatch):
-    """A refusal is issued before anything is forwarded, so nothing ran.
+    """Any refusal frame is a pre-dispatch rejection, never an unknown outcome.
 
-    Reporting it as an uncertain outcome would tell the caller not to retry a
-    command that never left the workstation. Driven through a fake socket rather
-    than a real daemon: the in-process test harness shares module globals with
-    the daemon, so lowering the client's ceiling would lower the daemon's too.
+    Nothing is forwarded before a refusal, so classifying it as "may have run"
+    would tell a caller not to retry a command that never left the workstation.
+    Driven through a fake socket: the offline harness runs the daemon as a thread
+    in this process, so patching module globals would move both sides at once.
     """
 
     class _RefusingDaemon:
@@ -1318,8 +1356,8 @@ def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, m
                 encode_frame(
                     {
                         "type": "error",
-                        "error": "timeout_too_large",
-                        "message": "requested 604800s exceeds the 3600s ceiling",
+                        "error": "some_future_refusal",
+                        "message": "refused before dispatch",
                         "id": request["id"],
                     }
                 )
@@ -1339,9 +1377,9 @@ def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, m
     monkeypatch.setattr(client, "_connect", lambda **_kwargs: _RefusingDaemon())
 
     with pytest.raises(O2BrokerError) as refused:
-        client.execute("sleep 600000", timeout=60)
+        client.execute("printf x", timeout=60)
 
-    assert "timeout_too_large" in str(refused.value)
+    assert "some_future_refusal" in str(refused.value)
     assert not isinstance(refused.value, O2BrokerCommandOutcomeUnknownError)
 
 
