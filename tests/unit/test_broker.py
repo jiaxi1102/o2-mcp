@@ -34,6 +34,7 @@ from o2mcp import broker as broker_module
 from o2mcp.broker import (
     DEFAULT_QUEUE_WAIT_SECONDS,
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
+    MAX_COMMAND_TIMEOUT_SECONDS,
     MAX_LAUNCH_BYTES,
     MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
     MAX_STATE_COMMAND_PREVIEW_CHARS,
@@ -1127,6 +1128,326 @@ def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_r
             occupant_stream.close()
         occupant.close()
         _stop_local_broker(thread, client)
+
+
+def test_a_forced_stop_survives_its_own_callers_timeout(tmp_path, broker_root):
+    """The only way to retire a busy broker is a request that outlives its caller.
+
+    A busy daemon cannot reach any request until its command ends, so an
+    ordinary stop -- cancelled the moment its caller gives up -- can never retire
+    one. A forced stop is honoured regardless, and is still graceful: the
+    in-flight command runs to completion first.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "blocker",
+                "command": "sleep 1.5; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
+
+        # A forced stop whose caller gives up long before the daemon can reach it.
+        with pytest.raises(O2BrokerError):
+            client.stop(reason="forced while busy", timeout=0.1, force=True)
+
+        # The occupying command still completes; the stop never abandons it.
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert not client.paths.socket.exists()
+        assert _read_state(client.paths)["status"] == "stopped"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_an_unforced_stop_is_still_cancelled_when_its_caller_gives_up(tmp_path, broker_root):
+    """Force is opt-in: the default must not shut a shared broker down late."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "blocker",
+                "command": "sleep 1.5; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
+
+        with pytest.raises(O2BrokerError):
+            client.stop(reason="unforced while busy", timeout=0.1)
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        # The abandoned stop was discarded, so the broker is still serving.
+        assert client.execute("printf alive", timeout=5).stdout == "alive"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_force_is_only_recommended_for_a_confirmed_busy_broker(tmp_path):
+    """Pointing at force when it cannot help sends the operator down a dead end.
+
+    A missing broker or an unreadable receipt raises the same error type as queue
+    starvation, and force resolves neither, so the original diagnosis must stand.
+    """
+
+    policy = _reuse_policy(tmp_path)
+
+    class _AbsentBroker:
+        def stop(self, *, reason, force=False):
+            raise O2BrokerUnavailableError("no broker receipt was found")
+
+        def local_status(self):
+            return {"status": "absent", "responsive": False, "busy": False}
+
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "login-broker",
+        transfer_broker_dir=tmp_path / "transfer-broker",
+    )
+    connection = O2Connection(config, policy=policy, broker_client=_AbsentBroker())
+
+    with pytest.raises(O2BrokerError) as refused:
+        connection.stop_broker(reason="stop a broker that is not there")
+
+    message = str(refused.value)
+    assert "no broker receipt was found" in message
+    assert "force" not in message
+
+
+def test_the_daemon_bounds_a_timeout_no_client_side_guard_would_catch(tmp_path, broker_root):
+    """A client-side ceiling binds only the callers that carry it.
+
+    Every already-running MCP process keeps its previous client until restarted,
+    and the protocol still permits seven days, so a bound living only in the
+    client is bypassed by exactly the processes already in flight. The daemon is
+    the one component every caller shares. It shortens rather than refuses: a
+    refusal has no wire form an older client reads as a pre-dispatch rejection.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(30)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        # A deadline the current client refuses locally, sent straight to the
+        # socket the way a stale in-process client would.
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "seven-day-hold",
+                "command": "printf bounded",
+                "timeout_seconds": MAX_TIMEOUT_SECONDS,
+                "stdin": None,
+            },
+        )
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "seven-day-hold"}
+        result = read_frame(raw_stream)
+
+        # Served, not refused -- an old client can read this normally.
+        assert result["type"] == "result"
+        assert result["stdout"] == "bounded"
+        assert result["returncode"] == 0
+        # And told, rather than left to infer it from an early timeout.
+        assert "deadline reduced" in result["stderr"]
+        assert f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s" in result["stderr"]
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
+def test_a_deadline_free_request_is_bounded_before_it_can_wedge_the_daemon(tmp_path, broker_root):
+    """A request with no deadline is the one shape that can wedge outright.
+
+    The daemon's result read has no watchdog for an unbounded command, so a
+    helper that never replies to one would hold the shared channel with nothing
+    to time out. The protocol still carries JSON null; the daemon declines to
+    honour it as unbounded.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(30)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "no-deadline",
+                "command": "printf unbounded",
+                "timeout_seconds": None,
+                "stdin": None,
+            },
+        )
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "no-deadline"}
+        result = read_frame(raw_stream)
+
+        # Served normally, so every client reads it without new handling.
+        assert result["type"] == "result"
+        assert result["stdout"] == "unbounded"
+        assert "no deadline" in result["stderr"]
+        assert f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s" in result["stderr"]
+        # And the deadline actually in force is recorded, not the absent one.
+        assert _read_state(client.paths)["last_command"]["timeout_seconds"] == MAX_COMMAND_TIMEOUT_SECONDS
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
+def test_the_clamp_governs_the_daemons_own_watchdog(tmp_path, broker_root):
+    """The point of the bound is the channel, so the wait must shrink too."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(30)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "clamped-hold",
+                "command": "printf x",
+                "timeout_seconds": MAX_TIMEOUT_SECONDS,
+                "stdin": None,
+            },
+        )
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "clamped-hold"}
+        assert read_frame(raw_stream)["type"] == "result"
+
+        # The receipt records the deadline actually in force, not the request.
+        recorded = _read_state(client.paths)["last_command"]["timeout_seconds"]
+        assert recorded == MAX_COMMAND_TIMEOUT_SECONDS
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
+def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, monkeypatch):
+    """Any refusal frame is a pre-dispatch rejection, never an unknown outcome.
+
+    Nothing is forwarded before a refusal, so classifying it as "may have run"
+    would tell a caller not to retry a command that never left the workstation.
+    Driven through a fake socket: the offline harness runs the daemon as a thread
+    in this process, so patching module globals would move both sides at once.
+    """
+
+    class _RefusingDaemon:
+        """A socket that answers one exec frame with a refusal frame."""
+
+        def __init__(self):
+            self.replies = io.BytesIO()
+
+        def settimeout(self, _timeout):
+            return None
+
+        def makefile(self, *_args, **_kwargs):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def write(self, data):
+            request = read_frame(io.BytesIO(bytes(data)))
+            self.replies = io.BytesIO(
+                encode_frame(
+                    {
+                        "type": "error",
+                        "error": "some_future_refusal",
+                        "message": "refused before dispatch",
+                        "id": request["id"],
+                    }
+                )
+            )
+            return len(data)
+
+        def flush(self):
+            return None
+
+        def recv(self, size):
+            return self.replies.read(size)
+
+        def close(self):
+            return None
+
+    client = BrokerClient(broker_root)
+    monkeypatch.setattr(client, "_connect", lambda **_kwargs: _RefusingDaemon())
+
+    with pytest.raises(O2BrokerError) as refused:
+        client.execute("printf x", timeout=60)
+
+    assert "some_future_refusal" in str(refused.value)
+    assert not isinstance(refused.value, O2BrokerCommandOutcomeUnknownError)
+
+
+@pytest.mark.parametrize("timeout", [MAX_COMMAND_TIMEOUT_SECONDS + 1, 100_000.0])
+def test_a_multi_hour_command_timeout_is_refused_before_any_socket_access(broker_root, timeout):
+    """One command's deadline is also its licence to hold the shared channel.
+
+    The MCP tool caps itself, but that guard is on a single input model; this
+    ceiling covers every caller of the client so an in-process one cannot
+    reinstate the multi-hour hold the cap was added to prevent.
+    """
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        BrokerClient(broker_root).execute("printf x", timeout=timeout)
+
+
+def test_a_timeout_at_the_ceiling_is_allowed_through_validation(broker_root):
+    """The ceiling is a bound, not an off-by-one refusal of the bound itself."""
+
+    # No broker exists, so passing validation surfaces as an unavailable broker
+    # rather than a ValueError.
+    with pytest.raises(O2BrokerError) as refused:
+        BrokerClient(broker_root).execute("printf x", timeout=MAX_COMMAND_TIMEOUT_SECONDS)
+    assert not isinstance(refused.value, ValueError)
 
 
 def test_a_saturated_backlog_is_reported_as_busy_not_as_a_missing_broker(broker_root, monkeypatch):

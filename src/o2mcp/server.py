@@ -196,6 +196,16 @@ class StopBrokerInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     reason: str = Field(..., min_length=1, max_length=240)
     transfer: bool = Field(default=False, description="Stop the transfer-host broker instead of the login broker.")
+    force: bool = Field(
+        default=False,
+        description=(
+            "Have the daemon honour this stop even after the request times out locally. Needed when the "
+            "broker is busy: an ordinary queued stop is cancelled once its caller gives up, so it cannot "
+            "retire a broker that is serving a command. A forced stop is graceful and queued, not "
+            "prioritized: it takes effect after the in-flight command and any requests already waiting "
+            "ahead of it, and abandons none of them."
+        ),
+    )
 
 
 class DisablePolicyInput(BaseModel):
@@ -656,13 +666,24 @@ async def o2_start_broker(params: StartBrokerInput) -> str:
     },
 )
 async def o2_stop_broker(params: StopBrokerInput) -> str:
-    """Close the local broker and its SSH process without changing policy."""
+    """Close the local broker and its SSH process without changing policy.
+
+    The default socket request retires an idle broker cleanly but cannot retire a
+    busy one, because a queued stop is cancelled once its caller times out. When
+    that happens the error names the command holding the channel and points at
+    `force`, which the daemon honours even after the caller gives up waiting.
+
+    A forced stop is graceful and queued rather than prioritized: the daemon
+    serves one request at a time in arrival order, so it takes effect after the
+    in-flight command and anything already waiting ahead of it, and abandons
+    none of them.
+    """
 
     def work() -> dict[str, Any]:
         return {
             "ok": True,
             "target": "transfer" if params.transfer else "login",
-            "broker": _connection().stop_broker(reason=params.reason, transfer=params.transfer),
+            "broker": _connection().stop_broker(reason=params.reason, transfer=params.transfer, force=params.force),
         }
 
     return await _run_tool(work)

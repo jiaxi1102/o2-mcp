@@ -179,6 +179,77 @@ automatic retry.
   request. It checks for a disconnected caller before forwarding, so a timed-out
   request is dropped rather than run unobserved.
 
+### Stopping a broker that cannot answer
+
+- `o2_stop_broker` asks over the socket. That retires an idle broker cleanly and
+  **cannot** retire a busy one: the request queues behind the command holding the
+  channel, and the daemon cancels a queued stop whose caller has already timed
+  out. That cancellation is deliberate — a stop reported as failed should not
+  shut the shared broker down minutes later — but it also means the documented
+  remedy did nothing in exactly the situation that prompts reaching for it.
+- `force: true` marks the request as one the daemon honours regardless of
+  whether its caller is still waiting. It is the only way to retire a busy
+  broker through the socket, and it stays inside the socket's own authority: no
+  pid is read and no signal is sent. An older daemon ignores the flag and
+  behaves as before.
+- **A forced stop is queued, not prioritized, and that bounds how fast it can
+  act.** The daemon serves one connection at a time from a FIFO accept queue, so
+  a forced stop takes effect after the in-flight command *and any connections
+  already queued ahead of it* — a delay bounded by queue depth times the
+  per-command ceiling, not by a single command. Through `o2_exec` that is queue
+  depth × 300s; a library caller at the 3600s ceiling makes it far worse. It
+  abandons nothing and jumps nothing.
+- A stop that must act *now* still means killing the daemon by hand. The proper
+  fix is a control path that does not sit behind the command queue — a second
+  listener the daemon services independently — which is deliberately **not** in
+  this change: it is a new authority boundary and wants its own review.
+- Signalling the daemon by pid was tried and abandoned. A pid can only be taken
+  from the receipt or from the lock file, and neither survives the gap to the
+  `kill`: a receipt outlives its daemon, and a lock read proves only who held
+  the lock during that read. Without a `pidfd` — unavailable on macOS — there is
+  no way to bind a pid to a process across that window, so the socket, whose
+  authority is the connection itself, is the correct channel.
+- Abandoning a running command outright remains a manual `kill -9`, which leaves
+  an orphaned receipt that `busy` correctly ignores because the lock is free.
+- Force is recommended only when the refreshed receipt confirms a busy daemon. A
+  missing broker or an unreadable receipt raises the same error type, and force
+  resolves neither, so those keep their own diagnosis.
+
+### Bounding one caller's cost, part two
+
+- The 300s cap on `o2_exec` guards one input model. `BrokerClient.execute`
+  enforces a 3600s ceiling for every caller of the client, **and the daemon
+  enforces it again** for every caller of the socket. Only the daemon can hold a
+  workstation-wide bound: a client-side guard binds only the processes carrying
+  it, and every already-running MCP process keeps its previous client until
+  restarted, while the protocol still permits seven days. The daemon
+  **shortens** an over-ceiling deadline rather than refusing it, and reports the
+  reduction in `stderr` alongside the truncation notices. Refusing looks
+  cleaner but has no wire form an older client reads correctly: it recognizes
+  only `policy_denied` and classifies anything else as a command that may
+  already have run — so refusing would tell exactly the stale callers this
+  guard exists for not to retry something that never left the workstation. A
+  clamp serves the request, bounds the channel, and says so.
+- **A deadline-free request is bounded too.** `timeout_seconds: null` is the one
+  shape that can wedge the daemon outright: its result read has no watchdog, so
+  a helper that never replies holds the shared channel with nothing to time out.
+  The protocol still carries JSON null, but the daemon bounds it to the ceiling
+  before dispatch and reports that in `stderr` like any other reduction. The
+  unbounded read remains only for direct in-process callers who choose it.
+- Any refusal frame the daemon does send is reported by the client as a
+  pre-dispatch rejection rather than an uncertain outcome, since nothing is
+  forwarded before one is written.
+- A forced stop must stay reachable under the contention that made it necessary,
+  so its connection waits (60s) rather than failing fast, and the listen backlog
+  is sized well above the number of MCP processes on a workstation. A connection
+  that cannot be queued fails outright, and a stop locked out by ordinary command
+  contention is no remedy at all.
+- An explicit `timeout=None` remains supported and unbounded by design. It is
+  not a wedge risk: a dead helper, a dead SSH process, and a black-holed network
+  all close the transport's stdout, so the daemon's read ends in every failure
+  mode. The only unbounded case is a command that genuinely never finishes,
+  which is what the caller asked for.
+
 ### Command observability
 
 The daemon serializes local clients over one channel, so it cannot answer a

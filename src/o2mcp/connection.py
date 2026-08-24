@@ -37,6 +37,7 @@ from typing import Callable, Optional
 
 from o2mcp.broker import (
     BrokerClient,
+    O2BrokerError,
     O2BrokerStartupError,
     open_private_append,
     prepare_broker_directory,
@@ -718,11 +719,46 @@ class O2Connection:
         client.wait_until_ready(timeout=self.config.broker_start_timeout)
         return client.local_status()
 
-    def stop_broker(self, *, reason: str, transfer: bool = False) -> dict[str, object]:
-        """Stop one local broker session; allowed even while policy is disabled."""
+    def stop_broker(self, *, reason: str, transfer: bool = False, force: bool = False) -> dict[str, object]:
+        """Stop one local broker session; allowed even while policy is disabled.
+
+        An ordinary stop retires an idle broker cleanly but cannot retire a busy
+        one: it queues behind the command holding the channel, and the daemon
+        cancels a queued stop whose caller has already timed out. ``force`` marks
+        the request as one the daemon honours anyway, which is the only way to
+        retire a busy broker through the socket. It stays inside the socket's own
+        authority -- no pid is read and no signal is sent -- and never abandons a
+        running command.
+
+        It is also queued, not prioritized: the daemon serves one connection at
+        a time in arrival order, so a forced stop waits out the in-flight command
+        and anything already queued ahead of it.
+        """
 
         client = self._broker_client(transfer=transfer)
-        return client.stop(reason=reason)
+        try:
+            return client.stop(reason=reason, force=force)
+        except O2BrokerError as exc:
+            # Only recommend force when the refreshed receipt actually shows a
+            # busy daemon. A missing broker, an unreadable receipt, or any other
+            # socket failure raises here too, and force resolves none of them --
+            # pointing at it would send the operator down a path that must fail.
+            status = client.local_status()
+            if force or not status.get("busy"):
+                raise
+            in_flight = status.get("in_flight") if isinstance(status.get("in_flight"), dict) else None
+            command = in_flight.get("command") if isinstance(in_flight, dict) else None
+            preview = command.get("preview") if isinstance(command, dict) else None
+            elapsed = status.get("busy_for_seconds")
+            seconds = f" for {elapsed:.0f}s" if isinstance(elapsed, (int, float)) else ""
+            named = f": {preview!r}" if isinstance(preview, str) and preview else ""
+            raise O2BrokerError(
+                f"The broker did not answer its socket, so it was not stopped: {exc}. It has been serving a "
+                f"command{seconds}{named}. A queued stop is cancelled once its caller times out, so a plain stop "
+                "cannot retire a busy broker. Re-issue with force=true to have the daemon honour the request "
+                "anyway. It is queued rather than prioritized, so it takes effect after this command and any "
+                "requests already waiting ahead of it, without abandoning any of them."
+            ) from exc
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def _master_check_argv(self, alias: str) -> list[str]:

@@ -102,6 +102,17 @@ MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYT
 # budget with the caller's own deadline: waiting longer than your own command
 # would have taken is the point at which the silence, not the queue, is the
 # problem. A floor keeps short commands from failing behind ordinary traffic.
+# The protocol permits a seven-day deadline, and the daemon's watchdog budget
+# follows whatever a caller requests -- so an hour-long timeout also buys an
+# hour before a silent transport is torn down. The MCP tool caps itself at 300s,
+# but that guard sits on one input model; this ceiling applies to every caller of
+# the client, so an in-process one cannot reinstate a multi-hour hold on a
+# channel shared by every MCP process on the workstation.
+MAX_COMMAND_TIMEOUT_SECONDS = 3600.0
+# A forced stop must outlast the contention that made it necessary: its
+# connection may sit in the listen backlog behind queued commands before the
+# daemon accepts it.
+FORCED_STOP_WAIT_SECONDS = 60.0
 MIN_QUEUE_WAIT_SECONDS = 60.0
 DEFAULT_QUEUE_WAIT_SECONDS = 300.0
 # ``socket.settimeout(0)`` selects non-blocking mode rather than an immediate
@@ -516,6 +527,13 @@ class BrokerClient:
             raise ValueError(
                 f"broker timeout must be None or a finite positive number no greater than {MAX_TIMEOUT_SECONDS}"
             )
+        if timeout is not None and float(timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"broker command timeout {float(timeout):.0f}s exceeds the {MAX_COMMAND_TIMEOUT_SECONDS:.0f}s "
+                "ceiling. One command's deadline is also how long it may hold the shared serialized channel and "
+                "how long the daemon will wait before tearing down a silent transport. Submit a job and poll for "
+                "it instead of waiting inside one command."
+            )
         if input_text is not None and not isinstance(input_text, str):
             raise ValueError("broker stdin must be text or None")
         if input_text is not None and not utf8_text_within_limit(
@@ -578,8 +596,15 @@ class BrokerClient:
                 # because ``makefile`` was opened unbuffered: neither side can
                 # strand bytes the other then fails to see.
                 response = read_frame(_DeadlineSocketReader(client, max(0.0, queue_deadline - time.monotonic())))
-                if response.get("type") == "error" and response.get("error") == "policy_denied":
-                    raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+                if response.get("type") == "error":
+                    if response.get("error") == "policy_denied":
+                        raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+                    # A refusal is issued before anything is forwarded, so this
+                    # is a rejected request, not an uncertain outcome.
+                    raise O2BrokerError(
+                        f"The O2 broker refused request {request_id}: {response.get('error')!r}. "
+                        f"{response.get('message') or ''}".strip()
+                    )
                 if response != {"type": "dispatched", "id": request_id}:
                     raise O2BrokerCommandOutcomeUnknownError(
                         f"O2 broker request {request_id} was sent but returned an unexpected dispatch response: "
@@ -774,11 +799,38 @@ class BrokerClient:
             "Do not start another attempt; inspect o2_local_status and the broker log first."
         )
 
-    def stop(self, *, reason: str, timeout: float = 3.0) -> dict[str, Any]:
-        """Ask the local daemon to close its one SSH process and exit."""
+    def stop(self, *, reason: str, timeout: float | None = None, force: bool = False) -> dict[str, Any]:
+        """Ask the local daemon to close its one SSH process and exit.
 
+        A plain stop is abandoned if this caller's short deadline expires before
+        the daemon reaches it, which is deliberate: a stop reported as failed
+        should not shut the shared broker down minutes later. It also means a
+        plain stop cannot retire a busy broker at all, because a busy daemon
+        cannot reach any request until its command ends.
+
+        ``force`` marks the request as one to honour regardless, so the operator's
+        intent survives their own timeout. An older daemon ignores the flag and
+        simply behaves as before.
+
+        It is graceful and it is queued, which bounds how fast it can possibly
+        act. The daemon serves one connection at a time from a FIFO accept
+        queue, so a forced stop takes effect after the in-flight command *and
+        any connections already queued ahead of it* have been served -- a delay
+        bounded by queue depth times the per-command ceiling, not by one
+        command. Nothing here abandons a running command, and no request jumps
+        the queue; a stop that must act immediately still needs a signal sent by
+        hand, and a control path that is not behind the command queue is the
+        proper fix.
+        """
+
+        # A forced stop is an explicit operator action against a broker that is
+        # by definition busy, so it waits: its connection may have to enter a
+        # backlog behind queued commands, and failing fast there would leave the
+        # only working remedy unreachable exactly when it is needed.
+        if timeout is None:
+            timeout = FORCED_STOP_WAIT_SECONDS if force else 3.0
         response = self._request(
-            {"type": "stop", "id": str(uuid.uuid4()), "reason": reason},
+            {"type": "stop", "id": str(uuid.uuid4()), "reason": reason, "force": bool(force)},
             timeout=timeout,
             # A local stop must remain possible after the configured SSH alias
             # or package protocol changes; only command reuse requires the
@@ -1091,8 +1143,13 @@ class BrokerServer:
         byte progress within a short inactivity window and a frame-size-scaled
         absolute budget. A miss is fatal to the channel: after dispatch, no
         automatic retry is safe, and retaining the socket would falsely
-        advertise reuse. Explicit no-deadline requests intentionally preserve
-        their unbounded contract and therefore read synchronously.
+        advertise reuse.
+
+        The unbounded branch below is no longer reachable from a request: the
+        daemon bounds a deadline-free exec to the workstation ceiling before
+        dispatching it, because a helper that never replies to one would block
+        the shared channel with nothing to time out. It is kept for direct
+        callers and reads synchronously by their explicit choice.
         """
 
         if command_timeout is None:
@@ -1191,7 +1248,11 @@ class BrokerServer:
         # untrusted pre-existing object untouched.
         self.listener = listener
         os.chmod(self.paths.socket, 0o600)
-        listener.listen(16)
+        # Callers pile into this backlog while a command is served, and a
+        # connection that cannot be queued fails outright -- including a stop.
+        # Size it well above the number of MCP processes on a workstation so a
+        # control request is not locked out by ordinary command contention.
+        listener.listen(128)
         listener.settimeout(1.0)
         assert self.transport is not None
         self._write_state("ready", ssh_pid=self.transport.pid, ready_at=self.clock())
@@ -1248,11 +1309,20 @@ class BrokerServer:
                     )
                 return
             if request_type == "stop":
-                # A stop can wait behind a long serialized command. A caller
-                # whose local deadline expires closes its socket; acknowledge
-                # first so that queued, abandoned requests are cancelled rather
-                # than shutting down the shared broker minutes after reporting
-                # failure. Once this frame is written, stop is dispatched.
+                # A stop can wait behind a long serialized command. By default a
+                # caller whose local deadline expires has its request cancelled,
+                # so a stop reported as failed does not shut the shared broker
+                # down minutes later. A forced stop opts out of exactly that: it
+                # is the only way to retire a busy broker, since a busy daemon
+                # cannot reach any request until its command ends, and discarding
+                # it here is what left o2_stop_broker unable to do so. Forced or
+                # not, the in-flight command is never abandoned.
+                if bool(request.get("force")):
+                    self._stop_requested = True
+                    self._write_state("stopping", stop_reason=str(request.get("reason") or "forced local request"))
+                    with suppress(OSError, BrokerProtocolError):
+                        write_frame(local, {"type": "stopping", "pid": os.getpid()})
+                    return
                 if self._local_caller_disconnected(client):
                     return
                 try:
@@ -1289,10 +1359,37 @@ class BrokerServer:
                 with suppress(OSError, BrokerProtocolError):
                     write_frame(local, {"type": "error", "error": "invalid_request"})
                 return
+            # The client enforces this ceiling too, but a client-side guard binds
+            # only the callers that carry it. Every already-running MCP process
+            # keeps its previous client until restarted, and the protocol still
+            # permits seven days, so the daemon -- the one component every caller
+            # shares -- has to be where a workstation-wide bound actually holds.
+            #
+            # Shorten the deadline rather than refuse. A refusal has no wire form
+            # an older client reads correctly: it recognizes only `policy_denied`
+            # and classifies anything else as a command that may already have
+            # run, so refusing would tell exactly the callers this guard exists
+            # for not to retry something that never left the workstation. A
+            # clamp serves the request, holds the channel no longer than the
+            # ceiling, and is reported in stderr rather than silently.
+            clamped_from: float | None = None
+            if request_timeout is None:
+                # A deadline-free request is the one shape that can wedge this
+                # daemon outright: the result read below has no watchdog for it,
+                # so a helper that never replies blocks the shared channel with
+                # nothing to time out. The protocol still carries JSON null, but
+                # the daemon will not honour it as unbounded.
+                clamped_from = math.inf
+                request_timeout = MAX_COMMAND_TIMEOUT_SECONDS
+            elif float(request_timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
+                clamped_from = float(request_timeout)
+                request_timeout = MAX_COMMAND_TIMEOUT_SECONDS
             # Never forward caller-owned container structure. Rebuilding the
             # exact wire object keeps local/remote validation independent of
             # JSON parser recursion behavior across Python versions.
             remote_request = {key: request[key] for key in expected_keys}
+            if clamped_from is not None:
+                remote_request["timeout_seconds"] = MAX_COMMAND_TIMEOUT_SECONDS
 
             # The client checks policy before connecting, while this second gate
             # blocks hand-crafted local socket requests that try to bypass the
@@ -1394,6 +1491,18 @@ class BrokerServer:
                         "stderr_truncated": bool(response.get("stderr_truncated", False)),
                     },
                 )
+            if clamped_from is not None:
+                # Say it where a caller already looks for notes the broker adds,
+                # alongside the truncation notices, so the shortened deadline is
+                # visible rather than inferred from an early timeout.
+                requested = "no deadline" if math.isinf(clamped_from) else f"{clamped_from:.0f}s"
+                note = (
+                    f"command deadline reduced from {requested} to "
+                    f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s by the workstation ceiling on how long one command may "
+                    "hold the shared serialized channel"
+                )
+                existing = response.get("stderr")
+                response["stderr"] = f"{existing}\n{note}" if isinstance(existing, str) and existing else note
             # A caller may time out or close while its remote command continues.
             # The result has already been drained, so losing only the local reply
             # must not tear down the healthy shared channel.
