@@ -482,6 +482,33 @@ class BrokerClient:
             client.close()
             raise O2BrokerUnavailableError(f"The persistent O2 broker did not answer locally: {exc}") from exc
 
+    def locked_daemon_pid(self) -> int | None:
+        """Return the pid published by the daemon that currently holds the lock.
+
+        Read inside the same open that tests the lock, so there is no window in
+        which the answer to "is it held" and the answer to "by whom" can come
+        from different holders. ``None`` means no daemon holds the lock, or the
+        holder has not published an identity -- both of which make signalling a
+        pid unsafe, so callers must refuse rather than fall back to a receipt.
+        """
+
+        try:
+            with _open_lifetime_lock(self.paths.lock, create=False) as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.seek(0)
+                    raw = handle.read(64).decode("utf-8", errors="replace").strip()
+                    if not raw.isdigit():
+                        return None
+                    pid = int(raw)
+                    return pid if pid > 0 else None
+                # Acquiring it proves nobody held it, so there is no daemon.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                return None
+        except (FileNotFoundError, O2BrokerError, OSError, ValueError):
+            return None
+
     def signal_stop(self, *, reason: str, grace: float = 2.0) -> dict[str, Any]:
         """Request a stop by signal when the daemon cannot answer its socket.
 
@@ -498,40 +525,36 @@ class BrokerClient:
         result says which case happened instead of implying the channel is free.
         """
 
-        state = _read_state(self.paths)
-        pid = state.get("pid")
-        if type(pid) is not int or pid <= 0:
+        # The pid comes from the lock, never from the receipt. A receipt can
+        # outlive the daemon that wrote it, and once that pid is reused, "a lock
+        # is held" and "this pid exists" are both true of two different
+        # processes -- so together they still do not authorize a signal.
+        pid = self.locked_daemon_pid()
+        if pid is None:
             raise O2BrokerError(
-                f"The broker receipt carries no usable daemon pid (status: {state.get('status')!r}), so there is "
-                "nothing safe to signal. Inspect o2_local_status and the broker log."
-            )
-        # Two independent checks before signalling anything. The lock proves a
-        # daemon is alive at all; the null signal proves this pid exists and is
-        # ours. Neither alone rules out a receipt left by a dead daemon whose pid
-        # has since been reused, which is why this path is opt-in rather than an
-        # automatic fallback.
-        if not self.launch_in_progress():
-            raise O2BrokerError(
-                "No daemon holds the broker lifetime lock, so the receipt is stale and its pid must not be "
-                "signalled. There is no broker to stop."
+                "No daemon has published ownership of the broker lifetime lock, so no pid here is safe to "
+                "signal. Either nothing is running, or the holder predates this identity check and must be "
+                "restarted to support force. Confirm with o2_local_status before stopping anything by hand."
             )
         try:
             os.kill(pid, 0)
         except ProcessLookupError as exc:
-            raise O2BrokerError(f"Broker daemon pid {pid} no longer exists; the receipt is stale.") from exc
+            raise O2BrokerError(f"Broker daemon pid {pid} no longer exists; the lock record is stale.") from exc
         except PermissionError as exc:
             raise O2BrokerError(f"Broker daemon pid {pid} is not owned by this user; refusing to signal it.") from exc
 
+        state = _read_state(self.paths)
         in_flight = state.get("in_flight") if isinstance(state.get("in_flight"), dict) else None
         os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline and self.launch_in_progress():
             time.sleep(0.05)
-        exited = not self.launch_in_progress()
+        exited = self.locked_daemon_pid() is None
         return {
             "signalled": True,
             "signal": "SIGTERM",
             "pid": pid,
+            "receipt_pid": state.get("pid"),
             "reason": reason,
             "exited": exited,
             "in_flight": in_flight,
@@ -993,6 +1016,16 @@ class BrokerServer:
             handle.close()
             raise O2BrokerStartupError("another O2 broker daemon already owns the lifetime lock") from exc
         self._lock_handle = handle
+        # Publish the holder's identity under the lock itself, so a stopper can
+        # bind a pid to the process that actually owns this broker directory
+        # rather than to whatever a possibly stale receipt names. Truncate
+        # first: until the new value lands the file must read as empty rather
+        # than as a previous holder's pid, because a reused pid would make that
+        # indistinguishable from a live daemon.
+        with suppress(OSError):
+            handle.truncate(0)
+            handle.write(f"{os.getpid()}\n".encode())
+            handle.flush()
 
     def _drain_transport_stderr(self, stderr: BinaryIO) -> None:
         """Append SSH diagnostics so its bounded pipe can never deadlock."""

@@ -192,10 +192,20 @@ automatic retry.
   daemon exits *later*, and the result distinguishes `exited: true` from a stop
   merely requested. Abandoning a running command outright remains a manual
   `kill -9`, which leaves an orphaned receipt that `busy` correctly ignores.
-- `force` is opt-in rather than an automatic fallback because it acts on a pid
-  read from a receipt rather than through the socket's own authority. It refuses
-  unless a daemon holds the lifetime lock *and* the pid exists and is owned by
-  this user; a stale receipt is never signalled.
+- **The signalled pid comes from the lock, never from the receipt.** A receipt
+  outlives the daemon that wrote it, and once that pid is reused, "a lock is
+  held" and "this pid exists" are both true *of two different processes* — so
+  together they still do not authorize a signal. The daemon therefore publishes
+  its pid into the lock file while holding it, truncating first so that until
+  the new value lands the file reads as empty rather than as a previous holder's
+  pid. A stopper reads that pid inside the same open that tests the lock, so
+  "is it held" and "by whom" cannot come from different holders.
+- A holder that has published no identity is refused, not fallen back on. That
+  covers both the truncate window and a daemon predating this check — a broker
+  started before it must be restarted before `force` will work, which fails
+  safe rather than guessing.
+- `force` stays opt-in on top of all that, because it acts outside the socket's
+  own authority.
 
 ### Bounding one caller's cost, part two
 

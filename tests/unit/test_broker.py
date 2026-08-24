@@ -9,6 +9,7 @@ Duo access.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import io
 import json
@@ -1192,11 +1193,27 @@ def test_a_busy_socket_stop_points_at_force_and_names_the_blocker(tmp_path):
     assert "240s" in message
 
 
-def test_signal_stop_refuses_a_stale_receipt_without_signalling(broker_root, monkeypatch):
-    """A pid read from a receipt is only safe to signal while a daemon is alive.
+def test_signal_stop_refuses_when_no_daemon_holds_the_lock(broker_root, monkeypatch):
+    """A receipt outlives its daemon, so its pid must never be signalled."""
 
-    Nothing holds the lifetime lock here, so the receipt describes a daemon that
-    is gone and its pid may since have been reused by something unrelated.
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(paths.state, _orphaned_receipt(pid=999_999))
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+
+    with pytest.raises(O2BrokerError, match="No daemon has published ownership"):
+        BrokerClient(paths.root).signal_stop(reason="stale receipt")
+
+    assert sent == []
+
+
+def test_signal_stop_refuses_a_lock_holder_that_has_not_published_its_identity(broker_root, monkeypatch):
+    """Held-but-anonymous is exactly the window a reused pid slips through.
+
+    A held lock proves some daemon is alive and `kill(pid, 0)` proves some
+    process exists, but with an anonymous holder those two facts can describe
+    two different processes -- the crashed daemon's pid having been reused by
+    something unrelated. Refusing is the only safe answer.
     """
 
     paths = prepare_broker_directory(broker_root)
@@ -1204,24 +1221,32 @@ def test_signal_stop_refuses_a_stale_receipt_without_signalling(broker_root, mon
     sent: list[tuple[int, int]] = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
 
-    with pytest.raises(O2BrokerError, match="No daemon holds the broker lifetime lock"):
-        BrokerClient(paths.root).signal_stop(reason="stale receipt")
+    holder = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(holder, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    assert sent == []
+        with pytest.raises(O2BrokerError, match="No daemon has published ownership"):
+            BrokerClient(paths.root).signal_stop(reason="anonymous holder")
+
+        assert sent == []
+    finally:
+        os.close(holder)
 
 
-def test_signal_stop_refuses_a_receipt_without_a_usable_pid(broker_root, monkeypatch):
-    """No pid means nothing safe to signal, whatever the lock says."""
+def test_the_lock_holder_publishes_the_pid_a_stopper_must_signal(tmp_path, broker_root):
+    """Binding the signal target to the lock is what makes force safe at all."""
 
-    paths = prepare_broker_directory(broker_root)
-    _atomic_json_write(paths.state, _orphaned_receipt(pid=None))
-    sent: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        # The daemon runs as a thread in this harness, so it owns the lock under
+        # this process's pid.
+        assert client.locked_daemon_pid() == os.getpid()
+    finally:
+        _stop_local_broker(thread, client)
 
-    with pytest.raises(O2BrokerError, match="no usable daemon pid"):
-        BrokerClient(paths.root).signal_stop(reason="pidless receipt")
-
-    assert sent == []
+    # Once it exits the lock is free, so there is no longer anyone to signal.
+    assert client.locked_daemon_pid() is None
 
 
 def test_signal_stop_reports_a_busy_daemon_as_not_yet_stopped(tmp_path, broker_root, monkeypatch):
