@@ -581,12 +581,10 @@ async def o2_probe(params: ProbeInput) -> str:
     def work() -> dict[str, Any]:
         conn = _connection()
         alias = conn.config.transfer_alias if params.transfer else conn.config.host_alias
-        result = conn.run(
-            "hostname; whoami; date",
-            timeout=conn.config.connect_timeout + 5,
-            alias=alias,
-            broker_role="transfer" if params.transfer else "login",
-        )
+        # Call the connection's own probe rather than restating it here: the
+        # duplicate deadline is what let the command ceiling bind one probe and
+        # not the other.
+        result = conn.probe(alias=alias, broker_role="transfer" if params.transfer else "login")
         return {"ok": result.ok, "alias": alias, **_command_payload(result)}
 
     return await _run_tool(work)

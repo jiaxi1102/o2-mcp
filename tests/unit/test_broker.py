@@ -1439,7 +1439,7 @@ def test_a_generous_connect_timeout_cannot_push_a_probe_past_the_ceiling(monkeyp
 
     requested: list[float | None] = []
 
-    def _record(self, command, **kwargs):
+    def _record(self, command, **kwargs):  # noqa: ARG001 - signature mirrors O2Connection.run
         requested.append(kwargs.get("timeout"))
         return CommandResult(argv=["probe"], returncode=0, stdout="host\nuser\n", stderr="")
 
@@ -1447,10 +1447,14 @@ def test_a_generous_connect_timeout_cannot_push_a_probe_past_the_ceiling(monkeyp
     monkeypatch.setattr(type(connection), "run", _record)
 
     connection.probe()
+    # The MCP tool routes through this same method rather than restating the
+    # deadline, so covering it here covers both callers.
+    connection.probe(alias="o2-transfer", broker_role="transfer")
 
-    assert requested, "expected the probe to issue a command"
-    assert requested[0] is not None
-    assert requested[0] <= MAX_COMMAND_TIMEOUT_SECONDS, requested[0]
+    assert len(requested) == 2, requested
+    for deadline in requested:
+        assert deadline is not None
+        assert deadline <= MAX_COMMAND_TIMEOUT_SECONDS, deadline
 
 
 def test_the_ceiling_still_admits_the_longest_deadline_any_caller_asks_for():
