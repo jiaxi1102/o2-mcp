@@ -1428,6 +1428,31 @@ def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, m
     assert not isinstance(refused.value, O2BrokerCommandOutcomeUnknownError)
 
 
+def test_a_generous_connect_timeout_cannot_push_a_probe_past_the_ceiling(monkeypatch):
+    """Lowering a ceiling must account for configured deadlines, not only literal ones.
+
+    `connect_timeout` is operator-configurable and unbounded, and the probe
+    derives its deadline from it. Passed through unclamped, a generous value
+    would be refused by the client ceiling before reaching the broker at all --
+    breaking the probe rather than bounding it.
+    """
+
+    requested: list[float | None] = []
+
+    def _record(self, command, **kwargs):
+        requested.append(kwargs.get("timeout"))
+        return CommandResult(argv=["probe"], returncode=0, stdout="host\nuser\n", stderr="")
+
+    connection = O2Connection(O2Config(connect_timeout=int(MAX_COMMAND_TIMEOUT_SECONDS) + 600))
+    monkeypatch.setattr(type(connection), "run", _record)
+
+    connection.probe()
+
+    assert requested, "expected the probe to issue a command"
+    assert requested[0] is not None
+    assert requested[0] <= MAX_COMMAND_TIMEOUT_SECONDS, requested[0]
+
+
 def test_the_ceiling_still_admits_the_longest_deadline_any_caller_asks_for():
     """Lowering a shared ceiling must not quietly break an existing caller.
 
