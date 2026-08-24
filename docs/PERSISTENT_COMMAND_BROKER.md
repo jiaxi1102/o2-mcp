@@ -148,6 +148,37 @@ automatic retry.
 - `o2_local_status` may read the receipt and ping the Unix socket, but it never
   sends a frame to O2.
 
+### Bounding one caller's cost
+
+- A single `o2_exec` may request at most 300 seconds. That number is both how
+  long one command can block every other caller on the shared channel and the
+  watchdog budget before a silent transport is torn down. Work needing longer
+  belongs in a submitted job polled from the caller, which releases the channel
+  between checks.
+- The wait for a dispatch acknowledgement is bounded too, scaled to the caller's
+  own deadline (`max(60s, timeout_seconds)`, or 300s when no deadline was
+  given). That budget starts at the connection, not after it: the daemon accepts
+  nothing while serving a command, so callers fill the listen backlog and
+  eventually `connect` itself blocks. A short ceiling there would report a
+  healthy but saturated broker as *absent*, which is the one diagnosis that
+  points a caller at starting another one. A receipt that fails validation still
+  raises before any connection, so a genuinely missing broker keeps its own
+  error. Without this bound a starved caller simply never returns, which is
+  indistinguishable from a hang; `o2_exec` reports it as `broker_busy` and the
+  message names the command occupying the channel from the in-flight receipt.
+- A budget expiry is **not** proof the request was never dispatched. The daemon
+  writes the acknowledgement and forwards the command as one step, so a budget
+  expiring in that instant leaves a command running and a caller that never read
+  the acknowledgement. `O2BrokerBusyError` therefore subclasses
+  `O2BrokerCommandOutcomeUnknownError` and reports `retry_safe: false`, so a
+  mutating command cannot be duplicated by a caller trusting an optimistic
+  classification. The receipt settles the one direction it can: when the request
+  recorded in flight is the caller's own, the command is known to be running and
+  the error says so outright.
+- Abandoning the socket is also how the daemon learns to cancel a queued
+  request. It checks for a disconnected caller before forwarding, so a timed-out
+  request is dropped rather than run unobserved.
+
 ### Command observability
 
 The daemon serializes local clients over one channel, so it cannot answer a

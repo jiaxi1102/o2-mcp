@@ -32,18 +32,23 @@ import pytest
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp import broker as broker_module
 from o2mcp.broker import (
+    DEFAULT_QUEUE_WAIT_SECONDS,
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_LAUNCH_BYTES,
     MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
     MAX_STATE_COMMAND_PREVIEW_CHARS,
     MAX_UNIX_SOCKET_PATH_BYTES,
+    MIN_QUEUE_WAIT_SECONDS,
     BrokerClient,
     BrokerExecutionResult,
     BrokerServer,
+    O2BrokerBusyError,
+    O2BrokerCommandOutcomeUnknownError,
     O2BrokerError,
     O2BrokerUnavailableError,
     _atomic_json_write,
     _interprocess_monotonic,
+    _queue_wait_seconds,
     _read_launch_fd,
     _read_state,
     _receipt_number,
@@ -621,8 +626,13 @@ def test_command_timeout_starts_only_after_dispatch(tmp_path, broker_root):
         _stop_local_broker(thread, client)
 
 
-def test_connect_deadline_is_cleared_before_a_large_queued_request_write(broker_root, monkeypatch):
-    """The connect-only timeout must not govern queue backpressure on writes."""
+def test_connect_deadline_does_not_govern_a_large_queued_request_write(broker_root, monkeypatch):
+    """The connect-only timeout must not govern queue backpressure on writes.
+
+    The queue budget governs it instead. That budget is finite now, but it is
+    far larger than the connect deadline, so a valid queue wait still cannot be
+    failed by a deadline meant only for establishing the connection.
+    """
 
     class ObservedDuplex:
         """Minimal framed stream that asserts the socket deadline at first write."""
@@ -640,8 +650,10 @@ def test_connect_deadline_is_cleared_before_a_large_queued_request_write(broker_
         def write(self, data):
             # A queued one-MiB frame may block here behind the current command.
             # Any inherited five-second connect deadline would make that valid
-            # queue wait fail before the daemon can acknowledge dispatch.
-            assert self.owner.timeout is None
+            # queue wait fail before the daemon can acknowledge dispatch, so the
+            # deadline in force must be the queue budget rather than that one.
+            assert self.owner.timeout is not None
+            assert 5.0 < self.owner.timeout <= MIN_QUEUE_WAIT_SECONDS
             request = read_frame(io.BytesIO(bytes(data)))
             request_id = request["id"]
             self.responses = io.BytesIO(
@@ -680,6 +692,10 @@ def test_connect_deadline_is_cleared_before_a_large_queued_request_write(broker_
 
         def makefile(self, *_args, **_kwargs):
             return self.stream
+
+        def recv(self, size):
+            # The bounded dispatch read reads through the socket directly.
+            return self.stream.read(size)
 
         def close(self):
             return None
@@ -1058,6 +1074,142 @@ def test_broker_state_is_json_serializable(tmp_path, broker_root):
         assert json.loads(json.dumps(state))["status"] == "ready"
     finally:
         _stop_local_broker(thread, client)
+
+
+def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_root, monkeypatch):
+    """A caller that never gets the channel must fail, not hang silently.
+
+    This is the failure the shared channel actually produces: one long command
+    holds it, and every other caller blocks before dispatch with nothing to show
+    for it. The point is to replace an MCP call that never returns with an error
+    that names the cause -- not to promise the request can be repeated blindly.
+    """
+
+    monkeypatch.setattr(broker_module, "MIN_QUEUE_WAIT_SECONDS", 0.3)
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "blocker",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
+        deadline = time.monotonic() + 5
+        while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        with pytest.raises(O2BrokerBusyError) as starved:
+            client.execute("printf starved", timeout=0.3)
+
+        message = str(starved.value)
+        # The diagnostic from the previous change is what makes this actionable.
+        assert "sleep 3; printf occupied" in message
+        # A queue expiry is not proof nothing ran, so it must not read as one.
+        assert "cannot be proven" in message
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        assert client.execute("printf alive", timeout=5).stdout == "alive"
+        # The abandoned request must have been cancelled, never run: two
+        # commands completed, not three.
+        assert client.ping()["commands_completed"] == 2
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_a_saturated_backlog_is_reported_as_busy_not_as_a_missing_broker(broker_root, monkeypatch):
+    """A full listen backlog means the broker is busy, not absent.
+
+    The daemon accepts nothing while serving a command, so callers pile into a
+    bounded listen backlog and eventually `connect` itself blocks. Absent is the
+    one diagnosis that points a caller at starting another broker, so a healthy
+    saturated one must never produce it. This pins the classification rather
+    than the kernel behaviour, which varies by platform.
+    """
+
+    client = BrokerClient(broker_root)
+
+    def _saturated_backlog(**_kwargs):
+        try:
+            raise socket.timeout("timed out")
+        except socket.timeout as cause:
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out") from cause
+
+    monkeypatch.setattr(client, "_connect", _saturated_backlog)
+    with pytest.raises(O2BrokerBusyError):
+        client.execute("printf queued", timeout=5)
+
+    def _socket_refused(**_kwargs):
+        try:
+            raise ConnectionRefusedError("connection refused")
+        except ConnectionRefusedError as cause:
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: refused") from cause
+
+    # A daemon that is genuinely gone must keep its own diagnosis: the remedy
+    # there really is to start one.
+    monkeypatch.setattr(client, "_connect", _socket_refused)
+    with pytest.raises(O2BrokerUnavailableError) as refused:
+        client.execute("printf queued", timeout=5)
+    assert not isinstance(refused.value, O2BrokerBusyError)
+
+
+def test_a_request_recorded_as_in_flight_is_never_reported_as_merely_queued(broker_root):
+    """The receipt settles the one direction it can: this request is running.
+
+    The daemon acknowledges and forwards as one step, so a client whose budget
+    expires in that instant missed the acknowledgement for a command that is
+    executing. The receipt names the request now in flight, so when that is our
+    own request the answer is not ambiguous at all.
+    """
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(
+        paths.state,
+        {
+            "schema_version": 1,
+            "protocol": PROTOCOL_VERSION,
+            "status": "ready",
+            "alias": "offline-o2",
+            "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+            "in_flight": {
+                "request_id": "mine",
+                "command": {"preview": "sbatch job.sh", "sha256": "0" * 64, "bytes": 13},
+                "dispatched_at": time.time(),
+            },
+        },
+    )
+    client = BrokerClient(paths.root)
+
+    mine = client._undispatched_error("mine", 60.0)
+    # Exactly the base error, not the busy subclass: there is nothing uncertain
+    # about a request the broker records as the one it is running.
+    assert type(mine) is O2BrokerCommandOutcomeUnknownError
+    assert "do not retry" in str(mine).lower()
+
+    # A different request in flight leaves our own genuinely undetermined.
+    assert isinstance(client._undispatched_error("someone-else", 60.0), O2BrokerBusyError)
+
+
+@pytest.mark.parametrize(
+    ("timeout", "expected"),
+    [(None, DEFAULT_QUEUE_WAIT_SECONDS), (1.0, MIN_QUEUE_WAIT_SECONDS), (600.0, 600.0)],
+)
+def test_queue_budget_scales_with_the_callers_own_deadline(timeout, expected):
+    """Waiting longer than your own command would take is when silence is wrong."""
+
+    assert _queue_wait_seconds(timeout) == expected
 
 
 def test_completed_command_receipt_records_channel_occupancy(tmp_path, broker_root):

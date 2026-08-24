@@ -21,6 +21,7 @@ from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
+    O2BrokerBusyError,  # noqa: E402
     O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
     async_transfer,  # noqa: E402
@@ -554,6 +555,54 @@ async def test_cancel_job(monkeypatch, tmp_path):
 
 
 # --- input validation (Pydantic, via the MCP layer) --------------------------
+@pytest.mark.anyio
+async def test_a_busy_broker_is_reported_separately_but_still_fails_closed(monkeypatch):
+    """Occupied is worth naming, but a queue expiry is not proof nothing ran.
+
+    The daemon acknowledges and forwards as one step, so a budget expiring in
+    that instant leaves a command running and a caller that never saw it
+    acknowledged. `broker_busy` subclasses the uncertain-outcome error for that
+    reason, and must be caught before its base or it would report the wrong
+    error string.
+    """
+
+    class _Connection:
+        def run(self, *_args, **_kwargs):
+            raise O2BrokerBusyError("waited 60s without an acknowledgement")
+
+    monkeypatch.setattr(o2server, "_connection", _Connection)
+    payload = await _call("o2_exec", {"params": {"command": "squeue -u me"}})
+
+    assert payload["ok"] is False
+    assert payload["error"] == "broker_busy"
+    # Never advertise a mutating command as safe to duplicate.
+    assert payload["retry_safe"] is False
+
+
+def test_busy_is_an_uncertain_outcome_so_existing_handlers_fail_closed():
+    """Inheritance is the guarantee: no caller can opt out of the safe default."""
+
+    assert issubclass(O2BrokerBusyError, O2BrokerCommandOutcomeUnknownError)
+
+
+@pytest.mark.anyio
+async def test_exec_timeout_is_capped_so_one_command_cannot_hold_the_channel_for_an_hour(monkeypatch, tmp_path):
+    """The cap is the contract: long remote waits belong in a submitted job."""
+
+    _patch_connection(monkeypatch, tmp_path, master=True)
+    with pytest.raises(ToolError):
+        await o2server.mcp.call_tool(
+            "o2_exec",
+            {"params": {"command": "sleep 3000", "timeout_seconds": 3600}},
+        )
+
+    at_the_cap = await _call(
+        "o2_exec",
+        {"params": {"command": "true", "timeout_seconds": o2server.MAX_EXEC_TIMEOUT_SECONDS}},
+    )
+    assert at_the_cap["ok"] is True
+
+
 @pytest.mark.anyio
 async def test_invalid_input_is_rejected(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True)
