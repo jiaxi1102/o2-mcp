@@ -109,6 +109,10 @@ MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYT
 # the client, so an in-process one cannot reinstate a multi-hour hold on a
 # channel shared by every MCP process on the workstation.
 MAX_COMMAND_TIMEOUT_SECONDS = 3600.0
+# A forced stop must outlast the contention that made it necessary: its
+# connection may sit in the listen backlog behind queued commands before the
+# daemon accepts it.
+FORCED_STOP_WAIT_SECONDS = 60.0
 MIN_QUEUE_WAIT_SECONDS = 60.0
 DEFAULT_QUEUE_WAIT_SECONDS = 300.0
 # ``socket.settimeout(0)`` selects non-blocking mode rather than an immediate
@@ -592,8 +596,15 @@ class BrokerClient:
                 # because ``makefile`` was opened unbuffered: neither side can
                 # strand bytes the other then fails to see.
                 response = read_frame(_DeadlineSocketReader(client, max(0.0, queue_deadline - time.monotonic())))
-                if response.get("type") == "error" and response.get("error") == "policy_denied":
-                    raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+                if response.get("type") == "error":
+                    if response.get("error") == "policy_denied":
+                        raise O2PolicyDeniedError(str(response.get("message") or "O2 policy denied broker execution"))
+                    # A refusal is issued before anything is forwarded, so this
+                    # is a rejected request, not an uncertain outcome.
+                    raise O2BrokerError(
+                        f"The O2 broker refused request {request_id}: {response.get('error')!r}. "
+                        f"{response.get('message') or ''}".strip()
+                    )
                 if response != {"type": "dispatched", "id": request_id}:
                     raise O2BrokerCommandOutcomeUnknownError(
                         f"O2 broker request {request_id} was sent but returned an unexpected dispatch response: "
@@ -788,7 +799,7 @@ class BrokerClient:
             "Do not start another attempt; inspect o2_local_status and the broker log first."
         )
 
-    def stop(self, *, reason: str, timeout: float = 3.0, force: bool = False) -> dict[str, Any]:
+    def stop(self, *, reason: str, timeout: float | None = None, force: bool = False) -> dict[str, Any]:
         """Ask the local daemon to close its one SSH process and exit.
 
         A plain stop is abandoned if this caller's short deadline expires before
@@ -804,6 +815,12 @@ class BrokerClient:
         simply behaves as before.
         """
 
+        # A forced stop is an explicit operator action against a broker that is
+        # by definition busy, so it waits: its connection may have to enter a
+        # backlog behind queued commands, and failing fast there would leave the
+        # only working remedy unreachable exactly when it is needed.
+        if timeout is None:
+            timeout = FORCED_STOP_WAIT_SECONDS if force else 3.0
         response = self._request(
             {"type": "stop", "id": str(uuid.uuid4()), "reason": reason, "force": bool(force)},
             timeout=timeout,
@@ -1218,7 +1235,11 @@ class BrokerServer:
         # untrusted pre-existing object untouched.
         self.listener = listener
         os.chmod(self.paths.socket, 0o600)
-        listener.listen(16)
+        # Callers pile into this backlog while a command is served, and a
+        # connection that cannot be queued fails outright -- including a stop.
+        # Size it well above the number of MCP processes on a workstation so a
+        # control request is not locked out by ordinary command contention.
+        listener.listen(128)
         listener.settimeout(1.0)
         assert self.transport is not None
         self._write_state("ready", ssh_pid=self.transport.pid, ready_at=self.clock())
@@ -1324,6 +1345,28 @@ class BrokerServer:
             if not valid_request:
                 with suppress(OSError, BrokerProtocolError):
                     write_frame(local, {"type": "error", "error": "invalid_request"})
+                return
+            # The client enforces this ceiling too, but a client-side guard binds
+            # only the callers that carry it. Every already-running MCP process
+            # keeps its previous client until restarted, and the protocol still
+            # permits seven days, so the daemon -- the one component every caller
+            # shares -- has to be where a workstation-wide bound actually holds.
+            # Refuse rather than clamp: silently shortening a caller's deadline
+            # would change what it asked for without telling it.
+            if request_timeout is not None and float(request_timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
+                with suppress(OSError, BrokerProtocolError):
+                    write_frame(
+                        local,
+                        {
+                            "type": "error",
+                            "error": "timeout_too_large",
+                            "message": (
+                                f"requested {float(request_timeout):.0f}s exceeds the "
+                                f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s ceiling on how long one command may hold "
+                                "the shared serialized channel"
+                            ),
+                        },
+                    )
                 return
             # Never forward caller-owned container structure. Rebuilding the
             # exact wire object keeps local/remote validation independent of

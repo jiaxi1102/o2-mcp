@@ -208,9 +208,19 @@ automatic retry.
 ### Bounding one caller's cost, part two
 
 - The 300s cap on `o2_exec` guards one input model. `BrokerClient.execute`
-  enforces a 3600s ceiling for **every** caller, including in-process ones, so a
-  library caller cannot reinstate a multi-hour hold. The protocol itself still
-  permits seven days; nothing should want it.
+  enforces a 3600s ceiling for every caller of the client, **and the daemon
+  enforces it again** for every caller of the socket. Only the daemon can hold a
+  workstation-wide bound: a client-side guard binds only the processes carrying
+  it, and every already-running MCP process keeps its previous client until
+  restarted, while the protocol still permits seven days. The daemon refuses
+  rather than clamps — silently shortening a caller's deadline would change what
+  it asked for without telling it — and refuses before forwarding anything, so a
+  refusal is a rejected request rather than an uncertain outcome.
+- A forced stop must stay reachable under the contention that made it necessary,
+  so its connection waits (60s) rather than failing fast, and the listen backlog
+  is sized well above the number of MCP processes on a workstation. A connection
+  that cannot be queued fails outright, and a stop locked out by ordinary command
+  contention is no remedy at all.
 - An explicit `timeout=None` remains supported and unbounded by design. It is
   not a wedge risk: a dead helper, a dead SSH process, and a black-holed network
   all close the transport's stdout, so the daemon's read ends in every failure

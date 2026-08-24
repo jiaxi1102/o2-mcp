@@ -1242,6 +1242,109 @@ def test_force_is_only_recommended_for_a_confirmed_busy_broker(tmp_path):
     assert "force" not in message
 
 
+def test_the_daemon_enforces_the_timeout_ceiling_against_any_client(tmp_path, broker_root):
+    """A client-side ceiling binds only the callers that carry it.
+
+    Every already-running MCP process keeps its previous client until restarted,
+    and the protocol still permits seven days, so a bound that lives only in the
+    client is bypassed by exactly the processes already in flight. The daemon is
+    the one component every caller shares.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(10)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        # A request the current client would refuse locally, sent directly.
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "seven-day-hold",
+                "command": "sleep 600000",
+                "timeout_seconds": MAX_TIMEOUT_SECONDS,
+                "stdin": None,
+            },
+        )
+        response = read_frame(raw_stream)
+
+        assert response["type"] == "error"
+        assert response["error"] == "timeout_too_large"
+        assert "ceiling" in response["message"]
+        # Refused before dispatch, so the channel is untouched and still usable.
+        assert client.execute("printf alive", timeout=5).stdout == "alive"
+        assert client.ping()["commands_completed"] == 1
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
+def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, monkeypatch):
+    """A refusal is issued before anything is forwarded, so nothing ran.
+
+    Reporting it as an uncertain outcome would tell the caller not to retry a
+    command that never left the workstation. Driven through a fake socket rather
+    than a real daemon: the in-process test harness shares module globals with
+    the daemon, so lowering the client's ceiling would lower the daemon's too.
+    """
+
+    class _RefusingDaemon:
+        """A socket that answers one exec frame with a refusal frame."""
+
+        def __init__(self):
+            self.replies = io.BytesIO()
+
+        def settimeout(self, _timeout):
+            return None
+
+        def makefile(self, *_args, **_kwargs):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def write(self, data):
+            request = read_frame(io.BytesIO(bytes(data)))
+            self.replies = io.BytesIO(
+                encode_frame(
+                    {
+                        "type": "error",
+                        "error": "timeout_too_large",
+                        "message": "requested 604800s exceeds the 3600s ceiling",
+                        "id": request["id"],
+                    }
+                )
+            )
+            return len(data)
+
+        def flush(self):
+            return None
+
+        def recv(self, size):
+            return self.replies.read(size)
+
+        def close(self):
+            return None
+
+    client = BrokerClient(broker_root)
+    monkeypatch.setattr(client, "_connect", lambda **_kwargs: _RefusingDaemon())
+
+    with pytest.raises(O2BrokerError) as refused:
+        client.execute("sleep 600000", timeout=60)
+
+    assert "timeout_too_large" in str(refused.value)
+    assert not isinstance(refused.value, O2BrokerCommandOutcomeUnknownError)
+
+
 @pytest.mark.parametrize("timeout", [MAX_COMMAND_TIMEOUT_SECONDS + 1, 100_000.0])
 def test_a_multi_hour_command_timeout_is_refused_before_any_socket_access(broker_root, timeout):
     """One command's deadline is also its licence to hold the shared channel.
