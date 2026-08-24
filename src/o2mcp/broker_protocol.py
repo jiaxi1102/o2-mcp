@@ -35,8 +35,9 @@ MAX_COMMAND_BYTES = 64 * 1024
 # added; production ids are UUIDs and need only 36 bytes.
 MAX_REQUEST_ID_BYTES = 128
 # Finite deadlines are capped below platform socket/select overflow ranges. A
-# caller that truly needs no deadline must send JSON null / Python ``None``
-# explicitly rather than approximating infinity with a huge number.
+# deadline-free request is sent as JSON null / Python ``None`` rather than
+# approximated with a huge number, so the daemon can recognize it -- and bound
+# it, since no caller may hold the shared channel indefinitely.
 MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 # Stdin shares a request frame with command metadata and crosses the policy
 # mutex-protected transport write. Keep it bounded independently from the much

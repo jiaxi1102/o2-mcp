@@ -244,11 +244,19 @@ automatic retry.
   is sized well above the number of MCP processes on a workstation. A connection
   that cannot be queued fails outright, and a stop locked out by ordinary command
   contention is no remedy at all.
-- An explicit `timeout=None` remains supported and unbounded by design. It is
-  not a wedge risk: a dead helper, a dead SSH process, and a black-holed network
-  all close the transport's stdout, so the daemon's read ends in every failure
-  mode. The only unbounded case is a command that genuinely never finishes,
-  which is what the caller asked for.
+- An explicit `timeout=None` is still accepted on the wire, but the daemon does
+  **not** honour it as unbounded: it is clamped to the ceiling before dispatch
+  like any over-ceiling deadline, and the reduction is reported in `stderr` as
+  "no deadline". A library caller must not design a long-running command around
+  an unbounded contract.
+- The earlier argument for leaving it unbounded — that a dead helper, a dead SSH
+  process, and a black-holed network all close the transport's stdout, so the
+  read ends in every failure mode — is true as far as it goes, and it is why
+  every *failure* mode self-heals. What it misses is the case it dismissed: a
+  command that genuinely never finishes is not just "what the caller asked for"
+  when the thing being asked for is exclusive use of a channel twenty sessions
+  share. That is precisely the shape an agent polling inside a command creates,
+  and it is the one request the daemon has no watchdog for.
 
 ### Command observability
 

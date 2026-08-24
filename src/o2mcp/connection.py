@@ -1227,9 +1227,11 @@ class O2Connection:
                 raise O2UnsafeTransportError(
                     f"Persistent brokers may target only configured O2 aliases, not '{target}'."
                 )
-            # Preserve the public runner contract: ``None`` means no deadline.
-            # The broker protocol carries JSON null explicitly rather than
-            # silently converting it into an arbitrary long finite timeout.
+            # ``None`` is forwarded as JSON null rather than approximated by a
+            # huge finite number, so the daemon can recognize a deadline-free
+            # request as such. It does not grant one: the daemon clamps null to
+            # the workstation ceiling, because unbounded exclusive use of a
+            # channel every session shares is not a caller's to request.
             remote_timeout = float(timeout) if timeout is not None else None
             result = broker.execute(command, timeout=remote_timeout, input_text=input_text)
             truncation_notes: list[str] = []
