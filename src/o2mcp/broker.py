@@ -585,6 +585,12 @@ class BrokerClient:
         try:
             pong = self.ping(timeout=0.25)
         except O2BrokerError as exc:
+            # A command dispatched after the snapshot above publishes its own
+            # receipt and then leaves this ping queued behind it, so the
+            # pre-ping snapshot can omit the very command that caused the
+            # silence. Re-read before summarizing: the fresher receipt is what
+            # explains an unanswered ping.
+            state = _read_state(self.paths)
             return {**state, **self._busy_summary(state), "responsive": False, "local_error": str(exc)}
         # A serialized daemon can only answer between commands, so a pong is
         # positive proof that nothing occupies the channel. That evidence

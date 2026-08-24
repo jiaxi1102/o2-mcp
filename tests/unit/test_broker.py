@@ -1195,6 +1195,60 @@ def test_receipt_keeps_ordinary_remote_measurements():
     assert _receipt_returncode(-1) == -1
 
 
+def test_status_rereads_the_receipt_after_an_unanswered_ping(tmp_path, broker_root):
+    """A command that starts during the status call must still be named.
+
+    The receipt snapshot is taken before the ping, so a command dispatched in
+    between publishes its record and then leaves the ping queued behind it. The
+    stale snapshot would report the silence without its cause -- exactly the
+    case this diagnostic exists for.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+
+        def dispatch_then_time_out(*_args, **_kwargs):
+            """Stand in for a ping queued behind a command that started late."""
+
+            write_frame(
+                occupant_stream,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "late-occupant",
+                    "command": "sleep 2; printf late",
+                    "timeout_seconds": 10,
+                    "stdin": None,
+                },
+            )
+            assert read_frame(occupant_stream) == {"type": "dispatched", "id": "late-occupant"}
+            deadline = time.monotonic() + 3
+            while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out")
+
+        # The snapshot inside local_status is taken before this runs.
+        client.ping = dispatch_then_time_out
+        status = client.local_status()
+
+        assert status["responsive"] is False
+        assert status["busy"] is True
+        assert status["in_flight"]["request_id"] == "late-occupant"
+        assert status["in_flight"]["command"]["preview"] == "sleep 2; printf late"
+
+        del client.ping
+        assert read_frame(occupant_stream)["stdout"] == "late"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
 def test_occupancy_survives_a_wall_clock_step(tmp_path, broker_root):
     """An NTP or manual clock correction must not corrupt the occupancy metric."""
 
