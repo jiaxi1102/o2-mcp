@@ -1008,6 +1008,13 @@ class BrokerServer:
         # rewrites one dict, so without this a control stop landing during a
         # command completion could interleave and persist a torn record.
         self._state_lock = threading.Lock()
+        # Held across the check-and-dispatch boundary, and by a control stop
+        # while it sets the flag. Rechecking the flag alone would only narrow
+        # the window: a request accepted before the stop is no longer queued,
+        # so nothing else prevents it starting after the operator was told the
+        # broker was stopping. The lock covers writing the remote frame, not
+        # waiting for its result, so a stop still never waits out a command.
+        self._dispatch_lock = threading.Lock()
         self._stop_requested = False
         self._commands_completed = 0
         self._in_flight: dict[str, Any] | None = None
@@ -1425,7 +1432,11 @@ class BrokerServer:
                 # than served first -- which is what makes this prompt. The
                 # running command itself is still allowed to finish; abandoning
                 # it would turn a stop into an unknown remote outcome.
-                self._stop_requested = True
+                # Take the dispatch lock so this cannot land between a command
+                # thread's own stop check and its remote frame write. Waiting
+                # here is bounded by that write, never by a running command.
+                with self._dispatch_lock:
+                    self._stop_requested = True
                 with suppress(O2BrokerError, OSError):
                     self._write_state("stopping", stop_reason=str(request.get("reason") or "control request"))
                 write_frame(reply, {"type": "stopping", "pid": os.getpid(), "via": "control"})
@@ -1574,12 +1585,20 @@ class BrokerServer:
             # also linearizes a concurrent disable: it either prevents this
             # command or observes a command that was already launched.
             try:
-                with self.policy.serialize_reuse_launch():
+                with self.policy.serialize_reuse_launch(), self._dispatch_lock:
                     # This acknowledgement is the execution boundary. If a
                     # queued caller has disconnected, do not forward its frame;
                     # otherwise it could perform a mutation after reporting a
                     # local timeout and invite a dangerous retry.
                     if self._local_caller_disconnected(client):
+                        return
+                    # A stop acknowledged on the control endpoint must mean no
+                    # further work starts. This request was accepted before that
+                    # stop and so is not in the queue the outer loop skips.
+                    # Returning without a reply is the same cancellation the
+                    # disconnect check performs: every client reads it as "not
+                    # dispatched", which is exactly true.
+                    if self._stop_requested:
                         return
                     try:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})

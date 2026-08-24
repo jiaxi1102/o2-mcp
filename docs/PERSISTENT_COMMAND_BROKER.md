@@ -197,9 +197,14 @@ automatic retry.
   while the command loop is blocked on a remote result — the state in which the
   command socket cannot answer at all. Setting the stop flag there is the whole
   mechanism: the command loop rechecks it before accepting anything else, so
-  every request already queued behind the running command is **skipped rather
-  than served first**. The bound falls from queue depth × per-command ceiling to
-  a single command.
+  every request behind the running command is **discarded rather than run**. The
+  bound falls from queue depth × per-command ceiling to a single command.
+- Skipping the queue is not sufficient on its own. A connection the command
+  thread has already accepted has left that queue, so a stop and the
+  check-and-dispatch boundary are made mutually exclusive by a lock the control
+  stop also takes. It covers writing the remote frame, never waiting for its
+  result, so a stop is still not delayed by a running command. Callers cancelled
+  this way are told their request was not dispatched, which is exactly true.
 - **The control endpoint carries no commands.** It answers `stop` and `ping` and
   refuses everything else, including `exec`. It is not a second route to O2 and
   must not become one; widening it should be a deliberate act, which is why it

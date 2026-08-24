@@ -726,8 +726,10 @@ class O2Connection:
         Prefers the control endpoint, which a separate daemon thread answers
         immediately even while a command holds the channel. The stop flag it
         sets is rechecked by the command loop before it accepts anything else,
-        so requests already queued behind the running command are skipped rather
-        than served first. The running command is still allowed to finish;
+        and again at the dispatch boundary, so requests behind the running
+        command are discarded rather than run -- whether they are still queued
+        or were accepted moments before the stop. Each such caller is told its
+        request was not dispatched, so nothing it submitted reached O2. The running command is still allowed to finish;
         abandoning it would convert a stop into an unknown remote outcome, and
         a stop that must pre-empt even that remains a manual kill.
 

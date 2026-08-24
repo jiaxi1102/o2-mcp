@@ -673,11 +673,11 @@ async def o2_stop_broker(params: StopBrokerInput) -> str:
     that happens the error names the command holding the channel and points at
     `force`, which the daemon honours even after the caller gives up waiting.
 
-    A stop is answered on the control endpoint, so it is prompt even while the
-    broker is busy, and the daemon
-    serves one request at a time in arrival order, so it takes effect after the
-    in-flight command and anything already waiting ahead of it, and abandons
-    none of them.
+    A stop is answered on the broker's control endpoint, so it is prompt even
+    while the broker is busy. It lets the in-flight command finish and then
+    exits: commands that were queued behind it are DISCARDED, not run. A caller
+    whose request is discarded is told it was not dispatched, so nothing it
+    submitted has run on O2 -- but do not assume queued work completes.
     """
 
     def work() -> dict[str, Any]:

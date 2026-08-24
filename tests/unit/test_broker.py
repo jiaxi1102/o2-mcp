@@ -1134,6 +1134,59 @@ def test_a_control_stop_skips_queued_commands_instead_of_waiting_for_them(tmp_pa
             _stop_local_broker(thread, client)
 
 
+def test_a_stop_prevents_a_command_accepted_just_before_it_from_running(tmp_path, broker_root):
+    """Skipping the queue is not enough: an accepted request has left it.
+
+    A connection the command thread has already accepted is no longer waiting in
+    the backlog the outer loop declines to serve, so nothing else stops it being
+    dispatched after the operator was told the broker was stopping. That window
+    is as long as reading a frame, not an instant.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    accepted = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    accepted_stream = None
+    try:
+        accepted.settimeout(10)
+        accepted.connect(str(client.paths.socket))
+        accepted_stream = accepted.makefile("rwb", buffering=0)
+        # Send only the frame marker. The daemon accepts, enters its handler and
+        # blocks awaiting the rest, which puts it precisely in the window under
+        # test rather than relying on timing alone.
+        accepted.sendall(FRAME_MAGIC)
+        time.sleep(0.2)
+
+        assert client.control_stop(reason="stop during frame read")["via"] == "control"
+
+        body = json.dumps(
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "accepted-before-stop",
+                "command": "printf must-not-run",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        accepted.sendall(struct.pack("!I", len(body)) + body)
+
+        # Cancelled exactly as a disconnected caller is: no reply at all, which
+        # every client reads as "not dispatched".
+        with pytest.raises((BrokerProtocolError, OSError)):
+            read_frame(accepted_stream)
+
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert _read_state(client.paths)["commands_completed"] == 0
+    finally:
+        if accepted_stream is not None:
+            accepted_stream.close()
+        accepted.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
 def test_the_control_endpoint_answers_a_ping_the_command_socket_cannot(tmp_path, broker_root):
     """A busy daemon looks dead on the command socket and alive on this one."""
 
