@@ -553,8 +553,7 @@ class BrokerClient:
             raise O2BrokerUnavailableError(f"unexpected local broker status response: {response!r}")
         return response
 
-    @staticmethod
-    def _busy_summary(state: dict[str, Any]) -> dict[str, Any]:
+    def _busy_summary(self, state: dict[str, Any]) -> dict[str, Any]:
         """Describe an in-flight command so an unanswered ping stays diagnosable.
 
         The daemon serializes local clients, so it cannot answer a ping while a
@@ -572,10 +571,29 @@ class BrokerClient:
         in_flight = state.get("in_flight")
         if state.get("status") != "ready" or not isinstance(in_flight, dict):
             return {"busy": False}
+        # A daemon killed before it can run its terminal write -- SIGKILL, a
+        # crash, a reboot -- leaves a `ready` receipt naming a command that
+        # nothing will ever retire. The lifetime lock is the liveness signal: no
+        # holder means no daemon, so the record describes a command that is not
+        # running and reporting it as busy would recreate the ambiguity this
+        # diagnostic exists to remove. Inspection failures are not evidence of
+        # occupancy either, and this call must never raise: a status read stays
+        # readable even when the lock cannot be examined.
+        try:
+            if not self.launch_in_progress():
+                return {"busy": False}
+        except O2BrokerError:
+            return {"busy": False}
         summary: dict[str, Any] = {"busy": True}
-        dispatched_at = _receipt_number(in_flight.get("dispatched_at"))
-        if dispatched_at is not None:
-            summary["busy_for_seconds"] = max(0.0, time.time() - dispatched_at)
+        # A held lock implies a live daemon, hence no reboot since it started,
+        # so its persisted monotonic reading is comparable with this process's
+        # clock. Prefer it: subtracting epochs would let an NTP or manual step
+        # inflate this value or clamp it to zero, the same defect already fixed
+        # for completed occupancy. Without a usable reading, report no elapsed
+        # time rather than a wrong one.
+        dispatched_monotonic = _receipt_number(in_flight.get("dispatched_monotonic"))
+        if dispatched_monotonic is not None:
+            summary["busy_for_seconds"] = max(0.0, time.monotonic() - dispatched_monotonic)
         return summary
 
     def local_status(self) -> dict[str, Any]:
@@ -1190,6 +1208,7 @@ class BrokerServer:
                         "command": _command_fingerprint(request["command"]),
                         "timeout_seconds": request_timeout,
                         "dispatched_at": dispatched_at,
+                        "dispatched_monotonic": dispatched_monotonic,
                     }
                     self._in_flight = in_flight
                     self._write_remote_frame_with_deadline(remote_in, remote_request)
@@ -1234,7 +1253,7 @@ class BrokerServer:
                     last_command_at=completed_at,
                     in_flight=None,
                     last_command={
-                        **in_flight,
+                        **{key: value for key, value in in_flight.items() if key != "dispatched_monotonic"},
                         "completed_at": completed_at,
                         # Broker-observed occupancy: how long this command held the
                         # sole serialized channel, which is what starves other

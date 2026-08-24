@@ -42,6 +42,7 @@ from o2mcp.broker import (
     BrokerServer,
     O2BrokerError,
     O2BrokerUnavailableError,
+    _atomic_json_write,
     _read_launch_fd,
     _read_state,
     _receipt_number,
@@ -1193,6 +1194,99 @@ def test_receipt_keeps_ordinary_remote_measurements():
     assert _receipt_number(2) == 2.0
     assert _receipt_returncode(0) == 0
     assert _receipt_returncode(-1) == -1
+
+
+def test_a_retained_record_is_not_busy_without_a_live_daemon(broker_root):
+    """A daemon killed before its terminal write must not look busy forever.
+
+    SIGKILL, a crash, or a reboot skips the terminal receipt, leaving `ready`
+    plus a record nothing will retire. Reporting that as busy would recreate the
+    ambiguity this diagnostic removes.
+    """
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(
+        paths.state,
+        {
+            "schema_version": 1,
+            "protocol": PROTOCOL_VERSION,
+            "status": "ready",
+            "alias": "offline-o2",
+            "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+            "in_flight": {
+                "request_id": "orphaned-command",
+                "command": {"preview": "sleep 900", "sha256": "0" * 64, "bytes": 9},
+                "dispatched_at": time.time() - 900,
+                "dispatched_monotonic": time.monotonic() - 900,
+            },
+        },
+    )
+
+    status = BrokerClient(paths.root).local_status()
+
+    assert status["responsive"] is False
+    # No process holds the lifetime lock, so nothing is occupying the channel.
+    assert status["busy"] is False
+    assert "busy_for_seconds" not in status
+    # The record itself is still retained for forensics.
+    assert status["in_flight"]["request_id"] == "orphaned-command"
+
+
+def test_live_busy_time_ignores_a_wrong_wall_clock(tmp_path, broker_root):
+    """`busy_for_seconds` must not inherit a stepped or otherwise wrong epoch."""
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        # A daemon whose wall clock reads a day and change in the past.
+        clock=lambda: time.time() - 100_000,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="wrong-clock-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "wrong-clock-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "wrong-clock-occupant"}
+
+        deadline = time.monotonic() + 5
+        status = client.local_status()
+        while status.get("busy") is not True and time.monotonic() < deadline:
+            status = client.local_status()
+
+        assert status["busy"] is True
+        # Epoch arithmetic would report roughly 100000 seconds here.
+        assert 0 <= status["busy_for_seconds"] < 60
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        client.stop(reason="wrong clock test complete")
+        thread.join(timeout=5)
 
 
 def test_status_rereads_the_receipt_after_an_unanswered_ping(tmp_path, broker_root):

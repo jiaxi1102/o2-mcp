@@ -186,6 +186,12 @@ carries the missing half of that picture:
   bounded by the write deadline, a write that fails inside it is still named by
   the terminal receipt, and occupancy already covers it because timing starts at
   the acknowledgement.
+- `busy` also requires that a daemon still holds the lifetime lock. A daemon
+  killed before its terminal write -- SIGKILL, a crash, a reboot -- leaves a
+  `ready` receipt naming a command nothing will retire, and without that check
+  it would report busy forever. `busy_for_seconds` is derived from a persisted
+  `time.monotonic()` reading rather than the epoch, which is sound precisely
+  because a held lock implies a live daemon and therefore the same boot.
 - The record is best effort, not a ledger. Consecutive suppressed writes can
   leave it naming an earlier command than the one actually running; it is a
   diagnostic aid, and the pong remains the authority on whether the channel is
