@@ -399,6 +399,11 @@ async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
             self.calls.append(("run", command, timeout, alias, broker_role))
             return CommandResult(["broker", alias, command], 0, "transfer-ok\n", "")
 
+        def probe(self, *, alias=None, broker_role=None):
+            # Mirrors the real connection, which routes its probe through `run`
+            # so a single deadline governs every caller of it.
+            return self.run("hostname; whoami; date", timeout=25, alias=alias, broker_role=broker_role)
+
         def stop_broker(self, *, reason, transfer=False, force=False):
             self.calls.append(("stop", reason, transfer, force))
             return {"type": "stopping"}

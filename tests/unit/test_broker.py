@@ -72,6 +72,7 @@ from o2mcp.broker_protocol import (
 )
 from o2mcp.connection import _held_lock_explanation
 from o2mcp.policy import DEFAULT_LOGIN_COOLDOWN_SECONDS, O2PolicyDeniedError, O2PolicyStore
+from o2mcp.workspace_exec import O2Workspace
 
 
 def _reuse_policy(tmp_path) -> O2PolicyStore:
@@ -1425,6 +1426,61 @@ def test_a_daemon_refusal_is_not_reported_as_an_uncertain_outcome(broker_root, m
 
     assert "some_future_refusal" in str(refused.value)
     assert not isinstance(refused.value, O2BrokerCommandOutcomeUnknownError)
+
+
+def test_a_generous_connect_timeout_cannot_push_a_probe_past_the_ceiling(monkeypatch):
+    """Lowering a ceiling must account for configured deadlines, not only literal ones.
+
+    `connect_timeout` is operator-configurable and unbounded, and the probe
+    derives its deadline from it. Passed through unclamped, a generous value
+    would be refused by the client ceiling before reaching the broker at all --
+    breaking the probe rather than bounding it.
+    """
+
+    requested: list[float | None] = []
+
+    def _record(self, command, **kwargs):  # noqa: ARG001 - signature mirrors O2Connection.run
+        requested.append(kwargs.get("timeout"))
+        return CommandResult(argv=["probe"], returncode=0, stdout="host\nuser\n", stderr="")
+
+    connection = O2Connection(O2Config(connect_timeout=int(MAX_COMMAND_TIMEOUT_SECONDS) + 600))
+    monkeypatch.setattr(type(connection), "run", _record)
+
+    connection.probe()
+    # The MCP tool routes through this same method rather than restating the
+    # deadline, so covering it here covers both callers.
+    connection.probe(alias="o2-transfer", broker_role="transfer")
+
+    assert len(requested) == 2, requested
+    for deadline in requested:
+        assert deadline is not None
+        assert deadline <= MAX_COMMAND_TIMEOUT_SECONDS, deadline
+
+
+def test_the_ceiling_still_admits_the_longest_deadline_any_caller_asks_for():
+    """Lowering a shared ceiling must not quietly break an existing caller.
+
+    `O2Workspace` sizes group storage with `du -sb` at 300s, the longest
+    deadline anything in this repository requests. A ceiling below it would fail
+    that call only when the filesystem is slow -- exactly when it matters -- so
+    the relationship is exercised here rather than left to be discovered there.
+    """
+
+    requested: list[float | None] = []
+
+    class _RecordingConnection:
+        config = O2Config()
+
+        def run(self, _command, *, timeout=None, **_kwargs):
+            requested.append(timeout)
+            return CommandResult(argv=["du"], returncode=0, stdout="10\t/n/groups/tabin/a", stderr="")
+
+    O2Workspace(_RecordingConnection()).disk_report(["/n/groups/tabin"])
+
+    assert requested, "expected the workspace probe to issue a command"
+    for deadline in requested:
+        assert deadline is not None
+        assert deadline <= MAX_COMMAND_TIMEOUT_SECONDS, (deadline, MAX_COMMAND_TIMEOUT_SECONDS)
 
 
 @pytest.mark.parametrize("timeout", [MAX_COMMAND_TIMEOUT_SECONDS + 1, 100_000.0])

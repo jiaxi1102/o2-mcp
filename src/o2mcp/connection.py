@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from o2mcp.broker import (
+    MAX_COMMAND_TIMEOUT_SECONDS,
     BrokerClient,
     O2BrokerError,
     O2BrokerStartupError,
@@ -1262,9 +1263,26 @@ class O2Connection:
             input_text,
         )
 
-    def probe(self) -> CommandResult:
-        """Run one explicit fixed command through the persistent broker."""
-        return self.run("hostname; whoami; date", timeout=self.config.connect_timeout + 5)
+    def probe(self, *, alias: str | None = None, broker_role: LoginTarget | None = None) -> CommandResult:
+        """Run one explicit fixed command through the persistent broker.
+
+        Takes the role arguments the MCP tool needs so there is one probe rather
+        than two. A second copy of this deadline is how the ceiling came to be
+        enforced in one of them and not the other.
+        """
+
+        # `connect_timeout` is operator-configurable and unbounded, so a
+        # generous value would otherwise derive a probe deadline above the
+        # command ceiling and be refused before reaching the broker at all.
+        # Clamp instead: no command may hold the shared channel longer than the
+        # ceiling, and a probe is not an exception to that.
+        probe_timeout = min(float(self.config.connect_timeout) + 5.0, MAX_COMMAND_TIMEOUT_SECONDS)
+        return self.run(
+            "hostname; whoami; date",
+            timeout=probe_timeout,
+            alias=alias,
+            broker_role=broker_role,
+        )
 
     def _ssh_destination_from_argv(self, argv: list[str]) -> str | None:
         """Return the destination operand from one raw SSH command.

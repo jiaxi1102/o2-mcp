@@ -228,7 +228,7 @@ automatic retry.
 ### Bounding one caller's cost, part two
 
 - The 60s cap on `o2_exec` guards one input model. `BrokerClient.execute`
-  enforces a 3600s ceiling for every caller of the client, **and the daemon
+  enforces a 300s ceiling for every caller of the client, **and the daemon
   enforces it again** for every caller of the socket. Only the daemon can hold a
   workstation-wide bound: a client-side guard binds only the processes carrying
   it, and every already-running MCP process keeps its previous client until
