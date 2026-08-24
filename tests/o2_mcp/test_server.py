@@ -604,6 +604,35 @@ async def test_exec_timeout_is_capped_so_one_command_cannot_hold_the_channel_for
 
 
 @pytest.mark.anyio
+async def test_a_remote_wait_is_not_expressible_through_exec(monkeypatch, tmp_path):
+    """The cap is what bans waiting, because detecting a wait cannot work.
+
+    This command is taken verbatim from a live occupancy record: an agent
+    waiting on a Slurm job by sleeping remotely under a 290s deadline, holding
+    the channel every other session shares for most of five minutes in order to
+    do nothing. `sleep`, `python -c "time.sleep(...)"` and a `while` loop are
+    one intent in three shapes, so the bound is on occupancy rather than on
+    anything read out of the command string.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, master=True)
+    with pytest.raises(ToolError):
+        await o2server.mcp.call_tool(
+            "o2_exec",
+            {
+                "params": {
+                    "command": "sleep 280; sacct -j 51202268 --format=State,Elapsed -P -n",
+                    "timeout_seconds": 290,
+                }
+            },
+        )
+
+    # Still ample for what the tool is actually for.
+    inspection = await _call("o2_exec", {"params": {"command": "squeue -u me", "timeout_seconds": 30}})
+    assert inspection["ok"] is True
+
+
+@pytest.mark.anyio
 async def test_invalid_input_is_rejected(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, master=True)
     # Empty command violates min_length=1; the MCP layer must reject it.
