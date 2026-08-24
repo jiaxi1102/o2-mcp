@@ -157,7 +157,13 @@ automatic retry.
   between checks.
 - The wait for a dispatch acknowledgement is bounded too, scaled to the caller's
   own deadline (`max(60s, timeout_seconds)`, or 300s when no deadline was
-  given). Without this bound a starved caller simply never returns, which is
+  given). That budget starts at the connection, not after it: the daemon accepts
+  nothing while serving a command, so callers fill the listen backlog and
+  eventually `connect` itself blocks. A short ceiling there would report a
+  healthy but saturated broker as *absent*, which is the one diagnosis that
+  points a caller at starting another one. A receipt that fails validation still
+  raises before any connection, so a genuinely missing broker keeps its own
+  error. Without this bound a starved caller simply never returns, which is
   indistinguishable from a hang; `o2_exec` reports it as `broker_busy` and the
   message names the command occupying the channel from the in-flight receipt.
 - A budget expiry is **not** proof the request was never dispatched. The daemon

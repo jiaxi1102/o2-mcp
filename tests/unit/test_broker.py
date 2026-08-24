@@ -1129,6 +1129,42 @@ def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_r
         _stop_local_broker(thread, client)
 
 
+def test_a_saturated_backlog_is_reported_as_busy_not_as_a_missing_broker(broker_root, monkeypatch):
+    """A full listen backlog means the broker is busy, not absent.
+
+    The daemon accepts nothing while serving a command, so callers pile into a
+    bounded listen backlog and eventually `connect` itself blocks. Absent is the
+    one diagnosis that points a caller at starting another broker, so a healthy
+    saturated one must never produce it. This pins the classification rather
+    than the kernel behaviour, which varies by platform.
+    """
+
+    client = BrokerClient(broker_root)
+
+    def _saturated_backlog(**_kwargs):
+        try:
+            raise socket.timeout("timed out")
+        except socket.timeout as cause:
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out") from cause
+
+    monkeypatch.setattr(client, "_connect", _saturated_backlog)
+    with pytest.raises(O2BrokerBusyError):
+        client.execute("printf queued", timeout=5)
+
+    def _socket_refused(**_kwargs):
+        try:
+            raise ConnectionRefusedError("connection refused")
+        except ConnectionRefusedError as cause:
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: refused") from cause
+
+    # A daemon that is genuinely gone must keep its own diagnosis: the remedy
+    # there really is to start one.
+    monkeypatch.setattr(client, "_connect", _socket_refused)
+    with pytest.raises(O2BrokerUnavailableError) as refused:
+        client.execute("printf queued", timeout=5)
+    assert not isinstance(refused.value, O2BrokerBusyError)
+
+
 def test_a_request_recorded_as_in_flight_is_never_reported_as_merely_queued(broker_root):
     """The receipt settles the one direction it can: this request is running.
 

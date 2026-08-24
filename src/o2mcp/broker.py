@@ -540,19 +540,33 @@ class BrokerClient:
             encode_frame(request)
         except BrokerProtocolError as exc:
             raise ValueError(f"encoded broker request exceeds the frame contract: {exc}") from exc
-        client = self._connect(timeout=5.0)
-        # The five-second socket deadline guards only the local connect. Queue
+        queue_wait = _queue_wait_seconds(timeout)
+        queue_deadline = time.monotonic() + queue_wait
+        # The queue begins at the connection, not after it. The daemon accepts
+        # nothing while it serves a command, so callers pile into the listen
+        # backlog; once that is full, connect() itself blocks. A short ceiling
+        # there would report a healthy but saturated broker as absent, and
+        # absent is the one diagnosis that tells a caller to start another one.
+        # A receipt that fails validation still raises before any connection, so
+        # a genuinely missing broker keeps its own error.
+        try:
+            client = self._connect(timeout=queue_wait)
+        except O2BrokerUnavailableError as exc:
+            if isinstance(exc.__cause__, socket.timeout):
+                raise self._undispatched_error(request_id, queue_wait) from exc
+            raise
+        # The connect deadline guards only the local connect. Queue
         # time is not command time: the daemon acknowledges `dispatched` only
         # once this request reaches the front and policy still permits its
         # remote frame, and a large valid frame can fill the Unix send buffer
         # while an earlier command is being served. Give the whole pre-dispatch
-        # phase one absolute budget rather than no budget at all -- a caller
-        # blocked here has sent nothing, so ending its wait is safe, whereas
-        # waiting forever turns a busy channel into an MCP call that never
-        # returns. Abandoning the socket also makes the daemon cancel the
-        # queued request instead of running it unobserved.
-        queue_wait = _queue_wait_seconds(timeout)
-        queue_deadline = time.monotonic() + queue_wait
+        # phase one absolute budget rather than no budget at all: waiting
+        # forever turns a busy channel into an MCP call that never returns,
+        # which is the failure this bound exists to replace. Expiry is reported,
+        # not treated as proof the request never ran -- see
+        # ``_undispatched_error``. Abandoning the socket does usually make the
+        # daemon cancel the queued request rather than run it unobserved, but
+        # that check is best effort and cannot be relied on for correctness.
         dispatched = False
         try:
             with client.makefile("rwb", buffering=0) as stream:
