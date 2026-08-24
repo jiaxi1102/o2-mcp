@@ -726,9 +726,13 @@ class O2Connection:
         one: it queues behind the command holding the channel, and the daemon
         cancels a queued stop whose caller has already timed out. ``force`` marks
         the request as one the daemon honours anyway, which is the only way to
-        retire a busy broker. It stays inside the socket's own authority -- no
-        pid is read and no signal is sent -- and never abandons the in-flight
-        command; the daemon exits once that command ends.
+        retire a busy broker through the socket. It stays inside the socket's own
+        authority -- no pid is read and no signal is sent -- and never abandons a
+        running command.
+
+        It is also queued, not prioritized: the daemon serves one connection at
+        a time in arrival order, so a forced stop waits out the in-flight command
+        and anything already queued ahead of it.
         """
 
         client = self._broker_client(transfer=transfer)
@@ -752,7 +756,8 @@ class O2Connection:
                 f"The broker did not answer its socket, so it was not stopped: {exc}. It has been serving a "
                 f"command{seconds}{named}. A queued stop is cancelled once its caller times out, so a plain stop "
                 "cannot retire a busy broker. Re-issue with force=true to have the daemon honour the request "
-                "anyway; it then stops once that command ends, without abandoning it."
+                "anyway. It is queued rather than prioritized, so it takes effect after this command and any "
+                "requests already waiting ahead of it, without abandoning any of them."
             ) from exc
 
     # -- ControlMaster lifecycle ------------------------------------------------

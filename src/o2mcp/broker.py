@@ -809,10 +809,18 @@ class BrokerClient:
         cannot reach any request until its command ends.
 
         ``force`` marks the request as one to honour regardless, so the operator's
-        intent survives their own timeout. It is still graceful and still
-        serialized: the daemon acts on it after the in-flight command finishes,
-        never by abandoning that command. An older daemon ignores the flag and
+        intent survives their own timeout. An older daemon ignores the flag and
         simply behaves as before.
+
+        It is graceful and it is queued, which bounds how fast it can possibly
+        act. The daemon serves one connection at a time from a FIFO accept
+        queue, so a forced stop takes effect after the in-flight command *and
+        any connections already queued ahead of it* have been served -- a delay
+        bounded by queue depth times the per-command ceiling, not by one
+        command. Nothing here abandons a running command, and no request jumps
+        the queue; a stop that must act immediately still needs a signal sent by
+        hand, and a control path that is not behind the command queue is the
+        proper fix.
         """
 
         # A forced stop is an explicit operator action against a broker that is

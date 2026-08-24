@@ -189,10 +189,20 @@ automatic retry.
   remedy did nothing in exactly the situation that prompts reaching for it.
 - `force: true` marks the request as one the daemon honours regardless of
   whether its caller is still waiting. It is the only way to retire a busy
-  broker, and it stays inside the socket's own authority: no pid is read and no
-  signal is sent. It is still graceful and still serialized — the daemon acts on
-  it once the in-flight command finishes, never by abandoning that command. An
-  older daemon ignores the flag and behaves as before.
+  broker through the socket, and it stays inside the socket's own authority: no
+  pid is read and no signal is sent. An older daemon ignores the flag and
+  behaves as before.
+- **A forced stop is queued, not prioritized, and that bounds how fast it can
+  act.** The daemon serves one connection at a time from a FIFO accept queue, so
+  a forced stop takes effect after the in-flight command *and any connections
+  already queued ahead of it* — a delay bounded by queue depth times the
+  per-command ceiling, not by a single command. Through `o2_exec` that is queue
+  depth × 300s; a library caller at the 3600s ceiling makes it far worse. It
+  abandons nothing and jumps nothing.
+- A stop that must act *now* still means killing the daemon by hand. The proper
+  fix is a control path that does not sit behind the command queue — a second
+  listener the daemon services independently — which is deliberately **not** in
+  this change: it is a new authority boundary and wants its own review.
 - Signalling the daemon by pid was tried and abandoned. A pid can only be taken
   from the receipt or from the lock file, and neither survives the gap to the
   `kill`: a receipt outlives its daemon, and a lock read proves only who held
