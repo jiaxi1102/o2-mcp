@@ -112,6 +112,14 @@ MAX_COMMAND_TIMEOUT_SECONDS = 3600.0
 # A forced stop must outlast the contention that made it necessary: its
 # connection may sit in the listen backlog behind queued commands before the
 # daemon accepts it.
+# A control frame is a stop or a ping: a couple of hundred bytes. Anything
+# slower than this is a stalled or broken caller, and the endpoint's whole value
+# is being answerable, so it does not wait on one the way a command socket may.
+CONTROL_REQUEST_TIMEOUT_SECONDS = 1.0
+# Control traffic is one frame per operator action. The cap exists so a burst of
+# stalled callers cannot consume unbounded threads; past it connections are
+# closed rather than queued, because queueing is what would delay a stop.
+MAX_CONCURRENT_CONTROL_HANDLERS = 16
 FORCED_STOP_WAIT_SECONDS = 60.0
 MIN_QUEUE_WAIT_SECONDS = 60.0
 DEFAULT_QUEUE_WAIT_SECONDS = 300.0
@@ -1022,6 +1030,7 @@ class BrokerServer:
         # write rather than a frame write that a large stdin can stretch to
         # tens of seconds.
         self._dispatch_lock = threading.Lock()
+        self._control_slots = threading.Semaphore(MAX_CONCURRENT_CONTROL_HANDLERS)
         self._stop_requested = False
         self._commands_completed = 0
         self._in_flight: dict[str, Any] | None = None
@@ -1414,18 +1423,43 @@ class BrokerServer:
             except OSError:
                 # The listener was closed underneath us during shutdown.
                 return
-            # One malformed or hostile request must not take the control
-            # thread down with it: a dead control thread is a silently
-            # unstoppable broker, which is the failure this endpoint exists to
-            # remove. Drop the request, keep serving.
+            # Handle each request on its own thread. Servicing them in turn
+            # would rebuild, on the control endpoint, the head-of-line blocking
+            # it exists to escape: a caller that sends a frame prefix and stops
+            # occupies the endpoint for a full request deadline, and a stream of
+            # them starves stops indefinitely.
+            if not self._control_slots.acquire(blocking=False):
+                # At capacity. Refuse rather than queue: a queued stop is a
+                # delayed stop, which is the thing being prevented.
+                with suppress(OSError):
+                    client.close()
+                continue
+            threading.Thread(
+                target=self._run_control_handler,
+                args=(client,),
+                name="o2-broker-control-request",
+                daemon=True,
+            ).start()
+
+    def _run_control_handler(self, client: socket.socket) -> None:
+        """Serve one control request and always return its slot.
+
+        One malformed or hostile request must not take anything down with it: a
+        control endpoint that stops answering is a silently unstoppable broker,
+        which is the failure it exists to remove.
+        """
+
+        try:
             with client, suppress(Exception):
                 self._handle_control_client(client)
+        finally:
+            self._control_slots.release()
 
     def _handle_control_client(self, client: socket.socket) -> None:
         """Handle one control request. Never forwards anything to O2."""
 
-        request = read_frame(_DeadlineSocketReader(client, self.local_request_timeout))
-        client.settimeout(self.local_request_timeout)
+        request = read_frame(_DeadlineSocketReader(client, CONTROL_REQUEST_TIMEOUT_SECONDS))
+        client.settimeout(CONTROL_REQUEST_TIMEOUT_SECONDS)
         request_type = request.get("type")
         with client.makefile("wb", buffering=0) as reply:
             if request_type == "ping":
@@ -1790,8 +1824,16 @@ class BrokerServer:
                     # The primary startup failure remains in the broker receipt;
                     # a concurrent repair/disable must not be overwritten.
                     pass
-            with suppress(O2BrokerError, OSError):
-                self._write_state("failed", error=failure, in_flight=self._in_flight)
+            # Mark control shutdown and publish the failure under one lock
+            # acquisition. Setting the marker only in `finally` would leave a
+            # stop handler already waiting on the state lock free to take it the
+            # instant this write completes, still see the marker unset, and
+            # overwrite the terminal receipt with `stopping` -- and this path
+            # returns, so nothing later corrects it.
+            with self._state_lock:
+                self._control_stopping = True
+                with suppress(O2BrokerError, OSError):
+                    self._write_state_locked("failed", error=failure, in_flight=self._in_flight)
             return 1
         finally:
             # Retire the control endpoint first. Closing its listener is what

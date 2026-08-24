@@ -32,6 +32,7 @@ import pytest
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp import broker as broker_module
 from o2mcp.broker import (
+    CONTROL_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_QUEUE_WAIT_SECONDS,
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_COMMAND_TIMEOUT_SECONDS,
@@ -1284,6 +1285,41 @@ def test_the_receipt_never_advertises_ready_after_a_stop_is_acknowledged(tmp_pat
         if occupant_stream is not None:
             occupant_stream.close()
         occupant.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_a_stalled_control_caller_cannot_delay_a_stop(tmp_path, broker_root):
+    """The control endpoint must not rebuild the blocking it exists to escape.
+
+    A caller that sends a frame prefix and then stops would, if requests were
+    served in turn, occupy the endpoint for a full request deadline each -- and
+    a stream of them would starve stops indefinitely.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    stalled = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(4)]
+    try:
+        for hanger in stalled:
+            hanger.settimeout(10)
+            hanger.connect(str(client.paths.control_socket))
+            # Enough to be accepted and awaited, never enough to complete.
+            hanger.sendall(FRAME_MAGIC)
+
+        started = time.monotonic()
+        assert client.control_stop(reason="stop behind stalled callers")["via"] == "control"
+        # Served concurrently, so this cannot have queued behind their deadlines.
+        # Serialized handling would need about one deadline per stalled caller;
+        # this bound is well under that and well over a concurrent answer.
+        elapsed = time.monotonic() - started
+        assert elapsed < CONTROL_REQUEST_TIMEOUT_SECONDS * 2, elapsed
+
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    finally:
+        for hanger in stalled:
+            with suppress(OSError):
+                hanger.close()
         if thread.is_alive():
             _stop_local_broker(thread, client)
 

@@ -217,6 +217,14 @@ automatic retry.
   *acknowledged* after a stop is, and the cost is one local socket write rather
   than a frame write a large stdin can stretch to tens of seconds. Callers cancelled
   this way are told their request was not dispatched, which is exactly true.
+- **Control requests are served concurrently, not in turn.** Handling them one
+  at a time would rebuild on this endpoint the head-of-line blocking it exists
+  to escape: a caller that sends a frame prefix and stops occupies it for a full
+  request deadline, and a stream of them starves stops indefinitely. Each
+  request gets its own short-lived thread, capped, with connections past the cap
+  closed rather than queued — queueing a stop is delaying it. The request
+  deadline is a second, not the command socket's five: a control frame is a stop
+  or a ping, so anything slower is a stalled caller.
 - **The control endpoint carries no commands.** It answers `stop` and `ping` and
   refuses everything else, including `exec`. It is not a second route to O2 and
   must not become one; widening it should be a deliberate act, which is why it
