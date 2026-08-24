@@ -287,12 +287,16 @@ MAX_EXEC_TIMEOUT_SECONDS = 60.0
 
 
 class RunInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    # ``validate_default`` because a constraint that skips the default is not a
+    # constraint on the common path: most callers omit the timeout, so a default
+    # above the ceiling silently grants every one of them more than the ceiling
+    # allows. Validating it turns that into an import-time failure instead.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", validate_default=True)
     command: str = Field(..., description="Remote shell command to run on an O2 login node.", min_length=1)
     timeout_seconds: float = Field(
-        default=120.0,
+        default=30.0,
         description=(
-            "Command timeout in seconds, capped at 60. The channel is shared and serialized by every MCP "
+            "Command timeout in seconds, default 30, capped at 60. The channel is shared and serialized by every MCP "
             "process on this workstation, so this is how long one command may block every other caller "
             "from doing anything at all. A minute is ample for inspecting state, and deliberately will "
             "not accommodate waiting: do not sleep, poll, or hold a foreground srun inside a command. "

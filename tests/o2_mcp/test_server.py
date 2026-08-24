@@ -603,6 +603,53 @@ async def test_exec_timeout_is_capped_so_one_command_cannot_hold_the_channel_for
     assert at_the_cap["ok"] is True
 
 
+def test_an_omitted_exec_timeout_stays_within_the_cap():
+    """Most callers omit the timeout, so the default is the common path.
+
+    A ceiling the default escapes is not a ceiling on the traffic that matters.
+    """
+
+    omitted = o2server.RunInput(command="squeue -u me")
+    assert omitted.timeout_seconds <= o2server.MAX_EXEC_TIMEOUT_SECONDS
+
+
+def test_no_input_default_escapes_its_own_constraint():
+    """Sweep every input model, not just the field that got this wrong.
+
+    Pydantic does not validate defaults unless asked, so a default outside a
+    declared bound passes straight through to the caller it was meant to bound.
+    """
+
+    import inspect
+
+    from pydantic import BaseModel
+
+    offenders: list[str] = []
+    for _name, model in vars(o2server).items():
+        if not (inspect.isclass(model) and issubclass(model, BaseModel) and model is not BaseModel):
+            continue
+        for field_name, field in model.model_fields.items():
+            default = field.default
+            if isinstance(default, bool) or not isinstance(default, (int, float)):
+                continue
+            for constraint in getattr(field, "metadata", []):
+                upper = getattr(constraint, "le", None)
+                strict_upper = getattr(constraint, "lt", None)
+                lower = getattr(constraint, "ge", None)
+                strict_lower = getattr(constraint, "gt", None)
+                where = f"{model.__name__}.{field_name} default={default}"
+                if upper is not None and default > upper:
+                    offenders.append(f"{where} exceeds le={upper}")
+                if strict_upper is not None and default >= strict_upper:
+                    offenders.append(f"{where} not below lt={strict_upper}")
+                if lower is not None and default < lower:
+                    offenders.append(f"{where} below ge={lower}")
+                if strict_lower is not None and default <= strict_lower:
+                    offenders.append(f"{where} not above gt={strict_lower}")
+
+    assert offenders == [], offenders
+
+
 @pytest.mark.anyio
 async def test_a_remote_wait_is_not_expressible_through_exec(monkeypatch, tmp_path):
     """The cap is what bans waiting, because detecting a wait cannot work.

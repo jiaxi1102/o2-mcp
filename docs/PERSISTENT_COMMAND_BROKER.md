@@ -207,7 +207,7 @@ automatic retry.
   a forced stop takes effect after the in-flight command *and any connections
   already queued ahead of it* — a delay bounded by queue depth times the
   per-command ceiling, not by a single command. Through `o2_exec` that is queue
-  depth × 300s; a library caller at the 3600s ceiling makes it far worse. It
+  depth × 60s; a library caller at the daemon ceiling makes it far worse. It
   abandons nothing and jumps nothing.
 - A stop that must act *now* still means killing the daemon by hand. The proper
   fix is a control path that does not sit behind the command queue — a second
@@ -227,7 +227,7 @@ automatic retry.
 
 ### Bounding one caller's cost, part two
 
-- The 300s cap on `o2_exec` guards one input model. `BrokerClient.execute`
+- The 60s cap on `o2_exec` guards one input model. `BrokerClient.execute`
   enforces a 3600s ceiling for every caller of the client, **and the daemon
   enforces it again** for every caller of the socket. Only the daemon can hold a
   workstation-wide bound: a client-side guard binds only the processes carrying
