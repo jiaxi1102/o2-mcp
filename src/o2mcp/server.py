@@ -249,7 +249,15 @@ class ProbeInput(BaseModel):
 class RunInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     command: str = Field(..., description="Remote shell command to run on an O2 login node.", min_length=1)
-    timeout_seconds: float = Field(default=120.0, description="Command timeout in seconds.", gt=0, le=3600)
+    timeout_seconds: float = Field(
+        default=120.0,
+        description=(
+            "Command timeout in seconds. A large value holds the shared serialized channel for that "
+            "long; poll from the caller rather than waiting inside the command."
+        ),
+        gt=0,
+        le=3600,
+    )
 
 
 class SubmitInput(BaseModel):
@@ -654,6 +662,16 @@ async def o2_exec(params: RunInput) -> str:
     Reuses the broker's existing SSH session channel and refuses if none is
     running — start one first with o2_start_broker. Returns JSON with
     returncode/stdout/stderr.
+
+    That channel is serialized and shared by every MCP process on this
+    workstation, so one command occupies it for all of them, and the broker
+    cannot answer a status ping while it runs. Do not wait inside a command: a
+    remote sleep, a `while ... squeue` poll, or any other blocking wait holds
+    the shared channel for its full duration and needs a long timeout_seconds
+    that starves every other caller. Poll from here instead — submit with
+    o2_submit_job, then call o2_job_status or o2_squeue repeatedly, which
+    releases the channel between checks. When a caller is blocked behind a
+    long command, o2_local_status names that command and its elapsed time.
     """
 
     def work() -> dict[str, Any]:

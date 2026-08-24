@@ -148,6 +148,71 @@ automatic retry.
 - `o2_local_status` may read the receipt and ping the Unix socket, but it never
   sends a frame to O2.
 
+### Command observability
+
+The daemon serializes local clients over one channel, so it cannot answer a
+ping while a command is running. Any command slower than the ping deadline
+therefore makes a healthy broker report `responsive: false`, which on its own
+is indistinguishable from a daemon that has stopped serving. The receipt
+carries the missing half of that picture:
+
+- `in_flight` names the command currently holding the channel (`request_id`,
+  bounded command fingerprint, requested `timeout_seconds`, `dispatched_at`)
+  and is `null` whenever the channel is idle. It is written before the daemon
+  waits for a result and is retained by the terminal receipt, so a daemon that
+  dies mid-command still records what it was running.
+- `last_command` records the completed command plus `duration_seconds` — the
+  broker-observed channel occupancy, which is what starves other callers —
+  alongside the helper's own `remote_duration_seconds`, `returncode`,
+  `timed_out`, and truncation flags. Remote-reported numbers are filtered to
+  finite, plausibly sized values before they reach a file later readers must
+  still parse.
+- `local_status` consults that record only when the ping went unanswered, and
+  then reports `busy` and `busy_for_seconds` so the caller learns which command
+  is responsible instead of only that no answer arrived. A successful pong
+  reports `busy: false` regardless of the record: a serialized daemon can only
+  answer between commands, so a pong is positive proof that nothing occupies
+  the channel, and it retires an `in_flight` entry that a suppressed
+  best-effort write would otherwise leave standing. A terminal receipt keeps
+  its `in_flight` record for forensics but is never reported as busy.
+- `duration_seconds` is measured with `time.monotonic()`, like every other
+  deadline in the daemon, so an NTP or manual wall-clock step during a long
+  command cannot inflate the metric or collapse it to zero. The epoch
+  timestamps beside it are for operator reading, not arithmetic.
+- The in-flight receipt is published after the remote frame write, so another
+  process reads `busy: false` for that write's duration. Publishing earlier
+  would place an unbounded fsync inside the policy mutex, whose hold time is
+  deliberately bounded so an incident disable stays responsive. The window is
+  bounded by the write deadline, a write that fails inside it is still named by
+  the terminal receipt, and occupancy already covers it because timing starts at
+  the acknowledgement.
+- `busy` also requires that a daemon still holds the lifetime lock. A daemon
+  killed before its terminal write -- SIGKILL, a crash, a reboot -- leaves a
+  `ready` receipt naming a command nothing will retire, and without that check
+  it would report busy forever. `busy_for_seconds` is derived from a persisted
+  monotonic reading rather than the epoch, which is sound precisely because a
+  held lock implies a live daemon and therefore the same boot. That reading
+  names its clock explicitly (`CLOCK_MONOTONIC`) instead of relying on
+  `time.monotonic()`, whose reference point is implementation-defined: on macOS
+  it maps to `mach_absolute_time()`, which excludes time the host spent asleep
+  and so differs from `CLOCK_MONOTONIC` on the same machine by however long it
+  has slept. Publishing one and subtracting the other would be silently wrong
+  by that amount. Where the named clock is unavailable the field is omitted
+  rather than guessed.
+- The record is best effort, not a ledger. Consecutive suppressed writes can
+  leave it naming an earlier command than the one actually running; it is a
+  diagnostic aid, and the pong remains the authority on whether the channel is
+  free.
+- Busy is not un-ready. `status` stays `ready` while a command runs, because a
+  busy broker is still a reusable broker: later clients queue behind the
+  in-flight command rather than being refused for lacking a ready receipt.
+- The command fingerprint is a SHA-256 digest, a UTF-8 byte length, and a
+  preview bounded to the first 200 characters. The full command is deliberately
+  not copied into the receipt, so a repeat offender stays identifiable without
+  retaining arguments that may embed sensitive paths.
+- The dispatch-time receipt write is best effort. It is diagnostic, so a
+  transient failure must not abort a command the channel is ready to run.
+
 ## MVP boundaries
 
 `o2_exec`, Slurm tools, workspace tools, and keepalive reach the login broker

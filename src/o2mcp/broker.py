@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -94,6 +95,12 @@ DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS = 5.0
 # throughput floor supplies a separate absolute transfer budget.
 MIN_REMOTE_RESPONSE_BYTES_PER_SECOND = 64 * 1024
 MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYTES_PER_SECOND
+# One bounded command preview is retained in the owner-only receipt so an
+# operator can name the command occupying the serialized channel. The bound is
+# in characters, not bytes, so truncation cannot split a UTF-8 code point, and
+# the full command stays out of the receipt: the digest identifies a repeat
+# offender without copying arguments that may embed sensitive paths.
+MAX_STATE_COMMAND_PREVIEW_CHARS = 200
 
 
 def _is_bounded_positive_timeout(value: Any) -> bool:
@@ -112,6 +119,67 @@ def _is_bounded_positive_timeout(value: Any) -> bool:
         return math.isfinite(value) and 0 < value <= MAX_TIMEOUT_SECONDS
     except OverflowError:
         return False
+
+
+def _command_fingerprint(command: str) -> dict[str, Any]:
+    """Summarize one command for the receipt without copying it in full."""
+
+    encoded = command.encode("utf-8")
+    preview = command[:MAX_STATE_COMMAND_PREVIEW_CHARS]
+    return {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "preview": preview,
+        "preview_truncated": len(preview) != len(command),
+    }
+
+
+def _receipt_number(value: Any) -> float | None:
+    """Return one finite number for the receipt, or None for anything else.
+
+    Result frames cross the SSH channel, so their fields are only as trustworthy
+    as the remote helper. Filtering here keeps a non-finite or non-numeric value
+    out of a file that every later reader must still be able to parse.
+    """
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _interprocess_monotonic() -> float | None:
+    """Return a monotonic reading that two processes may validly subtract.
+
+    ``time.monotonic()`` has an implementation-defined reference point. On macOS
+    it maps to ``mach_absolute_time()``, which excludes time the machine spent
+    asleep and therefore differs from ``CLOCK_MONOTONIC`` on the same host by
+    however long that host has slept. A reading the daemon persists is only
+    meaningful to a reader sampling the identical source, so name the POSIX
+    clock rather than depend on what ``time.monotonic()`` happens to map to for
+    a given interpreter and platform. Where that clock is unavailable, publish
+    nothing: no elapsed time is better than one another process cannot
+    interpret.
+    """
+
+    clock_gettime = getattr(time, "clock_gettime", None)
+    clock_id = getattr(time, "CLOCK_MONOTONIC", None)
+    if clock_gettime is None or clock_id is None:
+        return None
+    try:
+        return float(clock_gettime(clock_id))
+    except (OSError, ValueError):
+        return None
+
+
+def _receipt_returncode(value: Any) -> int | None:
+    """Return one plausibly sized remote exit status, or None."""
+
+    if type(value) is not int or not -(2**31) <= value < 2**31:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -509,6 +577,50 @@ class BrokerClient:
             raise O2BrokerUnavailableError(f"unexpected local broker status response: {response!r}")
         return response
 
+    def _busy_summary(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Describe an in-flight command so an unanswered ping stays diagnosable.
+
+        The daemon serializes local clients, so it cannot answer a ping while a
+        command occupies the one channel. Any command slower than the ping
+        deadline therefore makes a healthy broker look unresponsive. Reporting
+        the dispatched command and its elapsed time separates that ordinary busy
+        state from a daemon that has actually stopped serving. A terminal
+        receipt keeps its in-flight record for forensics but is never busy.
+
+        Only consult this when the ping went unanswered. Because receipt writes
+        are best effort, a suppressed completion write can leave a finished
+        command recorded as in flight, and the record alone cannot retire it.
+        """
+
+        in_flight = state.get("in_flight")
+        if state.get("status") != "ready" or not isinstance(in_flight, dict):
+            return {"busy": False}
+        # A daemon killed before it can run its terminal write -- SIGKILL, a
+        # crash, a reboot -- leaves a `ready` receipt naming a command that
+        # nothing will ever retire. The lifetime lock is the liveness signal: no
+        # holder means no daemon, so the record describes a command that is not
+        # running and reporting it as busy would recreate the ambiguity this
+        # diagnostic exists to remove. Inspection failures are not evidence of
+        # occupancy either, and this call must never raise: a status read stays
+        # readable even when the lock cannot be examined.
+        try:
+            if not self.launch_in_progress():
+                return {"busy": False}
+        except O2BrokerError:
+            return {"busy": False}
+        summary: dict[str, Any] = {"busy": True}
+        # A held lock implies a live daemon, hence no reboot since it started,
+        # so its persisted monotonic reading is comparable with this process's
+        # clock. Prefer it: subtracting epochs would let an NTP or manual step
+        # inflate this value or clamp it to zero, the same defect already fixed
+        # for completed occupancy. Without a usable reading, report no elapsed
+        # time rather than a wrong one.
+        dispatched = _receipt_number(in_flight.get("dispatched_clock_monotonic"))
+        sampled = _interprocess_monotonic()
+        if dispatched is not None and sampled is not None:
+            summary["busy_for_seconds"] = max(0.0, sampled - dispatched)
+        return summary
+
     def local_status(self) -> dict[str, Any]:
         """Return receipt plus local responsiveness without contacting O2."""
 
@@ -516,8 +628,18 @@ class BrokerClient:
         try:
             pong = self.ping(timeout=0.25)
         except O2BrokerError as exc:
-            return {**state, "responsive": False, "local_error": str(exc)}
-        return {**state, "responsive": True, "daemon": pong}
+            # A command dispatched after the snapshot above publishes its own
+            # receipt and then leaves this ping queued behind it, so the
+            # pre-ping snapshot can omit the very command that caused the
+            # silence. Re-read before summarizing: the fresher receipt is what
+            # explains an unanswered ping.
+            state = _read_state(self.paths)
+            return {**state, **self._busy_summary(state), "responsive": False, "local_error": str(exc)}
+        # A serialized daemon can only answer between commands, so a pong is
+        # positive proof that nothing occupies the channel. That evidence
+        # outranks the receipt and retires an in-flight record that a suppressed
+        # best-effort completion write would otherwise leave standing forever.
+        return {**state, "busy": False, "responsive": True, "daemon": pong}
 
     def launch_in_progress(self) -> bool:
         """Return whether a daemon holds the lifetime lock, without signaling it."""
@@ -656,6 +778,7 @@ class BrokerServer:
         self.listener: socket.socket | None = None
         self._stop_requested = False
         self._commands_completed = 0
+        self._in_flight: dict[str, Any] | None = None
         self._state: dict[str, Any] = {}
         self._lock_handle: BinaryIO | None = None
 
@@ -1092,6 +1215,33 @@ class BrokerServer:
                         write_frame(local, {"type": "dispatched", "id": request["id"]})
                     except (OSError, BrokerProtocolError):
                         return
+                    # The acknowledgement is also where this command starts
+                    # owning the channel, and the remote frame write below can
+                    # take seconds for a large stdin. Record it in memory here,
+                    # with no receipt I/O under the policy mutex, so measured
+                    # occupancy covers that write and a write that fails after
+                    # acknowledgement is still attributed to this command.
+                    dispatched_at = self.clock()
+                    # Epoch timestamps are what an operator reads, but they are
+                    # not a safe basis for a duration: an NTP or manual step
+                    # during a long command would inflate the occupancy metric
+                    # or collapse it to zero. Measure elapsed time the way every
+                    # other deadline in this daemon does.
+                    # Occupancy is computed entirely inside this process, so it
+                    # uses the ordinary monotonic clock. The published reading is
+                    # subtracted by a different process and must therefore name
+                    # its clock; it is absent when that clock is unavailable.
+                    dispatched_monotonic = time.monotonic()
+                    dispatched_shared = _interprocess_monotonic()
+                    in_flight = {
+                        "request_id": request_id,
+                        "command": _command_fingerprint(request["command"]),
+                        "timeout_seconds": request_timeout,
+                        "dispatched_at": dispatched_at,
+                    }
+                    if dispatched_shared is not None:
+                        in_flight["dispatched_clock_monotonic"] = dispatched_shared
+                    self._in_flight = in_flight
                     self._write_remote_frame_with_deadline(remote_in, remote_request)
             except O2PolicyError as exc:
                 with suppress(OSError, BrokerProtocolError):
@@ -1099,11 +1249,55 @@ class BrokerServer:
                 return
             except (OSError, BrokerProtocolError) as exc:
                 raise _O2BrokerTransportError(f"persistent remote stream failed: {exc}") from exc
+            # Publish the dispatched command. No ping can be answered until it
+            # finishes, so this receipt is the only local evidence of what the
+            # channel is doing.
+            #
+            # This lands after the remote frame write, so another process still
+            # reads `busy: false` for the duration of that write. Moving it
+            # earlier would put an unbounded fsync inside
+            # ``serialize_reuse_launch``, whose contract excludes unrelated
+            # preparation and whose hold time is deliberately bounded by
+            # explicit deadlines so an incident disable stays responsive. The
+            # window is bounded by the write deadline, a write that fails inside
+            # it is still attributed by the terminal receipt, and the occupancy
+            # metric already covers it because timing starts at the
+            # acknowledgement above.
+            #
+            # Publishing is diagnostic, so a transient filesystem failure must
+            # not abort a command that is already running remotely; a directory
+            # that no longer validates as owner-only is a security condition,
+            # not a diagnostic one, and is deliberately left to fail closed.
+            with suppress(OSError):
+                self._write_state("ready", in_flight=in_flight)
             response = self._read_remote_frame_with_deadline(remote_out, request_timeout)
             if response.get("id") != request.get("id"):
                 raise _O2BrokerTransportError("remote response id does not match the serialized request")
             self._commands_completed += 1
-            self._write_state("ready", last_command_at=self.clock())
+            completed_at = self.clock()
+            # ``_write_state`` accumulates keys across writes, so the in-flight
+            # record must be cleared explicitly rather than left to expire.
+            self._in_flight = None
+            with suppress(OSError):
+                self._write_state(
+                    "ready",
+                    last_command_at=completed_at,
+                    in_flight=None,
+                    last_command={
+                        **{key: value for key, value in in_flight.items() if key != "dispatched_clock_monotonic"},
+                        "completed_at": completed_at,
+                        # Broker-observed occupancy: how long this command held the
+                        # sole serialized channel, which is what starves other
+                        # callers. The remote helper's own measurement is recorded
+                        # beside it rather than in place of it.
+                        "duration_seconds": max(0.0, time.monotonic() - dispatched_monotonic),
+                        "remote_duration_seconds": _receipt_number(response.get("duration_seconds")),
+                        "returncode": _receipt_returncode(response.get("returncode")),
+                        "timed_out": bool(response.get("timed_out", False)),
+                        "stdout_truncated": bool(response.get("stdout_truncated", False)),
+                        "stderr_truncated": bool(response.get("stderr_truncated", False)),
+                    },
+                )
             # A caller may time out or close while its remote command continues.
             # The result has already been drained, so losing only the local reply
             # must not tear down the healthy shared channel.
@@ -1154,8 +1348,8 @@ class BrokerServer:
                     # The primary startup failure remains in the broker receipt;
                     # a concurrent repair/disable must not be overwritten.
                     pass
-            with suppress(O2BrokerError):
-                self._write_state("failed", error=failure)
+            with suppress(O2BrokerError, OSError):
+                self._write_state("failed", error=failure, in_flight=self._in_flight)
             return 1
         finally:
             if self.listener is not None:
@@ -1166,7 +1360,7 @@ class BrokerServer:
             if self._lock_handle is not None:
                 self._lock_handle.close()
 
-        self._write_state(outcome, stopped_at=self.clock(), error=failure)
+        self._write_state(outcome, stopped_at=self.clock(), error=failure, in_flight=self._in_flight)
         return 0 if outcome == "stopped" else 1
 
 

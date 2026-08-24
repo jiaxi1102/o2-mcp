@@ -8,6 +8,8 @@ Duo access.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 import os
@@ -28,17 +30,24 @@ from pathlib import Path
 import pytest
 
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
+from o2mcp import broker as broker_module
 from o2mcp.broker import (
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_LAUNCH_BYTES,
     MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
+    MAX_STATE_COMMAND_PREVIEW_CHARS,
     MAX_UNIX_SOCKET_PATH_BYTES,
     BrokerClient,
     BrokerExecutionResult,
     BrokerServer,
     O2BrokerError,
     O2BrokerUnavailableError,
+    _atomic_json_write,
+    _interprocess_monotonic,
     _read_launch_fd,
+    _read_state,
+    _receipt_number,
+    _receipt_returncode,
     prepare_broker_directory,
 )
 from o2mcp.broker_protocol import (
@@ -55,6 +64,7 @@ from o2mcp.broker_protocol import (
     remote_helper_source,
     write_frame,
 )
+from o2mcp.connection import _held_lock_explanation
 from o2mcp.policy import DEFAULT_LOGIN_COOLDOWN_SECONDS, O2PolicyDeniedError, O2PolicyStore
 
 
@@ -1048,6 +1058,523 @@ def test_broker_state_is_json_serializable(tmp_path, broker_root):
         assert json.loads(json.dumps(state))["status"] == "ready"
     finally:
         _stop_local_broker(thread, client)
+
+
+def test_completed_command_receipt_records_channel_occupancy(tmp_path, broker_root):
+    """Every finished command must leave measurable evidence of what it cost."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        assert client.execute("sleep 0.2; printf done", timeout=5).stdout == "done"
+
+        state = client.local_status()
+        last = state["last_command"]
+        assert state["in_flight"] is None
+        assert state["busy"] is False
+        assert last["command"]["preview"] == "sleep 0.2; printf done"
+        assert last["command"]["preview_truncated"] is False
+        assert last["returncode"] == 0
+        assert last["timed_out"] is False
+        assert last["completed_at"] >= last["dispatched_at"]
+        # Broker-observed occupancy is what starves other callers, so it is
+        # recorded beside the remote helper's own measurement, not replaced by it.
+        assert last["duration_seconds"] >= 0.1
+        assert last["remote_duration_seconds"] >= 0.1
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_busy_receipt_names_the_command_holding_the_serialized_channel(tmp_path, broker_root):
+    """An unanswered ping must still identify the command that owns the channel."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "channel-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "channel-occupant"}
+
+        deadline = time.monotonic() + 5
+        status = client.local_status()
+        while status.get("busy") is not True and time.monotonic() < deadline:
+            status = client.local_status()
+
+        # The daemon is healthy but serialized, so it cannot answer a ping while
+        # this command runs. Without the receipt that is indistinguishable from a
+        # daemon that has stopped serving entirely.
+        assert status["busy"] is True
+        assert status["responsive"] is False
+        assert status["in_flight"]["request_id"] == "channel-occupant"
+        assert status["in_flight"]["command"]["preview"] == "sleep 3; printf occupied"
+        assert status["busy_for_seconds"] >= 0
+        # Busy is not un-ready: the receipt must still authorize queued reuse.
+        assert status["status"] == "ready"
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        assert client.local_status()["busy"] is False
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_terminal_receipt_retains_the_command_that_was_in_flight(tmp_path, broker_root):
+    """A daemon that dies mid-command must still name what it was running."""
+
+    _policy, _server, thread, client = _start_local_broker(
+        tmp_path,
+        broker_root,
+        remote_response_grace=0.05,
+    )
+    try:
+        with pytest.raises(O2BrokerError, match="dispatched but its result was lost"):
+            client.execute("kill -STOP $PPID", timeout=0.05)
+
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+        state = client.local_status()
+        assert state["status"] == "failed"
+        assert state["in_flight"]["command"]["preview"] == "kill -STOP $PPID"
+        # The forensic record survives, but a terminal receipt is never busy.
+        assert state["busy"] is False
+    finally:
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_receipt_bounds_the_command_preview_and_records_a_digest(tmp_path, broker_root):
+    """A long command is identified by digest without being copied into the receipt."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        marker = "x" * (MAX_STATE_COMMAND_PREVIEW_CHARS * 3)
+        command = f"printf '%s' {marker} > /dev/null"
+        assert client.execute(command, timeout=5).returncode == 0
+
+        fingerprint = client.local_status()["last_command"]["command"]
+        assert fingerprint["sha256"] == hashlib.sha256(command.encode("utf-8")).hexdigest()
+        assert fingerprint["bytes"] == len(command.encode("utf-8"))
+        assert len(fingerprint["preview"]) == MAX_STATE_COMMAND_PREVIEW_CHARS
+        assert fingerprint["preview_truncated"] is True
+    finally:
+        _stop_local_broker(thread, client)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "12", None, True, 10**400])
+def test_receipt_rejects_an_unusable_remote_duration(value):
+    """A result frame is only as trustworthy as the remote helper that wrote it."""
+
+    assert _receipt_number(value) is None
+
+
+@pytest.mark.parametrize("value", [True, 2**31, -(2**31) - 1, "0", 1.0, None])
+def test_receipt_rejects_an_implausible_remote_returncode(value):
+    """Only a plausibly sized integer exit status is retained in the receipt."""
+
+    assert _receipt_returncode(value) is None
+
+
+def test_receipt_keeps_ordinary_remote_measurements():
+    """Sanitizing hostile values must not discard the normal ones."""
+
+    assert _receipt_number(1.5) == 1.5
+    assert _receipt_number(2) == 2.0
+    assert _receipt_returncode(0) == 0
+    assert _receipt_returncode(-1) == -1
+
+
+def test_a_retained_record_is_not_busy_without_a_live_daemon(broker_root):
+    """A daemon killed before its terminal write must not look busy forever.
+
+    SIGKILL, a crash, or a reboot skips the terminal receipt, leaving `ready`
+    plus a record nothing will retire. Reporting that as busy would recreate the
+    ambiguity this diagnostic removes.
+    """
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(
+        paths.state,
+        {
+            "schema_version": 1,
+            "protocol": PROTOCOL_VERSION,
+            "status": "ready",
+            "alias": "offline-o2",
+            "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+            "in_flight": {
+                "request_id": "orphaned-command",
+                "command": {"preview": "sleep 900", "sha256": "0" * 64, "bytes": 9},
+                "dispatched_at": time.time() - 900,
+                "dispatched_clock_monotonic": (_interprocess_monotonic() or 0.0) - 900,
+            },
+        },
+    )
+
+    status = BrokerClient(paths.root).local_status()
+
+    assert status["responsive"] is False
+    # No process holds the lifetime lock, so nothing is occupying the channel.
+    assert status["busy"] is False
+    assert "busy_for_seconds" not in status
+    # The record itself is still retained for forensics.
+    assert status["in_flight"]["request_id"] == "orphaned-command"
+
+
+def test_the_published_dispatch_reading_matches_a_readers_own_clock(tmp_path, broker_root):
+    """The daemon must publish the clock a separate reader actually samples.
+
+    `time.monotonic()` has an implementation-defined reference point: on macOS
+    it maps to `mach_absolute_time()`, which differs from CLOCK_MONOTONIC on the
+    same host by however long that host has slept. Publishing one and
+    subtracting the other is silently wrong by that amount, so the receipt has
+    to name its clock. (On platforms where both share a source this assertion
+    still holds; it simply cannot distinguish them.)
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "clock-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "clock-occupant"}
+
+        deadline = time.monotonic() + 5
+        while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        published = _read_state(client.paths)["in_flight"]["dispatched_clock_monotonic"]
+        assert abs(_interprocess_monotonic() - published) < 60
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_live_busy_time_ignores_a_wrong_wall_clock(tmp_path, broker_root):
+    """`busy_for_seconds` must not inherit a stepped or otherwise wrong epoch."""
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        # A daemon whose wall clock reads a day and change in the past.
+        clock=lambda: time.time() - 100_000,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="wrong-clock-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "wrong-clock-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "wrong-clock-occupant"}
+
+        deadline = time.monotonic() + 5
+        status = client.local_status()
+        while status.get("busy") is not True and time.monotonic() < deadline:
+            status = client.local_status()
+
+        assert status["busy"] is True
+        # Epoch arithmetic would report roughly 100000 seconds here.
+        assert 0 <= status["busy_for_seconds"] < 60
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        client.stop(reason="wrong clock test complete")
+        thread.join(timeout=5)
+
+
+def test_status_rereads_the_receipt_after_an_unanswered_ping(tmp_path, broker_root):
+    """A command that starts during the status call must still be named.
+
+    The receipt snapshot is taken before the ping, so a command dispatched in
+    between publishes its record and then leaves the ping queued behind it. The
+    stale snapshot would report the silence without its cause -- exactly the
+    case this diagnostic exists for.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+
+        def dispatch_then_time_out(*_args, **_kwargs):
+            """Stand in for a ping queued behind a command that started late."""
+
+            write_frame(
+                occupant_stream,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "late-occupant",
+                    "command": "sleep 2; printf late",
+                    "timeout_seconds": 10,
+                    "stdin": None,
+                },
+            )
+            assert read_frame(occupant_stream) == {"type": "dispatched", "id": "late-occupant"}
+            deadline = time.monotonic() + 3
+            while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out")
+
+        # The snapshot inside local_status is taken before this runs.
+        client.ping = dispatch_then_time_out
+        status = client.local_status()
+
+        assert status["responsive"] is False
+        assert status["busy"] is True
+        assert status["in_flight"]["request_id"] == "late-occupant"
+        assert status["in_flight"]["command"]["preview"] == "sleep 2; printf late"
+
+        del client.ping
+        assert read_frame(occupant_stream)["stdout"] == "late"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_occupancy_survives_a_wall_clock_step(tmp_path, broker_root):
+    """An NTP or manual clock correction must not corrupt the occupancy metric."""
+
+    stepped = {"offset": 0.0}
+
+    def stepping_clock() -> float:
+        return time.time() + stepped["offset"]
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", remote_helper_source()],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        clock=stepping_clock,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="stepped-clock-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Step the wall clock an hour backwards while the command is running.
+        # Subtracting epoch timestamps would clamp the result to 0.0 via ``max``.
+        stepper = threading.Timer(0.2, lambda: stepped.__setitem__("offset", -3600.0))
+        stepper.start()
+        try:
+            assert client.execute("sleep 0.5; printf stepped", timeout=10).stdout == "stepped"
+        finally:
+            stepper.cancel()
+
+        assert client.local_status()["last_command"]["duration_seconds"] >= 0.3
+    finally:
+        client.stop(reason="stepped clock test complete")
+        thread.join(timeout=5)
+
+
+def test_a_pong_retires_an_in_flight_record_left_by_a_failed_write(tmp_path, broker_root, monkeypatch):
+    """A daemon that answers a ping is proof the channel is idle.
+
+    Receipt writes are best effort, so a suppressed completion write can leave a
+    finished command recorded as in flight. The record cannot retire itself; the
+    pong must, or a responsive broker reports itself busy indefinitely.
+    """
+
+    real_write = broker_module._atomic_json_write
+    failures = {"armed": False, "raised": 0}
+
+    def flaky_completion_write(path, payload):
+        completing = payload.get("last_command") is not None and payload.get("in_flight") is None
+        if failures["armed"] and completing:
+            failures["armed"] = False
+            failures["raised"] += 1
+            raise OSError(28, "No space left on device")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(broker_module, "_atomic_json_write", flaky_completion_write)
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        failures["armed"] = True
+        assert client.execute("printf stale", timeout=5).stdout == "stale"
+        assert failures["raised"] == 1
+
+        # The durable receipt is genuinely stale: it still names a command that
+        # has already finished.
+        assert _read_state(client.paths)["in_flight"]["command"]["preview"] == "printf stale"
+
+        status = client.local_status()
+        assert status["responsive"] is True
+        assert status["busy"] is False
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_remote_write_failure_after_acknowledgement_is_still_attributed(tmp_path, broker_root):
+    """A command that dies between acknowledgement and execution must be named.
+
+    The caller has already been told `dispatched`, so it can only report an
+    unknown outcome and is directed at the receipt. The receipt must therefore
+    name the command whose outcome is unknown.
+    """
+
+    policy = _reuse_policy(tmp_path)
+    paths = prepare_broker_directory(broker_root)
+    # A helper that completes the protocol hello and then never drains stdin, so
+    # the remote frame write stalls only after the caller was acknowledged.
+    stalling_helper = (
+        "import base64,sys,time;"
+        "sys.stdout.buffer.write(base64.b64decode(sys.argv[1]));"
+        "sys.stdout.buffer.flush();"
+        "time.sleep(30)"
+    )
+    hello = base64.b64encode(encode_frame({"type": "hello", "protocol": PROTOCOL_VERSION})).decode()
+    server = BrokerServer(
+        paths=paths,
+        policy_file=policy.path,
+        transport_argv=[sys.executable, "-u", "-c", stalling_helper, hello],
+        alias="offline-o2",
+        destination={"hostname": "offline.example", "user": "offline", "port": "22"},
+        remote_write_timeout=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="stalled-write-broker", daemon=True)
+    thread.start()
+    client = BrokerClient(paths.root)
+    try:
+        deadline = time.monotonic() + 10
+        while client.local_status().get("responsive") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        with pytest.raises(O2BrokerError, match="dispatched but its result was lost"):
+            client.execute("cat", timeout=5, input_text="x" * (256 * 1024))
+
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+        state = _read_state(paths)
+        assert state["status"] == "failed"
+        assert state["in_flight"]["command"]["preview"] == "cat"
+    finally:
+        if server.transport is not None and server.transport.poll() is None:
+            server.transport.kill()
+            server.transport.wait(timeout=2)
+        thread.join(timeout=5)
+
+
+def test_receipt_write_failure_does_not_abort_a_running_command(tmp_path, broker_root, monkeypatch):
+    """A transient filesystem failure must not tear down the shared channel.
+
+    ``_atomic_json_write`` raises a raw ``OSError``, so guarding only against
+    ``O2BrokerError`` would let a full disk kill an already-dispatched command.
+    """
+
+    real_write = broker_module._atomic_json_write
+    failures = {"armed": False, "raised": 0}
+
+    def flaky_write(path, payload):
+        if failures["armed"]:
+            failures["armed"] = False
+            failures["raised"] += 1
+            raise OSError(28, "No space left on device")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(broker_module, "_atomic_json_write", flaky_write)
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    try:
+        failures["armed"] = True
+        assert client.execute("printf survived", timeout=5).stdout == "survived"
+        assert failures["raised"] == 1
+        # The channel and its receipt must both still work afterwards.
+        assert client.execute("printf again", timeout=5).stdout == "again"
+        assert client.local_status()["last_command"]["command"]["preview"] == "printf again"
+    finally:
+        _stop_local_broker(thread, client)
+
+
+def test_held_lock_explanation_names_a_busy_command():
+    """A held lock plus a silent ping must distinguish busy from wedged."""
+
+    busy = _held_lock_explanation(
+        {
+            "busy": True,
+            "busy_for_seconds": 42.4,
+            "in_flight": {"command": {"preview": "du -sb /n/groups/tabin"}},
+        }
+    )
+    assert busy == "It has been serving a command for 42s: 'du -sb /n/groups/tabin'."
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"busy": False},
+        {},
+        {"busy": True, "in_flight": None},
+        {"busy": True, "in_flight": {"command": "not-an-object"}},
+    ],
+)
+def test_held_lock_explanation_falls_back_without_a_usable_receipt(status):
+    """A missing or malformed in-flight record must not crash the start path."""
+
+    explanation = _held_lock_explanation(status)
+    assert explanation.startswith("It ") and explanation.endswith(".")
 
 
 def test_launch_capability_is_an_inherited_one_shot_descriptor(broker_root):
