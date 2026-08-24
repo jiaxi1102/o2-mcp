@@ -264,22 +264,44 @@ class ProbeInput(BaseModel):
 
 
 # One command's timeout is one command's hold on a channel shared by every MCP
-# process on the workstation, and it is also the watchdog budget the daemon uses
-# before it will tear down a silent transport. An hour of either is far past the
-# point where waiting remotely should have been a submitted job, so bound both
-# with the same number.
-MAX_EXEC_TIMEOUT_SECONDS = 300.0
+# process on the workstation -- roughly twenty of them here -- so this number is
+# not a per-caller convenience. It is how long one caller may stop all the
+# others from doing anything at all.
+#
+# A minute is generous for what this tool is for: inspecting state. `squeue`,
+# `sacct`, `cat`, staging a script all return in well under it. What a minute
+# will not accommodate is *waiting* -- a remote `sleep`, a `while ... squeue`
+# poll, an `srun` held in the foreground. That is deliberate and is the point of
+# the number. Detecting a wait by inspecting the command string cannot work:
+# `sleep 280`, `python -c 'time.sleep(280)'` and `while ! test -f done; do :;
+# done` are the same intent in three shapes, and any pattern broad enough to
+# catch them also catches a legitimate `sleep 5` between two operations.
+# Bounding occupancy needs no such judgement, and it treats a slow command and a
+# deliberate wait alike -- which is correct, because the callers being starved
+# cannot tell them apart either.
+#
+# Work that genuinely takes longer belongs in a submitted job: o2_submit_job,
+# then o2_job_status or o2_squeue polled from here, each of which holds the
+# channel for well under a second per check.
+MAX_EXEC_TIMEOUT_SECONDS = 60.0
 
 
 class RunInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    # ``validate_default`` because a constraint that skips the default is not a
+    # constraint on the common path: most callers omit the timeout, so a default
+    # above the ceiling silently grants every one of them more than the ceiling
+    # allows. Validating it turns that into an import-time failure instead.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", validate_default=True)
     command: str = Field(..., description="Remote shell command to run on an O2 login node.", min_length=1)
     timeout_seconds: float = Field(
-        default=120.0,
+        default=30.0,
         description=(
-            "Command timeout in seconds, capped at 300. The channel is shared and serialized, so this "
-            "is how long one command may block every other caller. Work that needs longer belongs in a "
-            "submitted job polled from here, not in a single command."
+            "Command timeout in seconds, default 30, capped at 60. The channel is shared and serialized by every MCP "
+            "process on this workstation, so this is how long one command may block every other caller "
+            "from doing anything at all. A minute is ample for inspecting state, and deliberately will "
+            "not accommodate waiting: do not sleep, poll, or hold a foreground srun inside a command. "
+            "Work that takes longer belongs in a submitted job -- o2_submit_job, then o2_job_status or "
+            "o2_squeue polled from here, each holding the channel for under a second per check."
         ),
         gt=0,
         le=MAX_EXEC_TIMEOUT_SECONDS,
