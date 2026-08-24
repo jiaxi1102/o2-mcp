@@ -199,10 +199,10 @@ class StopBrokerInput(BaseModel):
     force: bool = Field(
         default=False,
         description=(
-            "Signal the daemon instead of asking it over its socket. Needed when the broker is busy: a "
-            "queued socket stop is cancelled once its caller times out, so it cannot retire a broker that "
-            "is serving a command. The signal requests a graceful stop and does not abandon that command, "
-            "so the daemon exits once the command ends."
+            "Have the daemon honour this stop even after the request times out locally. Needed when the "
+            "broker is busy: an ordinary queued stop is cancelled once its caller gives up, so it cannot "
+            "retire a broker that is serving a command. A forced stop is still graceful and still waits for "
+            "that command to finish; it is never abandoned."
         ),
     )
 
@@ -670,8 +670,9 @@ async def o2_stop_broker(params: StopBrokerInput) -> str:
     The default socket request retires an idle broker cleanly but cannot retire a
     busy one, because a queued stop is cancelled once its caller times out. When
     that happens the error names the command holding the channel and points at
-    `force`, which signals the daemon instead. A signalled stop is still
-    graceful: the daemon exits after its in-flight command ends, not instantly.
+    `force`, which the daemon honours even after the caller gives up waiting. A
+    forced stop is still graceful: the daemon exits after its in-flight command
+    ends, never by abandoning it.
     """
 
     def work() -> dict[str, Any]:

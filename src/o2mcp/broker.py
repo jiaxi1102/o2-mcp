@@ -482,90 +482,6 @@ class BrokerClient:
             client.close()
             raise O2BrokerUnavailableError(f"The persistent O2 broker did not answer locally: {exc}") from exc
 
-    def locked_daemon_pid(self) -> int | None:
-        """Return the pid published by the daemon that currently holds the lock.
-
-        Read inside the same open that tests the lock, so there is no window in
-        which the answer to "is it held" and the answer to "by whom" can come
-        from different holders. ``None`` means no daemon holds the lock, or the
-        holder has not published an identity -- both of which make signalling a
-        pid unsafe, so callers must refuse rather than fall back to a receipt.
-        """
-
-        try:
-            with _open_lifetime_lock(self.paths.lock, create=False) as handle:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    handle.seek(0)
-                    raw = handle.read(64).decode("utf-8", errors="replace").strip()
-                    if not raw.isdigit():
-                        return None
-                    pid = int(raw)
-                    return pid if pid > 0 else None
-                # Acquiring it proves nobody held it, so there is no daemon.
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                return None
-        except (FileNotFoundError, O2BrokerError, OSError, ValueError):
-            return None
-
-    def signal_stop(self, *, reason: str, grace: float = 2.0) -> dict[str, Any]:
-        """Request a stop by signal when the daemon cannot answer its socket.
-
-        The socket stop cannot retire a busy broker: it queues behind whatever
-        command holds the channel, and the daemon cancels it outright when the
-        caller's short deadline expires first. ``SIGTERM`` reaches the daemon
-        regardless, and its handler sets the same graceful stop flag, so the
-        transport closes, the socket is removed, and the lifetime lock is
-        released through the ordinary exit path.
-
-        This requests a stop; it does not abandon a running command. The accept
-        loop observes the flag only after the in-flight command finishes or hits
-        its deadline, so a busy daemon exits later rather than now, and the
-        result says which case happened instead of implying the channel is free.
-        """
-
-        # The pid comes from the lock, never from the receipt. A receipt can
-        # outlive the daemon that wrote it, and once that pid is reused, "a lock
-        # is held" and "this pid exists" are both true of two different
-        # processes -- so together they still do not authorize a signal.
-        pid = self.locked_daemon_pid()
-        if pid is None:
-            raise O2BrokerError(
-                "No daemon has published ownership of the broker lifetime lock, so no pid here is safe to "
-                "signal. Either nothing is running, or the holder predates this identity check and must be "
-                "restarted to support force. Confirm with o2_local_status before stopping anything by hand."
-            )
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError as exc:
-            raise O2BrokerError(f"Broker daemon pid {pid} no longer exists; the lock record is stale.") from exc
-        except PermissionError as exc:
-            raise O2BrokerError(f"Broker daemon pid {pid} is not owned by this user; refusing to signal it.") from exc
-
-        state = _read_state(self.paths)
-        in_flight = state.get("in_flight") if isinstance(state.get("in_flight"), dict) else None
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline and self.launch_in_progress():
-            time.sleep(0.05)
-        exited = self.locked_daemon_pid() is None
-        return {
-            "signalled": True,
-            "signal": "SIGTERM",
-            "pid": pid,
-            "receipt_pid": state.get("pid"),
-            "reason": reason,
-            "exited": exited,
-            "in_flight": in_flight,
-            "note": (
-                "The daemon released its lifetime lock and stopped."
-                if exited
-                else "Stop requested. The daemon finishes or times out its in-flight command first, then exits; "
-                "it has not stopped yet. Re-check o2_local_status rather than signalling again."
-            ),
-        }
-
     def _request(
         self,
         payload: dict[str, Any],
@@ -872,11 +788,24 @@ class BrokerClient:
             "Do not start another attempt; inspect o2_local_status and the broker log first."
         )
 
-    def stop(self, *, reason: str, timeout: float = 3.0) -> dict[str, Any]:
-        """Ask the local daemon to close its one SSH process and exit."""
+    def stop(self, *, reason: str, timeout: float = 3.0, force: bool = False) -> dict[str, Any]:
+        """Ask the local daemon to close its one SSH process and exit.
+
+        A plain stop is abandoned if this caller's short deadline expires before
+        the daemon reaches it, which is deliberate: a stop reported as failed
+        should not shut the shared broker down minutes later. It also means a
+        plain stop cannot retire a busy broker at all, because a busy daemon
+        cannot reach any request until its command ends.
+
+        ``force`` marks the request as one to honour regardless, so the operator's
+        intent survives their own timeout. It is still graceful and still
+        serialized: the daemon acts on it after the in-flight command finishes,
+        never by abandoning that command. An older daemon ignores the flag and
+        simply behaves as before.
+        """
 
         response = self._request(
-            {"type": "stop", "id": str(uuid.uuid4()), "reason": reason},
+            {"type": "stop", "id": str(uuid.uuid4()), "reason": reason, "force": bool(force)},
             timeout=timeout,
             # A local stop must remain possible after the configured SSH alias
             # or package protocol changes; only command reuse requires the
@@ -1016,16 +945,6 @@ class BrokerServer:
             handle.close()
             raise O2BrokerStartupError("another O2 broker daemon already owns the lifetime lock") from exc
         self._lock_handle = handle
-        # Publish the holder's identity under the lock itself, so a stopper can
-        # bind a pid to the process that actually owns this broker directory
-        # rather than to whatever a possibly stale receipt names. Truncate
-        # first: until the new value lands the file must read as empty rather
-        # than as a previous holder's pid, because a reused pid would make that
-        # indistinguishable from a live daemon.
-        with suppress(OSError):
-            handle.truncate(0)
-            handle.write(f"{os.getpid()}\n".encode())
-            handle.flush()
 
     def _drain_transport_stderr(self, stderr: BinaryIO) -> None:
         """Append SSH diagnostics so its bounded pipe can never deadlock."""
@@ -1356,11 +1275,20 @@ class BrokerServer:
                     )
                 return
             if request_type == "stop":
-                # A stop can wait behind a long serialized command. A caller
-                # whose local deadline expires closes its socket; acknowledge
-                # first so that queued, abandoned requests are cancelled rather
-                # than shutting down the shared broker minutes after reporting
-                # failure. Once this frame is written, stop is dispatched.
+                # A stop can wait behind a long serialized command. By default a
+                # caller whose local deadline expires has its request cancelled,
+                # so a stop reported as failed does not shut the shared broker
+                # down minutes later. A forced stop opts out of exactly that: it
+                # is the only way to retire a busy broker, since a busy daemon
+                # cannot reach any request until its command ends, and discarding
+                # it here is what left o2_stop_broker unable to do so. Forced or
+                # not, the in-flight command is never abandoned.
+                if bool(request.get("force")):
+                    self._stop_requested = True
+                    self._write_state("stopping", stop_reason=str(request.get("reason") or "forced local request"))
+                    with suppress(OSError, BrokerProtocolError):
+                        write_frame(local, {"type": "stopping", "pid": os.getpid()})
+                    return
                 if self._local_caller_disconnected(client):
                     return
                 try:

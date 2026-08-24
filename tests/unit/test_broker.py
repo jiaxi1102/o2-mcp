@@ -9,7 +9,6 @@ Duo access.
 from __future__ import annotations
 
 import base64
-import fcntl
 import hashlib
 import io
 import json
@@ -1131,146 +1130,18 @@ def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_r
         _stop_local_broker(thread, client)
 
 
-def _orphaned_receipt(pid: int | None) -> dict:
-    """Build the receipt a daemon killed before its terminal write leaves."""
+def test_a_forced_stop_survives_its_own_callers_timeout(tmp_path, broker_root):
+    """The only way to retire a busy broker is a request that outlives its caller.
 
-    receipt = {
-        "schema_version": 1,
-        "protocol": PROTOCOL_VERSION,
-        "status": "ready",
-        "alias": "offline-o2",
-        "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
-        "in_flight": {
-            "request_id": "orphaned",
-            "command": {"preview": "sleep 900", "sha256": "0" * 64, "bytes": 9},
-            "dispatched_at": time.time() - 900,
-        },
-    }
-    if pid is not None:
-        receipt["pid"] = pid
-    return receipt
-
-
-def test_a_busy_socket_stop_points_at_force_and_names_the_blocker(tmp_path):
-    """A stop that cannot succeed must say why and what to do instead.
-
-    This is the failure an operator meets first: the documented remedy silently
-    does nothing against a busy broker, because a queued stop is cancelled once
-    its caller times out. Naming the occupying command is what separates "busy
-    with a long command" from "wedged".
-    """
-
-    policy = _reuse_policy(tmp_path)
-
-    class _BusyBroker:
-        """A healthy broker too occupied to answer its own socket."""
-
-        def stop(self, *, reason):
-            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out")
-
-        def local_status(self):
-            return {
-                "status": "ready",
-                "responsive": False,
-                "busy": True,
-                "busy_for_seconds": 240.0,
-                "in_flight": {"command": {"preview": "while true; do sleep 30; squeue -u me; done"}},
-            }
-
-    config = O2Config(
-        policy_file=policy.path,
-        broker_dir=tmp_path / "login-broker",
-        transfer_broker_dir=tmp_path / "transfer-broker",
-    )
-    connection = O2Connection(config, policy=policy, broker_client=_BusyBroker())
-
-    with pytest.raises(O2BrokerError) as refused:
-        connection.stop_broker(reason="is it wedged?")
-
-    message = str(refused.value)
-    assert "force=true" in message
-    assert "while true; do sleep 30" in message
-    assert "240s" in message
-
-
-def test_signal_stop_refuses_when_no_daemon_holds_the_lock(broker_root, monkeypatch):
-    """A receipt outlives its daemon, so its pid must never be signalled."""
-
-    paths = prepare_broker_directory(broker_root)
-    _atomic_json_write(paths.state, _orphaned_receipt(pid=999_999))
-    sent: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
-
-    with pytest.raises(O2BrokerError, match="No daemon has published ownership"):
-        BrokerClient(paths.root).signal_stop(reason="stale receipt")
-
-    assert sent == []
-
-
-def test_signal_stop_refuses_a_lock_holder_that_has_not_published_its_identity(broker_root, monkeypatch):
-    """Held-but-anonymous is exactly the window a reused pid slips through.
-
-    A held lock proves some daemon is alive and `kill(pid, 0)` proves some
-    process exists, but with an anonymous holder those two facts can describe
-    two different processes -- the crashed daemon's pid having been reused by
-    something unrelated. Refusing is the only safe answer.
-    """
-
-    paths = prepare_broker_directory(broker_root)
-    _atomic_json_write(paths.state, _orphaned_receipt(pid=999_999))
-    sent: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
-
-    holder = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        os.fchmod(holder, 0o600)
-        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-        with pytest.raises(O2BrokerError, match="No daemon has published ownership"):
-            BrokerClient(paths.root).signal_stop(reason="anonymous holder")
-
-        assert sent == []
-    finally:
-        os.close(holder)
-
-
-def test_the_lock_holder_publishes_the_pid_a_stopper_must_signal(tmp_path, broker_root):
-    """Binding the signal target to the lock is what makes force safe at all."""
-
-    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
-    try:
-        # The daemon runs as a thread in this harness, so it owns the lock under
-        # this process's pid.
-        assert client.locked_daemon_pid() == os.getpid()
-    finally:
-        _stop_local_broker(thread, client)
-
-    # Once it exits the lock is free, so there is no longer anyone to signal.
-    assert client.locked_daemon_pid() is None
-
-
-def test_signal_stop_reports_a_busy_daemon_as_not_yet_stopped(tmp_path, broker_root, monkeypatch):
-    """A signalled stop is graceful, so a busy daemon exits later, not now.
-
-    The handler only sets the stop flag; the accept loop observes it after the
-    in-flight command ends. Reporting this as stopped would be a lie an operator
-    would act on, so the result distinguishes requested from completed.
+    A busy daemon cannot reach any request until its command ends, so an
+    ordinary stop -- cancelled the moment its caller gives up -- can never retire
+    one. A forced stop is honoured regardless, and is still graceful: the
+    in-flight command runs to completion first.
     """
 
     _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
     occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     occupant_stream = None
-    real_kill = os.kill
-    delivered: list[tuple[int, int]] = []
-
-    def recording_kill(pid, sig):
-        # The daemon runs as a thread here, so its recorded pid is this test
-        # process. Let the liveness probe through; never deliver the real signal.
-        if sig == 0:
-            return real_kill(pid, sig)
-        delivered.append((pid, sig))
-        return None
-
     try:
         occupant.connect(str(client.paths.socket))
         occupant_stream = occupant.makefile("rwb", buffering=0)
@@ -1280,31 +1151,95 @@ def test_signal_stop_reports_a_busy_daemon_as_not_yet_stopped(tmp_path, broker_r
                 "type": "exec",
                 "protocol": PROTOCOL_VERSION,
                 "id": "blocker",
-                "command": "sleep 3; printf occupied",
+                "command": "sleep 1.5; printf occupied",
                 "timeout_seconds": 10,
                 "stdin": None,
             },
         )
         assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
-        deadline = time.monotonic() + 5
-        while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
-            time.sleep(0.01)
 
-        monkeypatch.setattr(os, "kill", recording_kill)
-        result = client.signal_stop(reason="busy broker", grace=0.2)
+        # A forced stop whose caller gives up long before the daemon can reach it.
+        with pytest.raises(O2BrokerError):
+            client.stop(reason="forced while busy", timeout=0.1, force=True)
 
-        assert delivered == [(os.getpid(), signal.SIGTERM)]
-        assert result["exited"] is False
-        assert result["in_flight"]["request_id"] == "blocker"
-        assert "has not stopped yet" in result["note"]
-        monkeypatch.undo()
+        # The occupying command still completes; the stop never abandons it.
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert not client.paths.socket.exists()
+        assert _read_state(client.paths)["status"] == "stopped"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_an_unforced_stop_is_still_cancelled_when_its_caller_gives_up(tmp_path, broker_root):
+    """Force is opt-in: the default must not shut a shared broker down late."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "blocker",
+                "command": "sleep 1.5; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
+
+        with pytest.raises(O2BrokerError):
+            client.stop(reason="unforced while busy", timeout=0.1)
 
         assert read_frame(occupant_stream)["stdout"] == "occupied"
+        # The abandoned stop was discarded, so the broker is still serving.
+        assert client.execute("printf alive", timeout=5).stdout == "alive"
     finally:
         if occupant_stream is not None:
             occupant_stream.close()
         occupant.close()
         _stop_local_broker(thread, client)
+
+
+def test_force_is_only_recommended_for_a_confirmed_busy_broker(tmp_path):
+    """Pointing at force when it cannot help sends the operator down a dead end.
+
+    A missing broker or an unreadable receipt raises the same error type as queue
+    starvation, and force resolves neither, so the original diagnosis must stand.
+    """
+
+    policy = _reuse_policy(tmp_path)
+
+    class _AbsentBroker:
+        def stop(self, *, reason, force=False):
+            raise O2BrokerUnavailableError("no broker receipt was found")
+
+        def local_status(self):
+            return {"status": "absent", "responsive": False, "busy": False}
+
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "login-broker",
+        transfer_broker_dir=tmp_path / "transfer-broker",
+    )
+    connection = O2Connection(config, policy=policy, broker_client=_AbsentBroker())
+
+    with pytest.raises(O2BrokerError) as refused:
+        connection.stop_broker(reason="stop a broker that is not there")
+
+    message = str(refused.value)
+    assert "no broker receipt was found" in message
+    assert "force" not in message
 
 
 @pytest.mark.parametrize("timeout", [MAX_COMMAND_TIMEOUT_SECONDS + 1, 100_000.0])

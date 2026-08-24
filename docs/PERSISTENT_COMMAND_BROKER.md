@@ -184,28 +184,26 @@ automatic retry.
 - `o2_stop_broker` asks over the socket. That retires an idle broker cleanly and
   **cannot** retire a busy one: the request queues behind the command holding the
   channel, and the daemon cancels a queued stop whose caller has already timed
-  out. The failure now names the occupying command and points at `force`.
-- `force: true` signals the daemon instead. `SIGTERM` is handled and sets the
-  same graceful stop flag, so the transport closes, the socket is removed and the
-  lock is released through the ordinary exit path. It is still graceful: the
-  accept loop observes the flag only after the in-flight command ends, so a busy
-  daemon exits *later*, and the result distinguishes `exited: true` from a stop
-  merely requested. Abandoning a running command outright remains a manual
-  `kill -9`, which leaves an orphaned receipt that `busy` correctly ignores.
-- **The signalled pid comes from the lock, never from the receipt.** A receipt
-  outlives the daemon that wrote it, and once that pid is reused, "a lock is
-  held" and "this pid exists" are both true *of two different processes* — so
-  together they still do not authorize a signal. The daemon therefore publishes
-  its pid into the lock file while holding it, truncating first so that until
-  the new value lands the file reads as empty rather than as a previous holder's
-  pid. A stopper reads that pid inside the same open that tests the lock, so
-  "is it held" and "by whom" cannot come from different holders.
-- A holder that has published no identity is refused, not fallen back on. That
-  covers both the truncate window and a daemon predating this check — a broker
-  started before it must be restarted before `force` will work, which fails
-  safe rather than guessing.
-- `force` stays opt-in on top of all that, because it acts outside the socket's
-  own authority.
+  out. That cancellation is deliberate — a stop reported as failed should not
+  shut the shared broker down minutes later — but it also means the documented
+  remedy did nothing in exactly the situation that prompts reaching for it.
+- `force: true` marks the request as one the daemon honours regardless of
+  whether its caller is still waiting. It is the only way to retire a busy
+  broker, and it stays inside the socket's own authority: no pid is read and no
+  signal is sent. It is still graceful and still serialized — the daemon acts on
+  it once the in-flight command finishes, never by abandoning that command. An
+  older daemon ignores the flag and behaves as before.
+- Signalling the daemon by pid was tried and abandoned. A pid can only be taken
+  from the receipt or from the lock file, and neither survives the gap to the
+  `kill`: a receipt outlives its daemon, and a lock read proves only who held
+  the lock during that read. Without a `pidfd` — unavailable on macOS — there is
+  no way to bind a pid to a process across that window, so the socket, whose
+  authority is the connection itself, is the correct channel.
+- Abandoning a running command outright remains a manual `kill -9`, which leaves
+  an orphaned receipt that `busy` correctly ignores because the lock is free.
+- Force is recommended only when the refreshed receipt confirms a busy daemon. A
+  missing broker or an unreadable receipt raises the same error type, and force
+  resolves neither, so those keep their own diagnosis.
 
 ### Bounding one caller's cost, part two
 
