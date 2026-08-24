@@ -103,12 +103,19 @@ MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYT
 # would have taken is the point at which the silence, not the queue, is the
 # problem. A floor keeps short commands from failing behind ordinary traffic.
 # The protocol permits a seven-day deadline, and the daemon's watchdog budget
-# follows whatever a caller requests -- so an hour-long timeout also buys an
-# hour before a silent transport is torn down. The MCP tool caps itself at 300s,
-# but that guard sits on one input model; this ceiling applies to every caller of
+# follows whatever a caller requests -- so a long timeout also buys that long
+# before a silent transport is torn down. The MCP tool caps itself at 60s, but
+# that guard sits on one input model; this ceiling applies to every caller of
 # the client, so an in-process one cannot reinstate a multi-hour hold on a
 # channel shared by every MCP process on the workstation.
-MAX_COMMAND_TIMEOUT_SECONDS = 3600.0
+#
+# Five minutes rather than an hour, because an hour was never a bound anyone
+# needed: the longest deadline any in-repo caller asks for is `du -sb` over
+# group storage, at exactly 300s. Leaving the ceiling twelve times above the
+# highest real demand bounded nothing that actually happens, while leaving room
+# for a library caller to hold the shared channel for most of an hour. Work
+# needing longer belongs in a submitted job.
+MAX_COMMAND_TIMEOUT_SECONDS = 300.0
 # A forced stop must outlast the contention that made it necessary: its
 # connection may sit in the listen backlog behind queued commands before the
 # daemon accepts it.
