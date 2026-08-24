@@ -199,11 +199,11 @@ class StopBrokerInput(BaseModel):
     force: bool = Field(
         default=False,
         description=(
-            "Have the daemon honour this stop even after the request times out locally. Needed when the "
-            "broker is busy: an ordinary queued stop is cancelled once its caller gives up, so it cannot "
-            "retire a broker that is serving a command. A forced stop is graceful and queued, not "
-            "prioritized: it takes effect after the in-flight command and any requests already waiting "
-            "ahead of it, and abandons none of them."
+            "Only affects the fallback path. Stops now go to the broker's control endpoint, which a "
+            "separate daemon thread answers immediately even while a command holds the channel, and which "
+            "skips work already queued behind it. This flag is used only when no control endpoint exists "
+            "-- a daemon started before it -- where a stop is otherwise cancelled once its caller gives up. "
+            "No stop abandons a running command."
         ),
     )
 
@@ -673,10 +673,11 @@ async def o2_stop_broker(params: StopBrokerInput) -> str:
     that happens the error names the command holding the channel and points at
     `force`, which the daemon honours even after the caller gives up waiting.
 
-    A forced stop is graceful and queued rather than prioritized: the daemon
-    serves one request at a time in arrival order, so it takes effect after the
-    in-flight command and anything already waiting ahead of it, and abandons
-    none of them.
+    A stop is answered on the broker's control endpoint, so it is prompt even
+    while the broker is busy. It lets the in-flight command finish and then
+    exits: commands that were queued behind it are DISCARDED, not run. A caller
+    whose request is discarded is told it was not dispatched, so nothing it
+    submitted has run on O2 -- but do not assume queued work completes.
     """
 
     def work() -> dict[str, Any]:

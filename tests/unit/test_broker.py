@@ -32,6 +32,7 @@ import pytest
 from o2mcp import CommandResult, O2Config, O2Connection, O2UnsafeTransportError
 from o2mcp import broker as broker_module
 from o2mcp.broker import (
+    CONTROL_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_QUEUE_WAIT_SECONDS,
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
     MAX_COMMAND_TIMEOUT_SECONDS,
@@ -59,6 +60,7 @@ from o2mcp.broker import (
 from o2mcp.broker_protocol import (
     FRAME_MAGIC,
     MAX_COMMAND_BYTES,
+    MAX_FRAME_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_REQUEST_ID_BYTES,
     MAX_STDIN_BYTES,
@@ -1062,6 +1064,367 @@ def test_overlong_socket_path_fails_before_directory_or_transport_creation(tmp_p
         prepare_broker_directory(long_root)
 
     assert not long_root.exists()
+
+
+def test_a_control_stop_skips_queued_commands_instead_of_waiting_for_them(tmp_path, broker_root):
+    """This is the whole point of the control endpoint, in one case.
+
+    A stop on the command socket is answered only when the daemon reaches it,
+    which is after the running command *and everything queued ahead of it* --
+    a delay bounded by queue depth times the per-command ceiling. Answered on
+    the control thread instead, the flag is set at once and the command loop
+    rechecks it before accepting anything else, so the bound becomes a single
+    command and queued work is skipped rather than served first.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    queued = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "occupant",
+                "command": "sleep 2; printf occupied",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "occupant"}
+
+        # A second command waiting behind it, which must never be dispatched.
+        queued.connect(str(client.paths.socket))
+        with queued.makefile("wb", buffering=0) as queued_stream:
+            write_frame(
+                queued_stream,
+                {
+                    "type": "exec",
+                    "protocol": PROTOCOL_VERSION,
+                    "id": "must-not-run",
+                    "command": "printf must-not-run",
+                    "timeout_seconds": 30,
+                    "stdin": None,
+                },
+            )
+
+        # Answered while the channel is held -- the command socket could not.
+        stopped = client.control_stop(reason="offline control stop")
+        assert stopped["via"] == "control"
+
+        # The running command is still allowed to finish. Abandoning it would
+        # turn a stop into an unknown remote outcome.
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+        # One command ran, not two: the queued request was skipped.
+        assert _read_state(client.paths)["commands_completed"] == 1
+        assert _read_state(client.paths)["status"] == "stopped"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        queued.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_a_stop_prevents_a_command_accepted_just_before_it_from_running(tmp_path, broker_root):
+    """Skipping the queue is not enough: an accepted request has left it.
+
+    A connection the command thread has already accepted is no longer waiting in
+    the backlog the outer loop declines to serve, so nothing else stops it being
+    dispatched after the operator was told the broker was stopping. That window
+    is as long as reading a frame, not an instant.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    accepted = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    accepted_stream = None
+    try:
+        accepted.settimeout(10)
+        accepted.connect(str(client.paths.socket))
+        accepted_stream = accepted.makefile("rwb", buffering=0)
+        # Send only the frame marker. The daemon accepts, enters its handler and
+        # blocks awaiting the rest, which puts it precisely in the window under
+        # test rather than relying on timing alone.
+        accepted.sendall(FRAME_MAGIC)
+        time.sleep(0.2)
+
+        assert client.control_stop(reason="stop during frame read")["via"] == "control"
+
+        body = json.dumps(
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "accepted-before-stop",
+                "command": "printf must-not-run",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        accepted.sendall(struct.pack("!I", len(body)) + body)
+
+        # Cancelled exactly as a disconnected caller is: no reply at all, which
+        # every client reads as "not dispatched".
+        with pytest.raises((BrokerProtocolError, OSError)):
+            read_frame(accepted_stream)
+
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert _read_state(client.paths)["commands_completed"] == 0
+    finally:
+        if accepted_stream is not None:
+            accepted_stream.close()
+        accepted.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_the_control_endpoint_answers_a_ping_the_command_socket_cannot(tmp_path, broker_root):
+    """A busy daemon looks dead on the command socket and alive on this one."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "ping-occupant",
+                "command": "sleep 2; printf occupied",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "ping-occupant"}
+
+        pong = client.control_ping()
+        assert pong["busy"] is True
+        assert pong["pid"] == os.getpid()
+        # The command socket, meanwhile, cannot answer at all.
+        with pytest.raises(O2BrokerUnavailableError):
+            client.ping(timeout=0.25)
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        assert client.control_ping()["busy"] is False
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+def test_the_receipt_never_advertises_ready_after_a_stop_is_acknowledged(tmp_path, broker_root):
+    """A command completing after a stop must not republish a reusable broker.
+
+    Between that completion write and the terminal one, a client reading the
+    receipt would believe the broker is ready and try to use it.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    observed: list[str] = []
+    watching = threading.Event()
+
+    def watch_receipt() -> None:
+        while watching.is_set():
+            status = _read_state(client.paths).get("status")
+            if isinstance(status, str) and (not observed or observed[-1] != status):
+                observed.append(status)
+            time.sleep(0.002)
+
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "receipt-occupant",
+                "command": "sleep 1.5; printf occupied",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "receipt-occupant"}
+
+        assert client.control_stop(reason="receipt status test")["via"] == "control"
+
+        # Sample only from here: before the stop the receipt legitimately says
+        # ready, because the command was dispatched by a running broker.
+        watching.set()
+        watcher = threading.Thread(target=watch_receipt, name="receipt-watch", daemon=True)
+        watcher.start()
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        watching.clear()
+        watcher.join(timeout=2)
+
+        assert "ready" not in observed, observed
+        # Read the terminal state directly rather than from the sampler, which
+        # may have taken its last sample before the final write landed.
+        assert _read_state(client.paths)["status"] == "stopped"
+    finally:
+        watching.clear()
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_a_stalled_control_caller_cannot_delay_a_stop(tmp_path, broker_root):
+    """The control endpoint must not rebuild the blocking it exists to escape.
+
+    A caller that sends a frame prefix and then stops would, if requests were
+    served in turn, occupy the endpoint for a full request deadline each -- and
+    a stream of them would starve stops indefinitely.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    stalled = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(4)]
+    try:
+        for hanger in stalled:
+            hanger.settimeout(10)
+            hanger.connect(str(client.paths.control_socket))
+            # Enough to be accepted and awaited, never enough to complete.
+            hanger.sendall(FRAME_MAGIC)
+
+        started = time.monotonic()
+        assert client.control_stop(reason="stop behind stalled callers")["via"] == "control"
+        # Served concurrently, so this cannot have queued behind their deadlines.
+        # Serialized handling would need about one deadline per stalled caller;
+        # this bound is well under that and well over a concurrent answer.
+        elapsed = time.monotonic() - started
+        assert elapsed < CONTROL_REQUEST_TIMEOUT_SECONDS * 2, elapsed
+
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    finally:
+        for hanger in stalled:
+            with suppress(OSError):
+                hanger.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_the_control_endpoint_refuses_to_run_commands(tmp_path, broker_root):
+    """The boundary that makes a second socket safe: it reaches nothing remote."""
+
+    _policy, server, thread, client = _start_local_broker(tmp_path, broker_root)
+    control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    control_stream = None
+    try:
+        control.settimeout(10)
+        control.connect(str(client.paths.control_socket))
+        control_stream = control.makefile("rwb", buffering=0)
+        write_frame(
+            control_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "smuggled",
+                "command": "printf smuggled",
+                "timeout_seconds": 30,
+                "stdin": None,
+            },
+        )
+
+        assert read_frame(control_stream) == {"type": "error", "error": "invalid_request"}
+        # Nothing reached the transport, and the broker is still usable.
+        assert client.execute("printf alive", timeout=5).stdout == "alive"
+        assert client.ping()["commands_completed"] == 1
+        assert server.transport is not None and server.transport.poll() is None
+    finally:
+        if control_stream is not None:
+            control_stream.close()
+        control.close()
+        _stop_local_broker(thread, client)
+
+
+def _hostile_control_payloads() -> list[tuple[str, bytes]]:
+    """Bytes a control caller could send that must not fell the thread.
+
+    The pathological JSON is framed properly so it reaches the parser guards
+    rather than being rejected at the magic check, which would test far less.
+    """
+
+    framed = [
+        (f"framed-pathological-{index}", FRAME_MAGIC + struct.pack("!I", len(body)) + body)
+        for index, body in enumerate(_pathological_json_payloads())
+    ]
+    return framed + [
+        ("not-a-frame", b"not-a-frame-at-all"),
+        ("truncated-body", FRAME_MAGIC + struct.pack("!I", 64) + b"{"),
+        ("declared-oversize", FRAME_MAGIC + struct.pack("!I", MAX_FRAME_BYTES + 1)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [payload for _name, payload in _hostile_control_payloads()],
+    ids=[name for name, _payload in _hostile_control_payloads()],
+)
+def test_a_hostile_control_request_does_not_kill_the_control_thread(tmp_path, broker_root, payload):
+    """A dead control thread is a silently unstoppable broker."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    hostile = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        hostile.settimeout(10)
+        hostile.connect(str(client.paths.control_socket))
+        # A broken pipe here is the daemon rejecting and closing, which is the
+        # behaviour under test rather than a failure of it.
+        with suppress(OSError):
+            hostile.sendall(payload)
+        hostile.close()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                assert client.control_ping()["busy"] is False
+                break
+            except O2BrokerError:
+                time.sleep(0.05)
+        else:  # pragma: no cover - only on a genuinely dead control thread
+            pytest.fail("control endpoint stopped answering after a hostile request")
+
+        assert client.control_stop(reason="after hostile control frame")["via"] == "control"
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    finally:
+        with suppress(OSError):
+            hostile.close()
+        if thread.is_alive():
+            _stop_local_broker(thread, client)
+
+
+def test_the_control_socket_does_not_outlive_its_daemon(tmp_path, broker_root):
+    """A leftover control socket would advertise a stop path that cannot work."""
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    assert client.paths.control_socket.exists()
+    _stop_local_broker(thread, client)
+
+    assert not client.paths.control_socket.exists()
+    with pytest.raises(O2BrokerUnavailableError):
+        client.control_ping()
 
 
 def test_broker_state_is_json_serializable(tmp_path, broker_root):

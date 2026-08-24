@@ -192,17 +192,50 @@ automatic retry.
   broker through the socket, and it stays inside the socket's own authority: no
   pid is read and no signal is sent. An older daemon ignores the flag and
   behaves as before.
-- **A forced stop is queued, not prioritized, and that bounds how fast it can
-  act.** The daemon serves one connection at a time from a FIFO accept queue, so
-  a forced stop takes effect after the in-flight command *and any connections
-  already queued ahead of it* — a delay bounded by queue depth times the
-  per-command ceiling, not by a single command. Through `o2_exec` that is queue
-  depth × 300s; a library caller at the 3600s ceiling makes it far worse. It
-  abandons nothing and jumps nothing.
-- A stop that must act *now* still means killing the daemon by hand. The proper
-  fix is a control path that does not sit behind the command queue — a second
-  listener the daemon services independently — which is deliberately **not** in
-  this change: it is a new authority boundary and wants its own review.
+- **Stops go to the control endpoint, which is never blocked.** `control.sock`
+  is a second mode-0600 socket serviced by its own daemon thread, so it answers
+  while the command loop is blocked on a remote result — the state in which the
+  command socket cannot answer at all. Setting the stop flag there is the whole
+  mechanism: the command loop rechecks it before accepting anything else, so
+  every request behind the running command is **discarded rather than run**. The
+  bound falls from queue depth × per-command ceiling to a single command.
+- Once a stop is acknowledged the receipt never says `ready` again. A command
+  completing afterwards publishes `stopping`, because between that write and the
+  terminal one a client reading `ready` would believe the broker reusable and
+  try to use it.
+- A control stop arriving while the daemon is publishing its terminal receipt is
+  refused rather than served. The state lock guards both, so a late stop cannot
+  overwrite a terminal `failed` or `stopped` with `stopping` and leave that as
+  the final word.
+- Skipping the queue is not sufficient on its own. A connection the command
+  thread has already accepted has left that queue, so a stop and the
+  check-and-acknowledge boundary are made mutually exclusive by a lock the
+  control stop also takes. It ends at the acknowledgement rather than the remote
+  frame write: past that point the caller has been told its command was
+  dispatched, so forwarding is obligatory and refusing would leave it believing
+  a command ran that never did. The guarantee is therefore that no command is
+  *acknowledged* after a stop is, and the cost is one local socket write rather
+  than a frame write a large stdin can stretch to tens of seconds. Callers cancelled
+  this way are told their request was not dispatched, which is exactly true.
+- **Control requests are served concurrently, not in turn.** Handling them one
+  at a time would rebuild on this endpoint the head-of-line blocking it exists
+  to escape: a caller that sends a frame prefix and stops occupies it for a full
+  request deadline, and a stream of them starves stops indefinitely. Each
+  request gets its own short-lived thread, capped, with connections past the cap
+  closed rather than queued — queueing a stop is delaying it. The request
+  deadline is a second, not the command socket's five: a control frame is a stop
+  or a ping, so anything slower is a stalled caller.
+- **The control endpoint carries no commands.** It answers `stop` and `ping` and
+  refuses everything else, including `exec`. It is not a second route to O2 and
+  must not become one; widening it should be a deliberate act, which is why it
+  is a separate socket rather than a flag on the command socket.
+- A stop still never abandons the running command — doing so would convert a
+  stop into an unknown remote outcome. A stop that must pre-empt even the
+  running command remains a manual kill.
+- A daemon started before the control endpoint existed publishes no
+  `control.sock`, so `stop_broker` falls back to the command socket, where
+  `force: true` still applies and a stop is still queued behind everything
+  waiting.
 - Signalling the daemon by pid was tried and abandoned. A pid can only be taken
   from the receipt or from the lock file, and neither survives the gap to the
   `kill`: a receipt outlives its daemon, and a lock read proves only who held
