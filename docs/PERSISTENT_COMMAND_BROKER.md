@@ -230,6 +230,12 @@ automatic retry.
   already have run — so refusing would tell exactly the stale callers this
   guard exists for not to retry something that never left the workstation. A
   clamp serves the request, bounds the channel, and says so.
+- **A deadline-free request is bounded too.** `timeout_seconds: null` is the one
+  shape that can wedge the daemon outright: its result read has no watchdog, so
+  a helper that never replies holds the shared channel with nothing to time out.
+  The protocol still carries JSON null, but the daemon bounds it to the ceiling
+  before dispatch and reports that in `stderr` like any other reduction. The
+  unbounded read remains only for direct in-process callers who choose it.
 - Any refusal frame the daemon does send is reported by the client as a
   pre-dispatch rejection rather than an uncertain outcome, since nothing is
   forwarded before one is written.

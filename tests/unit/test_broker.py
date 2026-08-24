@@ -1289,6 +1289,50 @@ def test_the_daemon_bounds_a_timeout_no_client_side_guard_would_catch(tmp_path, 
         _stop_local_broker(thread, client)
 
 
+def test_a_deadline_free_request_is_bounded_before_it_can_wedge_the_daemon(tmp_path, broker_root):
+    """A request with no deadline is the one shape that can wedge outright.
+
+    The daemon's result read has no watchdog for an unbounded command, so a
+    helper that never replies to one would hold the shared channel with nothing
+    to time out. The protocol still carries JSON null; the daemon declines to
+    honour it as unbounded.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_stream = None
+    try:
+        raw.settimeout(30)
+        raw.connect(str(client.paths.socket))
+        raw_stream = raw.makefile("rwb", buffering=0)
+        write_frame(
+            raw_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "no-deadline",
+                "command": "printf unbounded",
+                "timeout_seconds": None,
+                "stdin": None,
+            },
+        )
+        assert read_frame(raw_stream) == {"type": "dispatched", "id": "no-deadline"}
+        result = read_frame(raw_stream)
+
+        # Served normally, so every client reads it without new handling.
+        assert result["type"] == "result"
+        assert result["stdout"] == "unbounded"
+        assert "no deadline" in result["stderr"]
+        assert f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s" in result["stderr"]
+        # And the deadline actually in force is recorded, not the absent one.
+        assert _read_state(client.paths)["last_command"]["timeout_seconds"] == MAX_COMMAND_TIMEOUT_SECONDS
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        raw.close()
+        _stop_local_broker(thread, client)
+
+
 def test_the_clamp_governs_the_daemons_own_watchdog(tmp_path, broker_root):
     """The point of the bound is the channel, so the wait must shrink too."""
 

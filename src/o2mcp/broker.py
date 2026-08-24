@@ -1143,8 +1143,13 @@ class BrokerServer:
         byte progress within a short inactivity window and a frame-size-scaled
         absolute budget. A miss is fatal to the channel: after dispatch, no
         automatic retry is safe, and retaining the socket would falsely
-        advertise reuse. Explicit no-deadline requests intentionally preserve
-        their unbounded contract and therefore read synchronously.
+        advertise reuse.
+
+        The unbounded branch below is no longer reachable from a request: the
+        daemon bounds a deadline-free exec to the workstation ceiling before
+        dispatching it, because a helper that never replies to one would block
+        the shared channel with nothing to time out. It is kept for direct
+        callers and reads synchronously by their explicit choice.
         """
 
         if command_timeout is None:
@@ -1368,7 +1373,15 @@ class BrokerServer:
             # clamp serves the request, holds the channel no longer than the
             # ceiling, and is reported in stderr rather than silently.
             clamped_from: float | None = None
-            if request_timeout is not None and float(request_timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
+            if request_timeout is None:
+                # A deadline-free request is the one shape that can wedge this
+                # daemon outright: the result read below has no watchdog for it,
+                # so a helper that never replies blocks the shared channel with
+                # nothing to time out. The protocol still carries JSON null, but
+                # the daemon will not honour it as unbounded.
+                clamped_from = math.inf
+                request_timeout = MAX_COMMAND_TIMEOUT_SECONDS
+            elif float(request_timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
                 clamped_from = float(request_timeout)
                 request_timeout = MAX_COMMAND_TIMEOUT_SECONDS
             # Never forward caller-owned container structure. Rebuilding the
@@ -1482,8 +1495,9 @@ class BrokerServer:
                 # Say it where a caller already looks for notes the broker adds,
                 # alongside the truncation notices, so the shortened deadline is
                 # visible rather than inferred from an early timeout.
+                requested = "no deadline" if math.isinf(clamped_from) else f"{clamped_from:.0f}s"
                 note = (
-                    f"command deadline reduced from {clamped_from:.0f}s to "
+                    f"command deadline reduced from {requested} to "
                     f"{MAX_COMMAND_TIMEOUT_SECONDS:.0f}s by the workstation ceiling on how long one command may "
                     "hold the shared serialized channel"
                 )
