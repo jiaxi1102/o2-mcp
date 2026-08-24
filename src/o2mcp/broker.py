@@ -102,6 +102,13 @@ MAX_REMOTE_RESPONSE_TRANSFER_SECONDS = MAX_FRAME_BYTES / MIN_REMOTE_RESPONSE_BYT
 # budget with the caller's own deadline: waiting longer than your own command
 # would have taken is the point at which the silence, not the queue, is the
 # problem. A floor keeps short commands from failing behind ordinary traffic.
+# The protocol permits a seven-day deadline, and the daemon's watchdog budget
+# follows whatever a caller requests -- so an hour-long timeout also buys an
+# hour before a silent transport is torn down. The MCP tool caps itself at 300s,
+# but that guard sits on one input model; this ceiling applies to every caller of
+# the client, so an in-process one cannot reinstate a multi-hour hold on a
+# channel shared by every MCP process on the workstation.
+MAX_COMMAND_TIMEOUT_SECONDS = 3600.0
 MIN_QUEUE_WAIT_SECONDS = 60.0
 DEFAULT_QUEUE_WAIT_SECONDS = 300.0
 # ``socket.settimeout(0)`` selects non-blocking mode rather than an immediate
@@ -475,6 +482,67 @@ class BrokerClient:
             client.close()
             raise O2BrokerUnavailableError(f"The persistent O2 broker did not answer locally: {exc}") from exc
 
+    def signal_stop(self, *, reason: str, grace: float = 2.0) -> dict[str, Any]:
+        """Request a stop by signal when the daemon cannot answer its socket.
+
+        The socket stop cannot retire a busy broker: it queues behind whatever
+        command holds the channel, and the daemon cancels it outright when the
+        caller's short deadline expires first. ``SIGTERM`` reaches the daemon
+        regardless, and its handler sets the same graceful stop flag, so the
+        transport closes, the socket is removed, and the lifetime lock is
+        released through the ordinary exit path.
+
+        This requests a stop; it does not abandon a running command. The accept
+        loop observes the flag only after the in-flight command finishes or hits
+        its deadline, so a busy daemon exits later rather than now, and the
+        result says which case happened instead of implying the channel is free.
+        """
+
+        state = _read_state(self.paths)
+        pid = state.get("pid")
+        if type(pid) is not int or pid <= 0:
+            raise O2BrokerError(
+                f"The broker receipt carries no usable daemon pid (status: {state.get('status')!r}), so there is "
+                "nothing safe to signal. Inspect o2_local_status and the broker log."
+            )
+        # Two independent checks before signalling anything. The lock proves a
+        # daemon is alive at all; the null signal proves this pid exists and is
+        # ours. Neither alone rules out a receipt left by a dead daemon whose pid
+        # has since been reused, which is why this path is opt-in rather than an
+        # automatic fallback.
+        if not self.launch_in_progress():
+            raise O2BrokerError(
+                "No daemon holds the broker lifetime lock, so the receipt is stale and its pid must not be "
+                "signalled. There is no broker to stop."
+            )
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError as exc:
+            raise O2BrokerError(f"Broker daemon pid {pid} no longer exists; the receipt is stale.") from exc
+        except PermissionError as exc:
+            raise O2BrokerError(f"Broker daemon pid {pid} is not owned by this user; refusing to signal it.") from exc
+
+        in_flight = state.get("in_flight") if isinstance(state.get("in_flight"), dict) else None
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and self.launch_in_progress():
+            time.sleep(0.05)
+        exited = not self.launch_in_progress()
+        return {
+            "signalled": True,
+            "signal": "SIGTERM",
+            "pid": pid,
+            "reason": reason,
+            "exited": exited,
+            "in_flight": in_flight,
+            "note": (
+                "The daemon released its lifetime lock and stopped."
+                if exited
+                else "Stop requested. The daemon finishes or times out its in-flight command first, then exits; "
+                "it has not stopped yet. Re-check o2_local_status rather than signalling again."
+            ),
+        }
+
     def _request(
         self,
         payload: dict[str, Any],
@@ -515,6 +583,13 @@ class BrokerClient:
         if timeout is not None and not _is_bounded_positive_timeout(timeout):
             raise ValueError(
                 f"broker timeout must be None or a finite positive number no greater than {MAX_TIMEOUT_SECONDS}"
+            )
+        if timeout is not None and float(timeout) > MAX_COMMAND_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"broker command timeout {float(timeout):.0f}s exceeds the {MAX_COMMAND_TIMEOUT_SECONDS:.0f}s "
+                "ceiling. One command's deadline is also how long it may hold the shared serialized channel and "
+                "how long the daemon will wait before tearing down a silent transport. Submit a job and poll for "
+                "it instead of waiting inside one command."
             )
         if input_text is not None and not isinstance(input_text, str):
             raise ValueError("broker stdin must be text or None")

@@ -196,6 +196,15 @@ class StopBrokerInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     reason: str = Field(..., min_length=1, max_length=240)
     transfer: bool = Field(default=False, description="Stop the transfer-host broker instead of the login broker.")
+    force: bool = Field(
+        default=False,
+        description=(
+            "Signal the daemon instead of asking it over its socket. Needed when the broker is busy: a "
+            "queued socket stop is cancelled once its caller times out, so it cannot retire a broker that "
+            "is serving a command. The signal requests a graceful stop and does not abandon that command, "
+            "so the daemon exits once the command ends."
+        ),
+    )
 
 
 class DisablePolicyInput(BaseModel):
@@ -656,13 +665,20 @@ async def o2_start_broker(params: StartBrokerInput) -> str:
     },
 )
 async def o2_stop_broker(params: StopBrokerInput) -> str:
-    """Close the local broker and its SSH process without changing policy."""
+    """Close the local broker and its SSH process without changing policy.
+
+    The default socket request retires an idle broker cleanly but cannot retire a
+    busy one, because a queued stop is cancelled once its caller times out. When
+    that happens the error names the command holding the channel and points at
+    `force`, which signals the daemon instead. A signalled stop is still
+    graceful: the daemon exits after its in-flight command ends, not instantly.
+    """
 
     def work() -> dict[str, Any]:
         return {
             "ok": True,
             "target": "transfer" if params.transfer else "login",
-            "broker": _connection().stop_broker(reason=params.reason, transfer=params.transfer),
+            "broker": _connection().stop_broker(reason=params.reason, transfer=params.transfer, force=params.force),
         }
 
     return await _run_tool(work)

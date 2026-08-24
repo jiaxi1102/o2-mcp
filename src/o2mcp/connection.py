@@ -37,6 +37,7 @@ from typing import Callable, Optional
 
 from o2mcp.broker import (
     BrokerClient,
+    O2BrokerError,
     O2BrokerStartupError,
     open_private_append,
     prepare_broker_directory,
@@ -718,11 +719,40 @@ class O2Connection:
         client.wait_until_ready(timeout=self.config.broker_start_timeout)
         return client.local_status()
 
-    def stop_broker(self, *, reason: str, transfer: bool = False) -> dict[str, object]:
-        """Stop one local broker session; allowed even while policy is disabled."""
+    def stop_broker(self, *, reason: str, transfer: bool = False, force: bool = False) -> dict[str, object]:
+        """Stop one local broker session; allowed even while policy is disabled.
+
+        The socket request is the ordinary path and the only one that can retire
+        an idle broker cleanly. It cannot retire a busy one: it queues behind the
+        command holding the channel, and the daemon cancels a queued stop whose
+        caller has already timed out. ``force`` escalates to a signal, which
+        reaches the daemon regardless -- opt-in because it acts on a pid read
+        from a receipt rather than through the socket's own authority.
+        """
 
         client = self._broker_client(transfer=transfer)
-        return client.stop(reason=reason)
+        if force:
+            return client.signal_stop(reason=reason)
+        try:
+            return client.stop(reason=reason)
+        except O2BrokerError as exc:
+            # Point at the escape hatch, and name what is holding the channel so
+            # the operator can tell "busy with a long command" from "wedged".
+            status = client.local_status()
+            in_flight = status.get("in_flight") if isinstance(status.get("in_flight"), dict) else None
+            command = in_flight.get("command") if isinstance(in_flight, dict) else None
+            preview = command.get("preview") if isinstance(command, dict) else None
+            held = ""
+            if status.get("busy"):
+                elapsed = status.get("busy_for_seconds")
+                seconds = f" for {elapsed:.0f}s" if isinstance(elapsed, (int, float)) else ""
+                named = f": {preview!r}" if isinstance(preview, str) and preview else ""
+                held = f" It has been serving a command{seconds}{named}."
+            raise O2BrokerError(
+                f"The broker did not answer its socket, so it was not stopped: {exc}.{held} A queued stop is "
+                "cancelled once its caller times out, so this cannot retire a busy broker. Re-issue with "
+                "force=true to signal the daemon instead; it then stops after its in-flight command ends."
+            ) from exc
 
     # -- ControlMaster lifecycle ------------------------------------------------
     def _master_check_argv(self, alias: str) -> list[str]:

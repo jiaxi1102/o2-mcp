@@ -179,6 +179,36 @@ automatic retry.
   request. It checks for a disconnected caller before forwarding, so a timed-out
   request is dropped rather than run unobserved.
 
+### Stopping a broker that cannot answer
+
+- `o2_stop_broker` asks over the socket. That retires an idle broker cleanly and
+  **cannot** retire a busy one: the request queues behind the command holding the
+  channel, and the daemon cancels a queued stop whose caller has already timed
+  out. The failure now names the occupying command and points at `force`.
+- `force: true` signals the daemon instead. `SIGTERM` is handled and sets the
+  same graceful stop flag, so the transport closes, the socket is removed and the
+  lock is released through the ordinary exit path. It is still graceful: the
+  accept loop observes the flag only after the in-flight command ends, so a busy
+  daemon exits *later*, and the result distinguishes `exited: true` from a stop
+  merely requested. Abandoning a running command outright remains a manual
+  `kill -9`, which leaves an orphaned receipt that `busy` correctly ignores.
+- `force` is opt-in rather than an automatic fallback because it acts on a pid
+  read from a receipt rather than through the socket's own authority. It refuses
+  unless a daemon holds the lifetime lock *and* the pid exists and is owned by
+  this user; a stale receipt is never signalled.
+
+### Bounding one caller's cost, part two
+
+- The 300s cap on `o2_exec` guards one input model. `BrokerClient.execute`
+  enforces a 3600s ceiling for **every** caller, including in-process ones, so a
+  library caller cannot reinstate a multi-hour hold. The protocol itself still
+  permits seven days; nothing should want it.
+- An explicit `timeout=None` remains supported and unbounded by design. It is
+  not a wedge risk: a dead helper, a dead SSH process, and a black-holed network
+  all close the transport's stdout, so the daemon's read ends in every failure
+  mode. The only unbounded case is a command that genuinely never finishes,
+  which is what the caller asked for.
+
 ### Command observability
 
 The daemon serializes local clients over one channel, so it cannot answer a

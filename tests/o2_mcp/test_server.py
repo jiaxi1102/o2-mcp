@@ -399,8 +399,8 @@ async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
             self.calls.append(("run", command, timeout, alias, broker_role))
             return CommandResult(["broker", alias, command], 0, "transfer-ok\n", "")
 
-        def stop_broker(self, *, reason, transfer=False):
-            self.calls.append(("stop", reason, transfer))
+        def stop_broker(self, *, reason, transfer=False, force=False):
+            self.calls.append(("stop", reason, transfer, force))
             return {"type": "stopping"}
 
     connection = _Connection()
@@ -419,7 +419,7 @@ async def test_transfer_broker_tools_preserve_role_selection(monkeypatch):
     assert connection.calls == [
         ("start", "grant-1", True, True),
         ("run", "hostname; whoami; date", 25, "o2-transfer", "transfer"),
-        ("stop", "offline role-routing test", True),
+        ("stop", "offline role-routing test", True, False),
     ]
 
 

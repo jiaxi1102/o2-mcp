@@ -34,6 +34,7 @@ from o2mcp import broker as broker_module
 from o2mcp.broker import (
     DEFAULT_QUEUE_WAIT_SECONDS,
     DEFAULT_REMOTE_RESPONSE_GRACE_SECONDS,
+    MAX_COMMAND_TIMEOUT_SECONDS,
     MAX_LAUNCH_BYTES,
     MAX_REMOTE_RESPONSE_TRANSFER_SECONDS,
     MAX_STATE_COMMAND_PREVIEW_CHARS,
@@ -1127,6 +1128,181 @@ def test_a_starved_caller_fails_visibly_and_names_the_blocker(tmp_path, broker_r
             occupant_stream.close()
         occupant.close()
         _stop_local_broker(thread, client)
+
+
+def _orphaned_receipt(pid: int | None) -> dict:
+    """Build the receipt a daemon killed before its terminal write leaves."""
+
+    receipt = {
+        "schema_version": 1,
+        "protocol": PROTOCOL_VERSION,
+        "status": "ready",
+        "alias": "offline-o2",
+        "destination": {"hostname": "offline.example", "user": "offline", "port": "22"},
+        "in_flight": {
+            "request_id": "orphaned",
+            "command": {"preview": "sleep 900", "sha256": "0" * 64, "bytes": 9},
+            "dispatched_at": time.time() - 900,
+        },
+    }
+    if pid is not None:
+        receipt["pid"] = pid
+    return receipt
+
+
+def test_a_busy_socket_stop_points_at_force_and_names_the_blocker(tmp_path):
+    """A stop that cannot succeed must say why and what to do instead.
+
+    This is the failure an operator meets first: the documented remedy silently
+    does nothing against a busy broker, because a queued stop is cancelled once
+    its caller times out. Naming the occupying command is what separates "busy
+    with a long command" from "wedged".
+    """
+
+    policy = _reuse_policy(tmp_path)
+
+    class _BusyBroker:
+        """A healthy broker too occupied to answer its own socket."""
+
+        def stop(self, *, reason):
+            raise O2BrokerUnavailableError("The persistent O2 broker did not answer locally: timed out")
+
+        def local_status(self):
+            return {
+                "status": "ready",
+                "responsive": False,
+                "busy": True,
+                "busy_for_seconds": 240.0,
+                "in_flight": {"command": {"preview": "while true; do sleep 30; squeue -u me; done"}},
+            }
+
+    config = O2Config(
+        policy_file=policy.path,
+        broker_dir=tmp_path / "login-broker",
+        transfer_broker_dir=tmp_path / "transfer-broker",
+    )
+    connection = O2Connection(config, policy=policy, broker_client=_BusyBroker())
+
+    with pytest.raises(O2BrokerError) as refused:
+        connection.stop_broker(reason="is it wedged?")
+
+    message = str(refused.value)
+    assert "force=true" in message
+    assert "while true; do sleep 30" in message
+    assert "240s" in message
+
+
+def test_signal_stop_refuses_a_stale_receipt_without_signalling(broker_root, monkeypatch):
+    """A pid read from a receipt is only safe to signal while a daemon is alive.
+
+    Nothing holds the lifetime lock here, so the receipt describes a daemon that
+    is gone and its pid may since have been reused by something unrelated.
+    """
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(paths.state, _orphaned_receipt(pid=999_999))
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+
+    with pytest.raises(O2BrokerError, match="No daemon holds the broker lifetime lock"):
+        BrokerClient(paths.root).signal_stop(reason="stale receipt")
+
+    assert sent == []
+
+
+def test_signal_stop_refuses_a_receipt_without_a_usable_pid(broker_root, monkeypatch):
+    """No pid means nothing safe to signal, whatever the lock says."""
+
+    paths = prepare_broker_directory(broker_root)
+    _atomic_json_write(paths.state, _orphaned_receipt(pid=None))
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+
+    with pytest.raises(O2BrokerError, match="no usable daemon pid"):
+        BrokerClient(paths.root).signal_stop(reason="pidless receipt")
+
+    assert sent == []
+
+
+def test_signal_stop_reports_a_busy_daemon_as_not_yet_stopped(tmp_path, broker_root, monkeypatch):
+    """A signalled stop is graceful, so a busy daemon exits later, not now.
+
+    The handler only sets the stop flag; the accept loop observes it after the
+    in-flight command ends. Reporting this as stopped would be a lie an operator
+    would act on, so the result distinguishes requested from completed.
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    real_kill = os.kill
+    delivered: list[tuple[int, int]] = []
+
+    def recording_kill(pid, sig):
+        # The daemon runs as a thread here, so its recorded pid is this test
+        # process. Let the liveness probe through; never deliver the real signal.
+        if sig == 0:
+            return real_kill(pid, sig)
+        delivered.append((pid, sig))
+        return None
+
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "blocker",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "blocker"}
+        deadline = time.monotonic() + 5
+        while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        monkeypatch.setattr(os, "kill", recording_kill)
+        result = client.signal_stop(reason="busy broker", grace=0.2)
+
+        assert delivered == [(os.getpid(), signal.SIGTERM)]
+        assert result["exited"] is False
+        assert result["in_flight"]["request_id"] == "blocker"
+        assert "has not stopped yet" in result["note"]
+        monkeypatch.undo()
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
+
+
+@pytest.mark.parametrize("timeout", [MAX_COMMAND_TIMEOUT_SECONDS + 1, 100_000.0])
+def test_a_multi_hour_command_timeout_is_refused_before_any_socket_access(broker_root, timeout):
+    """One command's deadline is also its licence to hold the shared channel.
+
+    The MCP tool caps itself, but that guard is on a single input model; this
+    ceiling covers every caller of the client so an in-process one cannot
+    reinstate the multi-hour hold the cap was added to prevent.
+    """
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        BrokerClient(broker_root).execute("printf x", timeout=timeout)
+
+
+def test_a_timeout_at_the_ceiling_is_allowed_through_validation(broker_root):
+    """The ceiling is a bound, not an off-by-one refusal of the bound itself."""
+
+    # No broker exists, so passing validation surfaces as an unavailable broker
+    # rather than a ValueError.
+    with pytest.raises(O2BrokerError) as refused:
+        BrokerClient(broker_root).execute("printf x", timeout=MAX_COMMAND_TIMEOUT_SECONDS)
+    assert not isinstance(refused.value, ValueError)
 
 
 def test_a_saturated_backlog_is_reported_as_busy_not_as_a_missing_broker(broker_root, monkeypatch):
