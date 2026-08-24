@@ -43,6 +43,7 @@ from o2mcp.broker import (
     O2BrokerError,
     O2BrokerUnavailableError,
     _atomic_json_write,
+    _interprocess_monotonic,
     _read_launch_fd,
     _read_state,
     _receipt_number,
@@ -1217,7 +1218,7 @@ def test_a_retained_record_is_not_busy_without_a_live_daemon(broker_root):
                 "request_id": "orphaned-command",
                 "command": {"preview": "sleep 900", "sha256": "0" * 64, "bytes": 9},
                 "dispatched_at": time.time() - 900,
-                "dispatched_monotonic": time.monotonic() - 900,
+                "dispatched_clock_monotonic": (_interprocess_monotonic() or 0.0) - 900,
             },
         },
     )
@@ -1230,6 +1231,51 @@ def test_a_retained_record_is_not_busy_without_a_live_daemon(broker_root):
     assert "busy_for_seconds" not in status
     # The record itself is still retained for forensics.
     assert status["in_flight"]["request_id"] == "orphaned-command"
+
+
+def test_the_published_dispatch_reading_matches_a_readers_own_clock(tmp_path, broker_root):
+    """The daemon must publish the clock a separate reader actually samples.
+
+    `time.monotonic()` has an implementation-defined reference point: on macOS
+    it maps to `mach_absolute_time()`, which differs from CLOCK_MONOTONIC on the
+    same host by however long that host has slept. Publishing one and
+    subtracting the other is silently wrong by that amount, so the receipt has
+    to name its clock. (On platforms where both share a source this assertion
+    still holds; it simply cannot distinguish them.)
+    """
+
+    _policy, _server, thread, client = _start_local_broker(tmp_path, broker_root)
+    occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    occupant_stream = None
+    try:
+        occupant.connect(str(client.paths.socket))
+        occupant_stream = occupant.makefile("rwb", buffering=0)
+        write_frame(
+            occupant_stream,
+            {
+                "type": "exec",
+                "protocol": PROTOCOL_VERSION,
+                "id": "clock-occupant",
+                "command": "sleep 3; printf occupied",
+                "timeout_seconds": 10,
+                "stdin": None,
+            },
+        )
+        assert read_frame(occupant_stream) == {"type": "dispatched", "id": "clock-occupant"}
+
+        deadline = time.monotonic() + 5
+        while _read_state(client.paths).get("in_flight") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        published = _read_state(client.paths)["in_flight"]["dispatched_clock_monotonic"]
+        assert abs(_interprocess_monotonic() - published) < 60
+
+        assert read_frame(occupant_stream)["stdout"] == "occupied"
+    finally:
+        if occupant_stream is not None:
+            occupant_stream.close()
+        occupant.close()
+        _stop_local_broker(thread, client)
 
 
 def test_live_busy_time_ignores_a_wrong_wall_clock(tmp_path, broker_root):

@@ -190,8 +190,15 @@ carries the missing half of that picture:
   killed before its terminal write -- SIGKILL, a crash, a reboot -- leaves a
   `ready` receipt naming a command nothing will retire, and without that check
   it would report busy forever. `busy_for_seconds` is derived from a persisted
-  `time.monotonic()` reading rather than the epoch, which is sound precisely
-  because a held lock implies a live daemon and therefore the same boot.
+  monotonic reading rather than the epoch, which is sound precisely because a
+  held lock implies a live daemon and therefore the same boot. That reading
+  names its clock explicitly (`CLOCK_MONOTONIC`) instead of relying on
+  `time.monotonic()`, whose reference point is implementation-defined: on macOS
+  it maps to `mach_absolute_time()`, which excludes time the host spent asleep
+  and so differs from `CLOCK_MONOTONIC` on the same machine by however long it
+  has slept. Publishing one and subtracting the other would be silently wrong
+  by that amount. Where the named clock is unavailable the field is omitted
+  rather than guessed.
 - The record is best effort, not a ledger. Consecutive suppressed writes can
   leave it naming an earlier command than the one actually running; it is a
   diagnostic aid, and the pong remains the authority on whether the channel is

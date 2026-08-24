@@ -150,6 +150,30 @@ def _receipt_number(value: Any) -> float | None:
         return None
 
 
+def _interprocess_monotonic() -> float | None:
+    """Return a monotonic reading that two processes may validly subtract.
+
+    ``time.monotonic()`` has an implementation-defined reference point. On macOS
+    it maps to ``mach_absolute_time()``, which excludes time the machine spent
+    asleep and therefore differs from ``CLOCK_MONOTONIC`` on the same host by
+    however long that host has slept. A reading the daemon persists is only
+    meaningful to a reader sampling the identical source, so name the POSIX
+    clock rather than depend on what ``time.monotonic()`` happens to map to for
+    a given interpreter and platform. Where that clock is unavailable, publish
+    nothing: no elapsed time is better than one another process cannot
+    interpret.
+    """
+
+    clock_gettime = getattr(time, "clock_gettime", None)
+    clock_id = getattr(time, "CLOCK_MONOTONIC", None)
+    if clock_gettime is None or clock_id is None:
+        return None
+    try:
+        return float(clock_gettime(clock_id))
+    except (OSError, ValueError):
+        return None
+
+
 def _receipt_returncode(value: Any) -> int | None:
     """Return one plausibly sized remote exit status, or None."""
 
@@ -591,9 +615,10 @@ class BrokerClient:
         # inflate this value or clamp it to zero, the same defect already fixed
         # for completed occupancy. Without a usable reading, report no elapsed
         # time rather than a wrong one.
-        dispatched_monotonic = _receipt_number(in_flight.get("dispatched_monotonic"))
-        if dispatched_monotonic is not None:
-            summary["busy_for_seconds"] = max(0.0, time.monotonic() - dispatched_monotonic)
+        dispatched = _receipt_number(in_flight.get("dispatched_clock_monotonic"))
+        sampled = _interprocess_monotonic()
+        if dispatched is not None and sampled is not None:
+            summary["busy_for_seconds"] = max(0.0, sampled - dispatched)
         return summary
 
     def local_status(self) -> dict[str, Any]:
@@ -1202,14 +1227,20 @@ class BrokerServer:
                     # during a long command would inflate the occupancy metric
                     # or collapse it to zero. Measure elapsed time the way every
                     # other deadline in this daemon does.
+                    # Occupancy is computed entirely inside this process, so it
+                    # uses the ordinary monotonic clock. The published reading is
+                    # subtracted by a different process and must therefore name
+                    # its clock; it is absent when that clock is unavailable.
                     dispatched_monotonic = time.monotonic()
+                    dispatched_shared = _interprocess_monotonic()
                     in_flight = {
                         "request_id": request_id,
                         "command": _command_fingerprint(request["command"]),
                         "timeout_seconds": request_timeout,
                         "dispatched_at": dispatched_at,
-                        "dispatched_monotonic": dispatched_monotonic,
                     }
+                    if dispatched_shared is not None:
+                        in_flight["dispatched_clock_monotonic"] = dispatched_shared
                     self._in_flight = in_flight
                     self._write_remote_frame_with_deadline(remote_in, remote_request)
             except O2PolicyError as exc:
@@ -1253,7 +1284,7 @@ class BrokerServer:
                     last_command_at=completed_at,
                     in_flight=None,
                     last_command={
-                        **{key: value for key, value in in_flight.items() if key != "dispatched_monotonic"},
+                        **{key: value for key, value in in_flight.items() if key != "dispatched_clock_monotonic"},
                         "completed_at": completed_at,
                         # Broker-observed occupancy: how long this command held the
                         # sole serialized channel, which is what starves other
