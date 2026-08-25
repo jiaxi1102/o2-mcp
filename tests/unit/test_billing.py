@@ -87,11 +87,12 @@ def test_largest_same_price_memory_is_reported():
     assert info["billed"] is True
     assert info["largest_same_price_mem_gb"] == pytest.approx(31.0)
     assert info["free_headroom_gb"] == pytest.approx(11.0)
+    assert info["mem_per_billing_unit_gb"] == pytest.approx(16.0)
 
 
 def test_request_on_a_block_edge_is_flagged_with_the_cheaper_value():
     info = billing.boundary(billing.Request(cpus=4, mem_gb=32), SHORT)
-    assert info["on_block_edge"] is True
+    assert info["on_price_edge"] is True
     assert info["next_cheaper"]["mem_gb"] == pytest.approx(31.0)
     assert info["next_cheaper"]["units"] == 5
     assert info["next_cheaper"]["units_now"] == 6
@@ -145,7 +146,7 @@ class TestSbatchParsing:
         assert req.mem_gb == pytest.approx(32.0)
         assert req.mem_source == "--mem-per-cpu"
         assert any("--mem-per-cpu" in w for w in req.warnings)
-        assert billing.boundary(req, SHORT)["on_block_edge"] is True
+        assert billing.boundary(req, SHORT)["on_price_edge"] is True
 
     def test_absolute_mem_wins_over_mem_per_cpu(self):
         req = billing.parse_sbatch("#SBATCH -c 4\n#SBATCH --mem=31G\n" "#SBATCH --mem-per-cpu=8G\n")
@@ -262,3 +263,88 @@ class TestPrice:
     def test_no_alternatives_when_already_cheapest(self):
         request = billing.Request(cpus=4, mem_gb=6, gpus=1)
         assert billing.alternatives(request, self.TABLE, "gpu_requeue") == []
+
+
+class TestReviewFindings:
+    """Each case is a defect the review of PR #26 identified, kept as a guard."""
+
+    TABLE = {
+        "short": SHORT,
+        "gpu_requeue": GPU_REQUEUE,
+        "defaulted": billing.Weights(cpu=1.0, mem_per_gb=0.0625, def_mem_per_cpu_gb=4.0),
+    }
+
+    def test_unsuffixed_memory_is_megabytes_not_bytes(self):
+        # sbatch documents an unsuffixed --mem as MB. Reading 32000 as bytes
+        # priced a 31.25 GB job at ~0.00003 GB and dropped the whole memory
+        # charge along with every boundary derived from it.
+        assert billing.to_gb("32000") == pytest.approx(31.25)
+        req = billing.parse_sbatch("#SBATCH -c 4\n#SBATCH --mem=32000\n")
+        assert req.mem_gb == pytest.approx(31.25)
+        assert billing.billing_units(req, SHORT) == 5
+
+    def test_suffixed_memory_is_unaffected(self):
+        assert billing.to_gb("32G") == pytest.approx(32.0)
+        assert billing.to_gb("8192M") == pytest.approx(8.0)
+
+    def test_nodes_and_ntasks_per_node_reach_the_cpu_total(self):
+        # 2 nodes x 4 tasks x 2 CPUs = 16, not the 2 that ignoring the first two
+        # directives would give.
+        req = billing.parse_sbatch("#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=4\n#SBATCH --cpus-per-task=2\n")
+        assert req.cpus == 16
+        assert req.nodes == 2
+
+    def test_explicit_ntasks_wins_over_per_node(self):
+        req = billing.parse_sbatch("#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=4\n#SBATCH --ntasks=3\n")
+        assert req.cpus == 3
+
+    def test_node_range_takes_the_guaranteed_minimum(self):
+        req = billing.parse_sbatch("#SBATCH --nodes=2-8\n#SBATCH --ntasks-per-node=2\n")
+        assert req.cpus == 4
+
+    def test_boundaries_come_from_the_whole_weighted_sum(self):
+        # With cpu=0.1/gpu=0.1 an 8-CPU/1-GPU request contributes 0.9, so the
+        # price rises at 176 GB -- not at a multiple of 1/mem_per_gb = 160.
+        # The old shortcut reported 159 GB and turned a 1 GB shave into 17 GB.
+        req = billing.Request(cpus=8, mem_gb=176, gpus=1)
+        info = billing.boundary(req, GPU_REQUEUE)
+        assert billing.billing_units(req, GPU_REQUEUE) == 2
+        assert info["on_price_edge"] is True
+        assert info["next_cheaper"]["mem_gb"] == pytest.approx(175.0)
+        assert info["next_cheaper"]["units"] == 1
+        assert info["next_cheaper"]["kind"] == "edge_shave"
+
+    def test_largest_same_price_respects_a_fractional_base(self):
+        info = billing.boundary(billing.Request(cpus=8, mem_gb=160, gpus=1), GPU_REQUEUE)
+        assert info["largest_same_price_mem_gb"] == pytest.approx(175.0)
+
+    def test_integer_base_behaviour_is_unchanged(self):
+        info = billing.boundary(billing.Request(cpus=4, mem_gb=32), SHORT)
+        assert info["next_cheaper"]["mem_gb"] == pytest.approx(31.0)
+        assert info["largest_same_price_mem_gb"] == pytest.approx(47.0)
+
+    def test_partition_default_memory_is_applied(self):
+        # Omitting --mem does not allocate zero memory; Slurm applies the
+        # configured default and bills it.
+        req = billing.parse_sbatch("#SBATCH -c 4\n")
+        assert req.mem_specified is False
+        payload = billing.price(req, self.TABLE, "defaulted")
+        assert payload["request"]["mem_gb"] == pytest.approx(16.0)
+        assert "partition default" in payload["request"]["mem_source"]
+        assert payload["billing_units"] == 5
+
+    def test_unknown_default_memory_is_refused_not_priced_as_zero(self):
+        req = billing.parse_sbatch("#SBATCH -c 4\n")
+        with pytest.raises(billing.BillingError, match="DefMemPerCPU"):
+            billing.price(req, self.TABLE, "short")
+
+    def test_def_mem_per_node_is_read_and_scaled(self):
+        table = billing.parse_weight_table(
+            "PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerNode=8192\n"
+        )
+        assert table["p"].def_mem_per_node_gb == pytest.approx(8.0)
+        assert table["p"].default_mem_gb(cpus=4, nodes=2) == pytest.approx(16.0)
+
+    def test_zero_or_unset_defaults_are_not_treated_as_a_default(self):
+        table = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=0\n")
+        assert table["p"].def_mem_per_cpu_gb is None

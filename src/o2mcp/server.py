@@ -948,10 +948,6 @@ def main() -> None:
     mcp.run()
 
 
-if __name__ == "__main__":  # pragma: no cover
-    main()
-
-
 @mcp.tool(
     name="o2_price_job",
     annotations={"title": "Price a submission before submitting", "readOnlyHint": True, "openWorldHint": False},
@@ -1036,3 +1032,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
         return payload
 
     return await _run_tool(work)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

@@ -42,8 +42,12 @@ def cache_path(path: str | None = None) -> str:
     return os.environ.get(CACHE_PATH_ENV) or _DEFAULT_CACHE_PATH
 
 
-# sacct/scontrol memory suffixes, expressed in GB.
-_MEM_UNITS = {"": 1.0 / (1024**3), "K": 1.0 / (1024**2), "M": 1.0 / 1024, "G": 1.0, "T": 1024.0}
+# Memory suffixes expressed in GB. There is no "no unit" entry on purpose:
+# sbatch documents an unsuffixed --mem as MEGABYTES, so `--mem=32000` is 31.25
+# GB, not 32000 bytes. Reading it as bytes drops essentially the whole memory
+# charge and every boundary derived from it.
+_MEM_UNITS = {"K": 1.0 / (1024**2), "M": 1.0 / 1024, "G": 1.0, "T": 1024.0}
+SBATCH_DEFAULT_MEM_UNIT = "M"
 
 
 class BillingError(ValueError):
@@ -52,11 +56,27 @@ class BillingError(ValueError):
 
 @dataclass(frozen=True)
 class Weights:
-    """One partition's TRESBillingWeights."""
+    """One partition's TRESBillingWeights, plus the memory it defaults to.
+
+    The defaults matter because omitting --mem does not allocate zero memory:
+    Slurm applies DefMemPerCPU or DefMemPerNode and bills that allocation. They
+    come from the same ``scontrol show partition`` output as the weights, so
+    they are captured together or not at all.
+    """
 
     cpu: float = 1.0
     mem_per_gb: float = 0.0
     gpu: float = 0.0
+    def_mem_per_cpu_gb: float | None = None
+    def_mem_per_node_gb: float | None = None
+
+    def default_mem_gb(self, cpus: float, nodes: float = 1.0) -> float | None:
+        """Memory Slurm would allocate for a request that names none."""
+        if self.def_mem_per_cpu_gb is not None:
+            return self.def_mem_per_cpu_gb * cpus
+        if self.def_mem_per_node_gb is not None:
+            return self.def_mem_per_node_gb * max(1.0, nodes)
+        return None
 
     @property
     def block_gb(self) -> float | None:
@@ -73,6 +93,10 @@ class Request:
     cpus: float = 1.0
     mem_gb: float = 0.0
     gpus: float = 0.0
+    nodes: float = 1.0
+    # False when no --mem/--mem-per-cpu was given, so the partition default
+    # applies and a price of "zero memory" would be a fiction.
+    mem_specified: bool = True
     partition: str | None = None
     # Recorded because --mem-per-cpu multiplies out to a round total and so
     # lands on a block edge far more often than an absolute --mem does.
@@ -80,16 +104,22 @@ class Request:
     warnings: list[str] = field(default_factory=list)
 
 
-def to_gb(value: str | float | None) -> float:
-    """'32G' / '8192M' / 32 -> gigabytes."""
+def to_gb(value: str | float | None, default_unit: str = SBATCH_DEFAULT_MEM_UNIT) -> float:
+    """'32G' / '8192M' / '32000' -> gigabytes.
+
+    An unsuffixed value takes ``default_unit``, which is megabytes because that
+    is what sbatch documents for --mem and --mem-per-cpu. Callers reading a
+    source with different conventions must say so explicitly.
+    """
     if value is None or value == "":
         return 0.0
     if isinstance(value, (int, float)):
-        return float(value)
+        return float(value) * _MEM_UNITS[default_unit.upper()]
     m = re.match(r"^\s*([0-9.]+)\s*([KMGTkmgt]?)", str(value))
     if not m:
         raise BillingError(f"could not read a memory size from {value!r}")
-    return float(m.group(1)) * _MEM_UNITS[m.group(2).upper()]
+    suffix = m.group(2).upper() or default_unit.upper()
+    return float(m.group(1)) * _MEM_UNITS[suffix]
 
 
 def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
@@ -110,6 +140,17 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         if not name:
             continue
         cpu, mem, gpu = 1.0, 0.0, 0.0
+        def_cpu = def_node = None
+        for token in line.split():
+            # scontrol prints these as megabytes, and 0/UNLIMITED means "not set".
+            if token.startswith("DefMemPerCPU="):
+                value = token[len("DefMemPerCPU=") :]
+                if value.isdigit() and int(value) > 0:
+                    def_cpu = int(value) / 1024.0
+            elif token.startswith("DefMemPerNode="):
+                value = token[len("DefMemPerNode=") :]
+                if value.isdigit() and int(value) > 0:
+                    def_node = int(value) / 1024.0
         if raw and raw not in ("(null)", ""):
             for part in raw.split(","):
                 if "=" not in part:
@@ -126,7 +167,13 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                     mem = float(number)
                 elif key.startswith("gres/gpu"):
                     gpu = float(number)
-        table[name] = Weights(cpu=cpu, mem_per_gb=mem, gpu=gpu)
+        table[name] = Weights(
+            cpu=cpu,
+            mem_per_gb=mem,
+            gpu=gpu,
+            def_mem_per_cpu_gb=def_cpu,
+            def_mem_per_node_gb=def_node,
+        )
     return table
 
 
@@ -144,7 +191,9 @@ def parse_sbatch(text: str) -> Request:
     billing are read; --time is deliberately ignored because it is not billed.
     """
     req = Request()
-    ntasks = 1.0
+    ntasks: float | None = None
+    ntasks_per_node: float | None = None
+    nodes = 1.0
     cpus_per_task: float | None = None
     mem_per_cpu: float | None = None
     saw_mem = False
@@ -158,6 +207,11 @@ def parse_sbatch(text: str) -> Request:
                 cpus_per_task = float(value)
             elif key in ("--ntasks", "-n"):
                 ntasks = float(value)
+            elif key == "--ntasks-per-node":
+                ntasks_per_node = float(value)
+            elif key in ("--nodes", "-N"):
+                # --nodes=2-4 requests a range; the minimum is what is certain.
+                nodes = float(str(value).split("-")[0])
             elif key == "--mem":
                 req.mem_gb = to_gb(value)
                 req.mem_source = "--mem"
@@ -173,8 +227,18 @@ def parse_sbatch(text: str) -> Request:
             elif key in ("--partition", "-p"):
                 req.partition = value.strip()
 
-    req.cpus = ntasks * (cpus_per_task if cpus_per_task is not None else 1.0)
+    # Total tasks: an explicit --ntasks wins; otherwise --ntasks-per-node
+    # multiplied across --nodes; otherwise one.
+    if ntasks is not None:
+        total_tasks = ntasks
+    elif ntasks_per_node is not None:
+        total_tasks = ntasks_per_node * nodes
+    else:
+        total_tasks = 1.0
+    req.nodes = nodes
+    req.cpus = total_tasks * (cpus_per_task if cpus_per_task is not None else 1.0)
 
+    req.mem_specified = saw_mem or mem_per_cpu is not None
     if mem_per_cpu is not None and not saw_mem:
         req.mem_gb = mem_per_cpu * req.cpus
         req.mem_source = "--mem-per-cpu"
@@ -219,33 +283,46 @@ def billing_units(req: Request, w: Weights) -> int:
 
 
 def boundary(req: Request, w: Weights) -> dict[str, Any]:
-    """Where this request sits relative to the memory block edges.
+    """Where this request sits relative to the price transitions.
 
-    The cheapest safe request is the LARGEST one below the next edge, not the
-    smallest one that fits: inside a block the extra gigabytes are free, so
+    Derived from the COMPLETE weighted sum, not from memory alone. The tempting
+    shortcut -- that ``floor(C + G/k)`` factors into ``C + floor(G/k)``, so
+    transitions land on multiples of the block -- holds only when the CPU and
+    GPU contribution is a whole number. On a discounted partition it is not:
+    with cpu=0.1 and gpu=0.1, an 8-CPU/1-GPU request contributes 0.9, and the
+    price rises at 176 GB rather than at a multiple of 160. Assuming otherwise
+    turns a one-gigabyte edge shave into a seventeen-gigabyte cut.
+
+    Price is ``floor(base + w_mem * G)``, so for a given number of units the
+    admissible memory is the half-open band ``[(u - base)/w_mem,
+    (u+1 - base)/w_mem)``. Everything below is that band's arithmetic.
+
+    The cheapest SAFE request is the largest one below the next transition, not
+    the smallest one that fits: inside a band the extra gigabytes are free, so
     rounding memory down past what a job needs buys nothing and only removes
     headroom.
     """
-    block = w.block_gb
-    if block is None:
+    if w.mem_per_gb <= 0:
         return {"billed": False, "note": "memory is not billed on this partition"}
 
+    base = w.cpu * req.cpus + w.gpu * req.gpus
     units = billing_units(req, w)
-    blocks_used = math.floor(req.mem_gb / block)
-    # Largest memory that still yields one fewer whole block.
-    cheaper_gb = max(0.0, (blocks_used * block) - _EPSILON_GB) if blocks_used else None
-    top_of_block = ((blocks_used + 1) * block) - _EPSILON_GB
-    on_edge = abs(req.mem_gb - blocks_used * block) < 1e-9 and blocks_used > 0
+    band_start = (units - base) / w.mem_per_gb  # smallest memory still priced at `units`
+    band_end = (units + 1 - base) / w.mem_per_gb  # first memory priced one unit higher
 
     result: dict[str, Any] = {
         "billed": True,
-        "block_gb": block,
+        "mem_per_billing_unit_gb": round(1.0 / w.mem_per_gb, 6),
         "current_mem_gb": req.mem_gb,
-        "on_block_edge": on_edge,
-        "free_headroom_gb": round(top_of_block - req.mem_gb, 3),
-        "largest_same_price_mem_gb": round(top_of_block, 3),
+        # True when the request sits exactly on a transition, i.e. it just
+        # bought a whole unit and holds none of the band it paid for.
+        "on_price_edge": band_start > 0 and abs(req.mem_gb - band_start) < 1e-6,
+        "largest_same_price_mem_gb": round(band_end - _EPSILON_GB, 3),
+        "free_headroom_gb": round(max(0.0, band_end - _EPSILON_GB - req.mem_gb), 3),
     }
-    if cheaper_gb is not None and cheaper_gb < req.mem_gb:
+
+    cheaper_gb = band_start - _EPSILON_GB
+    if cheaper_gb >= 0 and cheaper_gb < req.mem_gb:
         cheaper = Request(cpus=req.cpus, mem_gb=cheaper_gb, gpus=req.gpus)
         cheaper_units = billing_units(cheaper, w)
         if cheaper_units < units:
@@ -254,24 +331,20 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
                 "mem_gb": round(cheaper_gb, 3),
                 "units": cheaper_units,
                 "units_now": units,
-                "reduction_pct": round(100.0 * (units - cheaper_units) / units, 1) if units else 0.0,
+                "reduction_pct": (round(100.0 * (units - cheaper_units) / units, 1) if units else 0.0),
                 "mem_given_up_gb": round(given_up, 3),
                 # An edge shave gives up ~nothing and is close to free. Anything
                 # larger is a genuine reduction in what the job can hold, and an
                 # OOM kill bills full elapsed AND forces a rerun -- so the two
                 # must not be presented as the same offer.
-                "kind": "edge_shave" if given_up <= _EPSILON_GB + 1e-9 else "real_reduction",
+                "kind": ("edge_shave" if given_up <= _EPSILON_GB + 1e-9 else "real_reduction"),
                 "note": (
-                    (
-                        f"Costs {given_up:.3g} GB of headroom. Safe only if the family's "
-                        "observed MAXIMUM RSS stays well under it -- a mean will "
-                        "not tell you."
-                    )
+                    f"Costs {given_up:.3g} GB of headroom. Safe only if the "
+                    "family's observed MAXIMUM RSS stays well under it -- a mean "
+                    "will not tell you."
                     if given_up > _EPSILON_GB + 1e-9
-                    else (
-                        f"Gives up {given_up:.3g} GB, the block edge only. The request keeps "
-                        "essentially the headroom it has now."
-                    )
+                    else f"Gives up {given_up:.3g} GB, the price edge only. The "
+                    "request keeps essentially the headroom it has now."
                 ),
             }
     return result
@@ -325,6 +398,25 @@ def price(
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
     w = table[partition]
+    resolved_default: float | None = None
+    if not req.mem_specified:
+        resolved_default = w.default_mem_gb(req.cpus, req.nodes)
+        if resolved_default is None:
+            raise BillingError(
+                f"{partition!r} was given no --mem and no DefMemPerCPU or "
+                "DefMemPerNode is recorded for it, so the memory Slurm would "
+                "actually allocate -- and bill -- is unknown. Refresh the weight "
+                "cache while connected, or state the memory explicitly."
+            )
+        req = Request(
+            cpus=req.cpus,
+            mem_gb=resolved_default,
+            gpus=req.gpus,
+            nodes=req.nodes,
+            mem_specified=True,
+            mem_source=f"partition default ({partition})",
+            warnings=list(req.warnings),
+        )
     units = billing_units(req, w)
     pre = weighted_sum(req, w)
     payload: dict[str, Any] = {

@@ -851,7 +851,7 @@ async def test_price_job_prices_a_script_from_cache_with_no_connection(monkeypat
     )
     assert payload["ok"] is True
     assert payload["billing_units"] == 6
-    assert payload["boundary"]["on_block_edge"] is True
+    assert payload["boundary"]["on_price_edge"] is True
     assert payload["boundary"]["next_cheaper"]["mem_gb"] == pytest.approx(31.0)
     assert payload["boundary"]["next_cheaper"]["units"] == 5
     assert payload["boundary"]["next_cheaper"]["kind"] == "edge_shave"
@@ -892,3 +892,24 @@ async def test_price_job_refuses_an_unknown_partition(monkeypatch, tmp_path):
     payload = await _call("o2_price_job", {"params": {"partition": "made_up", "cpus": 1}})
     assert payload["ok"] is False
     assert payload["error"] == "unpriceable"
+
+
+@pytest.mark.anyio
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+async def test_price_job_registers_under_python_dash_m(monkeypatch):
+    # A @mcp.tool below the `if __name__ == "__main__"` block never executes
+    # under `python -m o2mcp.server`: main() blocks in mcp.run() first, so the
+    # tool is absent for the server's whole lifetime. Import-based entry points
+    # and tests mask it, because they finish importing before calling main.
+    import runpy
+
+    from mcp.server.fastmcp import FastMCP
+
+    served: dict = {}
+
+    def fake_run(self, *args, **kwargs):
+        served["tools"] = {t.name for t in self._tool_manager.list_tools()}
+
+    monkeypatch.setattr(FastMCP, "run", fake_run, raising=False)
+    runpy.run_module("o2mcp.server", run_name="__main__", alter_sys=True)
+    assert "o2_price_job" in served.get("tools", set())
