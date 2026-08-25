@@ -34,6 +34,7 @@ import json
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -59,9 +60,11 @@ from o2mcp import (
     O2Slurm,
     O2UnsafeTransportError,
     O2Workspace,
+    billing,
     transfer_tools,
 )
 from o2mcp.policy import LoginTarget
+from o2mcp.slurm import _quote_remote_path
 
 mcp = FastMCP("o2_mcp")
 
@@ -325,6 +328,30 @@ class SubmitInput(BaseModel):
 class QueueInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     user: str | None = Field(default=None, description="Username for squeue -u (defaults to remote $USER).")
+
+
+class PriceJobInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    partition: str = Field(..., description="Partition the job would run on.", min_length=1)
+    script_text: str | None = Field(
+        default=None,
+        description="Submission script contents; its #SBATCH directives are read.",
+    )
+    remote_script_path: str | None = Field(
+        default=None,
+        description="Path to a script already on O2. Needs a ready login broker to read it.",
+    )
+    cpus: float | None = Field(default=None, description="CPUs, when not giving a script.", gt=0)
+    mem_gb: float | None = Field(default=None, description="Memory in GB, when not giving a script.", ge=0)
+    gpus: float | None = Field(default=None, description="GPUs, when not giving a script.", ge=0)
+    refresh_weights: bool = Field(
+        default=False,
+        description=(
+            "Re-read TRESBillingWeights from the cluster before pricing. This is "
+            "the only path that needs a ready broker; leave false to price from "
+            "the cache, which works with no connection at all."
+        ),
+    )
 
 
 class JobIdInput(BaseModel):
@@ -923,3 +950,89 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
+
+@mcp.tool(
+    name="o2_price_job",
+    annotations={"title": "Price a submission before submitting", "readOnlyHint": True, "openWorldHint": False},
+)
+async def o2_price_job(params: PriceJobInput) -> str:
+    """Compute what a submission will cost in Slurm billing units, before it runs.
+
+    Fair share is bought with ALLOCATED resources, and the weighted TRES sum is
+    floored -- so memory is sold in whole blocks and a request sitting exactly on
+    a block edge pays for a full block while forfeiting the headroom inside it.
+    Nothing in a job's own output reveals this, so the moment to check is while
+    the request is being written.
+
+    Pure arithmetic over a cached weight table: no SSH and no Slurm call unless
+    refresh_weights is set, so this answers while the O2 policy is disabled and
+    before any broker exists. Returns the price, the breakdown, the nearest
+    memory boundary, and cheaper partitions for the identical request.
+
+    Advisory only. It never submits, never edits a request, and does not
+    recommend reducing memory below what a job already holds -- an OOM kill
+    bills its full elapsed time AND forces a rerun, so a request trimmed too
+    close is a net loss, not a smaller win.
+    """
+
+    def work() -> dict[str, Any]:
+        table: dict[str, billing.Weights] = {}
+        captured_at: float | None = None
+
+        if params.refresh_weights:
+            result = _connection().run("scontrol show partition -o", timeout=30.0)
+            if not result.ok:
+                return {
+                    "ok": False,
+                    "error": "weights_unavailable",
+                    "message": "Could not read partition weights: {}".format((result.stderr or "").strip()[:200]),
+                }
+            table = billing.parse_weight_table(result.stdout)
+            captured_at = time.time()
+            billing.save_weight_cache(table, captured_at)
+        else:
+            cached = billing.load_weight_cache()
+            if not cached:
+                return {
+                    "ok": False,
+                    "error": "no_weight_cache",
+                    "message": (
+                        "No cached TRESBillingWeights. Call once with "
+                        "refresh_weights=true while a login broker is ready; "
+                        "afterwards pricing needs no connection."
+                    ),
+                }
+            table = billing.cache_to_table(cached)
+            captured_at = cached.get("captured_at")
+
+        script = params.script_text
+        if script is None and params.remote_script_path:
+            result = _connection().run(
+                f"cat -- {_quote_remote_path(params.remote_script_path)}",
+                timeout=30.0,
+            )
+            if not result.ok:
+                return {"ok": False, "error": "script_unreadable", "message": (result.stderr or "").strip()[:200]}
+            script = result.stdout
+
+        if script is not None:
+            request = billing.parse_sbatch(script)
+        elif params.cpus is not None:
+            request = billing.Request(cpus=params.cpus, mem_gb=params.mem_gb or 0.0, gpus=params.gpus or 0.0)
+        else:
+            return {
+                "ok": False,
+                "error": "bad_input",
+                "message": "Give script_text, remote_script_path, or cpus/mem_gb/gpus.",
+            }
+
+        try:
+            payload = billing.price(request, table, params.partition, captured_at)
+        except billing.BillingError as exc:
+            return {"ok": False, "error": "unpriceable", "message": str(exc)}
+        payload["alternatives"] = billing.alternatives(request, table, params.partition)
+        payload["ok"] = True
+        return payload
+
+    return await _run_tool(work)
