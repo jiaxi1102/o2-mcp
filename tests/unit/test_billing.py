@@ -531,3 +531,32 @@ def test_alternatives_never_offer_a_partition_that_cannot_price_the_model():
     assert "gpu_generic" in offered
     with pytest.raises(billing.BillingError):
         billing.resolve_request(req, table, "gpu_h")
+
+
+def test_a_partition_priced_only_per_model_is_still_offered():
+    # "GRES/gpu:a100=1" leaves the generic weight at zero while pricing an a100
+    # perfectly well. Reading the generic entry hid such a partition as
+    # GPU-less, which withholds a genuinely cheaper option.
+    table = {
+        "gpu_now": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0}),
+        "gpu_cheap": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0, gpu_by_model={"a100": 1.0}),
+    }
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    offered = {r["partition"] for r in billing.alternatives(req, table, "gpu_now")}
+    assert "gpu_cheap" in offered
+    # And it must be priceable there, not merely advertised.
+    assert billing.resolve_request(req, table, "gpu_cheap").gpu_model == "a100"
+
+
+def test_the_reported_weight_is_the_one_the_charge_used():
+    # A breakdown computed at the a100 rate beside a reported generic weight is
+    # a response that disagrees with itself, and cannot be audited.
+    table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0})}
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    out = billing.price(req, table, "gpu")
+    assert out["weights"]["gpu"] == 10.0
+    assert out["weights"]["gpu_generic"] == 5.0
+    assert out["weights"]["gpu_model"] == "a100"
+    assert out["request"]["gpu_model"] == "a100"
+    # The breakdown must reconcile against the weight that is reported.
+    assert out["breakdown"]["gpu"] == out["weights"]["gpu"] * req.gpus

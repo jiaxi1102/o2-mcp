@@ -587,7 +587,16 @@ def price(
     pre = weighted_sum(req, w)
     payload: dict[str, Any] = {
         "partition": partition,
-        "request": {"cpus": req.cpus, "mem_gb": req.mem_gb, "gpus": req.gpus, "mem_source": req.mem_source},
+        # gpu_model is echoed because it changes the price: a caller comparing
+        # this response against their own shape cannot tell which accelerator
+        # was charged without it.
+        "request": {
+            "cpus": req.cpus,
+            "mem_gb": req.mem_gb,
+            "gpus": req.gpus,
+            "gpu_model": req.gpu_model,
+            "mem_source": req.mem_source,
+        },
         "billing_units": units,
         "breakdown": {
             "cpu": round(w.cpu * req.cpus, 6),
@@ -597,7 +606,17 @@ def price(
             "floor_discards": round(pre - units, 6),
         },
         "boundary": boundary(req, w),
-        "weights": {"cpu": w.cpu, "mem_per_gb": w.mem_per_gb, "gpu": w.gpu},
+        # The GPU entry is the weight this request was actually charged at, so
+        # the breakdown above can be recomputed from it. Echoing the generic
+        # weight beside a model-priced breakdown made the response disagree
+        # with itself and left the caller unable to audit the charge.
+        "weights": {
+            "cpu": w.cpu,
+            "mem_per_gb": w.mem_per_gb,
+            "gpu": gpu_weight_for(req, w),
+            "gpu_generic": w.gpu,
+            "gpu_model": req.gpu_model,
+        },
         "caveats": [
             "Requested --time is not part of the billing formula; raising a "
             "wall limit costs no fair share and under-requesting destroys the "
@@ -646,8 +665,11 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             continue
         # A GPU request cannot run where GPUs are not a billed resource. That is
         # a proxy for "has no GPUs" rather than proof, so it can only exclude a
-        # suggestion -- never manufacture one.
-        if req.gpus > 0 and w.gpu <= 0:
+        # suggestion -- never manufacture one. Ask for the weight that would
+        # actually price THIS request: a partition carrying only
+        # "GRES/gpu:a100=1" has a generic weight of zero while pricing an a100
+        # perfectly well, and reading the generic entry hid it as GPU-less.
+        if req.gpus > 0 and gpu_weight_for(req, w) <= 0:
             continue
         # Never advertise a partition that pricing this same request directly
         # would refuse: the units would come from another model's weight.
