@@ -103,6 +103,9 @@ class Weights:
     # weights: cpu, mem (GB), node, gres/gpu, gres/gpu:<model>. None means the
     # inventory was never captured, which is not the same as holding nothing.
     stock: dict[str, float] | None = None
+    # Per-JOB limit, distinct from the aggregate inventory above: a partition
+    # can hold a hundred nodes and still cap one job at a single node.
+    max_nodes: float | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
         """Memory Slurm would allocate for a request that names none.
@@ -211,6 +214,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         # None until a TRES= token is seen: "holds none" and "never told" are
         # different answers, and only one of them permits a suggestion.
         stock: dict[str, float] | None = None
+        max_nodes: float | None = None
         max_mem_cpu = None
         gpu_by_model: dict[str, float] = {}
         for token in line.split():
@@ -256,6 +260,15 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("DenyQos=") :]
                 if value and value.upper() not in ("", "(NULL)", "NONE"):
                     unrestricted = False
+            elif token.startswith("RootOnly="):
+                # Only root may initiate a job here, and pricing carries no user
+                # identity -- so eligibility is unknown, as with QoS or accounts.
+                if token[len("RootOnly=") :].strip().upper() in ("YES", "TRUE", "1"):
+                    unrestricted = False
+            elif token.startswith("MaxNodes="):
+                value = token[len("MaxNodes=") :].strip()
+                if value.isdigit():
+                    max_nodes = float(value)
             elif token.startswith("ReqResv="):
                 # A partition that only accepts jobs inside a reservation will
                 # reject a plain submission, and the pricing input carries no
@@ -332,6 +345,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             gpu_by_model=gpu_by_model or None,
             unpriceable_tres=unpriceable or None,
             stock=stock,
+            max_nodes=max_nodes,
         )
     return table
 
@@ -381,7 +395,7 @@ def _unpriceable_gpu_reason(req: "Request", w: "Weights") -> str | None:
     if req.gpus <= 0 or not w.gpu_by_model:
         return None
     if req.gpu_model:
-        if req.gpu_model in w.gpu_by_model:
+        if _model_key(req.gpu_model) in w.gpu_by_model:
             return None
         known = ", ".join(sorted(w.gpu_by_model)) or "none"
         return (
@@ -409,7 +423,7 @@ def gpu_weight_for(req: Request, w: Weights) -> float:
     another model's rate -- so the named model wins when one is given.
     """
     if req.gpu_model and w.gpu_by_model:
-        by_model = w.gpu_by_model.get(req.gpu_model)
+        by_model = w.gpu_by_model.get(_model_key(req.gpu_model))
         if by_model is not None:
             return by_model
     return w.gpu
@@ -627,6 +641,7 @@ def save_weight_cache(
                 "gpu_by_model": w.gpu_by_model,
                 "unpriceable_tres": w.unpriceable_tres,
                 "stock": w.stock,
+                "max_nodes": w.max_nodes,
             }
             for name, w in table.items()
         },
@@ -680,10 +695,32 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 gpu_by_model=_float_map(entry.get("gpu_by_model")),
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
                 stock=_float_map(entry.get("stock")),
+                max_nodes=(None if entry.get("max_nodes") is None else float(entry["max_nodes"])),
             )
         except (TypeError, ValueError):
             continue
     return table
+
+
+def max_based_flags(flags: "list[str] | None") -> list[str]:
+    """The PriorityFlags that make billing a MAXIMUM rather than a sum.
+
+    A prefix match, because MAX_TRES_GRES is the same calculation with GRES
+    folded in. Exported so every caller shares it: an exact-match copy in the
+    refresh response once reported billing_model "sum" for a cluster this same
+    module then refused as max-based.
+    """
+    return sorted(f for f in {str(x).upper() for x in (flags or [])} if f.startswith("MAX_TRES"))
+
+
+def _model_key(model: "str | None") -> "str | None":
+    """A GPU model name as the tables store it.
+
+    Both scontrol-derived maps lowercase their keys, so a caller writing
+    "A100" -- the spelling scontrol itself prints -- missed every one of them
+    and had a perfectly valid model refused as unpriced.
+    """
+    return model.lower() if model else None
 
 
 def unsupported_billing_model(payload: dict[str, Any]) -> str | None:
@@ -709,7 +746,7 @@ def unsupported_billing_model(payload: dict[str, Any]) -> str | None:
         )
     # Prefix, not equality: MAX_TRES_GRES is the same maximum-based calculation
     # with GRES folded in, and an exact match let it through to the sum.
-    maxing = sorted(f for f in {str(x).upper() for x in flags} if f.startswith("MAX_TRES"))
+    maxing = max_based_flags(flags)
     if maxing:
         return (
             f"this cluster sets PriorityFlags={','.join(maxing)}, so Slurm bills the MAXIMUM "
@@ -894,14 +931,19 @@ def _can_hold(req: "Request", w: "Weights") -> bool:
         return False
     if req.mem_gb > 0 and stock.get("mem", 0.0) < req.mem_gb:
         return False
-    if req.nodes_stated and req.nodes > 0 and stock.get("node", 0.0) < req.nodes:
-        return False
+    if req.nodes_stated and req.nodes > 0:
+        if stock.get("node", 0.0) < req.nodes:
+            return False
+        # Aggregate inventory is not a per-job allowance: MaxNodes=1 rejects a
+        # two-node request on a partition holding a hundred.
+        if w.max_nodes is not None and w.max_nodes < req.nodes:
+            return False
     if req.gpus <= 0:
         return True
     if req.gpu_model:
         # A typed request needs typed evidence. An aggregate "gres/gpu=4" says
         # four accelerators exist, not that any of them is an a100.
-        return stock.get("gres/gpu:" + req.gpu_model, 0.0) >= req.gpus
+        return stock.get("gres/gpu:" + _model_key(req.gpu_model), 0.0) >= req.gpus
     return stock.get("gres/gpu", 0.0) >= req.gpus
 
 

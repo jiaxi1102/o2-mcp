@@ -1117,7 +1117,9 @@ async def o2_refresh_billing_weights(params: RefreshWeightsInput) -> str:
             "ok": True,
             "captured_at": captured_at,
             "priority_flags": priority_flags,
-            "billing_model": "max" if "MAX_TRES" in priority_flags else "sum",
+            # Same predicate the refusal uses: an exact-match copy here once
+            # reported "sum" for a cluster the very next price call refused.
+            "billing_model": "max" if billing.max_based_flags(priority_flags) else "sum",
             "partitions": sorted(table),
             "unpriceable": {name: w.unpriceable_tres for name, w in sorted(table.items()) if w.unpriceable_tres},
         }

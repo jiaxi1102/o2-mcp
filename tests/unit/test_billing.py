@@ -888,3 +888,71 @@ def test_a_reservation_only_partition_is_not_advertised():
     assert table["now"].unrestricted is True
     req = billing.Request(cpus=4, mem_gb=16)
     assert "resv" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
+
+
+def test_gpu_model_matching_is_case_insensitive():
+    # scontrol itself prints "GRES/gpu:A100=10", so a caller passing "A100" is
+    # using the spelling the site published. Lowercasing only the parsed key
+    # made every one of those miss, refusing a valid model as unpriced.
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu:A100=10"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu:A100=8 State=UP AllowGroups=ALL"
+    )
+    for spelling in ("A100", "a100", "A100"):
+        req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model=spelling)
+        resolved = billing.resolve_request(req, table, "gpu")
+        assert billing.billing_units(resolved, table["gpu"]) == 15
+    # And the typed-inventory check has to agree with the pricing check.
+    full = dict(table)
+    full["other"] = billing.Weights(
+        cpu=0.1,
+        mem_per_gb=0.00625,
+        gpu=0.1,
+        gpu_by_model={"a100": 1.0},
+        stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu:a100": 8},
+    )
+    offered = {
+        r["partition"]
+        for r in billing.alternatives(billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="A100"), full, "gpu")
+    }
+    assert "other" in offered
+
+
+def test_a_per_job_node_cap_is_not_aggregate_inventory():
+    # A partition can hold a hundred nodes and still cap one job at one.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=40000G,node=100 State=UP AllowGroups=ALL\n"
+        "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxNodes=1"
+        " TRES=cpu=4000,mem=40000G,node=100 State=UP AllowGroups=ALL\n"
+    )
+    assert table["capped"].max_nodes == 1.0
+    two = billing.Request(cpus=8, mem_gb=32, nodes=2, nodes_stated=True)
+    assert "capped" not in {r["partition"] for r in billing.alternatives(two, table, "now")}
+    # A single-node request is still welcome there.
+    one = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
+    assert "capped" in {r["partition"] for r in billing.alternatives(one, table, "now")}
+
+
+def test_root_only_partitions_are_not_advertised():
+    # Only root may initiate jobs there, and pricing carries no user identity.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL RootOnly=NO\n"
+        "PartitionName=rootly TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL RootOnly=YES\n"
+    )
+    assert table["rootly"].unrestricted is False
+    req = billing.Request(cpus=4, mem_gb=16)
+    assert "rootly" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
+
+
+def test_the_refresh_verdict_and_the_refusal_agree():
+    # One predicate, so a refresh cannot report "sum" for a cluster the next
+    # price call refuses as max-based.
+    for flags in (["MAX_TRES"], ["MAX_TRES_GRES"], ["NO_FAIR_TREE", "MAX_TRES_GRES"]):
+        assert billing.max_based_flags(flags)
+        assert billing.unsupported_billing_model({"priority_flags": flags}) is not None
+    for flags in ([], ["NO_FAIR_TREE"], ["SMALL_RELATIVE_TO_TIME"]):
+        assert not billing.max_based_flags(flags)
+        assert billing.unsupported_billing_model({"priority_flags": flags}) is None
