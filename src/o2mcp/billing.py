@@ -292,19 +292,41 @@ UNPRICEABLE_OPTIONS = {
 }
 
 
-def _model_is_priced(req: "Request", w: "Weights") -> bool:
-    """Can this partition price the GPU model the request names?
+def _unpriceable_gpu_reason(req: "Request", w: "Weights") -> str | None:
+    """Why this partition cannot price the request's GPUs, or None if it can.
 
-    A partition that prices models apart and has no weight for this one cannot
-    price the request at all. gpu_weight_for() would fall back to the generic
-    weight, which is a different accelerator's rate -- so this must be settled
-    before any number is produced, and by ONE predicate: alternatives() once
-    advertised a partition on a fallback weight that resolve_request() refuses
-    outright, offering a move that could not be priced on arrival.
+    gpu_weight_for() falls back to the generic weight whenever the named model
+    misses, and that fallback is wrong in both directions: it charges one
+    accelerator at another's rate, and where a site declares ONLY per-model
+    rates the generic entry is zero, so an untyped request prices every GPU as
+    free. Both are confident numbers, which is the failure that matters here.
+
+    So the question is settled once, before any number is produced, and by ONE
+    predicate -- alternatives() and resolve_request() disagreeing about it has
+    already produced both an advertised move that could not be priced on
+    arrival and a partition hidden as GPU-less while pricing perfectly well.
     """
-    if not req.gpu_model or not w.gpu_by_model:
-        return True
-    return req.gpu_model in w.gpu_by_model
+    if req.gpus <= 0 or not w.gpu_by_model:
+        return None
+    if req.gpu_model:
+        if req.gpu_model in w.gpu_by_model:
+            return None
+        known = ", ".join(sorted(w.gpu_by_model)) or "none"
+        return (
+            f"has no weight for GPU model {req.gpu_model!r} (priced: {known}). "
+            "Name a priced model, or omit gpu_model where the partition has a "
+            "generic GPU weight."
+        )
+    if w.gpu > 0:
+        # A declared generic rate is a real rate, so an untyped request is
+        # priceable even where models are also listed.
+        return None
+    known = ", ".join(sorted(w.gpu_by_model)) or "none"
+    return (
+        f"prices GPUs only per model (priced: {known}) and has no generic GPU "
+        "weight, so an untyped GPU request would be charged nothing for its "
+        "accelerators. Name the model the allocation will hold."
+    )
 
 
 def gpu_weight_for(req: Request, w: Weights) -> float:
@@ -517,14 +539,9 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
-    if not _model_is_priced(req, table[partition]):
-        priced_models = table[partition].gpu_by_model
-        known = ", ".join(sorted(priced_models)) or "none"
-        raise BillingError(
-            f"{partition!r} prices GPU models separately and has no weight "
-            f"for {req.gpu_model!r} (known: {known}). Name a priced model, "
-            "or omit gpu_model to use the partition's generic GPU weight."
-        )
+    reason = _unpriceable_gpu_reason(req, table[partition])
+    if reason:
+        raise BillingError(f"{partition!r} {reason}")
     # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
     # shape it can produce, and rounding one silently would price a job that
     # cannot exist.
@@ -673,7 +690,7 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             continue
         # Never advertise a partition that pricing this same request directly
         # would refuse: the units would come from another model's weight.
-        if not _model_is_priced(req, w):
+        if _unpriceable_gpu_reason(req, w):
             continue
         units = billing_units(req, w)
         if units < now_units:

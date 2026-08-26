@@ -560,3 +560,32 @@ def test_the_reported_weight_is_the_one_the_charge_used():
     assert out["request"]["gpu_model"] == "a100"
     # The breakdown must reconcile against the weight that is reported.
     assert out["breakdown"]["gpu"] == out["weights"]["gpu"] * req.gpus
+
+
+def test_untyped_gpus_are_refused_where_only_models_are_priced():
+    # gpu_by_model={"a100": 10} with no generic entry means the generic weight
+    # is 0, so an untyped GPU request would price every accelerator as free --
+    # 2 units for 1 CPU + 16 GB + 1 GPU, with the GPU charge silently absent.
+    table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0, gpu_by_model={"a100": 10.0})}
+    req = billing.Request(cpus=1, mem_gb=16, gpus=1)
+    with pytest.raises(billing.BillingError, match="only per model"):
+        billing.resolve_request(req, table, "gpu")
+    # Naming the model makes it priceable, at the model's rate.
+    named = billing.Request(cpus=1, mem_gb=16, gpus=1, gpu_model="a100")
+    assert billing.billing_units(billing.resolve_request(named, table, "gpu"), table["gpu"]) == 12
+
+
+def test_a_declared_generic_rate_still_prices_an_untyped_request():
+    # Models listed ALONGSIDE a real generic weight are not a refusal: the
+    # generic rate is declared, so an untyped request has a true price.
+    table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0})}
+    req = billing.Request(cpus=1, mem_gb=16, gpus=1)
+    assert billing.billing_units(billing.resolve_request(req, table, "gpu"), table["gpu"]) == 7
+
+
+def test_a_gpuless_request_is_unaffected_by_model_tables():
+    # The guard keys on gpus > 0; a CPU job must never be refused because the
+    # partition happens to list accelerator models.
+    table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0, gpu_by_model={"a100": 10.0})}
+    req = billing.Request(cpus=2, mem_gb=16)
+    assert billing.resolve_request(req, table, "gpu").cpus == 2
