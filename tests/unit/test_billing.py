@@ -631,3 +631,46 @@ def test_per_model_gpu_weights_survive_the_cache():
     assert back["gpu"].gpu_by_model == {"a100": 10.0}
     req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
     assert billing.billing_units(req, back["gpu"]) == billing.billing_units(req, table["gpu"])
+
+
+def test_cpu_is_billed_only_when_the_table_says_so():
+    # Slurm: "If TRESBillingWeights is not defined then the job's billing TRES
+    # is equal to the total CPUs allocated." A table that exists but names no
+    # CPU term therefore bills no CPUs -- seeding 1.0 regardless priced 32 CPUs
+    # + 16 GB at 33 units where the site had configured 1.
+    explicit = billing.parse_weight_table(
+        "PartitionName=memonly TRESBillingWeights=Mem=0.0625G State=UP AllowGroups=ALL"
+    )
+    assert explicit["memonly"].cpu == 0.0
+    assert billing.billing_units(billing.Request(cpus=32, mem_gb=16), explicit["memonly"]) == 1
+    # With no table at all the CPU fallback still applies.
+    absent = billing.parse_weight_table("PartitionName=plain State=UP AllowGroups=ALL")
+    assert absent["plain"].cpu == 1.0
+    assert billing.billing_units(billing.Request(cpus=32, mem_gb=16), absent["plain"]) == 32
+
+
+def test_same_price_headroom_is_never_behind_the_current_request():
+    # Blocks under 2 GB: at CPU=1, Mem=1G, 10.75 GB prices at 11 units and stays
+    # there until 11 GB. Stepping half a block back from band_end reported 10.5
+    # -- a "largest at this price" BELOW a request already held at that price.
+    w = billing.Weights(cpu=1.0, mem_per_gb=1.0)
+    req = billing.Request(cpus=1, mem_gb=10.75)
+    out = billing.boundary(req, w)
+    assert out["largest_same_price_mem_gb"] >= req.mem_gb
+    assert out["free_headroom_gb"] >= 0.0
+    # The reported value must genuinely still cost what the request costs.
+    assert billing.billing_units(
+        billing.Request(cpus=1, mem_gb=out["largest_same_price_mem_gb"]), w
+    ) == billing.billing_units(req, w)
+
+
+def test_headroom_below_a_band_edge_is_still_offered():
+    # The guard must not flatten real headroom: a request low in its band still
+    # has room to grow at the same price.
+    w = billing.Weights(cpu=1.0, mem_per_gb=0.0625)
+    req = billing.Request(cpus=4, mem_gb=17)
+    out = billing.boundary(req, w)
+    assert out["free_headroom_gb"] > 0
+    assert billing.billing_units(
+        billing.Request(cpus=4, mem_gb=out["largest_same_price_mem_gb"]), w
+    ) == billing.billing_units(req, w)

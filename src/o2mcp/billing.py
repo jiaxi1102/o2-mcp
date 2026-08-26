@@ -184,7 +184,14 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 raw = token[len("TRESBillingWeights=") :]
         if not name:
             continue
-        cpu, mem, gpu = 1.0, 0.0, 0.0
+        # Slurm's CPU fallback applies only when TRESBillingWeights is ABSENT:
+        # "If TRESBillingWeights is not defined then the job's billing TRES is
+        # equal to the total CPUs allocated." Where a table exists but names no
+        # CPU term, CPUs are not billed -- so seeding 1.0 unconditionally
+        # charged them anyway, pricing 32 CPUs + 16 GB under "Mem=0.0625G" at
+        # 33 units instead of the 1 the site configured.
+        cpu = 1.0 if not (raw and raw not in ("(null)", "")) else 0.0
+        mem, gpu = 0.0, 0.0
         def_cpu = def_node = None
         state_up, unrestricted = True, True
         unpriceable: dict[str, float] = {}
@@ -450,6 +457,8 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     band_start = (units - base) / w.mem_per_gb  # smallest memory still priced at `units`
     band_end = (units + 1 - base) / w.mem_per_gb  # first memory priced one unit higher
 
+    largest_same_price = max(_round_below(band_end - _step_for(w)), req.mem_gb)
+
     result: dict[str, Any] = {
         "billed": True,
         "mem_per_billing_unit_gb": round(1.0 / w.mem_per_gb, 6),
@@ -457,8 +466,12 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
         # True when the request sits exactly on a transition, i.e. it just
         # bought a whole unit and holds none of the band it paid for.
         "on_price_edge": band_start > 0 and abs(req.mem_gb - band_start) < 1e-6,
-        "largest_same_price_mem_gb": _round_below(band_end - _step_for(w)),
-        "free_headroom_gb": _round_below(max(0.0, band_end - _step_for(w) - req.mem_gb)),
+        # Never behind the current request: it demonstrably holds this price,
+        # so a "largest at this price" below it is a contradiction. On a
+        # sub-2 GB block a request in the upper half of its band produced
+        # exactly that, and then reported zero headroom for it.
+        "largest_same_price_mem_gb": largest_same_price,
+        "free_headroom_gb": _round_below(max(0.0, largest_same_price - req.mem_gb)),
     }
 
     # The step must stay inside the band it is stepping out of: on a partition
