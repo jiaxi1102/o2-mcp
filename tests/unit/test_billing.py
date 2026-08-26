@@ -637,3 +637,61 @@ class TestSpecialValuesAndConfigInteractions:
     def test_non_array_result_carries_no_array_block(self):
         payload = billing.price(billing.parse_sbatch("#SBATCH -c 2\n#SBATCH --mem=15G\n"), self.CAPPED, "p")
         assert "array" not in payload
+
+
+class TestOptionSyntaxAndScaling:
+    """Round six: two syntactic forms sbatch accepts, and a scaling error in
+    the MaxMemPerCPU adjustment added the round before."""
+
+    CAPPED = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G MaxMemPerCPU=8192\n")
+
+    def test_max_mem_per_cpu_scales_the_existing_cpus(self):
+        # Slurm multiplies CPUs-per-task by the memory ratio. Applying the ratio
+        # to the task count alone left a script already asking for 4 CPUs per
+        # task at 8 CPUs when Slurm allocates 16.
+        req = billing.parse_sbatch("#SBATCH --ntasks=2\n#SBATCH -c 4\n#SBATCH --mem-per-cpu=16G\n")
+        assert req.cpus == 8
+        assert billing.resolve_request(req, self.CAPPED, "p").cpus == 16
+
+    def test_single_cpu_per_task_case_still_holds(self):
+        req = billing.parse_sbatch("#SBATCH --ntasks=1\n#SBATCH --mem-per-cpu=64G\n")
+        assert billing.resolve_request(req, self.CAPPED, "p").cpus == 8
+
+    @pytest.mark.parametrize(
+        "script,attr,expected",
+        [
+            ("#SBATCH -c4\n", "cpus", 4),
+            ("#SBATCH -n8\n", "cpus", 8),
+            ("#SBATCH -N2\n", "cpus", 2),
+            ("#SBATCH -N2 -n8 -c4\n", "cpus", 32),
+            ("#SBATCH -pshort\n", "partition", "short"),
+        ],
+    )
+    def test_short_options_with_attached_arguments(self, script, attr, expected):
+        # -c4 is as valid as "-c 4"; treating the token as an unknown key
+        # dropped the value and fell back to one CPU.
+        assert getattr(billing.parse_sbatch(script), attr) == expected
+
+    def test_spaced_short_options_are_unaffected(self):
+        assert billing.parse_sbatch("#SBATCH -N 2 -n 8 -c 4\n").cpus == 32
+
+    @pytest.mark.parametrize(
+        "gres,expected",
+        [
+            ("gpu", 1),  # count is optional and defaults to one
+            ("gpu:a100", 1),  # type without a count
+            ("gpu:2", 2),
+            ("gpu:a100:2", 2),
+            ("gpu:2,lscratch:100", 2),
+            ("lscratch:100,gpu", 1),
+            ("lscratch:100", None),
+        ],
+    )
+    def test_gres_gpu_entry_forms(self, gres, expected):
+        assert billing._gres_gpu_count(gres) == (None if expected is None else pytest.approx(expected))
+
+    def test_countless_gres_reaches_the_price(self):
+        req = billing.parse_sbatch("#SBATCH --gres=gpu\n#SBATCH -c 4\n#SBATCH --mem=15G\n")
+        assert req.gpus == 1
+        weights = billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0)
+        assert billing.billing_units(req, weights) == 9

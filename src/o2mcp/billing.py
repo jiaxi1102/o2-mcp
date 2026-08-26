@@ -259,9 +259,16 @@ def _gres_gpu_count(value):
     against one pattern silently returned nothing for the third form.
     """
     for item in str(value).split(","):
-        m = re.match(r"^\s*gpu(?::[^:\s]+)?:(\d+)\s*$", item)
-        if m:
-            return float(m.group(1))
+        m = re.match(r"^\s*gpu(?::([^:\s]+))?(?::(\d+))?\s*$", item.strip())
+        if not m:
+            continue
+        first, second = m.group(1), m.group(2)
+        if second is not None:  # gpu:<type>:<count>
+            return float(second)
+        if first is not None and first.isdigit():  # gpu:<count>
+            return float(first)
+        # gpu, or gpu:<type> -- the count is optional and defaults to one.
+        return 1.0
     return None
 
 
@@ -424,6 +431,10 @@ def parse_sbatch(text: str) -> Request:
     return req
 
 
+# Short options that take a value, and so may appear with it attached.
+_SHORT_WITH_VALUE = ("n", "c", "N", "p", "a", "G", "t", "J")
+
+
 def _split_directives(chunk: str) -> list[tuple[str, str]]:
     """'--mem=32G -c 4' -> [('--mem','32G'), ('-c','4')]."""
     out: list[tuple[str, str]] = []
@@ -437,6 +448,12 @@ def _split_directives(chunk: str) -> list[tuple[str, str]]:
         if "=" in token:
             key, value = token.split("=", 1)
             out.append((key, value))
+            i += 1
+            continue
+        # -c4 is as valid as "-c 4"; treating the whole token as an unknown key
+        # silently dropped the value and fell back to one CPU.
+        if len(token) > 2 and not token.startswith("--") and token[1] in _SHORT_WITH_VALUE:
+            out.append((token[:2], token[2:]))
             i += 1
             continue
         if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
@@ -610,8 +627,11 @@ def _apply_max_mem_per_cpu(req: Request, w: Weights) -> Request:
     cap = w.max_mem_per_cpu_gb
     if not cap or not req.mem_per_cpu_gb or req.mem_per_cpu_gb <= cap:
         return req
-    needed_per_task = math.ceil(req.mem_per_cpu_gb / cap)
-    cpus = max(req.cpus, req.tasks * needed_per_task)
+    # Slurm multiplies CPUs-per-task by the requested-to-capped memory ratio,
+    # so a script already asking for several CPUs per task scales from that
+    # number -- not from the bare task count.
+    ratio = math.ceil(req.mem_per_cpu_gb / cap)
+    cpus = max(req.cpus, req.cpus * ratio)
     if cpus <= req.cpus:
         return req
     note = (
