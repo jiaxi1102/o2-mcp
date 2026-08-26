@@ -607,7 +607,17 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     band_start = (units - base) / w.mem_per_gb  # smallest memory still priced at `units`
     band_end = (units + 1 - base) / w.mem_per_gb  # first memory priced one unit higher
 
+    # A band can run past what the partition will allocate. Suggesting 47 GB
+    # where MaxMemPerNode is 32 is advice that cannot be taken, and the
+    # "free headroom" beside it is memory no submission could request.
+    cap = None
+    if w.max_mem_per_node_gb is not None:
+        cap = w.max_mem_per_node_gb * (req.nodes if req.nodes_stated and req.nodes > 0 else 1)
+    if cap is not None:
+        band_end = min(band_end, cap)
     largest_same_price = _largest_at_same_price(req, w, band_end)
+    if cap is not None:
+        largest_same_price = min(largest_same_price, cap)
 
     result: dict[str, Any] = {
         "billed": True,
@@ -871,6 +881,15 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     reason = _unpriceable_gpu_reason(req, table[partition])
     if reason:
         raise BillingError(f"{partition!r} {reason}")
+    # The same proven impossibilities that remove a partition from the
+    # alternatives list apply to the one being PRICED. This ran on every other
+    # partition and not on the chosen one, so a two-node request on a
+    # MaxNodes=1 partition got a confident price for a job Slurm would reject.
+    cannot = cannot_hold_reason(req, table[partition])
+    if cannot:
+        raise BillingError(
+            f"{partition!r} {cannot}. Slurm would reject this submission, so " "there is no price for it."
+        )
     # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
     # shape it can produce, and rounding one silently would price a job that
     # cannot exist.
@@ -1023,56 +1042,62 @@ def _fits_per_node(need: float, nodes: float, declared_cap: float | None) -> boo
     return need / nodes <= declared_cap
 
 
-def _can_hold(req: Request, w: Weights) -> bool:
-    """Can this partition hold the requested shape at all?
+def cannot_hold_reason(req: Request, w: Weights) -> str | None:
+    """Why this partition provably cannot hold the shape, or None.
 
-    Billing weights say what a resource COSTS. Only the TRES inventory says
-    what the partition HAS, and a suggestion the scheduler will reject is worse
-    than none. Every answer here needs positive support, so an inventory that
-    was never captured excludes the partition: "we did not look" is not
-    evidence that it fits.
+    Only PROVEN impossibilities. Billing weights say what a resource COSTS; the
+    TRES inventory and the per-job limits say what the partition will give ONE
+    job. Unknown is not absent -- an inventory that was never captured proves
+    nothing, so every check fires on a value that is actually present. A
+    declared cap can rule a shape OUT; nothing here rules one IN.
+
+    Returns the reason rather than a bool so a refusal can name the limit that
+    produced it, and so the same wording serves the priced partition and the
+    alternatives list.
     """
-    # Unknown is not absent. Since alternatives() no longer claims eligibility,
-    # a filter's whole job is to delete partitions PROVEN unusable -- and an
-    # inventory that was never captured proves nothing. Treating it as a hard
-    # exclusion silently emptied the list wherever the cluster does not report
-    # what this parser expected, which is a worse answer than an unverified one.
     stock = w.stock or {}
     if req.cpus > 0 and "cpu" in stock and stock["cpu"] < req.cpus:
-        return False
+        return f"holds {stock['cpu']:g} CPUs and the request wants {req.cpus:g}"
     if req.mem_gb > 0 and "mem" in stock and stock["mem"] < req.mem_gb:
-        return False
+        return f"holds {stock['mem']:g} GB and the request wants {req.mem_gb:g}"
     if req.nodes_stated and req.nodes > 0:
         if "node" in stock and stock["node"] < req.nodes:
-            return False
-        # Aggregate inventory is not a per-job allowance: MaxNodes=1 rejects a
-        # two-node request on a partition holding a hundred, and MinNodes=2
-        # makes a one-node request a different shape than the one being priced.
+            return f"holds {stock['node']:g} nodes and the request wants {req.nodes:g}"
         if w.max_nodes is not None and w.max_nodes < req.nodes:
-            return False
+            return f"caps one job at {w.max_nodes:g} node(s) (MaxNodes); " f"the request wants {req.nodes:g}"
         if w.min_nodes is not None and w.min_nodes > req.nodes:
-            return False
-        # Per-node capacity, which partition totals cannot establish.
+            return f"requires at least {w.min_nodes:g} node(s) (MinNodes); " f"the request states {req.nodes:g}"
         if not _fits_per_node(req.cpus, req.nodes, w.max_cpus_per_node):
-            return False
+            return (
+                f"caps one job at {w.max_cpus_per_node:g} CPUs per node "
+                f"(MaxCPUsPerNode); {req.cpus:g} across {req.nodes:g} node(s) "
+                f"needs {req.cpus / req.nodes:g}"
+            )
         if not _fits_per_node(req.mem_gb, req.nodes, w.max_mem_per_node_gb):
-            return False
-        # A declared cap rules the shape OUT; nothing here rules one IN. That
-        # asymmetry is the whole point -- see alternatives().
-    if req.gpus <= 0:
-        return True
+            return (
+                f"caps one job at {w.max_mem_per_node_gb:g} GB per node "
+                f"(MaxMemPerNode); {req.mem_gb:g} across {req.nodes:g} node(s) "
+                f"needs {req.mem_gb / req.nodes:g}"
+            )
     # GPUs keep a positive-evidence rule, because a GPU-less partition is the
     # one exclusion the billing weights genuinely cannot make: a weight says
-    # what a GPU costs there, never that one exists. But it applies only when
-    # SOME inventory was captured -- with none at all there is nothing to
-    # reason from, and silence is not a denial.
-    if not stock:
-        return True
+    # what a GPU costs there, never that one exists. It applies only where SOME
+    # inventory was captured -- with none, silence is not a denial.
+    if req.gpus <= 0 or not stock:
+        return None
     if req.gpu_model:
         # A typed request needs typed evidence. An aggregate "gres/gpu=4" says
         # four accelerators exist, not that any of them is an a100.
-        return stock.get("gres/gpu:" + _model_key(req.gpu_model), 0.0) >= req.gpus
-    return stock.get("gres/gpu", 0.0) >= req.gpus
+        if stock.get("gres/gpu:" + _model_key(req.gpu_model), 0.0) < req.gpus:
+            return f"is not known to hold {req.gpus:g} GPU(s) of model {req.gpu_model!r}"
+        return None
+    if stock.get("gres/gpu", 0.0) < req.gpus:
+        return f"is not known to hold {req.gpus:g} GPU(s)"
+    return None
+
+
+def _can_hold(req: Request, w: Weights) -> bool:
+    return cannot_hold_reason(req, w) is None
 
 
 def alternatives(req: Request, table: dict[str, Weights], current: str, limit: int = 4) -> list[dict[str, Any]]:

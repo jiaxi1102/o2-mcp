@@ -1129,3 +1129,51 @@ def test_a_missing_default_is_still_refused_where_memory_IS_billed():
     table = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP AllowGroups=ALL")
     with pytest.raises(billing.BillingError, match="no DefMemPerCPU"):
         billing.resolve_request(billing.Request(cpus=8, mem_specified=False), table, "p")
+
+
+def test_the_priced_partition_gets_the_same_checks_as_the_alternatives():
+    # These ran on every OTHER partition and not on the chosen one, so a shape
+    # Slurm would reject still received a confident price.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxNodes=1"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    two = billing.Request(cpus=8, mem_gb=32, nodes=2, nodes_stated=True)
+    with pytest.raises(billing.BillingError, match="MaxNodes"):
+        billing.price(two, table, "p")
+    # The shape it CAN take is priced as before.
+    one = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
+    assert billing.price(one, table, "p")["billing_units"] == 10
+
+
+def test_the_refusal_names_the_limit_that_produced_it():
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    req = billing.Request(cpus=1, mem_gb=64, nodes=1, nodes_stated=True)
+    with pytest.raises(billing.BillingError, match="MaxMemPerNode"):
+        billing.price(req, table, "p")
+
+
+def test_headroom_never_exceeds_what_the_partition_will_allocate():
+    # A billing band can run past the cap. Advertising 47 GB where the
+    # partition allows 32 is advice no submission could act on, and the "free
+    # headroom" beside it is memory that does not exist for this job.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    out = billing.boundary(billing.Request(cpus=1, mem_gb=32, nodes=1, nodes_stated=True), table["p"])
+    assert out["largest_same_price_mem_gb"] <= 32.0
+    assert out["free_headroom_gb"] == 0.0
+    # The cap is per node, so two nodes raise it rather than halving the band.
+    two = billing.boundary(billing.Request(cpus=1, mem_gb=32, nodes=2, nodes_stated=True), table["p"])
+    assert two["largest_same_price_mem_gb"] > 32.0
+
+
+def test_an_undeclared_cap_does_not_shrink_the_band():
+    # Only a declared limit clamps; absence of one is not a limit of zero.
+    w = billing.Weights(cpu=1.0, mem_per_gb=0.0625)
+    out = billing.boundary(billing.Request(cpus=4, mem_gb=17), w)
+    assert out["free_headroom_gb"] > 0
