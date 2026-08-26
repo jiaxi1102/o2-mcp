@@ -819,19 +819,60 @@ def test_gpu_alternatives_need_inventory_not_just_a_weight():
     assert "cheap_nogpu" in {r["partition"] for r in billing.alternatives(cpu_only, table, "now")}
 
 
-def test_uncaptured_gpu_inventory_does_not_manufacture_a_suggestion():
-    # "We never looked" is not support for a recommendation.
+def test_uncaptured_inventory_does_not_empty_the_list():
+    # Unknown is not absent. alternatives() no longer claims eligibility, so a
+    # filter's job is to delete partitions PROVEN unusable -- and an inventory
+    # that was never captured proves nothing. Treating it as exclusion silently
+    # returned nothing wherever the cluster does not report what this parser
+    # expected, which is worse than an unverified answer.
     table = {
-        "now": billing.Weights(
-            cpu=1.0,
-            mem_per_gb=0.0625,
-            gpu=5.0,
-            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8},
-        ),
-        "unknown": billing.Weights(cpu=0.1, mem_per_gb=0.00625, gpu=0.1),
+        "now": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0),
+        "cheap": billing.Weights(cpu=0.1, mem_per_gb=0.00625, gpu=0.1),
     }
     req = billing.Request(cpus=4, mem_gb=16, gpus=1)
-    assert "unknown" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
+    assert "cheap" in {r["partition"] for r in billing.alternatives(req, table, "now")}
+    pinned = billing.Request(cpus=4, mem_gb=16, nodes=2, nodes_stated=True)
+    assert "cheap" in {r["partition"] for r in billing.alternatives(pinned, table, "now")}
+
+
+def test_captured_inventory_still_excludes_what_it_disproves():
+    # The filters only lose their teeth where there is nothing to bite on.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=400,mem=4000G,node=10,gres/gpu=40 State=UP AllowGroups=ALL\n"
+        "PartitionName=nogpu TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+        " TRES=cpu=8,mem=32G,node=1,gres/gpu=2 State=UP AllowGroups=ALL\n"
+    )
+    gpu_req = billing.Request(cpus=4, mem_gb=16, gpus=1)
+    assert "nogpu" not in {r["partition"] for r in billing.alternatives(gpu_req, table, "now")}
+    big = billing.Request(cpus=64, mem_gb=128)
+    assert "tiny" not in {r["partition"] for r in billing.alternatives(big, table, "now")}
+
+
+def test_inventory_comes_from_totals_when_no_tres_token_is_present():
+    # TotalCPUs/TotalNodes are the fields `scontrol show partition` is
+    # documented to expose. Requiring a TRES= token that a given Slurm may not
+    # print left stock empty on the real refresh path.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP" " AllowGroups=ALL TotalCPUs=400 TotalNodes=10"
+    )
+    assert table["p"].stock == {"cpu": 400.0, "node": 10.0}
+    big = billing.Request(cpus=4000, mem_gb=16)
+    assert billing._can_hold(big, table["p"]) is False
+
+
+def test_a_tres_token_wins_over_the_totals_it_overlaps():
+    # TRES= is richer (it carries memory and GRES), so it fills first and the
+    # totals only supply what it did not.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP AllowGroups=ALL"
+        " TRES=cpu=128,mem=256G,node=2 TotalCPUs=999 TotalNodes=999"
+    )
+    assert table["p"].stock["cpu"] == 128.0
+    assert table["p"].stock["node"] == 2.0
+    assert table["p"].stock["mem"] == pytest.approx(256.0)
 
 
 def test_a_typed_gpu_request_needs_typed_inventory():

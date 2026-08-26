@@ -234,6 +234,8 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         # None until a TRES= token is seen: "holds none" and "never told" are
         # different answers, and only one of them permits a suggestion.
         stock: dict[str, float] | None = None
+        total_cpus: float | None = None
+        total_nodes: float | None = None
         max_nodes: float | None = None
         min_nodes: float | None = None
         max_cpus_per_node: float | None = None
@@ -296,6 +298,14 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("MaxNodes=") :].strip()
                 if value.isdigit():
                     max_nodes = float(value)
+            elif token.startswith("TotalCPUs="):
+                value = token[len("TotalCPUs=") :].strip()
+                if value.isdigit():
+                    total_cpus = float(value)
+            elif token.startswith("TotalNodes="):
+                value = token[len("TotalNodes=") :].strip()
+                if value.isdigit():
+                    total_nodes = float(value)
             elif token.startswith("MinNodes="):
                 value = token[len("MinNodes=") :].strip()
                 if value.isdigit():
@@ -373,6 +383,15 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                             unpriceable[key] = float(number)
                     except ValueError:
                         pass
+        # TRES= carries the richest inventory, but TotalCPUs/TotalNodes are the
+        # fields `scontrol show partition` is documented to expose, so they fill
+        # in whatever TRES did not provide rather than being ignored.
+        if total_cpus is not None or total_nodes is not None:
+            stock = dict(stock or {})
+            if total_cpus is not None:
+                stock.setdefault("cpu", total_cpus)
+            if total_nodes is not None:
+                stock.setdefault("node", total_nodes)
         table[name] = Weights(
             cpu=cpu,
             mem_per_gb=mem,
@@ -991,15 +1010,18 @@ def _can_hold(req: Request, w: Weights) -> bool:
     was never captured excludes the partition: "we did not look" is not
     evidence that it fits.
     """
-    stock = w.stock
-    if stock is None:
+    # Unknown is not absent. Since alternatives() no longer claims eligibility,
+    # a filter's whole job is to delete partitions PROVEN unusable -- and an
+    # inventory that was never captured proves nothing. Treating it as a hard
+    # exclusion silently emptied the list wherever the cluster does not report
+    # what this parser expected, which is a worse answer than an unverified one.
+    stock = w.stock or {}
+    if req.cpus > 0 and "cpu" in stock and stock["cpu"] < req.cpus:
         return False
-    if req.cpus > 0 and stock.get("cpu", 0.0) < req.cpus:
-        return False
-    if req.mem_gb > 0 and stock.get("mem", 0.0) < req.mem_gb:
+    if req.mem_gb > 0 and "mem" in stock and stock["mem"] < req.mem_gb:
         return False
     if req.nodes_stated and req.nodes > 0:
-        if stock.get("node", 0.0) < req.nodes:
+        if "node" in stock and stock["node"] < req.nodes:
             return False
         # Aggregate inventory is not a per-job allowance: MaxNodes=1 rejects a
         # two-node request on a partition holding a hundred, and MinNodes=2
@@ -1016,6 +1038,13 @@ def _can_hold(req: Request, w: Weights) -> bool:
         # A declared cap rules the shape OUT; nothing here rules one IN. That
         # asymmetry is the whole point -- see alternatives().
     if req.gpus <= 0:
+        return True
+    # GPUs keep a positive-evidence rule, because a GPU-less partition is the
+    # one exclusion the billing weights genuinely cannot make: a weight says
+    # what a GPU costs there, never that one exists. But it applies only when
+    # SOME inventory was captured -- with none at all there is nothing to
+    # reason from, and silence is not a denial.
+    if not stock:
         return True
     if req.gpu_model:
         # A typed request needs typed evidence. An aggregate "gres/gpu=4" says
@@ -1070,6 +1099,14 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             rows.append({"partition": name, "units": units, "units_now": now_units})
     rows.sort(key=lambda r: (r["units"], r["partition"]))
     return rows[:limit]
+
+
+# The inventory fixtures in the tests are CONSTRUCTED, not captured from a
+# cluster. The billing shapes in this suite are real observations; the
+# partition-inventory ones are not, so the filters below are known to be
+# self-consistent and are NOT known to match what a given Slurm prints. That is
+# why they only ever remove partitions proven unusable, and why an inventory
+# this parser does not recognise leaves the row in place.
 
 
 def alternatives_caveat() -> str:
