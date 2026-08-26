@@ -99,10 +99,10 @@ class Weights:
     # Weighted TRES types this calculator cannot charge for. Non-empty means
     # any price for this partition would be understated, so it refuses.
     unpriceable_tres: dict[str, float] | None = None
-    # GPUs the partition HOLDS, from its TRES inventory rather than its billing
-    # weights. None means the inventory was never captured.
-    gpu_stock: float | None = None
-    gpu_stock_by_model: dict[str, float] | None = None
+    # What the partition HOLDS, from its TRES inventory rather than its billing
+    # weights: cpu, mem (GB), node, gres/gpu, gres/gpu:<model>. None means the
+    # inventory was never captured, which is not the same as holding nothing.
+    stock: dict[str, float] | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
         """Memory Slurm would allocate for a request that names none.
@@ -208,10 +208,9 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         def_cpu = def_node = None
         state_up, unrestricted = True, True
         unpriceable: dict[str, float] = {}
-        # None until a TRES= token is seen: "no GPUs" and "never told" are
+        # None until a TRES= token is seen: "holds none" and "never told" are
         # different answers, and only one of them permits a suggestion.
-        gpu_stock: float | None = None
-        gpu_stock_by_model: dict[str, float] = {}
+        stock: dict[str, float] | None = None
         max_mem_cpu = None
         gpu_by_model: dict[str, float] = {}
         for token in line.split():
@@ -223,24 +222,22 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             elif token.startswith("TRES="):
                 # Distinct from TRESBillingWeights: this is the inventory the
                 # partition actually holds. Weights say what a resource COSTS;
-                # only inventory says whether it can run there at all.
+                # only inventory says whether it can run there at all -- and
+                # that applies to CPUs, memory and nodes exactly as it does to
+                # accelerators.
+                stock = {}
                 for part in token[len("TRES=") :].split(","):
                     if "=" not in part:
                         continue
                     tkey, tval = part.split("=", 1)
                     tkey = tkey.strip().lower()
-                    if not tkey.startswith("gres/gpu"):
-                        continue
                     try:
-                        count = float(re.sub(r"[A-Za-z]", "", tval) or 0)
+                        if tkey == "mem":
+                            stock[tkey] = to_gb(tval, default_unit="M")
+                        else:
+                            stock[tkey] = float(re.sub(r"[A-Za-z]", "", tval) or 0)
                     except ValueError:
                         continue
-                    if tkey == "gres/gpu":
-                        gpu_stock = count
-                    else:
-                        gpu_stock_by_model[tkey.split(":", 1)[1]] = count
-                if gpu_stock is None:
-                    gpu_stock = 0.0
             elif token.startswith("State="):
                 state_up = token[len("State=") :].upper() == "UP"
             elif token.startswith("AllowGroups="):
@@ -258,6 +255,12 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 # this tool cannot tell whether the caller is one of them.
                 value = token[len("DenyQos=") :]
                 if value and value.upper() not in ("", "(NULL)", "NONE"):
+                    unrestricted = False
+            elif token.startswith("ReqResv="):
+                # A partition that only accepts jobs inside a reservation will
+                # reject a plain submission, and the pricing input carries no
+                # reservation. Same treatment as a QoS or account restriction.
+                if token[len("ReqResv=") :].strip().upper() in ("YES", "TRUE", "1"):
                     unrestricted = False
             elif token.startswith("DenyAccounts="):
                 value = token[len("DenyAccounts=") :]
@@ -328,8 +331,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             max_mem_per_cpu_gb=max_mem_cpu,
             gpu_by_model=gpu_by_model or None,
             unpriceable_tres=unpriceable or None,
-            gpu_stock=gpu_stock,
-            gpu_stock_by_model=gpu_stock_by_model or None,
+            stock=stock,
         )
     return table
 
@@ -624,8 +626,7 @@ def save_weight_cache(
                 "max_mem_per_cpu_gb": w.max_mem_per_cpu_gb,
                 "gpu_by_model": w.gpu_by_model,
                 "unpriceable_tres": w.unpriceable_tres,
-                "gpu_stock": w.gpu_stock,
-                "gpu_stock_by_model": w.gpu_stock_by_model,
+                "stock": w.stock,
             }
             for name, w in table.items()
         },
@@ -678,8 +679,7 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 # disappeared and an a100 was charged at the generic rate.
                 gpu_by_model=_float_map(entry.get("gpu_by_model")),
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
-                gpu_stock=(None if entry.get("gpu_stock") is None else float(entry["gpu_stock"])),
-                gpu_stock_by_model=_float_map(entry.get("gpu_stock_by_model")),
+                stock=_float_map(entry.get("stock")),
             )
         except (TypeError, ValueError):
             continue
@@ -878,22 +878,31 @@ def price(
     return payload
 
 
-def _has_gpu_stock(req: "Request", w: "Weights") -> bool:
-    """Does this partition hold enough of the GPU the request names?
+def _can_hold(req: "Request", w: "Weights") -> bool:
+    """Can this partition hold the requested shape at all?
 
-    Answers False when the inventory was never captured: a suggestion has to be
-    positively supported, and "we did not look" is not support.
+    Billing weights say what a resource COSTS. Only the TRES inventory says
+    what the partition HAS, and a suggestion the scheduler will reject is worse
+    than none. Every answer here needs positive support, so an inventory that
+    was never captured excludes the partition: "we did not look" is not
+    evidence that it fits.
     """
-    if w.gpu_stock is None:
+    stock = w.stock
+    if stock is None:
         return False
+    if req.cpus > 0 and stock.get("cpu", 0.0) < req.cpus:
+        return False
+    if req.mem_gb > 0 and stock.get("mem", 0.0) < req.mem_gb:
+        return False
+    if req.nodes_stated and req.nodes > 0 and stock.get("node", 0.0) < req.nodes:
+        return False
+    if req.gpus <= 0:
+        return True
     if req.gpu_model:
-        by_model = w.gpu_stock_by_model or {}
-        if req.gpu_model in by_model:
-            return by_model[req.gpu_model] >= req.gpus
-        # A model-priced partition that never lists that model's stock cannot
-        # be shown to hold it.
-        return not (w.gpu_by_model or by_model) and w.gpu_stock >= req.gpus
-    return w.gpu_stock >= req.gpus
+        # A typed request needs typed evidence. An aggregate "gres/gpu=4" says
+        # four accelerators exist, not that any of them is an a100.
+        return stock.get("gres/gpu:" + req.gpu_model, 0.0) >= req.gpus
+    return stock.get("gres/gpu", 0.0) >= req.gpus
 
 
 def alternatives(req: Request, table: dict[str, Weights], current: str, limit: int = 4) -> list[dict[str, Any]]:
@@ -923,10 +932,9 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             continue
         # Can it RUN here? TRESBillingWeights defines charges; the partition's
         # TRES inventory defines what it holds. A positive weight is not
-        # evidence of a single GPU, so advertising on it offered moves that
-        # would be rejected on arrival. An uncaptured inventory is unknown, and
-        # unknown may not manufacture a suggestion either.
-        if req.gpus > 0 and not _has_gpu_stock(req, w):
+        # evidence of a single GPU -- nor of 64 cores, 128 GB or two nodes --
+        # so advertising on it offered moves the scheduler would reject.
+        if not _can_hold(req, w):
             continue
         # Never advertise a partition that pricing this same request directly
         # would refuse: the units would come from another model's weight.

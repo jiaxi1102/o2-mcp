@@ -18,8 +18,12 @@ import pytest
 from o2mcp import billing
 
 SHORT = billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0)
-GPU_QUAD = billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_stock=40)
-GPU_REQUEUE = billing.Weights(cpu=0.1, mem_per_gb=0.00625, gpu=0.1, gpu_stock=108)
+GPU_QUAD = billing.Weights(
+    cpu=1.0, mem_per_gb=0.0625, gpu=5.0, stock={"cpu": 400, "mem": 4000, "node": 10, "gres/gpu": 40}
+)
+GPU_REQUEUE = billing.Weights(
+    cpu=0.1, mem_per_gb=0.00625, gpu=0.1, stock={"cpu": 1080, "mem": 10000, "node": 27, "gres/gpu": 108}
+)
 
 # (weights, cpus, mem_gb, gpus, observed billing)
 OBSERVED = [
@@ -262,9 +266,12 @@ class TestSecondReviewFindings:
     consequences of the first round's own fixes."""
 
     SC = (
-        "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n"
-        "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G DefMemPerCPU=4096\n"
-        "PartitionName=bare TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"
+        "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096"
+        " TRES=cpu=400,mem=4000G,node=10\n"
+        "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G DefMemPerCPU=4096"
+        " TRES=cpu=400,mem=4000G,node=10\n"
+        "PartitionName=bare TRESBillingWeights=CPU=1.0,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10\n"
     )
 
     def table(self):
@@ -526,19 +533,30 @@ def test_alternatives_never_offer_a_partition_that_cannot_price_the_model():
             mem_per_gb=0.0625,
             gpu=5.0,
             gpu_by_model={"a100": 10.0},
-            gpu_stock=8,
-            gpu_stock_by_model={"a100": 8},
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:a100": 8},
         ),
         "gpu_h": billing.Weights(
-            cpu=0.5, mem_per_gb=0.03, gpu=1.0, gpu_by_model={"h100": 20.0}, gpu_stock=8, gpu_stock_by_model={"h100": 8}
+            cpu=0.5,
+            mem_per_gb=0.03,
+            gpu=1.0,
+            gpu_by_model={"h100": 20.0},
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:h100": 8},
         ),
-        "gpu_generic": billing.Weights(cpu=0.5, mem_per_gb=0.03, gpu=1.0, gpu_stock=8),
+        # Prices GPUs generically AND is known to hold a100s. Both halves
+        # matter: the pricing filter must not exclude it, and the inventory
+        # filter needs typed evidence before it may be offered.
+        "gpu_generic": billing.Weights(
+            cpu=0.5,
+            mem_per_gb=0.03,
+            gpu=1.0,
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:a100": 8},
+        ),
     }
     req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
     offered = {r["partition"] for r in billing.alternatives(req, table, "gpu_a")}
     assert "gpu_h" not in offered
-    # A partition with no per-model table at all still prices it generically,
-    # so it remains a real option -- the filter must not over-exclude.
+    # A partition with no per-model weight table still prices the request
+    # generically, so the PRICING filter must not exclude it.
     assert "gpu_generic" in offered
     with pytest.raises(billing.BillingError):
         billing.resolve_request(req, table, "gpu_h")
@@ -554,16 +572,14 @@ def test_a_partition_priced_only_per_model_is_still_offered():
             mem_per_gb=0.0625,
             gpu=5.0,
             gpu_by_model={"a100": 10.0},
-            gpu_stock=8,
-            gpu_stock_by_model={"a100": 8},
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:a100": 8},
         ),
         "gpu_cheap": billing.Weights(
             cpu=1.0,
             mem_per_gb=0.0625,
             gpu=0.0,
             gpu_by_model={"a100": 1.0},
-            gpu_stock=8,
-            gpu_stock_by_model={"a100": 8},
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:a100": 8},
         ),
     }
     req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
@@ -793,7 +809,7 @@ def test_gpu_alternatives_need_inventory_not_just_a_weight():
         "PartitionName=cheap_gpu TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
         " TRES=cpu=100,mem=1000G,node=4,gres/gpu=8 State=UP AllowGroups=ALL\n"
     )
-    assert table["cheap_nogpu"].gpu_stock == 0.0
+    assert table["cheap_nogpu"].stock.get("gres/gpu", 0.0) == 0.0
     req = billing.Request(cpus=4, mem_gb=16, gpus=1)
     offered = {r["partition"] for r in billing.alternatives(req, table, "now")}
     assert "cheap_nogpu" not in offered
@@ -806,8 +822,69 @@ def test_gpu_alternatives_need_inventory_not_just_a_weight():
 def test_uncaptured_gpu_inventory_does_not_manufacture_a_suggestion():
     # "We never looked" is not support for a recommendation.
     table = {
-        "now": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_stock=8),
+        "now": billing.Weights(
+            cpu=1.0,
+            mem_per_gb=0.0625,
+            gpu=5.0,
+            stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8},
+        ),
         "unknown": billing.Weights(cpu=0.1, mem_per_gb=0.00625, gpu=0.1),
     }
     req = billing.Request(cpus=4, mem_gb=16, gpus=1)
     assert "unknown" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
+
+
+def test_alternatives_check_cpu_memory_and_node_capacity():
+    # Inventory answers "can it run here" for every resource, not just GPUs. A
+    # one-node, 8-CPU, 32 GB partition was advertised for a 64-CPU/128-GB job
+    # because only the GPU count was ever consulted.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=8,mem=32G,node=1 State=UP AllowGroups=ALL\n"
+        "PartitionName=roomy TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    big = billing.Request(cpus=64, mem_gb=128, nodes=2, nodes_stated=True)
+    offered = {r["partition"] for r in billing.alternatives(big, table, "now")}
+    assert "tiny" not in offered
+    assert "roomy" in offered
+    # A shape the small partition CAN hold is still offered there.
+    small = billing.Request(cpus=4, mem_gb=16)
+    assert "tiny" in {r["partition"] for r in billing.alternatives(small, table, "now")}
+
+
+def test_a_typed_gpu_request_needs_typed_inventory():
+    # "gres/gpu=4" says four accelerators exist, not that any is an a100.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=8,gres/gpu:a100=8 State=UP AllowGroups=ALL\n"
+        "PartitionName=untyped TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=4 State=UP AllowGroups=ALL\n"
+        "PartitionName=typed TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=4,gres/gpu:a100=4 State=UP AllowGroups=ALL\n"
+    )
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    offered = {r["partition"] for r in billing.alternatives(req, table, "now")}
+    assert "untyped" not in offered
+    assert "typed" in offered
+    # An UNtyped request is happy with the aggregate count.
+    any_gpu = billing.Request(cpus=4, mem_gb=16, gpus=1)
+    assert "untyped" in {r["partition"] for r in billing.alternatives(any_gpu, table, "now")}
+
+
+def test_a_reservation_only_partition_is_not_advertised():
+    # ReqResv=YES means a plain submission is rejected, and the pricing input
+    # carries no reservation -- the same "eligibility unknown" treatment the
+    # QoS and account restrictions already get.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL ReqResv=NO\n"
+        "PartitionName=resv TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL ReqResv=YES\n"
+    )
+    assert table["resv"].unrestricted is False
+    assert table["now"].unrestricted is True
+    req = billing.Request(cpus=4, mem_gb=16)
+    assert "resv" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
