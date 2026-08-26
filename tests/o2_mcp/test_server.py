@@ -1002,3 +1002,21 @@ async def test_price_job_still_refuses_an_explicit_zero(tmp_path, monkeypatch):
     assert payload["ok"] is False
     assert payload["error"] == "unpriceable"
     assert "all memory on every allocated node" in payload["message"]
+
+
+@pytest.mark.anyio
+async def test_the_price_job_schema_states_what_its_numbers_mean():
+    """The schema is what an agent reads at the call site.
+
+    Lives here, not in tests/unit: that suite is dependency-free and runs on a
+    Python where the MCP extras are not installed, so importing the server
+    there broke the whole lane.
+    """
+    mem = o2server.PriceJobInput.model_fields["mem_gb"].description
+    assert "TOTAL" in mem
+    assert "per NODE" in mem
+    nodes = o2server.PriceJobInput.model_fields["nodes"].description
+    assert "whenever the submission" in nodes
+    assert "MaxNodes" in nodes
+    cpus = o2server.PriceJobInput.model_fields["cpus"].description
+    assert "Total CPUs" in cpus

@@ -1373,20 +1373,6 @@ def test_a_site_with_only_typed_weights_charges_only_those():
     assert billing.gpu_weight_for(billing.Request(gpus=1, gpu_model="a100"), table["p"]) == 10.0
 
 
-def test_the_price_job_schema_states_what_mem_gb_means():
-    # The skills say --mem is per node and mem_gb is the total, but the schema
-    # is what an agent reads at the call site. "Memory in GB" alone let a
-    # two-node --mem=32G job be priced at half its allocation.
-    from o2mcp.server import PriceJobInput
-
-    mem = PriceJobInput.model_fields["mem_gb"].description
-    assert "TOTAL" in mem
-    assert "per NODE" in mem
-    nodes = PriceJobInput.model_fields["nodes"].description
-    assert "whenever the submission" in nodes
-    assert "MaxNodes" in nodes
-
-
 def test_an_exclusive_partition_cannot_be_priced():
     # OverSubscribe=EXCLUSIVE gives a job whole NODES, so its billing TRES
     # comes from the hardware Slurm picks rather than the request.
