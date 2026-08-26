@@ -94,6 +94,9 @@ class Request:
     mem_gb: float = 0.0
     gpus: float = 0.0
     nodes: float = 1.0
+    # True when --nodes gave a range: the allocation is not determined, so a
+    # price would be a floor presented as a figure.
+    nodes_is_range: bool = False
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
@@ -194,8 +197,11 @@ def parse_sbatch(text: str) -> Request:
     ntasks: float | None = None
     ntasks_per_node: float | None = None
     nodes = 1.0
+    nodes_range = False
     cpus_per_task: float | None = None
     mem_per_cpu: float | None = None
+    total_gpus: float | None = None
+    gpus_per_node: float | None = None
     saw_mem = False
 
     for line in (text or "").splitlines():
@@ -210,8 +216,14 @@ def parse_sbatch(text: str) -> Request:
             elif key == "--ntasks-per-node":
                 ntasks_per_node = float(value)
             elif key in ("--nodes", "-N"):
-                # --nodes=2-4 requests a range; the minimum is what is certain.
-                nodes = float(str(value).split("-")[0])
+                text = str(value).strip()
+                if "-" in text:
+                    # A range: Slurm may allocate anything within it, so the
+                    # CPU total -- and every figure downstream -- is unknown.
+                    nodes_range = True
+                    nodes = float(text.split("-")[0])
+                else:
+                    nodes = float(text)
             elif key == "--mem":
                 req.mem_gb = to_gb(value)
                 req.mem_source = "--mem"
@@ -219,11 +231,14 @@ def parse_sbatch(text: str) -> Request:
             elif key == "--mem-per-cpu":
                 mem_per_cpu = to_gb(value)
             elif key == "--gres":
+                # --gres is per node, like --gpus-per-node.
                 gpu = re.match(r"^gpu(?::[^:]+)?:(\d+)$", value.strip())
                 if gpu:
-                    req.gpus = float(gpu.group(1))
-            elif key in ("--gpus", "--gpus-per-node"):
-                req.gpus = float(re.sub(r"^.*:", "", value.strip()))
+                    gpus_per_node = float(gpu.group(1))
+            elif key == "--gpus":
+                total_gpus = float(re.sub(r"^.*:", "", value.strip()))
+            elif key == "--gpus-per-node":
+                gpus_per_node = float(re.sub(r"^.*:", "", value.strip()))
             elif key in ("--partition", "-p"):
                 req.partition = value.strip()
 
@@ -236,6 +251,11 @@ def parse_sbatch(text: str) -> Request:
     else:
         total_tasks = 1.0
     req.nodes = nodes
+    req.nodes_is_range = nodes_range
+    if total_gpus is not None:
+        req.gpus = total_gpus
+    elif gpus_per_node is not None:
+        req.gpus = gpus_per_node * nodes
     req.cpus = total_tasks * (cpus_per_task if cpus_per_task is not None else 1.0)
 
     req.mem_specified = saw_mem or mem_per_cpu is not None
@@ -366,7 +386,16 @@ def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str |
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "captured_at": captured_at,
-        "partitions": {name: {"cpu": w.cpu, "mem_per_gb": w.mem_per_gb, "gpu": w.gpu} for name, w in table.items()},
+        "partitions": {
+            name: {
+                "cpu": w.cpu,
+                "mem_per_gb": w.mem_per_gb,
+                "gpu": w.gpu,
+                "def_mem_per_cpu_gb": w.def_mem_per_cpu_gb,
+                "def_mem_per_node_gb": w.def_mem_per_node_gb,
+            }
+            for name, w in table.items()
+        },
     }
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as handle:
@@ -378,14 +407,63 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
     table: dict[str, Weights] = {}
     for name, entry in (payload.get("partitions") or {}).items():
         try:
+            def_cpu = entry.get("def_mem_per_cpu_gb")
+            def_node = entry.get("def_mem_per_node_gb")
             table[name] = Weights(
                 cpu=float(entry.get("cpu", 1.0)),
                 mem_per_gb=float(entry.get("mem_per_gb", 0.0)),
                 gpu=float(entry.get("gpu", 0.0)),
+                def_mem_per_cpu_gb=None if def_cpu is None else float(def_cpu),
+                def_mem_per_node_gb=None if def_node is None else float(def_node),
             )
         except (TypeError, ValueError):
             continue
     return table
+
+
+def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> Request:
+    """Fill in what the submission left implicit, or refuse to price it.
+
+    Two things must be settled before any number is produced, and both were
+    previously resolved inside price() alone -- so alternatives() went on to
+    compare a different, memory-less shape across partitions.
+
+    A request that names no memory does not get none: Slurm applies
+    DefMemPerCPU or DefMemPerNode and bills that allocation. A --nodes range
+    leaves the allocation genuinely undetermined, and a price computed from its
+    minimum is a floor wearing the clothes of a figure.
+    """
+    if partition not in table:
+        raise BillingError(
+            "no billing weights known for partition {!r}; refresh the weight "
+            "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
+        )
+    if req.nodes_is_range:
+        raise BillingError(
+            "--nodes was given as a range, so Slurm may allocate anything within "
+            "it and the CPU total is not determined. Pricing the minimum would "
+            "understate every job that receives more. Fix the node count, or "
+            "price a specific size explicitly."
+        )
+    if req.mem_specified:
+        return req
+    default = table[partition].default_mem_gb(req.cpus, req.nodes)
+    if default is None:
+        raise BillingError(
+            f"{partition!r} was given no --mem and no DefMemPerCPU or DefMemPerNode is "
+            "recorded for it, so the memory Slurm would actually allocate -- and "
+            "bill -- is unknown. Refresh the weight cache while connected, or "
+            "state the memory explicitly."
+        )
+    return Request(
+        cpus=req.cpus,
+        mem_gb=default,
+        gpus=req.gpus,
+        nodes=req.nodes,
+        mem_specified=True,
+        mem_source=f"partition default ({partition})",
+        warnings=list(req.warnings),
+    )
 
 
 def price(
@@ -398,25 +476,7 @@ def price(
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
     w = table[partition]
-    resolved_default: float | None = None
-    if not req.mem_specified:
-        resolved_default = w.default_mem_gb(req.cpus, req.nodes)
-        if resolved_default is None:
-            raise BillingError(
-                f"{partition!r} was given no --mem and no DefMemPerCPU or "
-                "DefMemPerNode is recorded for it, so the memory Slurm would "
-                "actually allocate -- and bill -- is unknown. Refresh the weight "
-                "cache while connected, or state the memory explicitly."
-            )
-        req = Request(
-            cpus=req.cpus,
-            mem_gb=resolved_default,
-            gpus=req.gpus,
-            nodes=req.nodes,
-            mem_specified=True,
-            mem_source=f"partition default ({partition})",
-            warnings=list(req.warnings),
-        )
+    req = resolve_request(req, table, partition)
     units = billing_units(req, w)
     pre = weighted_sum(req, w)
     payload: dict[str, Any] = {

@@ -881,6 +881,24 @@ async def test_price_job_reports_cheaper_partitions_for_the_same_request(monkeyp
 
 
 @pytest.mark.anyio
+async def test_price_job_direct_call_without_memory_uses_the_partition_default(monkeypatch, tmp_path):
+    # `cpus=4` with no mem_gb is a request that names no memory, not a request
+    # for none: Slurm applies DefMemPerCPU and bills it.
+    from o2mcp import billing
+
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table("PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n"),
+        captured_at=1000.0,
+    )
+    payload = await _call("o2_price_job", {"params": {"partition": "short", "cpus": 4}})
+    assert payload["ok"] is True
+    assert payload["request"]["mem_gb"] == pytest.approx(16.0)
+    assert "partition default" in payload["request"]["mem_source"]
+    assert payload["billing_units"] == 5
+
+
+@pytest.mark.anyio
 async def test_price_job_refuses_an_unknown_partition(monkeypatch, tmp_path):
     from o2mcp import billing
 

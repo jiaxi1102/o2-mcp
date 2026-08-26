@@ -1015,7 +1015,14 @@ async def o2_price_job(params: PriceJobInput) -> str:
         if script is not None:
             request = billing.parse_sbatch(script)
         elif params.cpus is not None:
-            request = billing.Request(cpus=params.cpus, mem_gb=params.mem_gb or 0.0, gpus=params.gpus or 0.0)
+            # Omitting mem_gb means the request names no memory, which is not
+            # the same as requesting none: the partition default applies.
+            request = billing.Request(
+                cpus=params.cpus,
+                mem_gb=params.mem_gb or 0.0,
+                gpus=params.gpus or 0.0,
+                mem_specified=params.mem_gb is not None,
+            )
         else:
             return {
                 "ok": False,
@@ -1024,9 +1031,12 @@ async def o2_price_job(params: PriceJobInput) -> str:
             }
 
         try:
+            request = billing.resolve_request(request, table, params.partition)
             payload = billing.price(request, table, params.partition, captured_at)
         except billing.BillingError as exc:
             return {"ok": False, "error": "unpriceable", "message": str(exc)}
+        # Compare the SAME concrete allocation elsewhere; using the unresolved
+        # request priced every alternative with zero memory.
         payload["alternatives"] = billing.alternatives(request, table, params.partition)
         payload["ok"] = True
         return payload

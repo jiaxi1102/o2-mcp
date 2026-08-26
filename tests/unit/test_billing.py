@@ -348,3 +348,61 @@ class TestReviewFindings:
     def test_zero_or_unset_defaults_are_not_treated_as_a_default(self):
         table = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=0\n")
         assert table["p"].def_mem_per_cpu_gb is None
+
+
+class TestSecondReviewFindings:
+    """Guards for the second round on PR #26 -- four of the five were
+    consequences of the first round's own fixes."""
+
+    SC = (
+        "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n"
+        "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G DefMemPerCPU=4096\n"
+        "PartitionName=bare TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"
+    )
+
+    def table(self):
+        return billing.parse_weight_table(self.SC)
+
+    def test_cache_preserves_partition_memory_defaults(self):
+        # The defaults were parsed but never serialised, so they survived only
+        # the call that refreshed them -- and the cache is the primary path.
+        table = self.table()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "w.json")
+            billing.save_weight_cache(table, 1.0, path)
+            restored = billing.cache_to_table(billing.load_weight_cache(path))
+        assert restored["short"].def_mem_per_cpu_gb == pytest.approx(4.0)
+        assert restored["bare"].def_mem_per_cpu_gb is None
+        assert restored == table
+
+    def test_gres_and_gpus_per_node_scale_across_nodes(self):
+        assert billing.parse_sbatch("#SBATCH --nodes=3\n#SBATCH --gres=gpu:2\n").gpus == 6
+        assert billing.parse_sbatch("#SBATCH --nodes=3\n#SBATCH --gpus-per-node=2\n").gpus == 6
+
+    def test_total_gpus_is_not_scaled(self):
+        assert billing.parse_sbatch("#SBATCH --nodes=3\n#SBATCH --gpus=2\n").gpus == 2
+
+    def test_node_range_is_refused_not_priced_at_its_minimum(self):
+        req = billing.parse_sbatch("#SBATCH --nodes=2-8\n#SBATCH --mem=16G\n")
+        assert req.nodes_is_range is True
+        with pytest.raises(billing.BillingError, match="range"):
+            billing.resolve_request(req, self.table(), "short")
+
+    def test_fixed_node_count_still_prices(self):
+        req = billing.parse_sbatch("#SBATCH --nodes=2\n#SBATCH --mem=16G\n")
+        assert req.nodes_is_range is False
+        assert billing.resolve_request(req, self.table(), "short") is req
+
+    def test_alternatives_compare_the_resolved_allocation(self):
+        # Comparing partitions with an unresolved request priced every
+        # alternative as holding no memory at all.
+        table = self.table()
+        unresolved = billing.Request(cpus=4, mem_specified=False)
+        resolved = billing.resolve_request(unresolved, table, "short")
+        assert resolved.mem_gb == pytest.approx(16.0)
+        assert billing.alternatives(resolved, table, "short")[0]["units_now"] == 5
+        assert billing.alternatives(unresolved, table, "short")[0]["units_now"] == 4
+
+    def test_resolution_is_refused_when_no_default_is_recorded(self):
+        with pytest.raises(billing.BillingError, match="DefMemPerCPU"):
+            billing.resolve_request(billing.Request(cpus=4, mem_specified=False), self.table(), "bare")
