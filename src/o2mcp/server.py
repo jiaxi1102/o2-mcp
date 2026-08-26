@@ -1044,6 +1044,10 @@ async def o2_price_job(params: PriceJobInput) -> str:
         # Compare the SAME concrete allocation elsewhere; using an unresolved
         # request priced every alternative with zero memory.
         payload["alternatives"] = billing.alternatives(request, table, params.partition)
+        # An empty list would otherwise read as "nothing cheaper exists".
+        note = billing.alternatives_note(request, table, params.partition)
+        if note:
+            payload["alternatives_note"] = note
         payload["ok"] = True
         return payload
 

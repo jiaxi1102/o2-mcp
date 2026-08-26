@@ -834,27 +834,6 @@ def test_uncaptured_gpu_inventory_does_not_manufacture_a_suggestion():
     assert "unknown" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
 
 
-def test_alternatives_check_cpu_memory_and_node_capacity():
-    # Inventory answers "can it run here" for every resource, not just GPUs. A
-    # one-node, 8-CPU, 32 GB partition was advertised for a 64-CPU/128-GB job
-    # because only the GPU count was ever consulted.
-    table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
-        "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G"
-        " TRES=cpu=8,mem=32G,node=1 State=UP AllowGroups=ALL\n"
-        "PartitionName=roomy TRESBillingWeights=CPU=0.1,Mem=0.00625G"
-        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
-    )
-    big = billing.Request(cpus=64, mem_gb=128, nodes=2, nodes_stated=True)
-    offered = {r["partition"] for r in billing.alternatives(big, table, "now")}
-    assert "tiny" not in offered
-    assert "roomy" in offered
-    # A shape the small partition CAN hold is still offered there.
-    small = billing.Request(cpus=4, mem_gb=16)
-    assert "tiny" in {r["partition"] for r in billing.alternatives(small, table, "now")}
-
-
 def test_a_typed_gpu_request_needs_typed_inventory():
     # "gres/gpu=4" says four accelerators exist, not that any is an a100.
     table = billing.parse_weight_table(
@@ -918,22 +897,6 @@ def test_gpu_model_matching_is_case_insensitive():
     assert "other" in offered
 
 
-def test_a_per_job_node_cap_is_not_aggregate_inventory():
-    # A partition can hold a hundred nodes and still cap one job at one.
-    table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=4000,mem=40000G,node=100 State=UP AllowGroups=ALL\n"
-        "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxNodes=1"
-        " TRES=cpu=4000,mem=40000G,node=100 State=UP AllowGroups=ALL\n"
-    )
-    assert table["capped"].max_nodes == 1.0
-    two = billing.Request(cpus=8, mem_gb=32, nodes=2, nodes_stated=True)
-    assert "capped" not in {r["partition"] for r in billing.alternatives(two, table, "now")}
-    # A single-node request is still welcome there.
-    one = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
-    assert "capped" in {r["partition"] for r in billing.alternatives(one, table, "now")}
-
-
 def test_root_only_partitions_are_not_advertised():
     # Only root may initiate jobs there, and pricing carries no user identity.
     table = billing.parse_weight_table(
@@ -958,67 +921,80 @@ def test_the_refresh_verdict_and_the_refusal_agree():
         assert billing.unsupported_billing_model({"priority_flags": flags}) is None
 
 
-def test_aggregate_totals_do_not_prove_a_per_node_fit():
-    # 128 CPUs across 4 nodes does not put 64 on any one of them. The average
-    # (32) is the only per-node figure a total supports, by pigeonhole.
-    table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
-        "PartitionName=thin TRESBillingWeights=CPU=0.1,Mem=0.00625G"
-        " TRES=cpu=128,mem=1024G,node=4 State=UP AllowGroups=ALL\n"
-    )
-    one_fat_node = billing.Request(cpus=64, mem_gb=64, nodes=1, nodes_stated=True)
-    assert "thin" not in {r["partition"] for r in billing.alternatives(one_fat_node, table, "now")}
-    # 32 CPUs on one node is exactly the average, so some node must hold it.
-    fits = billing.Request(cpus=32, mem_gb=64, nodes=1, nodes_stated=True)
-    assert "thin" in {r["partition"] for r in billing.alternatives(fits, table, "now")}
-    # Without an explicit node count Slurm chooses the layout, so the aggregate
-    # bound is the right one and the partition stays on offer.
-    unstated = billing.Request(cpus=64, mem_gb=64)
-    assert "thin" in {r["partition"] for r in billing.alternatives(unstated, table, "now")}
+# --- node-count requests: what partition data can and cannot establish -------
+#
+# A partition-wide total bounds the SUM, never a single node, and it proves
+# neither that two resources co-locate nor that enough nodes qualify. An
+# earlier version of this module reasoned from averages by pigeonhole; that
+# argument holds for ONE resource on ONE node and fails for the shapes that
+# actually matter, so a pinned node count is now a question the cache declines
+# rather than answers.
+
+_ROOMY = (
+    "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+    " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+)
 
 
-def test_an_explicit_per_node_cap_is_honoured():
+def test_no_node_count_still_compares_on_partition_totals():
+    # Without a pinned node count Slurm chooses the layout, so the totals are
+    # the right bound and cheaper partitions are still offered.
     table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
-        "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxCPUsPerNode=16"
+        _ROOMY + "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G"
         " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
     )
-    assert table["capped"].max_cpus_per_node == 16.0
-    # The average would allow 400 per node; the declared cap is tighter.
-    req = billing.Request(cpus=32, mem_gb=32, nodes=1, nodes_stated=True)
-    assert "capped" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
-    ok = billing.Request(cpus=16, mem_gb=32, nodes=1, nodes_stated=True)
-    assert "capped" in {r["partition"] for r in billing.alternatives(ok, table, "now")}
-
-
-def test_a_minimum_node_count_excludes_smaller_shapes():
-    # MinNodes=2 means a one-node request is not the identical allocation, and
-    # the allocation it would become is not what was priced.
-    table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
-        "PartitionName=pair TRESBillingWeights=CPU=0.1,Mem=0.00625G MinNodes=2"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+    req = billing.Request(cpus=64, mem_gb=128)
+    assert "cheap" in {r["partition"] for r in billing.alternatives(req, table, "now")}
+    assert billing.alternatives_note(req, table, "now") is None
+    # A partition that cannot hold the aggregate is still excluded.
+    small = billing.parse_weight_table(
+        _ROOMY + "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=8,mem=32G,node=1 State=UP AllowGroups=ALL\n"
     )
-    assert table["pair"].min_nodes == 2.0
-    one = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
-    assert "pair" not in {r["partition"] for r in billing.alternatives(one, table, "now")}
-    two = billing.Request(cpus=8, mem_gb=32, nodes=2, nodes_stated=True)
-    assert "pair" in {r["partition"] for r in billing.alternatives(two, table, "now")}
+    assert not billing.alternatives(req, small, "now")
 
 
-def test_per_node_memory_caps_are_honoured_too():
-    # The direct sibling of MaxCPUsPerNode, in megabytes as scontrol prints it.
+def test_a_pinned_node_count_withholds_alternatives_and_says_so():
+    # cpu=128,mem=256G,node=2 is satisfied by a 96-CPU/32 GB node beside a
+    # 32-CPU/224 GB one. Both averages admit a 64-CPU/128 GB single-node
+    # request that NEITHER node can run, so averages cannot support the claim.
     table = billing.parse_weight_table(
-        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
-        "PartitionName=lean TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxMemPerNode=16384"
-        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        _ROOMY + "PartitionName=hetero TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=128,mem=256G,node=2 State=UP AllowGroups=ALL\n"
     )
-    assert table["lean"].max_mem_per_node_gb == pytest.approx(16.0)
-    big = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
-    assert "lean" not in {r["partition"] for r in billing.alternatives(big, table, "now")}
-    small = billing.Request(cpus=8, mem_gb=16, nodes=1, nodes_stated=True)
-    assert "lean" in {r["partition"] for r in billing.alternatives(small, table, "now")}
+    req = billing.Request(cpus=64, mem_gb=128, nodes=1, nodes_stated=True)
+    assert billing.alternatives(req, table, "now") == []
+    note = billing.alternatives_note(req, table, "now")
+    assert note and "SINGLE node" in note
+
+
+def test_a_declared_per_node_cap_can_still_exclude():
+    # A cap is a real upper bound, so it rules a shape out even though it can
+    # never rule one in.
+    w = billing.Weights(cpu=0.1, mem_per_gb=0.00625, max_cpus_per_node=16)
+    assert billing._fits_per_node(32, 1, w.max_cpus_per_node) is False
+    assert billing._fits_per_node(16, 1, w.max_cpus_per_node) is True
+    assert billing._fits_per_node(32, 2, w.max_cpus_per_node) is True
+    # No declared cap is not evidence of room.
+    assert billing._fits_per_node(4096, 1, None) is True
+
+
+def test_node_count_limits_are_captured_for_the_shapes_they_exclude():
+    table = billing.parse_weight_table(
+        "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " MaxNodes=1 MinNodes=1 MaxCPUsPerNode=16 MaxMemPerNode=16384"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL"
+    )
+    w = table["capped"]
+    assert (w.max_nodes, w.min_nodes, w.max_cpus_per_node) == (1.0, 1.0, 16.0)
+    assert w.max_mem_per_node_gb == pytest.approx(16.0)
+    # MaxNodes and MinNodes bound the node COUNT, which needs no topology.
+    two = billing.Request(cpus=8, mem_gb=8, nodes=2, nodes_stated=True)
+    assert billing._can_hold(two, w) is False
+
+
+def test_alternatives_note_is_silent_when_nothing_was_withheld():
+    table = billing.parse_weight_table(_ROOMY)
+    req = billing.Request(cpus=4, mem_gb=16, nodes=1, nodes_stated=True)
+    # Only one partition, so there was nothing to compare in the first place.
+    assert billing.alternatives_note(req, table, "now") is None

@@ -948,29 +948,29 @@ def price(
     return payload
 
 
-def _fits_per_node(
-    need: float,
-    nodes: float,
-    declared_cap: "float | None",
-    total: "float | None",
-    node_count: "float | None",
-) -> bool:
-    """Can each of ``nodes`` nodes carry its share of ``need``?
+def _fits_per_node(need: float, nodes: float, declared_cap: "float | None") -> bool:
+    """Is the per-node share within a cap the partition DECLARES?
 
-    A partition-wide total bounds the sum, not any single node. The only
-    per-node figure a total supports is the average, since some node must hold
-    at least it -- so that is the ceiling when the partition declares no
-    explicit cap, and an explicit cap wins when it is tighter.
+    Only a declared cap is usable here, and only to exclude. A partition-wide
+    total cannot support the claim: averages prove neither that the resources
+    co-locate nor that enough nodes qualify. TRES=cpu=128,mem=256G,node=2 is
+    satisfied by a 96-CPU/32 GB node beside a 32-CPU/224 GB one, where the
+    averages admit a 64-CPU/128 GB single-node request that neither can run.
     """
-    if need <= 0 or nodes <= 0:
+    if need <= 0 or nodes <= 0 or declared_cap is None:
         return True
-    per_node = need / nodes
-    if declared_cap is not None and per_node > declared_cap:
-        return False
-    if total is not None and node_count and node_count > 0:
-        if per_node > total / node_count:
-            return False
-    return True
+    return need / nodes <= declared_cap
+
+
+def node_topology_unknown(req: "Request") -> bool:
+    """Does this request need per-node data the cache does not hold?
+
+    True only when the caller pinned a node count. Without one Slurm chooses
+    the layout and partition totals are the right bound; with one, the question
+    becomes what a SINGLE node can hold, and `scontrol show partition` never
+    says.
+    """
+    return bool(req.nodes_stated and req.nodes > 0 and (req.cpus > 0 or req.mem_gb > 0))
 
 
 def _can_hold(req: "Request", w: "Weights") -> bool:
@@ -999,14 +999,17 @@ def _can_hold(req: "Request", w: "Weights") -> bool:
             return False
         if w.min_nodes is not None and w.min_nodes > req.nodes:
             return False
-        # Nor is an aggregate total proof that the shape fits on the nodes
-        # asked for: 128 CPUs across 4 nodes does not put 64 on any one of
-        # them. What IS provable from a total is the average -- some node holds
-        # at least it -- so that is the ceiling used when the partition
-        # declares no explicit per-node cap.
-        if not _fits_per_node(req.cpus, req.nodes, w.max_cpus_per_node, stock.get("cpu"), stock.get("node")):
+        # Per-node capacity, which partition totals cannot establish.
+        if not _fits_per_node(req.cpus, req.nodes, w.max_cpus_per_node):
             return False
-        if not _fits_per_node(req.mem_gb, req.nodes, w.max_mem_per_node_gb, stock.get("mem"), stock.get("node")):
+        if not _fits_per_node(req.mem_gb, req.nodes, w.max_mem_per_node_gb):
+            return False
+        # A declared cap can rule the shape OUT, but nothing here can rule it
+        # IN: a cap is an upper bound, not a promise any node offers it, and
+        # partition totals say nothing about a single node. So a pinned node
+        # count is a question this cache cannot answer, and the suggestion is
+        # withheld rather than guessed -- alternatives_note() says so.
+        if node_topology_unknown(req):
             return False
     if req.gpus <= 0:
         return True
@@ -1057,3 +1060,22 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             rows.append({"partition": name, "units": units, "units_now": now_units})
     rows.sort(key=lambda r: (r["units"], r["partition"]))
     return rows[:limit]
+
+
+def alternatives_note(req: Request, table: dict[str, Weights], current: str) -> str | None:
+    """Why the alternatives list may be short, or None if nothing was withheld.
+
+    An empty list otherwise reads as "nothing cheaper exists", which is its own
+    confident wrong answer.
+    """
+    if current not in table or len(table) <= 1:
+        return None
+    if node_topology_unknown(req):
+        return (
+            "Cheaper partitions were not compared: this request pins a node "
+            "count, so the question is what a SINGLE node can hold, and the "
+            "cached partition configuration does not describe individual "
+            "nodes. Omit the node count to compare on partition totals, or "
+            "check node sizes on the cluster."
+        )
+    return None
