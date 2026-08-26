@@ -97,6 +97,10 @@ class Request:
     # True when --nodes gave a range: the allocation is not determined, so a
     # price would be a floor presented as a figure.
     nodes_is_range: bool = False
+    # --exclusive bills every TRES on the allocated nodes, not what was asked
+    # for. Pricing it needs per-node CPU/GPU topology the weight cache has no
+    # way to hold.
+    exclusive: bool = False
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
@@ -166,8 +170,15 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 if key == "cpu":
                     cpu = float(number)
                 elif key == "mem":
-                    # Written per-unit: 'Mem=0.0625G' is 0.0625 per GB.
-                    mem = float(number)
+                    # The weight is per UNIT of memory, and the unit is part of
+                    # the value: Mem=0.0625G is 0.0625 per GB, but Mem=1M is one
+                    # per MB -- 1024 per GB. Dropping the suffix underprices
+                    # memory by that factor.
+                    unit = re.sub(r"[^A-Za-z]", "", value.strip()).upper()
+                    per_unit_gb = _MEM_UNITS.get(unit or SBATCH_DEFAULT_MEM_UNIT)
+                    if per_unit_gb is None:
+                        continue
+                    mem = float(number) / per_unit_gb
                 elif key.startswith("gres/gpu"):
                     gpu = float(number)
         table[name] = Weights(
@@ -202,12 +213,21 @@ def parse_sbatch(text: str) -> Request:
     mem_per_cpu: float | None = None
     total_gpus: float | None = None
     gpus_per_node: float | None = None
+    gpus_per_task: float | None = None
     saw_mem = False
 
+    prologue: list[str] = []
     for line in (text or "").splitlines():
+        stripped = line.strip()
         m = _SBATCH.match(line)
         if not m:
+            # sbatch stops processing directives at the first non-comment,
+            # non-blank line. A later #SBATCH in the body is inert, and honouring
+            # it prices resources Slurm will never request.
+            if stripped and not stripped.startswith("#"):
+                break
             continue
+        prologue.append(line)
         for key, value in _split_directives(m.group(1)):
             if key in ("--cpus-per-task", "-c"):
                 cpus_per_task = float(value)
@@ -241,6 +261,8 @@ def parse_sbatch(text: str) -> Request:
                 gpus_per_node = float(re.sub(r"^.*:", "", value.strip()))
             elif key in ("--partition", "-p"):
                 req.partition = value.strip()
+            elif key == "--gpus-per-task":
+                gpus_per_task = float(re.sub(r"^.*:", "", value.strip()))
 
     # Total tasks: an explicit --ntasks wins; otherwise --ntasks-per-node
     # multiplied across --nodes; otherwise one.
@@ -250,10 +272,14 @@ def parse_sbatch(text: str) -> Request:
         total_tasks = ntasks_per_node * nodes
     else:
         total_tasks = 1.0
+    # Valueless flags never take the key=value shape _split_directives yields.
+    req.exclusive = any(re.search(r"(?:^|\s)--exclusive(?:$|[\s=])", ln) for ln in prologue)
     req.nodes = nodes
     req.nodes_is_range = nodes_range
     if total_gpus is not None:
         req.gpus = total_gpus
+    elif gpus_per_task is not None:
+        req.gpus = gpus_per_task * total_tasks
     elif gpus_per_node is not None:
         req.gpus = gpus_per_node * nodes
     req.cpus = total_tasks * (cpus_per_task if cpus_per_task is not None else 1.0)
@@ -437,6 +463,14 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
         raise BillingError(
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
+        )
+    if req.exclusive:
+        raise BillingError(
+            "--exclusive allocates whole nodes and Slurm bills every TRES on "
+            "them, not the CPUs or GPUs the script asked for. The weight cache "
+            "holds no per-node topology, so the real charge cannot be computed "
+            "here -- it is bounded below by this request and above by the node's "
+            "full complement. Price it against the node specification instead."
         )
     if req.nodes_is_range:
         raise BillingError(

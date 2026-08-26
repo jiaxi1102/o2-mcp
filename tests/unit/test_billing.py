@@ -406,3 +406,47 @@ class TestSecondReviewFindings:
     def test_resolution_is_refused_when_no_default_is_recorded(self):
         with pytest.raises(billing.BillingError, match="DefMemPerCPU"):
             billing.resolve_request(billing.Request(cpus=4, mem_specified=False), self.table(), "bare")
+
+
+class TestThirdReviewFindings:
+    """Round three on PR #26: sbatch semantics the parser had not covered."""
+
+    def test_exclusive_is_refused_not_priced_as_the_request(self):
+        # --exclusive bills every TRES on the allocated nodes. Without node
+        # topology the charge is unknowable, and `--nodes=2 --exclusive` would
+        # otherwise be underpriced by nearly two whole nodes.
+        req = billing.parse_sbatch("#SBATCH --nodes=2\n#SBATCH --exclusive\n#SBATCH --mem=16G\n")
+        assert req.exclusive is True
+        with pytest.raises(billing.BillingError, match="exclusive"):
+            billing.resolve_request(req, {"p": SHORT}, "p")
+
+    def test_gpus_per_task_multiplies_by_the_task_count(self):
+        req = billing.parse_sbatch("#SBATCH --ntasks=4\n#SBATCH --gpus-per-task=1\n")
+        assert req.gpus == 4
+
+    def test_gpus_per_task_respects_nodes_and_per_node_tasks(self):
+        req = billing.parse_sbatch("#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=3\n#SBATCH --gpus-per-task=1\n")
+        assert req.gpus == 6
+
+    def test_directives_stop_at_the_first_executable_line(self):
+        # Slurm stops reading #SBATCH at the first non-comment, non-blank line;
+        # honouring a later one prices memory it will never request.
+        req = billing.parse_sbatch("#!/bin/bash\n# a comment\n#SBATCH --mem=16G\n\nsrun ./work\n#SBATCH --mem=128G\n")
+        assert req.mem_gb == pytest.approx(16.0)
+
+    def test_shebang_and_comments_do_not_end_the_prologue(self):
+        req = billing.parse_sbatch("#!/bin/bash\n\n# note\n#SBATCH --mem=31G\n")
+        assert req.mem_gb == pytest.approx(31.0)
+
+    def test_memory_weight_units_are_normalised_to_gb(self):
+        # Mem=1M is one weight per MB, i.e. 1024 per GB. Dropping the suffix
+        # underpriced memory by that factor.
+        assert billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=1M\n")[
+            "p"
+        ].mem_per_gb == pytest.approx(1024.0)
+        assert billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G\n")[
+            "p"
+        ].mem_per_gb == pytest.approx(0.0625)
+        assert billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=1T\n")[
+            "p"
+        ].mem_per_gb == pytest.approx(1.0 / 1024)

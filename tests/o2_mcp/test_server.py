@@ -899,6 +899,29 @@ async def test_price_job_direct_call_without_memory_uses_the_partition_default(m
 
 
 @pytest.mark.anyio
+async def test_price_job_refuses_a_partition_that_conflicts_with_the_script(monkeypatch, tmp_path):
+    # The script's own --partition is the one that will run; pricing another
+    # returns a consistent answer about an allocation that will not happen.
+    from o2mcp import billing
+
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"
+            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n"
+        ),
+        captured_at=1000.0,
+    )
+    payload = await _call(
+        "o2_price_job",
+        {"params": {"partition": "short", "script_text": "#SBATCH --partition=gpu_quad\n#SBATCH --mem=31G\n"}},
+    )
+    assert payload["ok"] is False
+    assert payload["error"] == "partition_conflict"
+    assert "gpu_quad" in payload["message"]
+
+
+@pytest.mark.anyio
 async def test_price_job_refuses_an_unknown_partition(monkeypatch, tmp_path):
     from o2mcp import billing
 

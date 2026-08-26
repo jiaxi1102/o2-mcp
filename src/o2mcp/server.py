@@ -1030,6 +1030,22 @@ async def o2_price_job(params: PriceJobInput) -> str:
                 "message": "Give script_text, remote_script_path, or cpus/mem_gb/gpus.",
             }
 
+        # A script naming its own partition is the one that will run. Pricing it
+        # against a different partition returns the wrong weights, defaults,
+        # boundaries and alternatives -- all internally consistent, all about an
+        # allocation that will not happen.
+        if request.partition and request.partition != params.partition:
+            return {
+                "ok": False,
+                "error": "partition_conflict",
+                "message": (
+                    f"The script sets --partition={request.partition} but this "
+                    f"call asked to price {params.partition!r}. Slurm will use "
+                    f"{request.partition}; re-price against that, or remove the "
+                    "directive from the script."
+                ),
+            }
+
         try:
             request = billing.resolve_request(request, table, params.partition)
             payload = billing.price(request, table, params.partition, captured_at)
