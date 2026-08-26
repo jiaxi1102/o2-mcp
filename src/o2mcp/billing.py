@@ -103,9 +103,13 @@ class Weights:
     # weights: cpu, mem (GB), node, gres/gpu, gres/gpu:<model>. None means the
     # inventory was never captured, which is not the same as holding nothing.
     stock: dict[str, float] | None = None
-    # Per-JOB limit, distinct from the aggregate inventory above: a partition
-    # can hold a hundred nodes and still cap one job at a single node.
+    # Per-JOB limits, distinct from the aggregate inventory above: a partition
+    # can hold a hundred nodes and still cap one job at a single node, require
+    # at least two, or cap what any single node will give a job.
     max_nodes: float | None = None
+    min_nodes: float | None = None
+    max_cpus_per_node: float | None = None
+    max_mem_per_node_gb: float | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
         """Memory Slurm would allocate for a request that names none.
@@ -215,6 +219,9 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         # different answers, and only one of them permits a suggestion.
         stock: dict[str, float] | None = None
         max_nodes: float | None = None
+        min_nodes: float | None = None
+        max_cpus_per_node: float | None = None
+        max_mem_per_node_gb: float | None = None
         max_mem_cpu = None
         gpu_by_model: dict[str, float] = {}
         for token in line.split():
@@ -269,6 +276,19 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("MaxNodes=") :].strip()
                 if value.isdigit():
                     max_nodes = float(value)
+            elif token.startswith("MinNodes="):
+                value = token[len("MinNodes=") :].strip()
+                if value.isdigit():
+                    min_nodes = float(value)
+            elif token.startswith("MaxCPUsPerNode="):
+                value = token[len("MaxCPUsPerNode=") :].strip()
+                if value.isdigit():
+                    max_cpus_per_node = float(value)
+            elif token.startswith("MaxMemPerNode="):
+                # scontrol prints this in megabytes, like the DefMem fields.
+                value = token[len("MaxMemPerNode=") :].strip()
+                if value.isdigit() and int(value) > 0:
+                    max_mem_per_node_gb = int(value) / 1024.0
             elif token.startswith("ReqResv="):
                 # A partition that only accepts jobs inside a reservation will
                 # reject a plain submission, and the pricing input carries no
@@ -346,6 +366,9 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             unpriceable_tres=unpriceable or None,
             stock=stock,
             max_nodes=max_nodes,
+            min_nodes=min_nodes,
+            max_cpus_per_node=max_cpus_per_node,
+            max_mem_per_node_gb=max_mem_per_node_gb,
         )
     return table
 
@@ -642,6 +665,9 @@ def save_weight_cache(
                 "unpriceable_tres": w.unpriceable_tres,
                 "stock": w.stock,
                 "max_nodes": w.max_nodes,
+                "min_nodes": w.min_nodes,
+                "max_cpus_per_node": w.max_cpus_per_node,
+                "max_mem_per_node_gb": w.max_mem_per_node_gb,
             }
             for name, w in table.items()
         },
@@ -696,6 +722,13 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
                 stock=_float_map(entry.get("stock")),
                 max_nodes=(None if entry.get("max_nodes") is None else float(entry["max_nodes"])),
+                min_nodes=(None if entry.get("min_nodes") is None else float(entry["min_nodes"])),
+                max_cpus_per_node=(
+                    None if entry.get("max_cpus_per_node") is None else float(entry["max_cpus_per_node"])
+                ),
+                max_mem_per_node_gb=(
+                    None if entry.get("max_mem_per_node_gb") is None else float(entry["max_mem_per_node_gb"])
+                ),
             )
         except (TypeError, ValueError):
             continue
@@ -915,6 +948,31 @@ def price(
     return payload
 
 
+def _fits_per_node(
+    need: float,
+    nodes: float,
+    declared_cap: "float | None",
+    total: "float | None",
+    node_count: "float | None",
+) -> bool:
+    """Can each of ``nodes`` nodes carry its share of ``need``?
+
+    A partition-wide total bounds the sum, not any single node. The only
+    per-node figure a total supports is the average, since some node must hold
+    at least it -- so that is the ceiling when the partition declares no
+    explicit cap, and an explicit cap wins when it is tighter.
+    """
+    if need <= 0 or nodes <= 0:
+        return True
+    per_node = need / nodes
+    if declared_cap is not None and per_node > declared_cap:
+        return False
+    if total is not None and node_count and node_count > 0:
+        if per_node > total / node_count:
+            return False
+    return True
+
+
 def _can_hold(req: "Request", w: "Weights") -> bool:
     """Can this partition hold the requested shape at all?
 
@@ -935,8 +993,20 @@ def _can_hold(req: "Request", w: "Weights") -> bool:
         if stock.get("node", 0.0) < req.nodes:
             return False
         # Aggregate inventory is not a per-job allowance: MaxNodes=1 rejects a
-        # two-node request on a partition holding a hundred.
+        # two-node request on a partition holding a hundred, and MinNodes=2
+        # makes a one-node request a different shape than the one being priced.
         if w.max_nodes is not None and w.max_nodes < req.nodes:
+            return False
+        if w.min_nodes is not None and w.min_nodes > req.nodes:
+            return False
+        # Nor is an aggregate total proof that the shape fits on the nodes
+        # asked for: 128 CPUs across 4 nodes does not put 64 on any one of
+        # them. What IS provable from a total is the average -- some node holds
+        # at least it -- so that is the ceiling used when the partition
+        # declares no explicit per-node cap.
+        if not _fits_per_node(req.cpus, req.nodes, w.max_cpus_per_node, stock.get("cpu"), stock.get("node")):
+            return False
+        if not _fits_per_node(req.mem_gb, req.nodes, w.max_mem_per_node_gb, stock.get("mem"), stock.get("node")):
             return False
     if req.gpus <= 0:
         return True

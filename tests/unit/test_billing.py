@@ -956,3 +956,69 @@ def test_the_refresh_verdict_and_the_refusal_agree():
     for flags in ([], ["NO_FAIR_TREE"], ["SMALL_RELATIVE_TO_TIME"]):
         assert not billing.max_based_flags(flags)
         assert billing.unsupported_billing_model({"priority_flags": flags}) is None
+
+
+def test_aggregate_totals_do_not_prove_a_per_node_fit():
+    # 128 CPUs across 4 nodes does not put 64 on any one of them. The average
+    # (32) is the only per-node figure a total supports, by pigeonhole.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=thin TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=128,mem=1024G,node=4 State=UP AllowGroups=ALL\n"
+    )
+    one_fat_node = billing.Request(cpus=64, mem_gb=64, nodes=1, nodes_stated=True)
+    assert "thin" not in {r["partition"] for r in billing.alternatives(one_fat_node, table, "now")}
+    # 32 CPUs on one node is exactly the average, so some node must hold it.
+    fits = billing.Request(cpus=32, mem_gb=64, nodes=1, nodes_stated=True)
+    assert "thin" in {r["partition"] for r in billing.alternatives(fits, table, "now")}
+    # Without an explicit node count Slurm chooses the layout, so the aggregate
+    # bound is the right one and the partition stays on offer.
+    unstated = billing.Request(cpus=64, mem_gb=64)
+    assert "thin" in {r["partition"] for r in billing.alternatives(unstated, table, "now")}
+
+
+def test_an_explicit_per_node_cap_is_honoured():
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxCPUsPerNode=16"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    assert table["capped"].max_cpus_per_node == 16.0
+    # The average would allow 400 per node; the declared cap is tighter.
+    req = billing.Request(cpus=32, mem_gb=32, nodes=1, nodes_stated=True)
+    assert "capped" not in {r["partition"] for r in billing.alternatives(req, table, "now")}
+    ok = billing.Request(cpus=16, mem_gb=32, nodes=1, nodes_stated=True)
+    assert "capped" in {r["partition"] for r in billing.alternatives(ok, table, "now")}
+
+
+def test_a_minimum_node_count_excludes_smaller_shapes():
+    # MinNodes=2 means a one-node request is not the identical allocation, and
+    # the allocation it would become is not what was priced.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=pair TRESBillingWeights=CPU=0.1,Mem=0.00625G MinNodes=2"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    assert table["pair"].min_nodes == 2.0
+    one = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
+    assert "pair" not in {r["partition"] for r in billing.alternatives(one, table, "now")}
+    two = billing.Request(cpus=8, mem_gb=32, nodes=2, nodes_stated=True)
+    assert "pair" in {r["partition"] for r in billing.alternatives(two, table, "now")}
+
+
+def test_per_node_memory_caps_are_honoured_too():
+    # The direct sibling of MaxCPUsPerNode, in megabytes as scontrol prints it.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=lean TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxMemPerNode=16384"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    assert table["lean"].max_mem_per_node_gb == pytest.approx(16.0)
+    big = billing.Request(cpus=8, mem_gb=32, nodes=1, nodes_stated=True)
+    assert "lean" not in {r["partition"] for r in billing.alternatives(big, table, "now")}
+    small = billing.Request(cpus=8, mem_gb=16, nodes=1, nodes_stated=True)
+    assert "lean" in {r["partition"] for r in billing.alternatives(small, table, "now")}
