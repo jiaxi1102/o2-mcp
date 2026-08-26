@@ -994,7 +994,7 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             f"ntasks={req.ntasks:g}. --cpus-per-task is a whole number, so "
             "this shape is not one Slurm can produce."
         )
-    whole = [("cpus", req.cpus), ("gpus", req.gpus)]
+    whole = [("cpus", req.cpus), ("gpus", req.gpus), ("ntasks", req.ntasks)]
     if req.nodes_stated:
         # Only when stated: the field defaults to 1 and an unstated default is
         # not a claim about the shape.

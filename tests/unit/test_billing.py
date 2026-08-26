@@ -1634,3 +1634,25 @@ def test_the_task_count_defaults_to_one():
     req = billing.Request(cpus=2, mem_gb=20, mem_per_cpu_gb=10)
     assert req.ntasks == 1
     assert billing.resolve_request(req, table, "p").cpus == 3
+
+
+def test_a_fractional_task_count_is_refused():
+    # ntasks=1.5 divides cpus=3 evenly, so the divisibility check alone let it
+    # through; the per-task adjustment then multiplied by 1.5 and truncated,
+    # fabricating an allocation. Slurm allocates whole tasks.
+    table = billing.parse_weight_table(CAPPED)
+    with pytest.raises(billing.BillingError, match="ntasks"):
+        billing.resolve_request(billing.Request(cpus=3, mem_gb=24, ntasks=1.5), table, "p")
+
+
+def test_the_adjustment_preserves_the_memory_each_task_asked_for():
+    # The point of the adjustment is that the memory survives it. A task
+    # wanting 2 CPUs at 10 GB/CPU asked for 20 GB; at an 8 GB cap that needs
+    # three CPUs. Two would silently reduce the task to 16 GB, which is the
+    # request being quietly changed rather than repriced.
+    table = billing.parse_weight_table(CAPPED)
+    req = billing.Request(cpus=2, mem_gb=20, mem_per_cpu_gb=10)
+    resolved = billing.resolve_request(req, table, "p")
+    assert resolved.cpus == 3
+    assert resolved.mem_gb == 20
+    assert resolved.cpus * resolved.mem_per_cpu_gb >= req.mem_gb
