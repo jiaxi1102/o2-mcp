@@ -589,3 +589,45 @@ def test_a_gpuless_request_is_unaffected_by_model_tables():
     table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0, gpu_by_model={"a100": 10.0})}
     req = billing.Request(cpus=2, mem_gb=16)
     assert billing.resolve_request(req, table, "gpu").cpus == 2
+
+
+def test_decimal_weights_land_on_the_boundary_they_were_written_as():
+    # cpu=0.29 across 100 CPUs is 29 exactly as configured, but 28.999999999999996
+    # in binary -- and the floor turns that into a whole unit lost, which then
+    # propagates into the boundary figures and the alternatives.
+    w = billing.Weights(cpu=0.29, mem_per_gb=0.0)
+    assert billing.billing_units(billing.Request(cpus=100, mem_gb=0), w) == 29
+    # A weight genuinely below the boundary must still floor down.
+    w2 = billing.Weights(cpu=0.289, mem_per_gb=0.0)
+    assert billing.billing_units(billing.Request(cpus=100, mem_gb=0), w2) == 28
+
+
+def test_a_weighted_tres_we_cannot_charge_is_refused_not_dropped():
+    # TRESBillingWeights is an open list. Dropping Node=10 prices a two-node
+    # request 20 units under what Slurm bills, with nothing to show for it.
+    table = billing.parse_weight_table("PartitionName=odd TRESBillingWeights=CPU=1,Node=10 State=UP AllowGroups=ALL")
+    assert table["odd"].unpriceable_tres == {"node": 10.0}
+    with pytest.raises(billing.BillingError, match="cannot charge"):
+        billing.resolve_request(billing.Request(cpus=2, mem_gb=8), table, "odd")
+    # And it must never be advertised as a cheaper destination either.
+    full = dict(table)
+    full["short"] = billing.Weights(cpu=1.0, mem_per_gb=0.0625)
+    offered = {r["partition"] for r in billing.alternatives(billing.Request(cpus=2, mem_gb=8), full, "short")}
+    assert "odd" not in offered
+
+
+def test_per_model_gpu_weights_survive_the_cache():
+    # The cache path is the DEFAULT path. gpu_by_model was written to it and
+    # never read back, so an a100 was charged at the generic rate by every
+    # caller that did not pass refresh_weights.
+    import time as _time
+
+    table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0})}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "w.json")
+        billing.save_weight_cache(table, _time.time(), path)
+        payload = billing.load_weight_cache(path)
+    back = billing.cache_to_table(payload)
+    assert back["gpu"].gpu_by_model == {"a100": 10.0}
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    assert billing.billing_units(req, back["gpu"]) == billing.billing_units(req, table["gpu"])

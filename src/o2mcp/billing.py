@@ -35,6 +35,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 _DEFAULT_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "o2mcp", "billing_weights.json")
@@ -86,6 +87,9 @@ class Weights:
     max_mem_per_cpu_gb: float | None = None
     # Per-model GPU weights, when the site prices accelerators differently.
     gpu_by_model: dict[str, float] | None = None
+    # Weighted TRES types this calculator cannot charge for. Non-empty means
+    # any price for this partition would be understated, so it refuses.
+    unpriceable_tres: dict[str, float] | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
         """Memory Slurm would allocate for a request that names none.
@@ -183,6 +187,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         cpu, mem, gpu = 1.0, 0.0, 0.0
         def_cpu = def_node = None
         state_up, unrestricted = True, True
+        unpriceable: dict[str, float] = {}
         max_mem_cpu = None
         gpu_by_model: dict[str, float] = {}
         for token in line.split():
@@ -250,6 +255,19 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                     # every GPU at one model's rate; recorded separately so a
                     # caller naming no model is never charged at it.
                     gpu_by_model[key.split(":", 1)[1]] = float(number)
+                else:
+                    # TRESBillingWeights is an open list of TRES types. A
+                    # nonzero weight this calculator cannot represent -- Node=10,
+                    # a licence, a burst buffer -- is charged by Slurm and not by
+                    # us, so every figure for the partition would be understated
+                    # by it. Recorded and refused at pricing time rather than
+                    # dropped: silently pricing what we only partly understand
+                    # is the one failure this module exists to avoid.
+                    try:
+                        if float(number) != 0:
+                            unpriceable[key] = float(number)
+                    except ValueError:
+                        pass
         table[name] = Weights(
             cpu=cpu,
             mem_per_gb=mem,
@@ -260,6 +278,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             unrestricted=unrestricted,
             max_mem_per_cpu_gb=max_mem_cpu,
             gpu_by_model=gpu_by_model or None,
+            unpriceable_tres=unpriceable or None,
         )
     return table
 
@@ -343,13 +362,37 @@ def gpu_weight_for(req: Request, w: Weights) -> float:
     return w.gpu
 
 
+def _exact(value: float) -> Decimal:
+    """The decimal a float was WRITTEN as, not the binary it became.
+
+    str() gives the shortest repr that round-trips, so a weight configured as
+    0.29 comes back as exactly 0.29 rather than 0.28999999999999998.
+    """
+    return Decimal(str(value))
+
+
+def _weighted_sum_exact(req: Request, w: Weights) -> Decimal:
+    """The pre-floor sum in decimal, because the floor is unforgiving.
+
+    Binary arithmetic puts a weight that should land ON a unit boundary just
+    under it: cpu=0.29 across 100 CPUs is 28.999999999999996, which floors to
+    28 rather than 29. That off-by-one then propagates into the boundary
+    figures and the alternatives, so it is settled once, here.
+    """
+    return (
+        _exact(w.cpu) * _exact(req.cpus)
+        + _exact(w.mem_per_gb) * _exact(req.mem_gb)
+        + _exact(gpu_weight_for(req, w)) * _exact(req.gpus)
+    )
+
+
 def weighted_sum(req: Request, w: Weights) -> float:
-    return w.cpu * req.cpus + w.mem_per_gb * req.mem_gb + gpu_weight_for(req, w) * req.gpus
+    return float(_weighted_sum_exact(req, w))
 
 
 def billing_units(req: Request, w: Weights) -> int:
     """Slurm's billing TRES: the weighted sum, floored to a whole unit."""
-    return int(math.floor(weighted_sum(req, w)))
+    return int(_weighted_sum_exact(req, w).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def _round_below(value: float, places: int = 9) -> float:
@@ -487,6 +530,7 @@ def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str |
                 "unrestricted": w.unrestricted,
                 "max_mem_per_cpu_gb": w.max_mem_per_cpu_gb,
                 "gpu_by_model": w.gpu_by_model,
+                "unpriceable_tres": w.unpriceable_tres,
             }
             for name, w in table.items()
         },
@@ -497,6 +541,23 @@ def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str |
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(tmp, path)
+
+
+def _float_map(value: Any) -> dict[str, float] | None:
+    """A cached {name: weight} map, or None. Never a partial one.
+
+    A half-read weight map is worse than none: it prices some models and
+    silently falls back for the rest.
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+    out: dict[str, float] = {}
+    for key, number in value.items():
+        try:
+            out[str(key)] = float(number)
+        except (TypeError, ValueError):
+            return None
+    return out or None
 
 
 def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
@@ -516,6 +577,12 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 max_mem_per_cpu_gb=(
                     None if entry.get("max_mem_per_cpu_gb") is None else float(entry["max_mem_per_cpu_gb"])
                 ),
+                # Both of these decide a price, and both were written to the
+                # cache but never read back -- so on the cache path, which is
+                # the DEFAULT path, every per-model GPU weight silently
+                # disappeared and an a100 was charged at the generic rate.
+                gpu_by_model=_float_map(entry.get("gpu_by_model")),
+                unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
             )
         except (TypeError, ValueError):
             continue
@@ -538,6 +605,14 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
         raise BillingError(
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
+        )
+    extra = table[partition].unpriceable_tres
+    if extra:
+        listed = ", ".join("%s=%g" % (k, v) for k, v in sorted(extra.items()))
+        raise BillingError(
+            f"{partition!r} bills weighted TRES this calculator cannot charge "
+            f"for ({listed}). Every figure for it would be understated by that "
+            "amount, so no price is offered rather than a low one."
         )
     reason = _unpriceable_gpu_reason(req, table[partition])
     if reason:
@@ -690,7 +765,7 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             continue
         # Never advertise a partition that pricing this same request directly
         # would refuse: the units would come from another model's weight.
-        if _unpriceable_gpu_reason(req, w):
+        if _unpriceable_gpu_reason(req, w) or w.unpriceable_tres:
             continue
         units = billing_units(req, w)
         if units < now_units:
