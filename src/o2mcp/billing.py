@@ -454,11 +454,15 @@ UNPRICEABLE_OPTIONS = {
 def _unpriceable_gpu_reason(req: Request, w: Weights) -> str | None:
     """Why this partition cannot price the request's GPUs, or None if it can.
 
-    gpu_weight_for() falls back to the generic weight whenever the named model
-    misses, and that fallback is wrong in both directions: it charges one
-    accelerator at another's rate, and where a site declares ONLY per-model
-    rates the generic entry is zero, so an untyped request prices every GPU as
-    free. Both are confident numbers, which is the failure that matters here.
+    A typed allocation holds the generic GRES too, so gpu_weight_for() adds the
+    typed weight to the generic one and an UNLISTED model correctly contributes
+    the generic rate alone -- exactly what Slurm would charge given the declared
+    weights. That case is priceable, and refusing it was over-refusal.
+
+    What is not priceable is a partition declaring ONLY per-model rates: there
+    the generic entry is zero, so an unlisted or untyped request would price
+    every GPU as free. That is a confident number, which is the failure that
+    matters here.
 
     So the question is settled once, before any number is produced, and by ONE
     predicate -- alternatives() and resolve_request() disagreeing about it has
@@ -468,13 +472,13 @@ def _unpriceable_gpu_reason(req: Request, w: Weights) -> str | None:
     if req.gpus <= 0 or not w.gpu_by_model:
         return None
     if req.gpu_model:
-        if _model_key(req.gpu_model) in w.gpu_by_model:
+        if _model_key(req.gpu_model) in w.gpu_by_model or w.gpu > 0:
             return None
         known = ", ".join(sorted(w.gpu_by_model)) or "none"
         return (
-            f"has no weight for GPU model {req.gpu_model!r} (priced: {known}). "
-            "Name a priced model, or omit gpu_model where the partition has a "
-            "generic GPU weight."
+            f"prices GPUs only per model (priced: {known}), has no generic GPU "
+            f"weight, and none for {req.gpu_model!r} -- so this allocation would "
+            "be charged nothing for its accelerators. Name a priced model."
         )
     if w.gpu > 0:
         # A declared generic rate is a real rate, so an untyped request is

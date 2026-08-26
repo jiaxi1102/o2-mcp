@@ -448,10 +448,24 @@ class TestModelWeightsAndWholeCounts:
         # base = 4 CPU + 15 GPU, so the memory band starts one unit up from 19
         assert payload["boundary"]["on_price_edge"] is True
 
-    def test_unpriced_model_is_refused_not_defaulted(self):
+    def test_an_unlisted_model_is_priced_at_the_generic_rate(self):
+        # A typed allocation holds the generic GRES too, so an unlisted model
+        # contributes the generic weight and nothing typed -- which is exactly
+        # what Slurm charges given these weights. Refusing it was over-refusal.
         req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="h100")
-        with pytest.raises(billing.BillingError, match="no weight for"):
-            billing.resolve_request(req, self.TYPED, "p")
+        resolved = billing.resolve_request(req, self.TYPED, "p")
+        assert billing.gpu_weight_for(resolved, self.TYPED["p"]) == 5.0
+        assert billing.billing_units(resolved, self.TYPED["p"]) == 10
+
+    def test_a_typed_only_partition_still_refuses_an_unlisted_model(self):
+        # With no generic entry there is nothing to fall back to, so the
+        # accelerators would be charged nothing at all.
+        typed_only = billing.parse_weight_table(
+            "PartitionName=q TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu:a100=10.0\n"
+        )
+        req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="h100")
+        with pytest.raises(billing.BillingError, match="only per model"):
+            billing.resolve_request(req, typed_only, "q")
 
     def test_model_is_ignored_where_the_site_prices_gpus_uniformly(self):
         req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
@@ -552,6 +566,7 @@ def test_alternatives_never_offer_a_partition_that_cannot_price_the_model():
             gpu=1.0,
             gpu_by_model={"h100": 20.0},
             stock={"cpu": 100, "mem": 1000, "node": 4, "gres/gpu": 8, "gres/gpu:h100": 8},
+            stock_from_tres=True,
         ),
         # Prices GPUs generically AND is known to hold a100s. Both halves
         # matter: the pricing filter must not exclude it, and the inventory
