@@ -874,6 +874,23 @@ def parse_priority_flags(text: str) -> list[str]:
     return []
 
 
+def _checked(req: Request, w: Weights, partition: str) -> Request:
+    """The request, or a refusal naming the limit it breaks.
+
+    Applied to whatever is about to be RETURNED, never to the request as
+    given. A partition default is filled in here, so checking the input meant a
+    DefMemPerCPU that exceeds MaxMemPerNode was never tested at all -- and
+    price() and resolve-then-price answered the same question differently, the
+    wrapper hiding it only because it happens to resolve twice.
+    """
+    cannot = cannot_hold_reason(req, w)
+    if cannot:
+        raise BillingError(
+            f"{partition!r} {cannot}. Slurm would reject this submission, so " "there is no price for it."
+        )
+    return req
+
+
 def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> Request:
     """Fill in what the submission left implicit, or refuse to price it.
 
@@ -906,11 +923,6 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     # alternatives list apply to the one being PRICED. This ran on every other
     # partition and not on the chosen one, so a two-node request on a
     # MaxNodes=1 partition got a confident price for a job Slurm would reject.
-    cannot = cannot_hold_reason(req, table[partition])
-    if cannot:
-        raise BillingError(
-            f"{partition!r} {cannot}. Slurm would reject this submission, so " "there is no price for it."
-        )
     # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
     # shape it can produce, and rounding one silently would price a job that
     # cannot exist.
@@ -938,20 +950,24 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "or omit mem_gb to price the partition default."
         )
     if req.mem_specified:
-        return req
+        return _checked(req, table[partition], partition)
     w = table[partition]
     # Memory that is not billed cannot change the bill. Refusing here was
     # over-refusal, and it caught Slurm's own default configuration: with no
     # TRESBillingWeights at all, billing is CPU-only and the price is exact
     # whatever memory the job ends up holding.
     if w.mem_per_gb <= 0:
-        return replace(
-            req,
-            mem_gb=0.0,
-            mem_specified=True,
-            mem_unknown=True,
-            mem_source=f"not billed on {partition}",
-            warnings=list(req.warnings),
+        return _checked(
+            replace(
+                req,
+                mem_gb=0.0,
+                mem_specified=True,
+                mem_unknown=True,
+                mem_source=f"not billed on {partition}",
+                warnings=list(req.warnings),
+            ),
+            table[partition],
+            partition,
         )
     default = w.default_mem_gb(req.cpus, req.nodes if req.nodes_stated else None)
     if default is None and w.def_mem_per_node_gb is not None and not req.nodes_stated:
@@ -967,12 +983,16 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "bill -- is unknown. Refresh the weight cache while connected, or "
             "state the memory explicitly."
         )
-    return replace(
-        req,
-        mem_gb=default,
-        mem_specified=True,
-        mem_source=f"partition default ({partition})",
-        warnings=list(req.warnings),
+    return _checked(
+        replace(
+            req,
+            mem_gb=default,
+            mem_specified=True,
+            mem_source=f"partition default ({partition})",
+            warnings=list(req.warnings),
+        ),
+        table[partition],
+        partition,
     )
 
 

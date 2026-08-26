@@ -1278,3 +1278,50 @@ def test_a_cap_at_the_request_still_reports_no_headroom():
     out = billing.boundary(billing.Request(cpus=1, mem_gb=32, nodes=1, nodes_stated=True), w)
     assert out["largest_same_price_mem_gb"] == 32.0
     assert out["free_headroom_gb"] == 0.0
+
+
+def test_a_partition_default_is_checked_against_the_partition_limits():
+    # The capacity check ran on the request as GIVEN, so a DefMemPerCPU that
+    # exceeds MaxMemPerNode was never tested: the default is filled in after.
+    # price() and resolve-then-price then answered the same question
+    # differently, and the MCP wrapper hid it only by resolving twice.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G DefMemPerCPU=65536"
+        " MaxNodes=1 MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    req = billing.Request(cpus=1, mem_specified=False)
+    with pytest.raises(billing.BillingError, match="at most 1 node"):
+        billing.price(req, table, "p")
+    with pytest.raises(billing.BillingError, match="at most 1 node"):
+        billing.price(billing.resolve_request(req, table, "p"), table, "p")
+
+
+def test_a_default_inside_the_limits_still_prices():
+    # The check must fire on the resolved shape, not simply refuse defaults.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G DefMemPerCPU=8192"
+        " MaxNodes=1 MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    out = billing.price(billing.Request(cpus=2, mem_specified=False), table, "p")
+    assert out["request"]["mem_gb"] == pytest.approx(16.0)
+    assert out["billing_units"] == 3
+
+
+def test_resolution_is_idempotent_across_every_path():
+    # Resolving twice must not change the answer, whichever branch produced it:
+    # the wrapper does exactly that, and it has masked two bugs already.
+    table = billing.parse_weight_table(
+        "PartitionName=billed TRESBillingWeights=CPU=1,Mem=0.0625G DefMemPerCPU=8192"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=plain State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+    )
+    for part, req in (
+        ("billed", billing.Request(cpus=2, mem_specified=False)),
+        ("billed", billing.Request(cpus=2, mem_gb=32)),
+        ("plain", billing.Request(cpus=2, mem_specified=False)),
+    ):
+        once = billing.resolve_request(req, table, part)
+        twice = billing.resolve_request(once, table, part)
+        assert once == twice, (part, once, twice)
