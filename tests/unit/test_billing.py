@@ -455,3 +455,59 @@ class TestModelWeightsAndWholeCounts:
         # interleave into one corrupt file.
         with open(billing.__file__, encoding="utf-8") as handle:
             assert "threading.get_ident()" in handle.read()
+
+
+# A repriced shape must stay the SAME shape apart from its memory. Both paths
+# below rebuilt the request from named fields and omitted gpu_model, so a
+# model-priced GPU was silently repriced at the generic weight. The quoted
+# figure then described an allocation the caller never asked about -- and it
+# was cheaper, which is the direction that gets acted on.
+A100 = billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0})
+
+
+def test_boundary_reprices_with_the_model_weight():
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    out = billing.boundary(req, A100)
+    cheaper = out["next_cheaper"]
+    assert cheaper["units_now"] == billing.billing_units(req, A100)
+    assert cheaper["units"] == billing.billing_units(
+        billing.Request(cpus=4, mem_gb=cheaper["mem_gb"], gpus=1, gpu_model="a100"),
+        A100,
+    )
+    # The generic weight is 5 lower per GPU; a dropped model shows up here.
+    assert cheaper["units"] > 4 + 5
+
+
+def test_partition_default_memory_keeps_the_model():
+    table = {
+        "gpu": billing.Weights(
+            cpu=1.0,
+            mem_per_gb=0.0625,
+            gpu=5.0,
+            gpu_by_model={"a100": 10.0},
+            def_mem_per_cpu_gb=4.0,
+        )
+    }
+    req = billing.Request(cpus=2, gpus=1, gpu_model="a100", mem_specified=False)
+    resolved = billing.resolve_request(req, table, "gpu")
+    assert resolved.gpu_model == "a100"
+    assert resolved.mem_gb == 8.0
+    # 2 CPU + 8 GB*0.0625 + 1 a100*10 = 12.5 -> 12. Generic would give 7.
+    assert billing.billing_units(resolved, table["gpu"]) == 12
+
+
+def test_fractional_nodes_are_refused_like_cpus_and_gpus():
+    # Slurm allocates whole nodes; 1.5 is not a shape it can produce, and
+    # pricing it would answer confidently about a job that cannot exist.
+    table = {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}
+    req = billing.Request(cpus=2, mem_gb=8, nodes=1.5, nodes_stated=True)
+    with pytest.raises(billing.BillingError, match="nodes"):
+        billing.resolve_request(req, table, "short")
+
+
+def test_unstated_node_default_is_not_read_as_a_claim():
+    # nodes defaults to 1.0 and is whole anyway, but the guard must key on
+    # nodes_stated so an unstated default never becomes a refusable "claim".
+    table = {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}
+    req = billing.Request(cpus=2, mem_gb=8)
+    assert billing.resolve_request(req, table, "short").nodes == 1.0

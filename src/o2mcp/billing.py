@@ -34,7 +34,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 _DEFAULT_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "o2mcp", "billing_weights.json")
@@ -132,6 +132,17 @@ class Request:
     # lands on a block edge far more often than an absolute --mem does.
     mem_source: str = "default"
     warnings: list[str] = field(default_factory=list)
+
+
+def _remem(req: "Request", mem_gb: float) -> "Request":
+    """``req`` at a different memory size, with every other field intact.
+
+    Repricing a shape means changing exactly one number. Rebuilding the request
+    from named fields instead has twice dropped ``gpu_model``, which reprices a
+    model-specific GPU at the generic weight and reports a saving for an
+    allocation the caller never asked about.
+    """
+    return replace(req, mem_gb=mem_gb, warnings=list(req.warnings))
 
 
 def to_gb(value: str | float | None, default_unit: str = SBATCH_DEFAULT_MEM_UNIT) -> float:
@@ -375,13 +386,17 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     # several price levels and reports a far larger cut than the one needed.
     cheaper_gb = band_start - _step_for(w)
     if cheaper_gb >= 0 and cheaper_gb < req.mem_gb:
-        cheaper = Request(cpus=req.cpus, mem_gb=cheaper_gb, gpus=req.gpus)
+        # replace(), not a fresh Request: only the memory changes, and naming
+        # the surviving fields by hand is what silently dropped gpu_model here
+        # -- a model-priced GPU then repriced at the generic weight, so the
+        # quoted reduction described a different allocation than the caller's.
+        cheaper = _remem(req, cheaper_gb)
         cheaper_units = billing_units(cheaper, w)
         if cheaper_units < units:
             given_up = req.mem_gb - cheaper_gb
             suggested = _round_below(cheaper_gb)
             # A suggestion that does not reprice lower is worse than none.
-            if billing_units(Request(cpus=req.cpus, mem_gb=suggested, gpus=req.gpus), w) >= units:
+            if billing_units(_remem(req, suggested), w) >= units:
                 suggested = cheaper_gb
             result["next_cheaper"] = {
                 "mem_gb": suggested,
@@ -498,7 +513,12 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
     # shape it can produce, and rounding one silently would price a job that
     # cannot exist.
-    for label, value in (("cpus", req.cpus), ("gpus", req.gpus)):
+    whole = [("cpus", req.cpus), ("gpus", req.gpus)]
+    if req.nodes_stated:
+        # Only when stated: the field defaults to 1 and an unstated default is
+        # not a claim about the shape.
+        whole.append(("nodes", req.nodes))
+    for label, value in whole:
         if value != int(value):
             raise BillingError(
                 f"{label}={value:g} is not a whole number, and Slurm allocates "
@@ -528,11 +548,9 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "bill -- is unknown. Refresh the weight cache while connected, or "
             "state the memory explicitly."
         )
-    return Request(
-        cpus=req.cpus,
+    return replace(
+        req,
         mem_gb=default,
-        gpus=req.gpus,
-        nodes=req.nodes,
         mem_specified=True,
         mem_source=f"partition default ({partition})",
         warnings=list(req.warnings),
