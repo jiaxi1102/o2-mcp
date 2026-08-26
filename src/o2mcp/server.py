@@ -1048,6 +1048,15 @@ async def o2_price_job(params: PriceJobInput) -> str:
         # caller who reads them as "partitions that can run this" has been told
         # something this cache cannot know.
         payload["alternatives_note"] = billing.alternatives_caveat()
+        if request.mem_unknown:
+            # An empty list here has a specific cause worth naming: the price
+            # stands, the comparison cannot.
+            payload["alternatives_note"] = (
+                "Not compared: this partition does not bill memory, so the size "
+                "was never established -- but any partition that DOES bill it "
+                "would be priced as holding none. The price above is exact; "
+                "state mem_gb to compare partitions. "
+            ) + payload["alternatives_note"]
         payload["ok"] = True
         return payload
 

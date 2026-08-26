@@ -1094,3 +1094,38 @@ def test_sacct_per_node_and_per_cpu_qualifiers_still_parse():
     # and must not be mistaken for one.
     assert billing.to_gb("16Gn") == pytest.approx(16.0)
     assert billing.to_gb("4Gc") == pytest.approx(4.0)
+
+
+def test_a_partition_that_does_not_bill_memory_is_still_priced():
+    # Slurm's own default: no TRESBillingWeights at all means CPU-only billing.
+    # The bill is then exact whatever memory the job holds, so refusing to
+    # price it was over-refusal -- and it caught the commonest configuration
+    # there is.
+    table = billing.parse_weight_table("PartitionName=plain State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10")
+    resolved = billing.resolve_request(billing.Request(cpus=8, mem_specified=False), table, "plain")
+    assert billing.billing_units(resolved, table["plain"]) == 8
+    assert resolved.mem_unknown is True
+    # Any memory at all gives the same bill, which is why it is priceable.
+    assert billing.billing_units(billing.Request(cpus=8, mem_gb=99999), table["plain"]) == 8
+
+
+def test_an_unknown_memory_size_withholds_partition_comparison():
+    # It costs nothing HERE. Somewhere that bills memory it would be priced as
+    # holding none, which is the cheapest possible lie.
+    table = billing.parse_weight_table(
+        "PartitionName=plain State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+        "PartitionName=billed TRESBillingWeights=CPU=0.1,Mem=0.00625G State=UP"
+        " AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+    )
+    resolved = billing.resolve_request(billing.Request(cpus=8, mem_specified=False), table, "plain")
+    assert billing.alternatives(resolved, table, "plain") == []
+    # State the size and the comparison becomes meaningful again.
+    stated = billing.Request(cpus=8, mem_gb=64)
+    assert "billed" in {r["partition"] for r in billing.alternatives(stated, table, "plain")}
+
+
+def test_a_missing_default_is_still_refused_where_memory_IS_billed():
+    # The relaxation must not leak into the case it was guarding.
+    table = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP AllowGroups=ALL")
+    with pytest.raises(billing.BillingError, match="no DefMemPerCPU"):
+        billing.resolve_request(billing.Request(cpus=8, mem_specified=False), table, "p")

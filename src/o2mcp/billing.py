@@ -151,6 +151,10 @@ class Request:
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
+    # True when the size was never established but does not matter HERE,
+    # because this partition does not bill memory. The price is exact; any
+    # comparison against a partition that DOES bill memory is not.
+    mem_unknown: bool = False
     partition: str | None = None
     # Recorded because --mem-per-cpu multiplies out to a round total and so
     # lands on a block edge far more often than an absolute --mem does.
@@ -891,6 +895,19 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     if req.mem_specified:
         return req
     w = table[partition]
+    # Memory that is not billed cannot change the bill. Refusing here was
+    # over-refusal, and it caught Slurm's own default configuration: with no
+    # TRESBillingWeights at all, billing is CPU-only and the price is exact
+    # whatever memory the job ends up holding.
+    if w.mem_per_gb <= 0:
+        return replace(
+            req,
+            mem_gb=0.0,
+            mem_specified=True,
+            mem_unknown=True,
+            mem_source=f"not billed on {partition}",
+            warnings=list(req.warnings),
+        )
     default = w.default_mem_gb(req.cpus, req.nodes if req.nodes_stated else None)
     if default is None and w.def_mem_per_node_gb is not None and not req.nodes_stated:
         raise BillingError(
@@ -1067,6 +1084,10 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
     acceptable is a property of the job this module cannot see.
     """
     if current not in table:
+        return []
+    # The size was never established. It costs nothing here, but every
+    # comparison below would price it as zero somewhere it is billed.
+    if req.mem_unknown:
         return []
     now_units = billing_units(req, table[current])
     rows = []
