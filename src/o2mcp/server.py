@@ -332,7 +332,18 @@ class QueueInput(BaseModel):
 class PriceJobInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     partition: str = Field(..., description="Partition the job would run on.", min_length=1)
-    cpus: float = Field(..., description="Total CPUs the allocation will hold.", gt=0)
+    cpus: float = Field(
+        ...,
+        description=(
+            "Total CPUs the submission REQUESTS, across all tasks: --ntasks "
+            "multiplied by --cpus-per-task. Give what the directives ask for, "
+            "not what you expect Slurm to allocate -- where mem_per_cpu_gb "
+            "exceeds a partition's MaxMemPerCPU this raises the count itself, "
+            "and passing an already-raised number would raise it again. The "
+            "allocated count comes back in the response."
+        ),
+        gt=0,
+    )
     mem_gb: float | None = Field(
         default=None,
         description=(

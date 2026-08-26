@@ -1479,3 +1479,51 @@ def test_the_raised_count_is_what_the_boundary_is_computed_from():
     out = billing.price(billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64), table, "p")
     assert out["request"]["cpus"] == 8
     assert out["breakdown"]["cpu"] == pytest.approx(8.0)
+
+
+def test_the_cpu_adjustment_is_idempotent():
+    # The MCP wrapper resolves, then price() resolves again. Leaving the
+    # original per-CPU value on the adjusted request made the second pass
+    # inflate the already-inflated count: 1 -> 8 -> 64.
+    table = billing.parse_weight_table(CAPPED)
+    req = billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64)
+    once = billing.resolve_request(req, table, "p")
+    twice = billing.resolve_request(once, table, "p")
+    assert once.cpus == 8
+    assert twice.cpus == 8
+    assert once == twice
+    # Through the real path, which is where it actually bit.
+    assert billing.price(once, table, "p")["request"]["cpus"] == 8
+
+
+def test_each_alternative_applies_its_own_per_cpu_cap():
+    # MaxMemPerCPU differs by partition, so a request that stays at one CPU
+    # here may be allocated eight there. Pricing the candidate with THIS
+    # partition's count advertised it at 0 units when it really costs 1.
+    table = billing.parse_weight_table(
+        "PartitionName=here TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=65536"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=tight TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxMemPerCPU=8192"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    here = billing.resolve_request(billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64), table, "here")
+    assert here.cpus == 1
+    rows = billing.alternatives(here, table, "here")
+    assert len(rows) == 1
+    assert rows[0]["partition"] == "tight"
+    assert rows[0]["cpus_there"] == 8
+    assert rows[0]["units"] == 1
+    assert "8 CPUs rather than 1" in rows[0]["note"]
+
+
+def test_an_alternative_with_no_cap_change_carries_no_note():
+    table = billing.parse_weight_table(
+        "PartitionName=here TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    req = billing.Request(cpus=8, mem_gb=32)
+    rows = billing.alternatives(req, table, "here")
+    assert rows and rows[0]["partition"] == "cheap"
+    assert "cpus_there" not in rows[0]

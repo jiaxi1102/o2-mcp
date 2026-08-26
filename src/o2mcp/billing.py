@@ -929,7 +929,16 @@ def _apply_cpu_floor(req: Request, w: Weights) -> Request:
         f"exceeds MaxMemPerCPU ({cap:g} GB/CPU), and Slurm adds CPUs rather "
         "than trimming the memory"
     )
-    return replace(req, cpus=float(needed), warnings=[*req.warnings, note])
+    # mem_per_cpu_gb drops to the cap, which is what the adjusted allocation
+    # actually holds per CPU. That also makes this idempotent: re-running finds
+    # per_cpu == cap and changes nothing. Leaving the original value made the
+    # wrapper's second resolution inflate 1 -> 8 -> 64.
+    return replace(
+        req,
+        cpus=float(needed),
+        mem_per_cpu_gb=cap,
+        warnings=[*req.warnings, note],
+    )
 
 
 def _checked(req: Request, w: Weights, partition: str) -> Request:
@@ -1274,9 +1283,23 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
         # would refuse: the units would come from another model's weight.
         if _unpriceable_gpu_reason(req, w) or w.unpriceable_tres:
             continue
-        units = billing_units(req, w)
+        # Per DESTINATION: MaxMemPerCPU differs by partition, so a request
+        # that stays at one CPU here may be allocated eight there. Pricing the
+        # candidate with this partition's CPU count advertised a move as
+        # cheaper that would cost more on arrival.
+        there = _apply_cpu_floor(req, w)
+        if cannot_hold_reason(there, w):
+            continue
+        units = billing_units(there, w)
         if units < now_units:
-            rows.append({"partition": name, "units": units, "units_now": now_units})
+            row = {"partition": name, "units": units, "units_now": now_units}
+            if there.cpus != req.cpus:
+                row["cpus_there"] = there.cpus
+                row["note"] = (
+                    f"{name} caps memory per CPU lower, so Slurm would allocate "
+                    f"{there.cpus:g} CPUs rather than {req.cpus:g}"
+                )
+            rows.append(row)
     rows.sort(key=lambda r: (r["units"], r["partition"]))
     return rows[:limit]
 
