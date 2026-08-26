@@ -1010,6 +1010,29 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     # settled. price() resolves again, so this guard has to let its own output
     # back through -- otherwise the sentinel reads as an explicit --mem=0 on
     # the second pass and the tool refuses a price it had already computed.
+    if req.mem_per_cpu_gb and req.cpus > 0:
+        implied = _exact(req.cpus) * _exact(req.mem_per_cpu_gb)
+        if not req.mem_specified:
+            # Deriving beats defaulting: a partition default here would price
+            # memory the submission never asked for while the CPU adjustment
+            # used the per-CPU figure, so the two halves described different
+            # jobs.
+            req = replace(
+                req,
+                mem_gb=float(implied),
+                mem_specified=True,
+                mem_source=f"--mem-per-cpu {req.mem_per_cpu_gb:g} GB x {req.cpus:g} CPUs",
+                warnings=list(req.warnings),
+            )
+        elif abs(_exact(req.mem_gb) - implied) > Decimal("0.000001"):
+            raise BillingError(
+                f"mem_gb={req.mem_gb:g} does not match mem_per_cpu_gb="
+                f"{req.mem_per_cpu_gb:g} across {req.cpus:g} CPUs, which implies "
+                f"{implied:f} GB. The CPU adjustment reads the per-CPU value and "
+                "the bill reads the total, so a disagreement prices two "
+                "different jobs. Give the total these directives actually "
+                "produce, or omit mem_gb and it is derived."
+            )
     if req.mem_specified and req.mem_gb <= 0 and not req.mem_unknown:
         raise BillingError(
             "a memory size of zero is not an allocation Slurm makes: sbatch "
@@ -1238,7 +1261,13 @@ def _can_hold(req: Request, w: Weights) -> bool:
     return cannot_hold_reason(req, w) is None
 
 
-def alternatives(req: Request, table: dict[str, Weights], current: str, limit: int = 4) -> list[dict[str, Any]]:
+def alternatives(
+    req: Request,
+    table: dict[str, Weights],
+    current: str,
+    limit: int = 4,
+    original: Request | None = None,
+) -> list[dict[str, Any]]:
     """Cheaper PRICES for the identical request, cheapest first.
 
     Not a placement recommendation, and not a claim that the job can run there.
@@ -1258,6 +1287,14 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
     if req.mem_unknown:
         return []
     now_units = billing_units(req, table[current])
+    # Candidates are resolved from the request AS GIVEN, not from the one this
+    # partition produced. Resolution is per-partition -- the memory default,
+    # the per-CPU cap and the CPU count it forces all differ -- and once the
+    # current partition has raised a count and lowered the per-CPU figure to
+    # its own cap, that adjustment cannot be undone. A candidate with a HIGHER
+    # cap would then be priced at the raised count and could be dropped for
+    # being no cheaper.
+    source = original if original is not None else req
     rows = []
     for name, w in table.items():
         if name == current:
@@ -1266,29 +1303,12 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
         # invites a resubmission that will be rejected.
         if not w.state_up or not w.unrestricted:
             continue
-        # Two different questions, and the weights answer only the first.
-        #
-        # Can it be PRICED here? A partition carrying only "GRES/gpu:a100=1"
-        # has a generic weight of zero while pricing an a100 perfectly well, so
-        # ask for the weight that would actually price THIS request.
-        if req.gpus > 0 and gpu_weight_for(req, w) <= 0:
-            continue
-        # Can it RUN here? TRESBillingWeights defines charges; the partition's
-        # TRES inventory defines what it holds. A positive weight is not
-        # evidence of a single GPU -- nor of 64 cores, 128 GB or two nodes --
-        # so advertising on it offered moves the scheduler would reject.
-        if not _can_hold(req, w):
-            continue
-        # Never advertise a partition that pricing this same request directly
-        # would refuse: the units would come from another model's weight.
-        if _unpriceable_gpu_reason(req, w) or w.unpriceable_tres:
-            continue
-        # Per DESTINATION: MaxMemPerCPU differs by partition, so a request
-        # that stays at one CPU here may be allocated eight there. Pricing the
-        # candidate with this partition's CPU count advertised a move as
-        # cheaper that would cost more on arrival.
-        there = _apply_cpu_floor(req, w)
-        if cannot_hold_reason(there, w):
+        # Resolving is the same question the priced partition answers, so it
+        # covers the refusals uniformly: unpriceable TRES, unknown GPU models,
+        # capacity, and per-job limits all raise here.
+        try:
+            there = resolve_request(source, table, name)
+        except BillingError:
             continue
         units = billing_units(there, w)
         if units < now_units:
@@ -1296,8 +1316,8 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
             if there.cpus != req.cpus:
                 row["cpus_there"] = there.cpus
                 row["note"] = (
-                    f"{name} caps memory per CPU lower, so Slurm would allocate "
-                    f"{there.cpus:g} CPUs rather than {req.cpus:g}"
+                    f"{name} would allocate {there.cpus:g} CPUs rather than "
+                    f"{req.cpus:g}, because its MaxMemPerCPU differs"
                 )
             rows.append(row)
     rows.sort(key=lambda r: (r["units"], r["partition"]))

@@ -1056,7 +1056,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
         table = billing.cache_to_table(cached)
         captured_at = cached.get("captured_at")
 
-        request = billing.Request(
+        unresolved = billing.Request(
             cpus=params.cpus,
             mem_gb=params.mem_gb or 0.0,
             gpus=params.gpus or 0.0,
@@ -1070,13 +1070,16 @@ async def o2_price_job(params: PriceJobInput) -> str:
         )
 
         try:
-            request = billing.resolve_request(request, table, params.partition)
+            request = billing.resolve_request(unresolved, table, params.partition)
             payload = billing.price(request, table, params.partition, captured_at)
         except billing.BillingError as exc:
             return {"ok": False, "error": "unpriceable", "message": str(exc)}
         # Compare the SAME concrete allocation elsewhere; using an unresolved
         # request priced every alternative with zero memory.
-        payload["alternatives"] = billing.alternatives(request, table, params.partition)
+        # `original` is the request as the caller stated it: resolving a
+        # candidate from the shape THIS partition produced cannot undo a CPU
+        # count its own cap forced.
+        payload["alternatives"] = billing.alternatives(request, table, params.partition, original=unresolved)
         # Always, not conditionally: the rows are a price comparison, and a
         # caller who reads them as "partitions that can run this" has been told
         # something this cache cannot know.

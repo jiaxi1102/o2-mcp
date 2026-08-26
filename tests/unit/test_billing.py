@@ -1527,3 +1527,66 @@ def test_an_alternative_with_no_cap_change_carries_no_note():
     rows = billing.alternatives(req, table, "here")
     assert rows and rows[0]["partition"] == "cheap"
     assert "cpus_there" not in rows[0]
+
+
+def test_a_per_cpu_request_must_agree_with_its_total():
+    # The CPU adjustment reads the per-CPU value and the bill reads the total,
+    # so a disagreement prices two different jobs: cpus=2 at 64 GB/CPU is
+    # 128 GB, and charging 64 while allocating for 128 is neither request.
+    table = billing.parse_weight_table(CAPPED)
+    with pytest.raises(billing.BillingError, match="does not match"):
+        billing.resolve_request(billing.Request(cpus=2, mem_gb=64, mem_per_cpu_gb=64), table, "p")
+    # Omitting the total derives it, rather than substituting a partition
+    # default the submission never asked for.
+    derived = billing.resolve_request(billing.Request(cpus=2, mem_per_cpu_gb=64, mem_specified=False), table, "p")
+    assert derived.mem_gb == 128
+    assert "--mem-per-cpu" in derived.mem_source
+    # A consistent pair passes untouched.
+    ok = billing.resolve_request(billing.Request(cpus=2, mem_gb=128, mem_per_cpu_gb=64), table, "p")
+    assert ok.mem_gb == 128
+
+
+def test_alternatives_are_resolved_from_the_request_as_given():
+    # Once the current partition raises a CPU count and lowers the per-CPU
+    # figure to its own cap, that cannot be undone -- so a candidate with a
+    # HIGHER cap was priced at the raised count and looked barely cheaper.
+    table = billing.parse_weight_table(
+        "PartitionName=tight TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=8192"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+        "PartitionName=roomy TRESBillingWeights=CPU=0.9,Mem=0.05G MaxMemPerCPU=65536"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    original = billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64)
+    here = billing.resolve_request(original, table, "tight")
+    assert here.cpus == 8
+
+    stale = billing.alternatives(here, table, "tight")
+    assert stale[0]["units"] == 10  # priced at this partition's 8 CPUs
+    fresh = billing.alternatives(here, table, "tight", original=original)
+    assert fresh[0]["units"] == 4  # roomy allocates 1 CPU, not 8
+    assert fresh[0]["cpus_there"] == 1
+    assert "MaxMemPerCPU differs" in fresh[0]["note"]
+
+
+def test_a_partition_that_does_not_bill_gpus_can_still_be_offered():
+    # A candidate with GPU inventory whose table prices only CPU and memory
+    # gives an exact price -- the GPU contribution is intentionally zero, and
+    # direct pricing already accepts it. Excluding it on the weight alone
+    # withheld a genuinely cheaper destination.
+    table = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=400,mem=4000G,node=10,gres/gpu=8 State=UP AllowGroups=ALL\n"
+        "PartitionName=nogpubill TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10,gres/gpu=8 State=UP AllowGroups=ALL\n"
+    )
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1)
+    offered = {r["partition"] for r in billing.alternatives(req, table, "now")}
+    assert "nogpubill" in offered
+    # And a partition with no GPUs at all is still excluded, on inventory.
+    none = billing.parse_weight_table(
+        "PartitionName=now TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=400,mem=4000G,node=10,gres/gpu=8 State=UP AllowGroups=ALL\n"
+        "PartitionName=cpuonly TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    assert billing.alternatives(req, none, "now") == []
