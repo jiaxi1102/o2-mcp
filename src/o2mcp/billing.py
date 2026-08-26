@@ -180,10 +180,26 @@ def to_gb(value: str | float | None, default_unit: str = SBATCH_DEFAULT_MEM_UNIT
         return 0.0
     if isinstance(value, (int, float)):
         return float(value) * _MEM_UNITS[default_unit.upper()]
-    m = re.match(r"^\s*([0-9.]+)\s*([KMGTkmgt]?)", str(value))
+    m = re.match(r"^\s*([0-9.]+)\s*([A-Za-z]*)", str(value))
     if not m:
         raise BillingError(f"could not read a memory size from {value!r}")
-    suffix = m.group(2).upper() or default_unit.upper()
+    letters = m.group(2)
+    if not letters:
+        suffix = default_unit.upper()
+    else:
+        # First letter is the unit; sacct appends a per-node/per-CPU qualifier
+        # ("16Gn", "4Gc") that says nothing about the size.
+        suffix = letters[0].upper()
+        if suffix not in _MEM_UNITS:
+            # Defaulting an unrecognised suffix to megabytes is how "1P" became
+            # one megabyte: a petabyte partition then looked too small for
+            # nearly every request. The unit class comes from _MEM_UNITS so
+            # adding one there can never again leave this path behind.
+            raise BillingError(
+                "unrecognised memory unit {!r} in {!r}; known units are {}".format(
+                    letters[0], value, ", ".join(sorted(_MEM_UNITS))
+                )
+            )
     return float(m.group(1)) * _MEM_UNITS[suffix]
 
 

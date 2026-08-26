@@ -1026,3 +1026,30 @@ def test_restrictions_survive_whatever_order_scontrol_prints_them_in():
 def test_the_caveat_travels_with_every_list():
     assert "Prices only" in billing.alternatives_caveat()
     assert "NOT verified" in billing.alternatives_caveat()
+
+
+def test_inventory_memory_reads_every_unit_the_weights_do():
+    # The P suffix was added to _MEM_UNITS for billing weights, but to_gb kept
+    # its own [KMGT] class -- so partition INVENTORY read "mem=1P" as one
+    # megabyte, and a petabyte partition looked too small for nearly anything.
+    assert billing.to_gb("1P") == pytest.approx(1024.0**2)
+    assert billing.to_gb("1p") == pytest.approx(1024.0**2)
+    table = billing.parse_weight_table(
+        "PartitionName=huge TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=4000,mem=1P,node=100 State=UP AllowGroups=ALL"
+    )
+    assert table["huge"].stock["mem"] == pytest.approx(1024.0**2)
+    assert billing._can_hold(billing.Request(cpus=8, mem_gb=256), table["huge"])
+
+
+def test_an_unrecognised_memory_unit_is_refused_not_defaulted():
+    # Silently defaulting is exactly how 1P became 1M.
+    with pytest.raises(billing.BillingError, match="unrecognised memory unit"):
+        billing.to_gb("1Z")
+
+
+def test_sacct_per_node_and_per_cpu_qualifiers_still_parse():
+    # sacct appends n/c to say per-node or per-CPU; that letter is not a unit
+    # and must not be mistaken for one.
+    assert billing.to_gb("16Gn") == pytest.approx(16.0)
+    assert billing.to_gb("4Gc") == pytest.approx(4.0)
