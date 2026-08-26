@@ -898,8 +898,34 @@ def parse_priority_flags(text: str) -> list[str]:
     return []
 
 
+def _apply_cpu_floor(req: Request, w: Weights) -> Request:
+    """Raise the CPU count where MaxMemPerCPU forces Slurm to.
+
+    Slurm will not give a job more memory per CPU than MaxMemPerCPU allows: it
+    keeps the memory and adds CPUs until the ratio fits. One CPU asking 64 GB
+    under an 8 GB cap is allocated -- and BILLED -- as eight CPUs.
+
+    The field recording that has been parsed and cached since it was first
+    added and never consulted by any calculation, which is the third time a
+    captured weight sat unused here. Pricing the requested CPU count instead of
+    the allocated one understated those jobs by the whole difference.
+    """
+    cap = w.max_mem_per_cpu_gb
+    if not cap or cap <= 0 or req.mem_gb <= 0:
+        return req
+    needed = math.ceil(_exact(req.mem_gb) / _exact(cap))
+    if needed <= req.cpus:
+        return req
+    note = (
+        f"CPUs raised {req.cpus:g} -> {needed:g}: {req.mem_gb:g} GB exceeds "
+        f"MaxMemPerCPU ({cap:g} GB/CPU), and Slurm adds CPUs rather than "
+        "trimming the memory"
+    )
+    return replace(req, cpus=float(needed), warnings=[*req.warnings, note])
+
+
 def _checked(req: Request, w: Weights, partition: str) -> Request:
-    """The request, or a refusal naming the limit it breaks.
+    """The request as Slurm would allocate it, or a refusal naming the limit.
 
     Applied to whatever is about to be RETURNED, never to the request as
     given. A partition default is filled in here, so checking the input meant a
@@ -907,6 +933,7 @@ def _checked(req: Request, w: Weights, partition: str) -> Request:
     price() and resolve-then-price answered the same question differently, the
     wrapper hiding it only because it happens to resolve twice.
     """
+    req = _apply_cpu_floor(req, w)
     cannot = cannot_hold_reason(req, w)
     if cannot:
         raise BillingError(
