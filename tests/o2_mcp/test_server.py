@@ -926,27 +926,33 @@ async def test_pricing_never_writes_the_weight_cache(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_price_job_says_when_alternatives_were_withheld(tmp_path, monkeypatch):
-    """An empty alternatives list is not the same claim as "nothing is cheaper"."""
+async def test_price_job_always_labels_alternatives_as_prices(tmp_path, monkeypatch):
+    """The rows are a price comparison, and every response has to say so.
+
+    Whether a job may actually run on a partition is Slurm's admission control,
+    which the cached partition configuration cannot settle -- so a caller
+    reading these as "partitions that can run this" has been told something
+    this tool does not know.
+    """
     monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
     billing.save_weight_cache(
         billing.parse_weight_table(
             "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G"
             " TRES=cpu=4000,mem=40000G,node=10\n"
             "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G"
-            " TRES=cpu=128,mem=256G,node=2\n"
+            " TRES=cpu=4000,mem=40000G,node=10\n"
         ),
         captured_at=1000.0,
         priority_flags=[],
     )
-    payload = json.loads(
-        await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=64, mem_gb=128, nodes=1))
-    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=64, mem_gb=128)))
     assert payload["ok"] is True
-    assert payload["alternatives"] == []
-    assert "SINGLE node" in payload["alternatives_note"]
+    assert payload["alternatives"]
+    assert "NOT verified" in payload["alternatives_note"]
 
-    # And with no node count pinned, the comparison happens and no note is set.
-    plain = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=64, mem_gb=128)))
-    assert plain["alternatives"]
-    assert "alternatives_note" not in plain
+    # Present even when nothing survived the filters, so an empty list is not
+    # read as "nothing cheaper exists" either.
+    pinned = json.loads(
+        await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16, nodes=1))
+    )
+    assert "NOT verified" in pinned["alternatives_note"]

@@ -252,7 +252,11 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             elif token.startswith("State="):
                 state_up = token[len("State=") :].upper() == "UP"
             elif token.startswith("AllowGroups="):
-                unrestricted = token[len("AllowGroups=") :].upper() == "ALL"
+                # Narrow, never assign: every other restriction below sets
+                # this False, and an assignment here silently reinstated any
+                # of them that scontrol happened to print first.
+                if token[len("AllowGroups=") :].upper() != "ALL":
+                    unrestricted = False
             elif token.startswith("AllowAccounts="):
                 value = token[len("AllowAccounts=") :]
                 if value and value.upper() != "ALL":
@@ -962,17 +966,6 @@ def _fits_per_node(need: float, nodes: float, declared_cap: "float | None") -> b
     return need / nodes <= declared_cap
 
 
-def node_topology_unknown(req: "Request") -> bool:
-    """Does this request need per-node data the cache does not hold?
-
-    True only when the caller pinned a node count. Without one Slurm chooses
-    the layout and partition totals are the right bound; with one, the question
-    becomes what a SINGLE node can hold, and `scontrol show partition` never
-    says.
-    """
-    return bool(req.nodes_stated and req.nodes > 0 and (req.cpus > 0 or req.mem_gb > 0))
-
-
 def _can_hold(req: "Request", w: "Weights") -> bool:
     """Can this partition hold the requested shape at all?
 
@@ -1004,13 +997,8 @@ def _can_hold(req: "Request", w: "Weights") -> bool:
             return False
         if not _fits_per_node(req.mem_gb, req.nodes, w.max_mem_per_node_gb):
             return False
-        # A declared cap can rule the shape OUT, but nothing here can rule it
-        # IN: a cap is an upper bound, not a promise any node offers it, and
-        # partition totals say nothing about a single node. So a pinned node
-        # count is a question this cache cannot answer, and the suggestion is
-        # withheld rather than guessed -- alternatives_note() says so.
-        if node_topology_unknown(req):
-            return False
+        # A declared cap rules the shape OUT; nothing here rules one IN. That
+        # asymmetry is the whole point -- see alternatives().
     if req.gpus <= 0:
         return True
     if req.gpu_model:
@@ -1021,11 +1009,17 @@ def _can_hold(req: "Request", w: "Weights") -> bool:
 
 
 def alternatives(req: Request, table: dict[str, Weights], current: str, limit: int = 4) -> list[dict[str, Any]]:
-    """Cheaper partitions for the identical request, cheapest first.
+    """Cheaper PRICES for the identical request, cheapest first.
 
-    Reported as prices, not as advice: a discounted partition is usually
-    preemptible, and whether that is acceptable is a property of the job that
-    this module cannot see.
+    Not a placement recommendation, and not a claim that the job can run there.
+    The filters below remove partitions that provably cannot take it or cannot
+    price it, which only ever deletes bad suggestions -- but Slurm's admission
+    control is far larger than the partition configuration this module caches,
+    so a surviving row means "cheaper IF eligible", never "eligible". Callers
+    must pass alternatives_caveat() along with the rows.
+
+    A discounted partition is also usually preemptible, and whether that is
+    acceptable is a property of the job this module cannot see.
     """
     if current not in table:
         return []
@@ -1062,20 +1056,20 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
     return rows[:limit]
 
 
-def alternatives_note(req: Request, table: dict[str, Weights], current: str) -> str | None:
-    """Why the alternatives list may be short, or None if nothing was withheld.
+def alternatives_caveat() -> str:
+    """What the alternatives list is, stated every time it is returned.
 
-    An empty list otherwise reads as "nothing cheaper exists", which is its own
-    confident wrong answer.
+    It is a PRICE comparison. Whether a job may actually run on a partition is
+    Slurm's admission control, and `scontrol show partition` is not the whole
+    of it: MaxTime, node topology and QoS interactions all sit outside the
+    cached configuration. Successive reviews found one such constraint after
+    another, which is the signal that the category is open-ended rather than
+    nearly complete -- so the list stops claiming to be partitions that can run
+    the shape, and says what it actually knows.
     """
-    if current not in table or len(table) <= 1:
-        return None
-    if node_topology_unknown(req):
-        return (
-            "Cheaper partitions were not compared: this request pins a node "
-            "count, so the question is what a SINGLE node can hold, and the "
-            "cached partition configuration does not describe individual "
-            "nodes. Omit the node count to compare on partition totals, or "
-            "check node sizes on the cluster."
-        )
-    return None
+    return (
+        "Prices only. Eligibility is NOT verified: partition configuration "
+        "cannot settle time limits, node topology or QoS interactions, so "
+        "confirm a partition accepts the job before moving work to it. "
+        "Partitions shown to be unusable or unpriceable are already omitted."
+    )

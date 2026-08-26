@@ -945,7 +945,6 @@ def test_no_node_count_still_compares_on_partition_totals():
     )
     req = billing.Request(cpus=64, mem_gb=128)
     assert "cheap" in {r["partition"] for r in billing.alternatives(req, table, "now")}
-    assert billing.alternatives_note(req, table, "now") is None
     # A partition that cannot hold the aggregate is still excluded.
     small = billing.parse_weight_table(
         _ROOMY + "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G"
@@ -954,18 +953,35 @@ def test_no_node_count_still_compares_on_partition_totals():
     assert not billing.alternatives(req, small, "now")
 
 
-def test_a_pinned_node_count_withholds_alternatives_and_says_so():
-    # cpu=128,mem=256G,node=2 is satisfied by a 96-CPU/32 GB node beside a
-    # 32-CPU/224 GB one. Both averages admit a 64-CPU/128 GB single-node
-    # request that NEITHER node can run, so averages cannot support the claim.
+def test_a_pinned_node_count_is_compared_but_not_vouched_for():
+    # cpu=128,mem=256G,node=2 could be a 96-CPU/32 GB node beside a
+    # 32-CPU/224 GB one, so nothing here proves a 64-CPU/128 GB single-node
+    # request fits. The row is a price, and the caveat says exactly that
+    # rather than the list pretending to have checked.
     table = billing.parse_weight_table(
         _ROOMY + "PartitionName=hetero TRESBillingWeights=CPU=0.1,Mem=0.00625G"
         " TRES=cpu=128,mem=256G,node=2 State=UP AllowGroups=ALL\n"
     )
     req = billing.Request(cpus=64, mem_gb=128, nodes=1, nodes_stated=True)
-    assert billing.alternatives(req, table, "now") == []
-    note = billing.alternatives_note(req, table, "now")
-    assert note and "SINGLE node" in note
+    assert "hetero" in {r["partition"] for r in billing.alternatives(req, table, "now")}
+    assert "NOT verified" in billing.alternatives_caveat()
+
+
+def test_provable_exclusions_still_apply():
+    # Relabelling the list did not turn the filters off: a partition that
+    # demonstrably cannot take the shape is still omitted, because removing a
+    # bad suggestion needs no claim about the good ones.
+    table = billing.parse_weight_table(
+        _ROOMY + "PartitionName=tiny TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=8,mem=32G,node=1 State=UP AllowGroups=ALL\n"
+        + "PartitionName=capped TRESBillingWeights=CPU=0.1,Mem=0.00625G MaxNodes=1"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+        + "PartitionName=rootly TRESBillingWeights=CPU=0.1,Mem=0.00625G RootOnly=YES"
+        " TRES=cpu=4000,mem=40000G,node=10 State=UP AllowGroups=ALL\n"
+    )
+    two_node = billing.Request(cpus=64, mem_gb=128, nodes=2, nodes_stated=True)
+    offered = {r["partition"] for r in billing.alternatives(two_node, table, "now")}
+    assert offered == set(), offered
 
 
 def test_a_declared_per_node_cap_can_still_exclude():
@@ -993,8 +1009,20 @@ def test_node_count_limits_are_captured_for_the_shapes_they_exclude():
     assert billing._can_hold(two, w) is False
 
 
-def test_alternatives_note_is_silent_when_nothing_was_withheld():
-    table = billing.parse_weight_table(_ROOMY)
-    req = billing.Request(cpus=4, mem_gb=16, nodes=1, nodes_stated=True)
-    # Only one partition, so there was nothing to compare in the first place.
-    assert billing.alternatives_note(req, table, "now") is None
+def test_restrictions_survive_whatever_order_scontrol_prints_them_in():
+    # AllowGroups=ALL used to ASSIGN eligibility rather than narrow it, so a
+    # RootOnly or ReqResv restriction printed before it was silently undone.
+    for line in (
+        "PartitionName=p TRESBillingWeights=CPU=1 RootOnly=YES AllowGroups=ALL",
+        "PartitionName=p TRESBillingWeights=CPU=1 AllowGroups=ALL RootOnly=YES",
+        "PartitionName=p TRESBillingWeights=CPU=1 ReqResv=YES AllowGroups=ALL",
+        "PartitionName=p TRESBillingWeights=CPU=1 DenyQos=bad AllowGroups=ALL",
+    ):
+        assert billing.parse_weight_table(line)["p"].unrestricted is False, line
+    plain = "PartitionName=p TRESBillingWeights=CPU=1 AllowGroups=ALL RootOnly=NO"
+    assert billing.parse_weight_table(plain)["p"].unrestricted is True
+
+
+def test_the_caveat_travels_with_every_list():
+    assert "Prices only" in billing.alternatives_caveat()
+    assert "NOT verified" in billing.alternatives_caveat()
