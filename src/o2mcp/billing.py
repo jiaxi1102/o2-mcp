@@ -55,7 +55,16 @@ def cache_path(path: str | None = None) -> str:
 # sbatch documents an unsuffixed --mem as MEGABYTES, so `--mem=32000` is 31.25
 # GB, not 32000 bytes. Reading it as bytes drops essentially the whole memory
 # charge and every boundary derived from it.
-_MEM_UNITS = {"K": 1.0 / (1024**2), "M": 1.0 / 1024, "G": 1.0, "T": 1024.0}
+# Every suffix Slurm permits on a memory billing weight. A missing one is not
+# harmless: an unrecognised unit left mem_per_gb at zero, so "Mem=1P" priced
+# memory as free rather than as the largest term in the sum.
+_MEM_UNITS = {
+    "K": 1.0 / (1024**2),
+    "M": 1.0 / 1024,
+    "G": 1.0,
+    "T": 1024.0,
+    "P": 1024.0**2,
+}
 SBATCH_DEFAULT_MEM_UNIT = "M"
 
 
@@ -90,6 +99,10 @@ class Weights:
     # Weighted TRES types this calculator cannot charge for. Non-empty means
     # any price for this partition would be understated, so it refuses.
     unpriceable_tres: dict[str, float] | None = None
+    # GPUs the partition HOLDS, from its TRES inventory rather than its billing
+    # weights. None means the inventory was never captured.
+    gpu_stock: float | None = None
+    gpu_stock_by_model: dict[str, float] | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
         """Memory Slurm would allocate for a request that names none.
@@ -195,6 +208,10 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         def_cpu = def_node = None
         state_up, unrestricted = True, True
         unpriceable: dict[str, float] = {}
+        # None until a TRES= token is seen: "no GPUs" and "never told" are
+        # different answers, and only one of them permits a suggestion.
+        gpu_stock: float | None = None
+        gpu_stock_by_model: dict[str, float] = {}
         max_mem_cpu = None
         gpu_by_model: dict[str, float] = {}
         for token in line.split():
@@ -203,6 +220,27 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("DefMemPerCPU=") :]
                 if value.isdigit() and int(value) > 0:
                     def_cpu = int(value) / 1024.0
+            elif token.startswith("TRES="):
+                # Distinct from TRESBillingWeights: this is the inventory the
+                # partition actually holds. Weights say what a resource COSTS;
+                # only inventory says whether it can run there at all.
+                for part in token[len("TRES=") :].split(","):
+                    if "=" not in part:
+                        continue
+                    tkey, tval = part.split("=", 1)
+                    tkey = tkey.strip().lower()
+                    if not tkey.startswith("gres/gpu"):
+                        continue
+                    try:
+                        count = float(re.sub(r"[A-Za-z]", "", tval) or 0)
+                    except ValueError:
+                        continue
+                    if tkey == "gres/gpu":
+                        gpu_stock = count
+                    else:
+                        gpu_stock_by_model[tkey.split(":", 1)[1]] = count
+                if gpu_stock is None:
+                    gpu_stock = 0.0
             elif token.startswith("State="):
                 state_up = token[len("State=") :].upper() == "UP"
             elif token.startswith("AllowGroups="):
@@ -252,6 +290,10 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                     unit = re.sub(r"[^A-Za-z]", "", value.strip()).upper()
                     per_unit_gb = _MEM_UNITS.get(unit or SBATCH_DEFAULT_MEM_UNIT)
                     if per_unit_gb is None:
+                        # Recorded, not skipped: skipping leaves mem_per_gb at
+                        # zero, which prices memory as free -- the same silent
+                        # drop that "Node=10" used to get.
+                        unpriceable["mem:" + unit] = float(number)
                         continue
                     mem = float(number) / per_unit_gb
                 elif key == "gres/gpu":
@@ -286,6 +328,8 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             max_mem_per_cpu_gb=max_mem_cpu,
             gpu_by_model=gpu_by_model or None,
             unpriceable_tres=unpriceable or None,
+            gpu_stock=gpu_stock,
+            gpu_stock_by_model=gpu_stock_by_model or None,
         )
     return table
 
@@ -580,6 +624,8 @@ def save_weight_cache(
                 "max_mem_per_cpu_gb": w.max_mem_per_cpu_gb,
                 "gpu_by_model": w.gpu_by_model,
                 "unpriceable_tres": w.unpriceable_tres,
+                "gpu_stock": w.gpu_stock,
+                "gpu_stock_by_model": w.gpu_stock_by_model,
             }
             for name, w in table.items()
         },
@@ -632,6 +678,8 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 # disappeared and an a100 was charged at the generic rate.
                 gpu_by_model=_float_map(entry.get("gpu_by_model")),
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
+                gpu_stock=(None if entry.get("gpu_stock") is None else float(entry["gpu_stock"])),
+                gpu_stock_by_model=_float_map(entry.get("gpu_stock_by_model")),
             )
         except (TypeError, ValueError):
             continue
@@ -659,9 +707,12 @@ def unsupported_billing_model(payload: dict[str, Any]) -> str | None:
             "the two imply opposite advice about memory. Run "
             "o2_refresh_billing_weights to record it."
         )
-    if "MAX_TRES" in {str(f).upper() for f in flags}:
+    # Prefix, not equality: MAX_TRES_GRES is the same maximum-based calculation
+    # with GRES folded in, and an exact match let it through to the sum.
+    maxing = sorted(f for f in {str(x).upper() for x in flags} if f.startswith("MAX_TRES"))
+    if maxing:
         return (
-            "this cluster sets PriorityFlags=MAX_TRES, so Slurm bills the MAXIMUM "
+            f"this cluster sets PriorityFlags={','.join(maxing)}, so Slurm bills the MAXIMUM "
             "weighted TRES rather than their sum. This tool computes the sum, and "
             "the memory-boundary reasoning it exists to support does not hold "
             "under MAX_TRES: trimming a non-dominant TRES saves nothing and only "
@@ -827,6 +878,24 @@ def price(
     return payload
 
 
+def _has_gpu_stock(req: "Request", w: "Weights") -> bool:
+    """Does this partition hold enough of the GPU the request names?
+
+    Answers False when the inventory was never captured: a suggestion has to be
+    positively supported, and "we did not look" is not support.
+    """
+    if w.gpu_stock is None:
+        return False
+    if req.gpu_model:
+        by_model = w.gpu_stock_by_model or {}
+        if req.gpu_model in by_model:
+            return by_model[req.gpu_model] >= req.gpus
+        # A model-priced partition that never lists that model's stock cannot
+        # be shown to hold it.
+        return not (w.gpu_by_model or by_model) and w.gpu_stock >= req.gpus
+    return w.gpu_stock >= req.gpus
+
+
 def alternatives(req: Request, table: dict[str, Weights], current: str, limit: int = 4) -> list[dict[str, Any]]:
     """Cheaper partitions for the identical request, cheapest first.
 
@@ -845,13 +914,19 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
         # invites a resubmission that will be rejected.
         if not w.state_up or not w.unrestricted:
             continue
-        # A GPU request cannot run where GPUs are not a billed resource. That is
-        # a proxy for "has no GPUs" rather than proof, so it can only exclude a
-        # suggestion -- never manufacture one. Ask for the weight that would
-        # actually price THIS request: a partition carrying only
-        # "GRES/gpu:a100=1" has a generic weight of zero while pricing an a100
-        # perfectly well, and reading the generic entry hid it as GPU-less.
+        # Two different questions, and the weights answer only the first.
+        #
+        # Can it be PRICED here? A partition carrying only "GRES/gpu:a100=1"
+        # has a generic weight of zero while pricing an a100 perfectly well, so
+        # ask for the weight that would actually price THIS request.
         if req.gpus > 0 and gpu_weight_for(req, w) <= 0:
+            continue
+        # Can it RUN here? TRESBillingWeights defines charges; the partition's
+        # TRES inventory defines what it holds. A positive weight is not
+        # evidence of a single GPU, so advertising on it offered moves that
+        # would be rejected on arrival. An uncaptured inventory is unknown, and
+        # unknown may not manufacture a suggestion either.
+        if req.gpus > 0 and not _has_gpu_stock(req, w):
             continue
         # Never advertise a partition that pricing this same request directly
         # would refuse: the units would come from another model's weight.

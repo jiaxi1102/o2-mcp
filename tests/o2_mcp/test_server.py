@@ -839,8 +839,10 @@ async def test_price_job_reports_cheaper_partitions_for_the_same_request(monkeyp
     monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "weights.json"))
     billing.save_weight_cache(
         billing.parse_weight_table(
-            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n"
-            "PartitionName=gpu_requeue TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1\n"
+            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0"
+            " TRES=cpu=400,mem=4000G,node=10,gres/gpu=40\n"
+            "PartitionName=gpu_requeue TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+            " TRES=cpu=1080,mem=10000G,node=27,gres/gpu=108\n"
         ),
         captured_at=1000.0,
         priority_flags=[],
