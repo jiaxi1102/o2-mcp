@@ -158,7 +158,7 @@ class Request:
     warnings: list[str] = field(default_factory=list)
 
 
-def _remem(req: "Request", mem_gb: float) -> "Request":
+def _remem(req: Request, mem_gb: float) -> Request:
     """``req`` at a different memory size, with every other field intact.
 
     Repricing a shape means changing exactly one number. Rebuilding the request
@@ -421,7 +421,7 @@ UNPRICEABLE_OPTIONS = {
 }
 
 
-def _unpriceable_gpu_reason(req: "Request", w: "Weights") -> str | None:
+def _unpriceable_gpu_reason(req: Request, w: Weights) -> str | None:
     """Why this partition cannot price the request's GPUs, or None if it can.
 
     gpu_weight_for() falls back to the generic weight whenever the named model
@@ -755,7 +755,7 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
     return table
 
 
-def max_based_flags(flags: "list[str] | None") -> list[str]:
+def max_based_flags(flags: list[str] | None) -> list[str]:
     """The PriorityFlags that make billing a MAXIMUM rather than a sum.
 
     A prefix match, because MAX_TRES_GRES is the same calculation with GRES
@@ -766,7 +766,7 @@ def max_based_flags(flags: "list[str] | None") -> list[str]:
     return sorted(f for f in {str(x).upper() for x in (flags or [])} if f.startswith("MAX_TRES"))
 
 
-def _model_key(model: "str | None") -> "str | None":
+def _model_key(model: str | None) -> str | None:
     """A GPU model name as the tables store it.
 
     Both scontrol-derived maps lowercase their keys, so a caller writing
@@ -839,7 +839,7 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
         )
     extra = table[partition].unpriceable_tres
     if extra:
-        listed = ", ".join("%s=%g" % (k, v) for k, v in sorted(extra.items()))
+        listed = ", ".join(f"{k}={v:g}" for k, v in sorted(extra.items()))
         raise BillingError(
             f"{partition!r} bills weighted TRES this calculator cannot charge "
             f"for ({listed}). Every figure for it would be understated by that "
@@ -968,7 +968,7 @@ def price(
     return payload
 
 
-def _fits_per_node(need: float, nodes: float, declared_cap: "float | None") -> bool:
+def _fits_per_node(need: float, nodes: float, declared_cap: float | None) -> bool:
     """Is the per-node share within a cap the partition DECLARES?
 
     Only a declared cap is usable here, and only to exclude. A partition-wide
@@ -982,7 +982,7 @@ def _fits_per_node(need: float, nodes: float, declared_cap: "float | None") -> b
     return need / nodes <= declared_cap
 
 
-def _can_hold(req: "Request", w: "Weights") -> bool:
+def _can_hold(req: Request, w: Weights) -> bool:
     """Can this partition hold the requested shape at all?
 
     Billing weights say what a resource COSTS. Only the TRES inventory says

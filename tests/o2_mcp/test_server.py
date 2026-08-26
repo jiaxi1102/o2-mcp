@@ -25,13 +25,13 @@ from o2mcp import (  # noqa: E402
     O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
     async_transfer,  # noqa: E402
+    billing,  # noqa: E402
     transfer_tools,  # noqa: E402
 )
 from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
 from o2mcp import (
     O2Connection as _ProductionO2Connection,
 )
-from o2mcp import billing  # noqa: E402
 from o2mcp import server as o2server  # noqa: E402
 
 
