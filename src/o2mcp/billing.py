@@ -103,6 +103,10 @@ class Weights:
     # weights: cpu, mem (GB), node, gres/gpu, gres/gpu:<model>. None means the
     # inventory was never captured, which is not the same as holding nothing.
     stock: dict[str, float] | None = None
+    # True when a TRES= token supplied the inventory. Totals alone give CPUs
+    # and nodes and say nothing about accelerators, so absence of a GPU entry
+    # means "not reported" there and "genuinely none" here.
+    stock_from_tres: bool = False
     # Per-JOB limits, distinct from the aggregate inventory above: a partition
     # can hold a hundred nodes and still cap one job at a single node, require
     # at least two, or cap what any single node will give a job.
@@ -238,6 +242,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         # None until a TRES= token is seen: "holds none" and "never told" are
         # different answers, and only one of them permits a suggestion.
         stock: dict[str, float] | None = None
+        stock_from_tres = False
         total_cpus: float | None = None
         total_nodes: float | None = None
         max_nodes: float | None = None
@@ -259,6 +264,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 # that applies to CPUs, memory and nodes exactly as it does to
                 # accelerators.
                 stock = {}
+                stock_from_tres = True
                 for part in token[len("TRES=") :].split(","):
                     if "=" not in part:
                         continue
@@ -408,6 +414,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             gpu_by_model=gpu_by_model or None,
             unpriceable_tres=unpriceable or None,
             stock=stock,
+            stock_from_tres=stock_from_tres,
             max_nodes=max_nodes,
             min_nodes=min_nodes,
             max_cpus_per_node=max_cpus_per_node,
@@ -620,10 +627,15 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
             cap = w.max_mem_per_node_gb * req.nodes
         elif w.max_nodes is not None:
             cap = w.max_mem_per_node_gb * w.max_nodes
-    if cap is not None:
-        band_end = min(band_end, cap)
+    # The cap is INCLUSIVE and band_end is EXCLUSIVE, so they cannot be merged.
+    # Substituting the cap for band_end made _largest_at_same_price() subtract
+    # its edge margin from an amount that is itself requestable: with a 40 GB
+    # cap and a 39 GB request, both cost 3 units, yet the answer came back 39
+    # with no headroom. A cap inside the band IS the largest same-price size.
     largest_same_price = _largest_at_same_price(req, w, band_end)
     if cap is not None:
+        if cap < band_end:
+            largest_same_price = max(largest_same_price, cap)
         largest_same_price = min(largest_same_price, cap)
 
     result: dict[str, Any] = {
@@ -724,6 +736,7 @@ def save_weight_cache(
                 "gpu_by_model": w.gpu_by_model,
                 "unpriceable_tres": w.unpriceable_tres,
                 "stock": w.stock,
+                "stock_from_tres": w.stock_from_tres,
                 "max_nodes": w.max_nodes,
                 "min_nodes": w.min_nodes,
                 "max_cpus_per_node": w.max_cpus_per_node,
@@ -781,6 +794,7 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 gpu_by_model=_float_map(entry.get("gpu_by_model")),
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
                 stock=_float_map(entry.get("stock")),
+                stock_from_tres=bool(entry.get("stock_from_tres", False)),
                 max_nodes=(None if entry.get("max_nodes") is None else float(entry["max_nodes"])),
                 min_nodes=(None if entry.get("min_nodes") is None else float(entry["min_nodes"])),
                 max_cpus_per_node=(
@@ -1106,9 +1120,14 @@ def cannot_hold_reason(req: Request, w: Weights) -> str | None:
             )
     # GPUs keep a positive-evidence rule, because a GPU-less partition is the
     # one exclusion the billing weights genuinely cannot make: a weight says
-    # what a GPU costs there, never that one exists. It applies only where SOME
-    # inventory was captured -- with none, silence is not a denial.
-    if req.gpus <= 0 or not stock:
+    # what a GPU costs there, never that one exists.
+    #
+    # It applies only where a TRES= token supplied the inventory. Merging
+    # TotalCPUs/TotalNodes made `stock` non-empty while saying nothing about
+    # accelerators, and reading that silence as zero refused EVERY GPU request
+    # on the primary pricing path -- two separate fixes of mine combining into
+    # a hard failure neither produced alone.
+    if req.gpus <= 0 or not w.stock_from_tres:
         return None
     if req.gpu_model:
         # A typed request needs typed evidence. An aggregate "gres/gpu=4" says

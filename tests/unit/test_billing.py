@@ -19,10 +19,18 @@ from o2mcp import billing
 
 SHORT = billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0)
 GPU_QUAD = billing.Weights(
-    cpu=1.0, mem_per_gb=0.0625, gpu=5.0, stock={"cpu": 400, "mem": 4000, "node": 10, "gres/gpu": 40}
+    cpu=1.0,
+    mem_per_gb=0.0625,
+    gpu=5.0,
+    stock={"cpu": 400, "mem": 4000, "node": 10, "gres/gpu": 40},
+    stock_from_tres=True,
 )
 GPU_REQUEUE = billing.Weights(
-    cpu=0.1, mem_per_gb=0.00625, gpu=0.1, stock={"cpu": 1080, "mem": 10000, "node": 27, "gres/gpu": 108}
+    cpu=0.1,
+    mem_per_gb=0.00625,
+    gpu=0.1,
+    stock={"cpu": 1080, "mem": 10000, "node": 27, "gres/gpu": 108},
+    stock_from_tres=True,
 )
 
 # (weights, cpus, mem_gb, gpus, observed billing)
@@ -1223,3 +1231,50 @@ def test_the_memory_clamp_needs_a_provable_total_ceiling():
     )
     out2 = billing.boundary(billing.Request(cpus=4, mem_gb=64), capped["q"])
     assert out2["largest_same_price_mem_gb"] <= 64.0
+
+
+def test_totals_only_inventory_does_not_deny_gpus():
+    # Merging TotalCPUs/TotalNodes makes stock non-empty while saying nothing
+    # about accelerators. Reading that silence as zero refused EVERY GPU
+    # request on the primary pricing path -- two separate fixes combining into
+    # a failure neither produced alone.
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10"
+    )
+    assert table["gpu"].stock_from_tres is False
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1)
+    assert billing.price(req, table, "gpu")["billing_units"] == 10
+
+
+def test_a_tres_token_without_gpus_still_denies_them():
+    # Where the inventory WAS reported, absence of a GPU entry is a real
+    # absence -- which is the exclusion the billing weights cannot make.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5 State=UP"
+        " AllowGroups=ALL TRES=cpu=400,mem=4000G,node=10"
+    )
+    assert table["p"].stock_from_tres is True
+    with pytest.raises(billing.BillingError, match="not known to hold"):
+        billing.price(billing.Request(cpus=4, mem_gb=16, gpus=1), table, "p")
+
+
+def test_a_memory_cap_inside_the_band_is_itself_the_headroom():
+    # MaxMemPerNode is INCLUSIVE; band_end is EXCLUSIVE. Substituting one for
+    # the other subtracted an edge margin from an amount that is itself
+    # requestable: with a 40 GB cap and a 39 GB request, both cost 3 units, yet
+    # the answer came back 39 with no headroom at all.
+    w = billing.Weights(cpu=1.0, mem_per_gb=0.0625, max_mem_per_node_gb=40.0)
+    req = billing.Request(cpus=1, mem_gb=39, nodes=1, nodes_stated=True)
+    out = billing.boundary(req, w)
+    assert out["largest_same_price_mem_gb"] == 40.0
+    assert out["free_headroom_gb"] == 1.0
+    # And it really is the same price, not merely a larger number.
+    assert billing.billing_units(billing.Request(cpus=1, mem_gb=40), w) == billing.billing_units(req, w)
+
+
+def test_a_cap_at_the_request_still_reports_no_headroom():
+    w = billing.Weights(cpu=1.0, mem_per_gb=0.0625, max_mem_per_node_gb=32.0)
+    out = billing.boundary(billing.Request(cpus=1, mem_gb=32, nodes=1, nodes_stated=True), w)
+    assert out["largest_same_price_mem_gb"] == 32.0
+    assert out["free_headroom_gb"] == 0.0
