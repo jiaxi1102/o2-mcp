@@ -175,7 +175,7 @@ class TestPrice:
 
     def test_unknown_partition_refuses_rather_than_guessing(self):
         with pytest.raises(billing.BillingError):
-            billing.price(billing.Request(cpus=1), self.TABLE, "nonexistent")
+            billing.price(billing.Request(cpus=1, mem_gb=4), self.TABLE, "nonexistent")
 
     def test_breakdown_reconciles_to_the_billed_units(self):
         payload = billing.price(billing.Request(cpus=4, mem_gb=6), self.TABLE, "short")
@@ -184,7 +184,7 @@ class TestPrice:
         assert b["pre_floor"] - b["floor_discards"] == pytest.approx(payload["billing_units"])
 
     def test_stale_cache_reports_its_age(self):
-        payload = billing.price(billing.Request(cpus=1), self.TABLE, "short", captured_at=0.0, now=7200.0)
+        payload = billing.price(billing.Request(cpus=1, mem_gb=4), self.TABLE, "short", captured_at=0.0, now=7200.0)
         assert payload["weights"]["age_hours"] == pytest.approx(2.0)
 
     def test_zero_units_is_flagged_not_sold_as_free(self):
@@ -195,7 +195,7 @@ class TestPrice:
         assert any("one-unit minimum" in w for w in payload["warnings"])
 
     def test_time_caveat_is_always_present(self):
-        payload = billing.price(billing.Request(cpus=1), self.TABLE, "short")
+        payload = billing.price(billing.Request(cpus=1, mem_gb=4), self.TABLE, "short")
         assert any("--time" in c for c in payload["caveats"])
 
     def test_alternatives_are_cheaper_and_ordered(self):
@@ -297,3 +297,51 @@ class TestSecondReviewFindings:
 
 class TestThirdReviewFindings:
     """Round three on PR #26: sbatch semantics the parser had not covered."""
+
+
+class TestShapeOnlySurface:
+    """Round eight, the first after the parser was removed. Every finding is
+    now about the shape interface itself rather than sbatch semantics."""
+
+    PER_NODE = billing.parse_weight_table("PartitionName=n TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerNode=8192\n")
+    PER_CPU = billing.parse_weight_table("PartitionName=c TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n")
+
+    def test_per_node_default_requires_a_node_count(self):
+        # DefMemPerNode scales with nodes; assuming one would underprice every
+        # multi-node allocation by the whole per-node default.
+        req = billing.Request(cpus=4, mem_specified=False)
+        with pytest.raises(billing.BillingError, match="per NODE"):
+            billing.resolve_request(req, self.PER_NODE, "n")
+
+    def test_stated_node_count_resolves_the_per_node_default(self):
+        req = billing.Request(cpus=4, mem_specified=False, nodes=3, nodes_stated=True)
+        assert billing.resolve_request(req, self.PER_NODE, "n").mem_gb == pytest.approx(24.0)
+
+    def test_per_cpu_default_needs_no_node_count(self):
+        req = billing.Request(cpus=4, mem_specified=False)
+        assert billing.resolve_request(req, self.PER_CPU, "c").mem_gb == pytest.approx(16.0)
+
+    def test_explicit_zero_memory_is_refused(self):
+        # sbatch reads a zero size as all memory on every allocated node, so it
+        # is not the "no memory term" a caller might intend.
+        req = billing.Request(cpus=4, mem_gb=0, mem_specified=True)
+        with pytest.raises(billing.BillingError, match="zero is not an allocation"):
+            billing.resolve_request(req, self.PER_CPU, "c")
+
+    def test_omitted_memory_is_still_the_partition_default(self):
+        req = billing.Request(cpus=4, mem_gb=0.0, mem_specified=False)
+        assert billing.resolve_request(req, self.PER_CPU, "c").mem_gb == pytest.approx(16.0)
+
+    def test_cache_override_without_a_directory_component(self):
+        # os.makedirs("") raises; a bare filename is a legitimate override.
+        import contextlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                billing.save_weight_cache(self.PER_CPU, 1.0, "bare.json")
+                assert billing.cache_to_table(billing.load_weight_cache("bare.json")) == self.PER_CPU
+            finally:
+                with contextlib.suppress(OSError):
+                    os.chdir(cwd)

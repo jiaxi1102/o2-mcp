@@ -86,12 +86,20 @@ class Weights:
     # Per-model GPU weights, when the site prices accelerators differently.
     gpu_by_model: dict[str, float] | None = None
 
-    def default_mem_gb(self, cpus: float, nodes: float = 1.0) -> float | None:
-        """Memory Slurm would allocate for a request that names none."""
+    def default_mem_gb(self, cpus: float, nodes: float | None = None) -> float | None:
+        """Memory Slurm would allocate for a request that names none.
+
+        DefMemPerCPU needs only the CPU count. DefMemPerNode scales with the
+        NODE count, which a resource shape does not have to state -- and
+        assuming one node would underprice a multi-node allocation by the whole
+        per-node default, so the caller is asked instead of guessed at.
+        """
         if self.def_mem_per_cpu_gb is not None:
             return self.def_mem_per_cpu_gb * cpus
         if self.def_mem_per_node_gb is not None:
-            return self.def_mem_per_node_gb * max(1.0, nodes)
+            if nodes is None:
+                return None
+            return self.def_mem_per_node_gb * nodes
         return None
 
     @property
@@ -110,6 +118,9 @@ class Request:
     mem_gb: float = 0.0
     gpus: float = 0.0
     nodes: float = 1.0
+    # Whether the caller actually said how many nodes. Only DefMemPerNode needs
+    # it, and silently assuming one would underprice every multi-node job.
+    nodes_stated: bool = False
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
@@ -359,7 +370,9 @@ def load_weight_cache(path: str | None = None) -> dict[str, Any] | None:
 
 def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str | None = None) -> None:
     path = cache_path(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:  # a bare filename has no directory to create
+        os.makedirs(parent, exist_ok=True)
     payload = {
         "captured_at": captured_at,
         "partitions": {
@@ -423,9 +436,23 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
+    if req.mem_specified and req.mem_gb <= 0:
+        raise BillingError(
+            "a memory size of zero is not an allocation Slurm makes: sbatch "
+            "reads --mem=0 as all memory on every allocated node, which depends "
+            "on node sizes this weight table does not hold. Give the real size, "
+            "or omit mem_gb to price the partition default."
+        )
     if req.mem_specified:
         return req
-    default = table[partition].default_mem_gb(req.cpus, req.nodes)
+    w = table[partition]
+    default = w.default_mem_gb(req.cpus, req.nodes if req.nodes_stated else None)
+    if default is None and w.def_mem_per_node_gb is not None and not req.nodes_stated:
+        raise BillingError(
+            f"{partition!r} defaults memory per NODE ({w.def_mem_per_node_gb:g} GB), "
+            "so the allocation's memory depends on how many nodes it holds. State "
+            "`nodes`, or give mem_gb explicitly."
+        )
     if default is None:
         raise BillingError(
             f"{partition!r} was given no --mem and no DefMemPerCPU or DefMemPerNode is "

@@ -342,6 +342,14 @@ class PriceJobInput(BaseModel):
         ge=0,
     )
     gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
+    nodes: float | None = Field(
+        default=None,
+        description=(
+            "Nodes the allocation will hold. Needed only when the partition "
+            "defaults memory per node and mem_gb is omitted."
+        ),
+        gt=0,
+    )
     refresh_weights: bool = Field(
         default=False,
         description=(
@@ -948,7 +956,13 @@ def main() -> None:
 
 @mcp.tool(
     name="o2_price_job",
-    annotations={"title": "Price a submission before submitting", "readOnlyHint": True, "openWorldHint": False},
+    annotations={
+        "title": "Price an allocation before submitting",
+        "readOnlyHint": True,
+        # refresh_weights reads scontrol through the broker, so this is not a
+        # closed-world tool even though the common path answers from cache.
+        "openWorldHint": True,
+    },
 )
 async def o2_price_job(params: PriceJobInput) -> str:
     """Compute what an allocation will cost in Slurm billing units, before it runs.
@@ -1016,6 +1030,8 @@ async def o2_price_job(params: PriceJobInput) -> str:
             # Omitting mem_gb means the shape names no memory, which is not the
             # same as requesting none: the partition default applies.
             mem_specified=params.mem_gb is not None,
+            nodes=params.nodes or 1.0,
+            nodes_stated=params.nodes is not None,
         )
 
         try:

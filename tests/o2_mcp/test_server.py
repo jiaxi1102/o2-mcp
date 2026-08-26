@@ -190,7 +190,9 @@ async def test_tool_registry_and_annotations():
     # only when explicitly asked to refresh, so it must never look like a tool
     # that mutates or that requires a connection to answer.
     assert tools["o2_price_job"].annotations.readOnlyHint is True
-    assert tools["o2_price_job"].annotations.openWorldHint is False
+    # refresh_weights reads scontrol through the broker, so the tool reaches
+    # outside itself even though the common path answers from cache.
+    assert tools["o2_price_job"].annotations.openWorldHint is True
 
 
 @pytest.mark.anyio
