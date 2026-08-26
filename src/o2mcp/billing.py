@@ -416,6 +416,11 @@ def _round_below(value: float, places: int = 9) -> float:
     return math.floor(value * scale) / scale
 
 
+# The finest margin worth suggesting below a price edge. Anything smaller is
+# noise against node memory granularity.
+_MIN_STEP_GB = 0.001
+
+
 def _step_for(w: Weights) -> float:
     """How far below a transition to sit.
 
@@ -427,6 +432,25 @@ def _step_for(w: Weights) -> float:
     if w.mem_per_gb <= 0:
         return _EPSILON_GB
     return min(_EPSILON_GB, (1.0 / w.mem_per_gb) / 2.0)
+
+
+def _largest_at_same_price(req: Request, w: Weights, band_end: float) -> float:
+    """The largest memory we would recommend at the request's current price.
+
+    A fixed step below band_end is a deliberate safety margin -- node memory
+    granularity can round a request back over the edge -- but a request already
+    sitting above that step lands BEHIND itself, and then reports none of the
+    same-price capacity it genuinely still has. So the margin adapts: half the
+    distance that actually remains, and finally a hair below the edge.
+    """
+    remaining = band_end - req.mem_gb
+    for step in (_step_for(w), remaining / 2.0, _MIN_STEP_GB):
+        if step <= 0:
+            continue
+        candidate = _round_below(band_end - step)
+        if candidate >= req.mem_gb:
+            return candidate
+    return req.mem_gb
 
 
 def boundary(req: Request, w: Weights) -> dict[str, Any]:
@@ -457,7 +481,7 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     band_start = (units - base) / w.mem_per_gb  # smallest memory still priced at `units`
     band_end = (units + 1 - base) / w.mem_per_gb  # first memory priced one unit higher
 
-    largest_same_price = max(_round_below(band_end - _step_for(w)), req.mem_gb)
+    largest_same_price = _largest_at_same_price(req, w, band_end)
 
     result: dict[str, Any] = {
         "billed": True,
@@ -525,13 +549,25 @@ def load_weight_cache(path: str | None = None) -> dict[str, Any] | None:
     return payload
 
 
-def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str | None = None) -> None:
+def save_weight_cache(
+    table: dict[str, Weights],
+    captured_at: float,
+    path: str | None = None,
+    priority_flags: list[str] | None = None,
+) -> None:
     path = cache_path(path)
     parent = os.path.dirname(path)
     if parent:  # a bare filename has no directory to create
         os.makedirs(parent, exist_ok=True)
     payload = {
         "captured_at": captured_at,
+        # Cluster-global, not per-partition: PriorityFlags decides whether
+        # Billing is the SUM of weighted TRES or their MAX, and this module
+        # only implements the sum. None means the flags were never captured,
+        # which is not the same as "no flags".
+        "priority_flags": (
+            None if priority_flags is None else sorted({f.strip().upper() for f in priority_flags if f.strip()})
+        ),
         "partitions": {
             name: {
                 "cpu": w.cpu,
@@ -600,6 +636,47 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
         except (TypeError, ValueError):
             continue
     return table
+
+
+def unsupported_billing_model(payload: dict[str, Any]) -> str | None:
+    """Why the cached configuration cannot be priced here, or None.
+
+    Everything in this module computes floor(weighted SUM). Under
+    PriorityFlags=MAX_TRES Slurm bills the MAXIMUM weighted TRES instead, and
+    the two give opposite advice: with CPU and memory contributions of four
+    units each, the sum says eight and the max says four, and trimming a
+    non-dominant TRES saves nothing at all. The partition weights alone cannot
+    reveal this -- the flag is global -- so it is captured with them.
+
+    An absent record is refused rather than assumed, because assuming is how a
+    confident wrong number reaches an approval.
+    """
+    flags = payload.get("priority_flags")
+    if flags is None:
+        return (
+            "the cached weights predate PriorityFlags capture, so whether this "
+            "cluster bills the SUM or the MAX of weighted TRES is unknown -- and "
+            "the two imply opposite advice about memory. Run "
+            "o2_refresh_billing_weights to record it."
+        )
+    if "MAX_TRES" in {str(f).upper() for f in flags}:
+        return (
+            "this cluster sets PriorityFlags=MAX_TRES, so Slurm bills the MAXIMUM "
+            "weighted TRES rather than their sum. This tool computes the sum, and "
+            "the memory-boundary reasoning it exists to support does not hold "
+            "under MAX_TRES: trimming a non-dominant TRES saves nothing and only "
+            "removes headroom. Right-size the dominant TRES instead."
+        )
+    return None
+
+
+def parse_priority_flags(text: str) -> list[str]:
+    """PriorityFlags from `scontrol show config` output."""
+    for line in text.splitlines():
+        if line.strip().startswith("PriorityFlags"):
+            _, _, value = line.partition("=")
+            return [f.strip().upper() for f in value.split(",") if f.strip()]
+    return []
 
 
 def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> Request:

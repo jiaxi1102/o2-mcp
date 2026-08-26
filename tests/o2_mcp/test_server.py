@@ -843,6 +843,7 @@ async def test_price_job_reports_cheaper_partitions_for_the_same_request(monkeyp
             "PartitionName=gpu_requeue TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1\n"
         ),
         captured_at=1000.0,
+        priority_flags=[],
     )
     payload = await _call(
         "o2_price_job",
@@ -863,6 +864,7 @@ async def test_price_job_direct_call_without_memory_uses_the_partition_default(m
     billing.save_weight_cache(
         billing.parse_weight_table("PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n"),
         captured_at=1000.0,
+        priority_flags=[],
     )
     payload = await _call("o2_price_job", {"params": {"partition": "short", "cpus": 4}})
     assert payload["ok"] is True
@@ -879,6 +881,7 @@ async def test_price_job_refuses_an_unknown_partition(monkeypatch, tmp_path):
     billing.save_weight_cache(
         billing.parse_weight_table("PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"),
         captured_at=1000.0,
+        priority_flags=[],
     )
     payload = await _call("o2_price_job", {"params": {"partition": "made_up", "cpus": 1}})
     assert payload["ok"] is False
@@ -911,7 +914,9 @@ async def test_pricing_never_writes_the_weight_cache(tmp_path, monkeypatch):
     """The readOnly claim, checked against behaviour rather than the annotation."""
     cache = tmp_path / "weights.json"
     monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(cache))
-    billing.save_weight_cache({"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}, 1.0, str(cache))
+    billing.save_weight_cache(
+        {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}, 1.0, str(cache), priority_flags=[]
+    )
     before = cache.read_bytes()
     payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=2, mem_gb=16)))
     assert payload["ok"] is True

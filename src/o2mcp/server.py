@@ -1011,6 +1011,16 @@ async def o2_price_job(params: PriceJobInput) -> str:
                     "no connection at all."
                 ),
             }
+        unsupported = billing.unsupported_billing_model(cached)
+        if unsupported:
+            # Refused before any number is produced: a price computed under the
+            # wrong model is not a smaller error than no price, it is a
+            # confident one that reaches an approval.
+            return {
+                "ok": False,
+                "error": "unsupported_billing_model",
+                "message": unsupported,
+            }
         table = billing.cache_to_table(cached)
         captured_at = cached.get("captured_at")
 
@@ -1085,11 +1095,29 @@ async def o2_refresh_billing_weights(params: RefreshWeightsInput) -> str:
                     "scontrol returned no partitions with billing weights; the " "existing cache was left untouched."
                 ),
             }
+        # PriorityFlags is cluster-global and decides whether Billing is the SUM
+        # of weighted TRES or their MAX. Weights alone cannot reveal it, and the
+        # two imply opposite advice about memory, so the flags are captured with
+        # the weights or the cache is not written at all.
+        flags_result = _connection().run("scontrol show config", timeout=30.0)
+        if not flags_result.ok:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": (
+                    "Read the partition weights but not PriorityFlags ({}), which "
+                    "decides whether billing sums or maximises the weighted TRES. "
+                    "The existing cache was left untouched.".format((flags_result.stderr or "").strip()[:120])
+                ),
+            }
+        priority_flags = billing.parse_priority_flags(flags_result.stdout)
         captured_at = time.time()
-        billing.save_weight_cache(table, captured_at)
+        billing.save_weight_cache(table, captured_at, priority_flags=priority_flags)
         return {
             "ok": True,
             "captured_at": captured_at,
+            "priority_flags": priority_flags,
+            "billing_model": "max" if "MAX_TRES" in priority_flags else "sum",
             "partitions": sorted(table),
             "unpriceable": {name: w.unpriceable_tres for name, w in sorted(table.items()) if w.unpriceable_tres},
         }

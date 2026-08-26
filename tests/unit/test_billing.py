@@ -674,3 +674,59 @@ def test_headroom_below_a_band_edge_is_still_offered():
     assert billing.billing_units(
         billing.Request(cpus=4, mem_gb=out["largest_same_price_mem_gb"]), w
     ) == billing.billing_units(req, w)
+
+
+def test_max_tres_is_refused_rather_than_summed():
+    # Under PriorityFlags=MAX_TRES Slurm bills the MAXIMUM weighted TRES, not
+    # the sum: CPU and memory contributions of 4 each are 8 by this module's
+    # arithmetic and 4 by Slurm's. The two imply opposite advice about memory,
+    # so a sum-shaped price here would be confidently wrong.
+    assert billing.unsupported_billing_model({"priority_flags": ["MAX_TRES"]}) is not None
+    assert "MAX_TRES" in billing.unsupported_billing_model({"priority_flags": ["MAX_TRES"]})
+    assert billing.unsupported_billing_model({"priority_flags": ["NO_FAIR_TREE"]}) is None
+    assert billing.unsupported_billing_model({"priority_flags": []}) is None
+
+
+def test_uncaptured_priority_flags_are_refused_not_assumed():
+    # A cache written before the flags were captured cannot say which model
+    # applies. Assuming the sum is how a confident wrong number reaches an
+    # approval, so it refuses and names the one command that fixes it.
+    reason = billing.unsupported_billing_model({"captured_at": 1.0})
+    assert reason is not None
+    assert "o2_refresh_billing_weights" in reason
+
+
+def test_priority_flags_are_parsed_from_scontrol_config():
+    text = (
+        "AccountingStorageType    = accounting_storage/slurmdbd\n"
+        "PriorityFlags           = NO_FAIR_TREE,MAX_TRES\n"
+        "PriorityType            = priority/multifactor\n"
+    )
+    assert billing.parse_priority_flags(text) == ["NO_FAIR_TREE", "MAX_TRES"]
+    assert billing.parse_priority_flags("PriorityType = priority/basic\n") == []
+
+
+def test_flags_round_trip_through_the_weight_cache():
+    import time as _time
+
+    table = {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "w.json")
+        billing.save_weight_cache(table, _time.time(), path, priority_flags=["max_tres"])
+        payload = billing.load_weight_cache(path)
+    assert payload["priority_flags"] == ["MAX_TRES"]
+    assert billing.unsupported_billing_model(payload) is not None
+
+
+def test_same_price_headroom_is_preserved_above_the_fixed_step():
+    # 10.75 GB at CPU=1, Mem=1G costs 11 units and stays there until 11 GB. A
+    # fixed half-block margin lands behind the request; clamping to the request
+    # merely reported zero headroom for capacity that genuinely exists.
+    w = billing.Weights(cpu=1.0, mem_per_gb=1.0)
+    req = billing.Request(cpus=1, mem_gb=10.75)
+    out = billing.boundary(req, w)
+    assert out["largest_same_price_mem_gb"] > req.mem_gb
+    assert out["free_headroom_gb"] > 0
+    assert billing.billing_units(
+        billing.Request(cpus=1, mem_gb=out["largest_same_price_mem_gb"]), w
+    ) == billing.billing_units(req, w)
