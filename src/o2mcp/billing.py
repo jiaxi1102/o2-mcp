@@ -489,17 +489,23 @@ def _unpriceable_gpu_reason(req: Request, w: Weights) -> str | None:
 
 
 def gpu_weight_for(req: Request, w: Weights) -> float:
-    """The GPU weight that applies to this request.
+    """The GPU weight per accelerator for this request.
 
-    A site may price accelerators per model. Capturing those weights without
-    consulting them charges an A100 at whatever the generic entry says -- or at
-    another model's rate -- so the named model wins when one is given.
+    A typed GRES allocation also allocates the generic GRES -- an A100 job
+    holds gres/gpu AND gres/gpu:a100 -- and TRESBillingWeights is summed across
+    every TRES held. So a site configuring both charges both, and returning the
+    typed weight INSTEAD of the generic one undercharged every model-priced GPU
+    by the whole generic rate.
+
+    Capturing per-model weights without consulting them was the original error
+    here; replacing rather than adding was the overcorrection.
     """
+    weight = w.gpu
     if req.gpu_model and w.gpu_by_model:
         by_model = w.gpu_by_model.get(_model_key(req.gpu_model))
         if by_model is not None:
-            return by_model
-    return w.gpu
+            weight += by_model
+    return weight
 
 
 def _exact(value: float) -> Decimal:

@@ -426,13 +426,16 @@ class TestModelWeightsAndWholeCounts:
     )
     PLAIN = billing.parse_weight_table("PartitionName=q TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n")
 
-    def test_named_model_is_priced_at_its_own_weight(self):
-        # The per-model weights were captured two rounds ago and never read, so
-        # an A100 was charged the generic rate.
+    def test_named_model_adds_its_weight_to_the_generic_one(self):
+        # A typed GRES allocation ALSO allocates the generic GRES, and billing
+        # weights are summed over every TRES held -- so a site configuring both
+        # charges both. Reading the typed weight instead of the generic one
+        # undercharged every model-priced GPU by the whole generic rate.
         generic = billing.Request(cpus=4, mem_gb=16, gpus=1)
         a100 = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
         assert billing.billing_units(generic, self.TYPED["p"]) == 10
-        assert billing.billing_units(a100, self.TYPED["p"]) == 15
+        # 4 CPU + 1 mem + (5 generic + 10 typed) = 20
+        assert billing.billing_units(a100, self.TYPED["p"]) == 20
 
     def test_unnamed_model_uses_the_generic_weight(self):
         req = billing.Request(cpus=4, mem_gb=16, gpus=1)
@@ -441,8 +444,8 @@ class TestModelWeightsAndWholeCounts:
     def test_model_reaches_the_breakdown_and_the_boundary(self):
         a100 = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
         payload = billing.price(a100, self.TYPED, "p")
-        assert payload["breakdown"]["gpu"] == pytest.approx(10.0)
-        # base = 4 CPU + 10 GPU, so the memory band starts one unit up from 14
+        assert payload["breakdown"]["gpu"] == pytest.approx(15.0)
+        # base = 4 CPU + 15 GPU, so the memory band starts one unit up from 19
         assert payload["boundary"]["on_price_edge"] is True
 
     def test_unpriced_model_is_refused_not_defaulted(self):
@@ -509,8 +512,8 @@ def test_partition_default_memory_keeps_the_model():
     resolved = billing.resolve_request(req, table, "gpu")
     assert resolved.gpu_model == "a100"
     assert resolved.mem_gb == 8.0
-    # 2 CPU + 8 GB*0.0625 + 1 a100*10 = 12.5 -> 12. Generic would give 7.
-    assert billing.billing_units(resolved, table["gpu"]) == 12
+    # 2 CPU + 8 GB*0.0625 + (5 generic + 10 typed) = 17.5 -> 17.
+    assert billing.billing_units(resolved, table["gpu"]) == 17
 
 
 def test_fractional_nodes_are_refused_like_cpus_and_gpus():
@@ -603,7 +606,9 @@ def test_the_reported_weight_is_the_one_the_charge_used():
     table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0})}
     req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
     out = billing.price(req, table, "gpu")
-    assert out["weights"]["gpu"] == 10.0
+    # The effective per-GPU weight is generic + typed, which is what the
+    # breakdown was computed from.
+    assert out["weights"]["gpu"] == 15.0
     assert out["weights"]["gpu_generic"] == 5.0
     assert out["weights"]["gpu_model"] == "a100"
     assert out["request"]["gpu_model"] == "a100"
@@ -1325,3 +1330,43 @@ def test_resolution_is_idempotent_across_every_path():
         once = billing.resolve_request(req, table, part)
         twice = billing.resolve_request(once, table, part)
         assert once == twice, (part, once, twice)
+
+
+def test_a_typed_gpu_is_charged_generic_plus_typed():
+    # Slurm allocates the generic GRES alongside the typed one -- an A100 job
+    # holds gres/gpu AND gres/gpu:a100 -- and TRESBillingWeights sums over every
+    # TRES held. A site configuring both therefore charges both.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5,GRES/gpu:a100=10"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=8,gres/gpu:a100=8"
+        " State=UP AllowGroups=ALL"
+    )
+    w = table["p"]
+    assert billing.gpu_weight_for(billing.Request(gpus=1), w) == 5.0
+    assert billing.gpu_weight_for(billing.Request(gpus=1, gpu_model="a100"), w) == 15.0
+    # Two A100s are charged twice the combined rate, not twice the typed rate.
+    two = billing.Request(cpus=0, mem_gb=0, gpus=2, gpu_model="a100")
+    assert billing.billing_units(two, w) == 30
+
+
+def test_a_site_with_only_typed_weights_charges_only_those():
+    # No generic entry means no generic contribution to add.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,GRES/gpu:a100=10"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu:a100=8 State=UP AllowGroups=ALL"
+    )
+    assert billing.gpu_weight_for(billing.Request(gpus=1, gpu_model="a100"), table["p"]) == 10.0
+
+
+def test_the_price_job_schema_states_what_mem_gb_means():
+    # The skills say --mem is per node and mem_gb is the total, but the schema
+    # is what an agent reads at the call site. "Memory in GB" alone let a
+    # two-node --mem=32G job be priced at half its allocation.
+    from o2mcp.server import PriceJobInput
+
+    mem = PriceJobInput.model_fields["mem_gb"].description
+    assert "TOTAL" in mem
+    assert "per NODE" in mem
+    nodes = PriceJobInput.model_fields["nodes"].description
+    assert "whenever the submission" in nodes
+    assert "MaxNodes" in nodes

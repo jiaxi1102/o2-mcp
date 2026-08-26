@@ -336,8 +336,13 @@ class PriceJobInput(BaseModel):
     mem_gb: float | None = Field(
         default=None,
         description=(
-            "Memory in GB. Omit only to price the partition's configured "
-            "default; omitting it does not mean a request for no memory."
+            "TOTAL memory in GB across the whole allocation. sbatch's --mem is "
+            "per NODE, so a two-node job written --mem=32G holds 64 here; "
+            "--mem-per-cpu multiplies out the same way. Passing the directive "
+            "unchanged halves the charge and moves every boundary. Omit only to "
+            "price the partition's configured default; omitting it does not "
+            "mean a request for no memory, and 0 is not accepted because sbatch "
+            "reads --mem=0 as all memory on every node."
         ),
         ge=0,
     )
@@ -351,8 +356,12 @@ class PriceJobInput(BaseModel):
     nodes: float | None = Field(
         default=None,
         description=(
-            "Nodes the allocation will hold. Needed only when the partition "
-            "defaults memory per node and mem_gb is omitted."
+            "Nodes the allocation will hold. Give it whenever the submission "
+            "pins a node count: it is what lets MinNodes, MaxNodes and the "
+            "per-node CPU and memory caps be checked, and what bounds the "
+            "headroom this reports. Required when the partition defaults "
+            "memory per node and mem_gb is omitted, since that default is per "
+            "node and cannot be multiplied out without it."
         ),
         gt=0,
     )
