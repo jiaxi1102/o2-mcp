@@ -562,3 +562,78 @@ class TestDeliberateOptionPass:
             billing.save_weight_cache(table, 1.0, path)
             restored = billing.cache_to_table(billing.load_weight_cache(path))
         assert restored["priv"].unrestricted is False
+
+
+class TestSpecialValuesAndConfigInteractions:
+    """Round five: special option VALUES and partition-config interactions --
+    a different class from the option-surface pass, and one the same
+    parse-or-refuse framework absorbs."""
+
+    CAPPED = billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G MaxMemPerCPU=8192\n")
+
+    def test_zero_memory_is_refused_in_every_spelling(self):
+        # Slurm reads a zero size as "all memory on every allocated node".
+        for script in ("#SBATCH --mem=0\n", "#SBATCH --mem 0\n", "#SBATCH --mem=0G\n"):
+            req = billing.parse_sbatch(script)
+            assert [o for o, _ in req.unpriceable] == ["--mem=0"], script
+            with pytest.raises(billing.BillingError, match="cannot be priced"):
+                billing.resolve_request(req, self.CAPPED, "p")
+
+    def test_a_real_memory_size_is_not_mistaken_for_zero(self):
+        assert billing.parse_sbatch("#SBATCH --mem=10G\n").unpriceable == []
+
+    def test_heterogeneous_components_are_refused_not_merged(self):
+        # Folding components into one set of scalars prices neither: later
+        # directives simply overwrite earlier ones.
+        req = billing.parse_sbatch("#SBATCH -c 4\n#SBATCH --mem=16G\n#SBATCH hetjob\n#SBATCH --gres=gpu:1\n")
+        assert [o for o, _ in req.unpriceable] == ["hetjob"]
+        with pytest.raises(billing.BillingError, match="hetjob"):
+            billing.resolve_request(req, self.CAPPED, "p")
+
+    def test_max_mem_per_cpu_raises_the_billed_cpu_count(self):
+        # Slurm preserves the memory per task and adds CPUs, so the CPU term is
+        # billed at the raised count rather than the one written.
+        req = billing.parse_sbatch("#SBATCH --ntasks=1\n#SBATCH --mem-per-cpu=64G\n")
+        assert req.cpus == 1
+        resolved = billing.resolve_request(req, self.CAPPED, "p")
+        assert resolved.cpus == 8
+        assert any("MaxMemPerCPU" in w for w in resolved.warnings)
+
+    def test_request_under_the_cap_is_untouched(self):
+        req = billing.parse_sbatch("#SBATCH --ntasks=2\n#SBATCH --mem-per-cpu=4G\n")
+        assert billing.resolve_request(req, self.CAPPED, "p").cpus == 2
+
+    def test_cap_scales_with_the_task_count(self):
+        req = billing.parse_sbatch("#SBATCH --ntasks=3\n#SBATCH --mem-per-cpu=16G\n")
+        assert billing.resolve_request(req, self.CAPPED, "p").cpus == 6
+
+    def test_max_mem_per_cpu_survives_the_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "w.json")
+            billing.save_weight_cache(self.CAPPED, 1.0, path)
+            restored = billing.cache_to_table(billing.load_weight_cache(path))
+        assert restored["p"].max_mem_per_cpu_gb == pytest.approx(8.0)
+
+    def test_gpu_request_skips_partitions_that_do_not_bill_gpus(self):
+        table = billing.parse_weight_table(
+            "PartitionName=cpu TRESBillingWeights=CPU=0.1,Mem=0.00625G\n"
+            "PartitionName=gpu TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n"
+        )
+        assert billing.alternatives(billing.Request(cpus=4, mem_gb=8, gpus=1), table, "gpu") == []
+        # A CPU-only request may still legitimately move to the cheap partition.
+        assert billing.alternatives(billing.Request(cpus=4, mem_gb=8), table, "gpu")[0]["partition"] == "cpu"
+
+    def test_array_price_is_labelled_per_element(self):
+        # Slurm creates a job record per index, so equal-runtime elements accrue
+        # the quoted figure once each.
+        payload = billing.price(
+            billing.parse_sbatch("#SBATCH --array=1-100\n#SBATCH -c 2\n#SBATCH --mem=15G\n"),
+            self.CAPPED,
+            "p",
+        )
+        assert payload["array"]["spec"] == "1-100"
+        assert "PER ELEMENT" in payload["array"]["note"]
+
+    def test_non_array_result_carries_no_array_block(self):
+        payload = billing.price(billing.parse_sbatch("#SBATCH -c 2\n#SBATCH --mem=15G\n"), self.CAPPED, "p")
+        assert "array" not in payload

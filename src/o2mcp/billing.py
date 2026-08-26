@@ -73,6 +73,9 @@ class Weights:
     # here, so a restricted partition is "unknown", never "available".
     state_up: bool = True
     unrestricted: bool = True
+    # Slurm caps --mem-per-cpu at this and adds CPUs to preserve the memory the
+    # task asked for, so it changes the billed CPU count, not just the memory.
+    max_mem_per_cpu_gb: float | None = None
 
     def default_mem_gb(self, cpus: float, nodes: float = 1.0) -> float | None:
         """Memory Slurm would allocate for a request that names none."""
@@ -109,6 +112,10 @@ class Request:
     unpriceable: list[tuple[str, str]] = field(default_factory=list)
     # Each array task is billed as its own job; this price is per task.
     array_spec: str | None = None
+    # Retained so a MaxMemPerCPU cap can be reproduced: Slurm keeps the memory
+    # per task and raises the CPU count instead.
+    mem_per_cpu_gb: float | None = None
+    tasks: float = 1.0
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
@@ -157,6 +164,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         cpu, mem, gpu = 1.0, 0.0, 0.0
         def_cpu = def_node = None
         state_up, unrestricted = True, True
+        max_mem_cpu = None
         for token in line.split():
             # scontrol prints these as megabytes, and 0/UNLIMITED means "not set".
             if token.startswith("DefMemPerCPU="):
@@ -171,6 +179,10 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("AllowAccounts=") :]
                 if value and value.upper() != "ALL":
                     unrestricted = False
+            elif token.startswith("MaxMemPerCPU="):
+                value = token[len("MaxMemPerCPU=") :]
+                if value.isdigit() and int(value) > 0:
+                    max_mem_cpu = int(value) / 1024.0
             elif token.startswith("DefMemPerNode="):
                 value = token[len("DefMemPerNode=") :]
                 if value.isdigit() and int(value) > 0:
@@ -206,6 +218,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             def_mem_per_node_gb=def_node,
             state_up=state_up,
             unrestricted=unrestricted,
+            max_mem_per_cpu_gb=max_mem_cpu,
         )
     return table
 
@@ -230,6 +243,11 @@ UNPRICEABLE_OPTIONS = {
     "--threads-per-core": "changes how many CPUs a core contributes",
     "--extra-node-info": "specifies sockets/cores/threads of the chosen nodes",
     "--overcommit": "decouples the CPU allocation from the task count",
+    "--mem=0": "means all memory on every allocated node, which needs node sizes",
+    "hetjob": (
+        "separates heterogeneous components, each with its own allocation; "
+        "folding them into one set of numbers prices neither"
+    ),
 }
 
 
@@ -285,6 +303,7 @@ def parse_sbatch(text: str) -> Request:
     cpus_per_task = cpus_per_gpu = None
     mem_gb = mem_per_cpu = mem_per_gpu = None
     total_gpus = gpus_per_node = gpus_per_task = None
+    zero_mem = False
 
     def note_unpriceable(flag: str) -> None:
         if flag not in [o for o, _ in req.unpriceable]:
@@ -295,7 +314,10 @@ def parse_sbatch(text: str) -> Request:
 
     for chunk in prologue:
         for flag in UNPRICEABLE_OPTIONS:
-            if mentions(chunk, flag):
+            # Only bare option flags are found by scanning; entries keyed on a
+            # value (--mem=0) or a separator word (hetjob) are detected where
+            # they are actually parsed, so a variant spelling cannot slip past.
+            if flag.startswith("-") and "=" not in flag and mentions(chunk, flag):
                 note_unpriceable(flag)
         # Short forms of the same options.
         if mentions(chunk, "-O"):
@@ -321,6 +343,10 @@ def parse_sbatch(text: str) -> Request:
             elif key == "--cpus-per-gpu":
                 cpus_per_gpu = float(token)
             elif key == "--mem":
+                if float(re.match(r"^([0-9.]+)", token).group(1)) == 0:
+                    # Slurm reads a zero size as "all memory on every allocated
+                    # node", which is a topology fact the weight table lacks.
+                    zero_mem = True
                 mem_gb = to_gb(token)
             elif key == "--mem-per-cpu":
                 mem_per_cpu = to_gb(token)
@@ -341,6 +367,10 @@ def parse_sbatch(text: str) -> Request:
             elif key in ("--array", "-a"):
                 req.array_spec = token
 
+    if zero_mem:
+        note_unpriceable("--mem=0")
+    if any(c.strip() == "hetjob" for c in prologue):
+        note_unpriceable("hetjob")
     req.nodes = nodes
     req.nodes_is_range = nodes_range
     req.exclusive = any(o == "--exclusive" for o, _ in req.unpriceable)
@@ -373,6 +403,8 @@ def parse_sbatch(text: str) -> Request:
     else:
         req.cpus = tasks
 
+    req.tasks = tasks
+    req.mem_per_cpu_gb = mem_per_cpu
     if mem_gb is not None:
         req.mem_gb, req.mem_source, req.mem_specified = mem_gb, "--mem", True
     elif mem_per_cpu is not None:
@@ -533,6 +565,7 @@ def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str |
                 "def_mem_per_node_gb": w.def_mem_per_node_gb,
                 "state_up": w.state_up,
                 "unrestricted": w.unrestricted,
+                "max_mem_per_cpu_gb": w.max_mem_per_cpu_gb,
             }
             for name, w in table.items()
         },
@@ -557,10 +590,47 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 def_mem_per_node_gb=None if def_node is None else float(def_node),
                 state_up=bool(entry.get("state_up", True)),
                 unrestricted=bool(entry.get("unrestricted", True)),
+                max_mem_per_cpu_gb=(
+                    None if entry.get("max_mem_per_cpu_gb") is None else float(entry["max_mem_per_cpu_gb"])
+                ),
             )
         except (TypeError, ValueError):
             continue
     return table
+
+
+def _apply_max_mem_per_cpu(req: Request, w: Weights) -> Request:
+    """Reproduce Slurm's MaxMemPerCPU adjustment.
+
+    Where a partition caps memory per CPU, Slurm does not shrink the memory a
+    task asked for -- it raises the CPU count until the request fits under the
+    cap. That changes the BILLED CPUs, so a request written as one task at
+    64 GB/CPU against an 8 GB cap is allocated, and charged for, eight.
+    """
+    cap = w.max_mem_per_cpu_gb
+    if not cap or not req.mem_per_cpu_gb or req.mem_per_cpu_gb <= cap:
+        return req
+    needed_per_task = math.ceil(req.mem_per_cpu_gb / cap)
+    cpus = max(req.cpus, req.tasks * needed_per_task)
+    if cpus <= req.cpus:
+        return req
+    note = (
+        f"--mem-per-cpu={req.mem_per_cpu_gb:g} GB exceeds this partition's MaxMemPerCPU of {cap:g} GB, so "
+        f"Slurm raises the CPU count to {cpus:g} to preserve the memory per task. The "
+        "CPU term is billed at that raised count, not the one written."
+    )
+    return Request(
+        cpus=cpus,
+        mem_gb=req.mem_gb,
+        gpus=req.gpus,
+        nodes=req.nodes,
+        mem_specified=req.mem_specified,
+        mem_source=req.mem_source,
+        warnings=[*req.warnings, note],
+        tasks=req.tasks,
+        mem_per_cpu_gb=req.mem_per_cpu_gb,
+        array_spec=req.array_spec,
+    )
 
 
 def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> Request:
@@ -595,8 +665,9 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "understate every job that receives more. Fix the node count, or "
             "price a specific size explicitly."
         )
+    w = table[partition]
     if req.mem_specified:
-        return req
+        return _apply_max_mem_per_cpu(req, w)
     default = table[partition].default_mem_gb(req.cpus, req.nodes)
     if default is None:
         raise BillingError(
@@ -605,7 +676,7 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "bill -- is unknown. Refresh the weight cache while connected, or "
             "state the memory explicitly."
         )
-    return Request(
+    resolved = Request(
         cpus=req.cpus,
         mem_gb=default,
         gpus=req.gpus,
@@ -613,7 +684,11 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
         mem_specified=True,
         mem_source=f"partition default ({partition})",
         warnings=list(req.warnings),
+        tasks=req.tasks,
+        mem_per_cpu_gb=req.mem_per_cpu_gb,
+        array_spec=req.array_spec,
     )
+    return _apply_max_mem_per_cpu(resolved, w)
 
 
 def price(
@@ -652,6 +727,15 @@ def price(
         ],
         "warnings": list(req.warnings),
     }
+    if req.array_spec:
+        payload["array"] = {
+            "spec": req.array_spec,
+            "note": (
+                "Slurm creates a separate job record per array index, so this "
+                "price is PER ELEMENT. Multiply by the number of indices for "
+                "the batch's total."
+            ),
+        }
     if units == 0 and pre > 0:
         # Whether a site clamps a positive rate up to one whole unit is not
         # discoverable from scontrol, and no sub-1.0 shape has ever been
@@ -687,6 +771,11 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
         # Offering a partition the caller cannot submit to wastes their time and
         # invites a resubmission that will be rejected.
         if not w.state_up or not w.unrestricted:
+            continue
+        # A GPU request cannot run where GPUs are not a billed resource. That is
+        # a proxy for "has no GPUs" rather than proof, so it can only exclude a
+        # suggestion -- never manufacture one.
+        if req.gpus > 0 and w.gpu <= 0:
             continue
         units = billing_units(req, w)
         if units < now_units:
