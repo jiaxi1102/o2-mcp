@@ -107,6 +107,9 @@ class Weights:
     # and nodes and say nothing about accelerators, so absence of a GPU entry
     # means "not reported" there and "genuinely none" here.
     stock_from_tres: bool = False
+    # OverSubscribe=EXCLUSIVE: the job gets whole nodes, so its billing TRES is
+    # the hardware's, not the request's, and no shape can be priced here.
+    exclusive: bool = False
     # Per-JOB limits, distinct from the aggregate inventory above: a partition
     # can hold a hundred nodes and still cap one job at a single node, require
     # at least two, or cap what any single node will give a job.
@@ -243,6 +246,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
         # different answers, and only one of them permits a suggestion.
         stock: dict[str, float] | None = None
         stock_from_tres = False
+        exclusive = False
         total_cpus: float | None = None
         total_nodes: float | None = None
         max_nodes: float | None = None
@@ -299,6 +303,13 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("DenyQos=") :]
                 if value and value.upper() not in ("", "(NULL)", "NONE"):
                     unrestricted = False
+            elif token.startswith("OverSubscribe="):
+                # EXCLUSIVE gives a job whole NODES, so its billing TRES comes
+                # from the hardware Slurm picks rather than from the request.
+                # UNPRICEABLE_OPTIONS already says exactly this about the
+                # per-job --exclusive; the partition-level setting is the same
+                # fact arriving from the other direction.
+                exclusive = token[len("OverSubscribe=") :].strip().upper().startswith("EXCLUSIVE")
             elif token.startswith("RootOnly="):
                 # Only root may initiate a job here, and pricing carries no user
                 # identity -- so eligibility is unknown, as with QoS or accounts.
@@ -415,6 +426,7 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
             unpriceable_tres=unpriceable or None,
             stock=stock,
             stock_from_tres=stock_from_tres,
+            exclusive=exclusive,
             max_nodes=max_nodes,
             min_nodes=min_nodes,
             max_cpus_per_node=max_cpus_per_node,
@@ -747,6 +759,7 @@ def save_weight_cache(
                 "unpriceable_tres": w.unpriceable_tres,
                 "stock": w.stock,
                 "stock_from_tres": w.stock_from_tres,
+                "exclusive": w.exclusive,
                 "max_nodes": w.max_nodes,
                 "min_nodes": w.min_nodes,
                 "max_cpus_per_node": w.max_cpus_per_node,
@@ -805,6 +818,7 @@ def cache_to_table(payload: dict[str, Any]) -> dict[str, Weights]:
                 unpriceable_tres=_float_map(entry.get("unpriceable_tres")),
                 stock=_float_map(entry.get("stock")),
                 stock_from_tres=bool(entry.get("stock_from_tres", False)),
+                exclusive=bool(entry.get("exclusive", False)),
                 max_nodes=(None if entry.get("max_nodes") is None else float(entry["max_nodes"])),
                 min_nodes=(None if entry.get("min_nodes") is None else float(entry["min_nodes"])),
                 max_cpus_per_node=(
@@ -1106,6 +1120,12 @@ def cannot_hold_reason(req: Request, w: Weights) -> str | None:
     produced it, and so the same wording serves the priced partition and the
     alternatives list.
     """
+    if w.exclusive:
+        return (
+            "allocates whole nodes (OverSubscribe=EXCLUSIVE), so the billing "
+            "TRES comes from the hardware Slurm picks and not from this request "
+            "-- the same reason --exclusive cannot be priced"
+        )
     stock = w.stock or {}
     if req.cpus > 0 and "cpu" in stock and stock["cpu"] < req.cpus:
         return f"holds {stock['cpu']:g} CPUs and the request wants {req.cpus:g}"

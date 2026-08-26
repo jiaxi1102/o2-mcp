@@ -1385,3 +1385,53 @@ def test_the_price_job_schema_states_what_mem_gb_means():
     nodes = PriceJobInput.model_fields["nodes"].description
     assert "whenever the submission" in nodes
     assert "MaxNodes" in nodes
+
+
+def test_an_exclusive_partition_cannot_be_priced():
+    # OverSubscribe=EXCLUSIVE gives a job whole NODES, so its billing TRES
+    # comes from the hardware Slurm picks rather than the request.
+    # UNPRICEABLE_OPTIONS already says exactly this about the per-job
+    # --exclusive; the partition-level setting is the same fact from the other
+    # direction, and pricing it produced a number for an allocation nobody
+    # asked for.
+    table = billing.parse_weight_table(
+        "PartitionName=norm TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL OverSubscribe=NO\n"
+        "PartitionName=excl TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+        " OverSubscribe=EXCLUSIVE\n"
+    )
+    assert table["excl"].exclusive is True
+    assert table["norm"].exclusive is False
+    req = billing.Request(cpus=4, mem_gb=16)
+    with pytest.raises(billing.BillingError, match="OverSubscribe=EXCLUSIVE"):
+        billing.price(req, table, "excl")
+    # And never advertised as a cheaper destination, for the same reason.
+    assert billing.alternatives(req, table, "norm") == []
+
+
+def test_other_oversubscribe_settings_price_normally():
+    # Only EXCLUSIVE changes what the allocation is; YES/FORCE/NO share nodes
+    # but still allocate the requested shape.
+    for setting in ("NO", "YES:4", "FORCE:2"):
+        table = billing.parse_weight_table(
+            "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G"
+            " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+            f" OverSubscribe={setting}"
+        )
+        assert table["p"].exclusive is False, setting
+        assert billing.price(billing.Request(cpus=4, mem_gb=16), table, "p")["billing_units"] == 5
+
+
+def test_the_exclusive_flag_survives_the_cache():
+    import time as _time
+
+    table = billing.parse_weight_table(
+        "PartitionName=excl TRESBillingWeights=CPU=1,Mem=0.0625G State=UP"
+        " AllowGroups=ALL OverSubscribe=EXCLUSIVE TotalCPUs=400 TotalNodes=10"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "w.json")
+        billing.save_weight_cache(table, _time.time(), path)
+        back = billing.cache_to_table(billing.load_weight_cache(path))
+    assert back["excl"].exclusive is True
