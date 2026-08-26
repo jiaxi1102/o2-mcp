@@ -450,3 +450,115 @@ class TestThirdReviewFindings:
         assert billing.parse_weight_table("PartitionName=p TRESBillingWeights=CPU=1.0,Mem=1T\n")[
             "p"
         ].mem_per_gb == pytest.approx(1.0 / 1024)
+
+
+class TestDeliberateOptionPass:
+    """One pass over sbatch's resource options instead of one per review round.
+
+    The contract this pins is not "every option is parsed" but "every option is
+    either computed or refused" -- an unpriceable script is a complete answer, a
+    wrongly-priced one is not.
+    """
+
+    TABLE = {"p": SHORT}
+
+    # --- computed -----------------------------------------------------------
+
+    def test_node_only_request_runs_one_task_per_node(self):
+        assert billing.parse_sbatch("#SBATCH --nodes=4\n").cpus == 4
+
+    def test_gres_list_with_other_resources(self):
+        assert billing.parse_sbatch("#SBATCH --gres=gpu:2,scratch:100\n").gpus == 2
+        assert billing.parse_sbatch("#SBATCH --gres=scratch:100,gpu:a100:4\n").gpus == 4
+        assert billing.parse_sbatch("#SBATCH --gres=scratch:100\n").gpus == 0
+
+    def test_mem_per_gpu_scales_with_gpus(self):
+        req = billing.parse_sbatch("#SBATCH --gres=gpu:2\n#SBATCH --mem-per-gpu=8G\n")
+        assert req.mem_gb == pytest.approx(16.0)
+        assert req.mem_source == "--mem-per-gpu"
+
+    def test_cpus_per_gpu_scales_with_gpus(self):
+        assert billing.parse_sbatch("#SBATCH --gpus=4\n#SBATCH --cpus-per-gpu=3\n").cpus == 12
+
+    def test_ntasks_per_gpu_drives_the_task_count(self):
+        assert billing.parse_sbatch("#SBATCH --gpus=2\n#SBATCH --ntasks-per-gpu=3\n").cpus == 6
+
+    def test_memory_precedence_mem_beats_per_cpu_beats_per_gpu(self):
+        both = billing.parse_sbatch(
+            "#SBATCH -c 4\n#SBATCH --gres=gpu:2\n"
+            "#SBATCH --mem=31G\n#SBATCH --mem-per-cpu=8G\n#SBATCH --mem-per-gpu=8G\n"
+        )
+        assert both.mem_gb == pytest.approx(31.0)
+        per_cpu = billing.parse_sbatch(
+            "#SBATCH -c 4\n#SBATCH --gres=gpu:2\n#SBATCH --mem-per-cpu=2G\n#SBATCH --mem-per-gpu=8G\n"
+        )
+        assert per_cpu.mem_gb == pytest.approx(8.0)
+
+    def test_array_is_recorded_because_each_task_bills_separately(self):
+        assert billing.parse_sbatch("#SBATCH --array=1-100\n").array_spec == "1-100"
+
+    # --- refused ------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "directive,expected",
+        [
+            ("#SBATCH --exclusive\n", "--exclusive"),
+            ("#SBATCH --ntasks-per-socket=2\n", "--ntasks-per-socket"),
+            ("#SBATCH --gpus-per-socket=1\n", "--gpus-per-socket"),
+            ("#SBATCH --sockets-per-node=2\n", "--sockets-per-node"),
+            ("#SBATCH --cores-per-socket=8\n", "--cores-per-socket"),
+            ("#SBATCH --threads-per-core=1\n", "--threads-per-core"),
+            ("#SBATCH --overcommit\n", "--overcommit"),
+            ("#SBATCH -O\n", "--overcommit"),
+            ("#SBATCH -B 2:4:1\n", "--extra-node-info"),
+        ],
+    )
+    def test_topology_dependent_options_are_refused(self, directive, expected):
+        req = billing.parse_sbatch(directive + "#SBATCH --mem=16G\n")
+        assert expected in [o for o, _ in req.unpriceable]
+        with pytest.raises(billing.BillingError, match="cannot be priced"):
+            billing.resolve_request(req, self.TABLE, "p")
+
+    def test_an_ordinary_script_is_not_refused(self):
+        req = billing.parse_sbatch("#SBATCH -c 4\n#SBATCH --mem=31G\n")
+        assert req.unpriceable == []
+        assert billing.resolve_request(req, self.TABLE, "p") is req
+
+    def test_refusal_names_the_option_and_the_reason(self):
+        req = billing.parse_sbatch("#SBATCH --exclusive\n#SBATCH --mem=16G\n")
+        with pytest.raises(billing.BillingError) as exc:
+            billing.resolve_request(req, self.TABLE, "p")
+        assert "--exclusive" in str(exc.value)
+        assert "cpus/mem_gb/gpus" in str(exc.value)
+
+    # --- round-four remainder ----------------------------------------------
+
+    def test_boundary_step_stays_inside_a_sub_gigabyte_block(self):
+        # A fixed 1 GB shave would skip several price levels where a block is
+        # a quarter of a gigabyte, reporting a far larger cut than needed.
+        tiny = billing.Weights(cpu=1.0, mem_per_gb=4.0)  # 0.25 GB per unit
+        info = billing.boundary(billing.Request(cpus=1, mem_gb=1.0), tiny)
+        assert info["next_cheaper"]["mem_given_up_gb"] == pytest.approx(0.125)
+        assert info["next_cheaper"]["units"] < billing.billing_units(billing.Request(cpus=1, mem_gb=1.0), tiny)
+
+    def test_alternatives_exclude_ineligible_partitions(self):
+        table = billing.parse_weight_table(
+            "PartitionName=open TRESBillingWeights=CPU=1.0,Mem=0.0625G State=UP AllowGroups=ALL\n"
+            "PartitionName=priv TRESBillingWeights=CPU=0.1,Mem=0.00625G State=UP AllowGroups=labonly\n"
+            "PartitionName=down TRESBillingWeights=CPU=0.1,Mem=0.00625G State=DOWN AllowGroups=ALL\n"
+            "PartitionName=acct TRESBillingWeights=CPU=0.1,Mem=0.00625G State=UP AllowAccounts=x\n"
+        )
+        assert table["priv"].unrestricted is False
+        assert table["down"].state_up is False
+        assert table["acct"].unrestricted is False
+        assert billing.alternatives(billing.Request(cpus=8, mem_gb=32), table, "open") == []
+
+    def test_eligibility_survives_the_cache(self):
+        table = billing.parse_weight_table(
+            "PartitionName=priv TRESBillingWeights=CPU=1.0,Mem=0.0625G AllowGroups=labonly\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "w.json")
+            billing.save_weight_cache(table, 1.0, path)
+            restored = billing.cache_to_table(billing.load_weight_cache(path))
+        assert restored["priv"].unrestricted is False
