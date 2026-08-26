@@ -166,6 +166,11 @@ class Request:
     # on THAT and not on an absolute --mem, and AllocTRES cannot tell them
     # apart -- so the caller has to say, or the cap cannot be applied honestly.
     mem_per_cpu_gb: float | None = None
+    # Tasks the allocation runs. Slurm adjusts --cpus-per-task, so the
+    # MaxMemPerCPU ceiling applies to each task independently and the grouping
+    # changes the total. One is Slurm's own default, and for one task the
+    # per-task and aggregate arithmetic agree.
+    ntasks: float = 1.0
     partition: str | None = None
     # Recorded because --mem-per-cpu multiplies out to a round total and so
     # lands on a block edge far more often than an absolute --mem does.
@@ -902,9 +907,15 @@ def _apply_cpu_floor(req: Request, w: Weights) -> Request:
     per_cpu = req.mem_per_cpu_gb
     if not cap or cap <= 0 or not per_cpu or per_cpu <= cap or req.cpus <= 0:
         return req
-    # Total memory is preserved; the per-CPU figure drops to the cap and the
-    # count rises to match.
-    needed = math.ceil(_exact(req.cpus) * _exact(per_cpu) / _exact(cap))
+    # PER TASK. Slurm raises --cpus-per-task, so the ceiling is taken once for
+    # each task rather than once across the total: two tasks of one CPU at
+    # 10 GB/CPU under an 8 GB cap need two CPUs each, four in all, where the
+    # aggregate ceiling gives three and underprices by one. The gap grows with
+    # the task count.
+    tasks = max(1.0, req.ntasks or 1.0)
+    per_task_cpus = _exact(req.cpus) / _exact(tasks)
+    raised_per_task = math.ceil(per_task_cpus * _exact(per_cpu) / _exact(cap))
+    needed = int(_exact(raised_per_task) * _exact(tasks))
     if needed <= req.cpus:
         return req
     note = (
@@ -977,6 +988,12 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
     # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
     # shape it can produce, and rounding one silently would price a job that
     # cannot exist.
+    if req.ntasks and req.ntasks > 0 and req.cpus > 0 and (_exact(req.cpus) / _exact(req.ntasks)) % 1 != 0:
+        raise BillingError(
+            f"cpus={req.cpus:g} does not divide evenly across "
+            f"ntasks={req.ntasks:g}. --cpus-per-task is a whole number, so "
+            "this shape is not one Slurm can produce."
+        )
     whole = [("cpus", req.cpus), ("gpus", req.gpus)]
     if req.nodes_stated:
         # Only when stated: the field defaults to 1 and an unstated default is

@@ -372,6 +372,18 @@ class PriceJobInput(BaseModel):
         ),
         gt=0,
     )
+    ntasks: float | None = Field(
+        default=None,
+        description=(
+            "Tasks the allocation runs (--ntasks), when the submission states "
+            "one. Slurm raises --cpus-per-task, so a MaxMemPerCPU adjustment "
+            "is rounded up for EACH task and the grouping changes the total: "
+            "two tasks of one CPU is not the same allocation as one task of "
+            "two. Defaults to Slurm's own default of one, for which the "
+            "arithmetic is the same either way."
+        ),
+        gt=0,
+    )
     gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
     gpu_model: str | None = Field(
         default=None,
@@ -1070,6 +1082,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
             nodes_stated=params.nodes is not None,
             gpu_model=params.gpu_model,
             mem_per_cpu_gb=params.mem_per_cpu_gb,
+            ntasks=params.ntasks or 1.0,
         )
 
         try:

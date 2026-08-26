@@ -1598,3 +1598,39 @@ def test_a_partition_that_does_not_bill_gpus_can_still_be_offered():
         " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL\n"
     )
     assert billing.alternatives(req, none, "now") == []
+
+
+def test_the_per_cpu_ceiling_is_taken_once_per_task():
+    # Slurm raises --cpus-per-task, so the MaxMemPerCPU ceiling applies to each
+    # task independently. Two tasks of one CPU at 10 GB/CPU under an 8 GB cap
+    # need two CPUs EACH -- four in all -- where a single aggregate ceiling
+    # gives three and underprices by one. The gap grows with the task count.
+    table = billing.parse_weight_table(CAPPED)
+    two = billing.Request(cpus=2, mem_gb=20, mem_per_cpu_gb=10, ntasks=2)
+    assert billing.resolve_request(two, table, "p").cpus == 4
+    # One task of two CPUs is a different allocation from the same totals.
+    one = billing.Request(cpus=2, mem_gb=20, mem_per_cpu_gb=10)
+    assert billing.resolve_request(one, table, "p").cpus == 3
+
+
+def test_a_wider_task_count_widens_the_gap():
+    table = billing.parse_weight_table(CAPPED)
+    # 8 tasks x 1 CPU at 10 GB/CPU: 2 CPUs each, 16 total.
+    req = billing.Request(cpus=8, mem_gb=80, mem_per_cpu_gb=10, ntasks=8)
+    assert billing.resolve_request(req, table, "p").cpus == 16
+
+
+def test_cpus_must_divide_across_the_tasks():
+    # --cpus-per-task is a whole number, so 3 CPUs across 2 tasks is not a
+    # shape Slurm can produce.
+    table = billing.parse_weight_table(CAPPED)
+    with pytest.raises(billing.BillingError, match="divide evenly"):
+        billing.resolve_request(billing.Request(cpus=3, mem_gb=24, ntasks=2), table, "p")
+
+
+def test_the_task_count_defaults_to_one():
+    # Slurm's own default, and the arithmetic agrees either way for one task.
+    table = billing.parse_weight_table(CAPPED)
+    req = billing.Request(cpus=2, mem_gb=20, mem_per_cpu_gb=10)
+    assert req.ntasks == 1
+    assert billing.resolve_request(req, table, "p").cpus == 3
