@@ -398,3 +398,60 @@ class TestSuggestionFidelity:
             "PartitionName=deny TRESBillingWeights=CPU=0.1,Mem=0.00625G DenyAccounts=x\n"
         )
         assert billing.alternatives(billing.Request(cpus=8, mem_gb=32), table, "here") == []
+
+
+class TestModelWeightsAndWholeCounts:
+    """Round ten: a captured weight that was never consulted, and shapes Slurm
+    cannot allocate."""
+
+    TYPED = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0,GRES/gpu:a100=10.0\n"
+    )
+    PLAIN = billing.parse_weight_table("PartitionName=q TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n")
+
+    def test_named_model_is_priced_at_its_own_weight(self):
+        # The per-model weights were captured two rounds ago and never read, so
+        # an A100 was charged the generic rate.
+        generic = billing.Request(cpus=4, mem_gb=16, gpus=1)
+        a100 = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+        assert billing.billing_units(generic, self.TYPED["p"]) == 10
+        assert billing.billing_units(a100, self.TYPED["p"]) == 15
+
+    def test_unnamed_model_uses_the_generic_weight(self):
+        req = billing.Request(cpus=4, mem_gb=16, gpus=1)
+        assert billing.billing_units(req, self.TYPED["p"]) == 10
+
+    def test_model_reaches_the_breakdown_and_the_boundary(self):
+        a100 = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+        payload = billing.price(a100, self.TYPED, "p")
+        assert payload["breakdown"]["gpu"] == pytest.approx(10.0)
+        # base = 4 CPU + 10 GPU, so the memory band starts one unit up from 14
+        assert payload["boundary"]["on_price_edge"] is True
+
+    def test_unpriced_model_is_refused_not_defaulted(self):
+        req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="h100")
+        with pytest.raises(billing.BillingError, match="no weight for"):
+            billing.resolve_request(req, self.TYPED, "p")
+
+    def test_model_is_ignored_where_the_site_prices_gpus_uniformly(self):
+        req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+        assert billing.resolve_request(req, self.PLAIN, "q") is req
+        assert billing.billing_units(req, self.PLAIN["q"]) == 10
+
+    @pytest.mark.parametrize("field,value", [("cpus", 2.5), ("gpus", 0.5)])
+    def test_fractional_counts_are_refused(self, field, value):
+        # Slurm allocates whole CPUs and GPUs; rounding one silently would price
+        # a job that cannot exist.
+        kwargs = {"cpus": 4, "mem_gb": 16, field: value}
+        with pytest.raises(billing.BillingError, match="whole number"):
+            billing.resolve_request(billing.Request(**kwargs), self.PLAIN, "q")
+
+    def test_whole_counts_expressed_as_floats_are_fine(self):
+        req = billing.Request(cpus=4.0, mem_gb=16.0, gpus=1.0)
+        assert billing.resolve_request(req, self.PLAIN, "q") is req
+
+    def test_temp_cache_name_is_unique_per_writer(self):
+        # Two threads refreshing at once would otherwise share a name and
+        # interleave into one corrupt file.
+        with open(billing.__file__, encoding="utf-8") as handle:
+            assert "threading.get_ident()" in handle.read()

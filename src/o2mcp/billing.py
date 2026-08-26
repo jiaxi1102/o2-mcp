@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -121,6 +122,8 @@ class Request:
     # Whether the caller actually said how many nodes. Only DefMemPerNode needs
     # it, and silently assuming one would underprice every multi-node job.
     nodes_stated: bool = False
+    # The GPU model, when the shape names one and the site prices models apart.
+    gpu_model: str | None = None
     # False when no --mem/--mem-per-cpu was given, so the partition default
     # applies and a price of "zero memory" would be a fiction.
     mem_specified: bool = True
@@ -278,8 +281,22 @@ UNPRICEABLE_OPTIONS = {
 }
 
 
+def gpu_weight_for(req: Request, w: Weights) -> float:
+    """The GPU weight that applies to this request.
+
+    A site may price accelerators per model. Capturing those weights without
+    consulting them charges an A100 at whatever the generic entry says -- or at
+    another model's rate -- so the named model wins when one is given.
+    """
+    if req.gpu_model and w.gpu_by_model:
+        by_model = w.gpu_by_model.get(req.gpu_model)
+        if by_model is not None:
+            return by_model
+    return w.gpu
+
+
 def weighted_sum(req: Request, w: Weights) -> float:
-    return w.cpu * req.cpus + w.mem_per_gb * req.mem_gb + w.gpu * req.gpus
+    return w.cpu * req.cpus + w.mem_per_gb * req.mem_gb + gpu_weight_for(req, w) * req.gpus
 
 
 def billing_units(req: Request, w: Weights) -> int:
@@ -337,7 +354,7 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     if w.mem_per_gb <= 0:
         return {"billed": False, "note": "memory is not billed on this partition"}
 
-    base = w.cpu * req.cpus + w.gpu * req.gpus
+    base = w.cpu * req.cpus + gpu_weight_for(req, w) * req.gpus
     units = billing_units(req, w)
     band_start = (units - base) / w.mem_per_gb  # smallest memory still priced at `units`
     band_end = (units + 1 - base) / w.mem_per_gb  # first memory priced one unit higher
@@ -422,7 +439,9 @@ def save_weight_cache(table: dict[str, Weights], captured_at: float, path: str |
             for name, w in table.items()
         },
     }
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # Unique per writer, not merely per process: two threads refreshing at once
+    # would otherwise share a name and interleave into one corrupt file.
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(tmp, path)
@@ -468,6 +487,23 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
+    priced_models = table[partition].gpu_by_model
+    if req.gpu_model and priced_models and req.gpu_model not in priced_models:
+        known = ", ".join(sorted(priced_models)) or "none"
+        raise BillingError(
+            f"{partition!r} prices GPU models separately and has no weight "
+            f"for {req.gpu_model!r} (known: {known}). Name a priced model, "
+            "or omit gpu_model to use the partition's generic GPU weight."
+        )
+    # Slurm allocates whole CPUs and whole GPUs; a fractional count is not a
+    # shape it can produce, and rounding one silently would price a job that
+    # cannot exist.
+    for label, value in (("cpus", req.cpus), ("gpus", req.gpus)):
+        if value != int(value):
+            raise BillingError(
+                f"{label}={value:g} is not a whole number, and Slurm allocates "
+                f"whole {label}. Give the count the allocation will actually hold."
+            )
     if req.mem_specified and req.mem_gb <= 0:
         raise BillingError(
             "a memory size of zero is not an allocation Slurm makes: sbatch "
@@ -523,7 +559,7 @@ def price(
         "breakdown": {
             "cpu": round(w.cpu * req.cpus, 6),
             "mem": round(w.mem_per_gb * req.mem_gb, 6),
-            "gpu": round(w.gpu * req.gpus, 6),
+            "gpu": round(gpu_weight_for(req, w) * req.gpus, 6),
             "pre_floor": round(pre, 6),
             "floor_discards": round(pre - units, 6),
         },

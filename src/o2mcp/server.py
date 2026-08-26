@@ -342,6 +342,12 @@ class PriceJobInput(BaseModel):
         ge=0,
     )
     gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
+    gpu_model: str | None = Field(
+        default=None,
+        description=(
+            "GPU model, when the partition prices models separately " "(TRESBillingWeights GRES/gpu:<model>)."
+        ),
+    )
     nodes: float | None = Field(
         default=None,
         description=(
@@ -1032,6 +1038,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
             mem_specified=params.mem_gb is not None,
             nodes=params.nodes or 1.0,
             nodes_stated=params.nodes is not None,
+            gpu_model=params.gpu_model,
         )
 
         try:
