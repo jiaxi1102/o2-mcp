@@ -511,3 +511,23 @@ def test_unstated_node_default_is_not_read_as_a_claim():
     table = {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}
     req = billing.Request(cpus=2, mem_gb=8)
     assert billing.resolve_request(req, table, "short").nodes == 1.0
+
+
+def test_alternatives_never_offer_a_partition_that_cannot_price_the_model():
+    # An A100 request must not be advertised on a partition that prices only
+    # H100: gpu_weight_for() would quote it at the H100 rate, while pricing the
+    # same request there directly is refused as unpriceable. A suggestion that
+    # cannot be taken is worse than none.
+    table = {
+        "gpu_a": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=5.0, gpu_by_model={"a100": 10.0}),
+        "gpu_h": billing.Weights(cpu=0.5, mem_per_gb=0.03, gpu=1.0, gpu_by_model={"h100": 20.0}),
+        "gpu_generic": billing.Weights(cpu=0.5, mem_per_gb=0.03, gpu=1.0),
+    }
+    req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
+    offered = {r["partition"] for r in billing.alternatives(req, table, "gpu_a")}
+    assert "gpu_h" not in offered
+    # A partition with no per-model table at all still prices it generically,
+    # so it remains a real option -- the filter must not over-exclude.
+    assert "gpu_generic" in offered
+    with pytest.raises(billing.BillingError):
+        billing.resolve_request(req, table, "gpu_h")

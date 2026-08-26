@@ -292,6 +292,21 @@ UNPRICEABLE_OPTIONS = {
 }
 
 
+def _model_is_priced(req: "Request", w: "Weights") -> bool:
+    """Can this partition price the GPU model the request names?
+
+    A partition that prices models apart and has no weight for this one cannot
+    price the request at all. gpu_weight_for() would fall back to the generic
+    weight, which is a different accelerator's rate -- so this must be settled
+    before any number is produced, and by ONE predicate: alternatives() once
+    advertised a partition on a fallback weight that resolve_request() refuses
+    outright, offering a move that could not be priced on arrival.
+    """
+    if not req.gpu_model or not w.gpu_by_model:
+        return True
+    return req.gpu_model in w.gpu_by_model
+
+
 def gpu_weight_for(req: Request, w: Weights) -> float:
     """The GPU weight that applies to this request.
 
@@ -502,8 +517,8 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             "no billing weights known for partition {!r}; refresh the weight "
             "cache before pricing (known: {})".format(partition, ", ".join(sorted(table)) or "none")
         )
-    priced_models = table[partition].gpu_by_model
-    if req.gpu_model and priced_models and req.gpu_model not in priced_models:
+    if not _model_is_priced(req, table[partition]):
+        priced_models = table[partition].gpu_by_model
         known = ", ".join(sorted(priced_models)) or "none"
         raise BillingError(
             f"{partition!r} prices GPU models separately and has no weight "
@@ -633,6 +648,10 @@ def alternatives(req: Request, table: dict[str, Weights], current: str, limit: i
         # a proxy for "has no GPUs" rather than proof, so it can only exclude a
         # suggestion -- never manufacture one.
         if req.gpus > 0 and w.gpu <= 0:
+            continue
+        # Never advertise a partition that pricing this same request directly
+        # would refuse: the units would come from another model's weight.
+        if not _model_is_priced(req, w):
             continue
         units = billing_units(req, w)
         if units < now_units:
