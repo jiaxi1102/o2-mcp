@@ -825,41 +825,6 @@ async def test_price_job_without_a_cache_says_how_to_get_one(monkeypatch, tmp_pa
 
 
 @pytest.mark.anyio
-async def test_price_job_prices_a_script_from_cache_with_no_connection(monkeypatch, tmp_path):
-    from o2mcp import billing
-
-    cache = tmp_path / "weights.json"
-    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(cache))
-    billing.save_weight_cache(
-        billing.parse_weight_table(
-            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"
-            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n"
-            "PartitionName=gpu_requeue TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1\n"
-        ),
-        captured_at=1000.0,
-    )
-    # Deliberately no _connection monkeypatch: reaching the cluster here would
-    # be a bug, since the whole point is answering while nothing is connected.
-    payload = await _call(
-        "o2_price_job",
-        {
-            "params": {
-                "partition": "short",
-                "script_text": "#!/bin/bash\n#SBATCH -c 4\n#SBATCH --mem=32G\n#SBATCH -t 8:00:00\n",
-            }
-        },
-    )
-    assert payload["ok"] is True
-    assert payload["billing_units"] == 6
-    assert payload["boundary"]["on_price_edge"] is True
-    assert payload["boundary"]["next_cheaper"]["mem_gb"] == pytest.approx(31.0)
-    assert payload["boundary"]["next_cheaper"]["units"] == 5
-    assert payload["boundary"]["next_cheaper"]["kind"] == "edge_shave"
-    assert payload["weights"]["age_hours"] >= 0
-    assert any("--time" in c for c in payload["caveats"])
-
-
-@pytest.mark.anyio
 async def test_price_job_reports_cheaper_partitions_for_the_same_request(monkeypatch, tmp_path):
     from o2mcp import billing
 
@@ -896,29 +861,6 @@ async def test_price_job_direct_call_without_memory_uses_the_partition_default(m
     assert payload["request"]["mem_gb"] == pytest.approx(16.0)
     assert "partition default" in payload["request"]["mem_source"]
     assert payload["billing_units"] == 5
-
-
-@pytest.mark.anyio
-async def test_price_job_refuses_a_partition_that_conflicts_with_the_script(monkeypatch, tmp_path):
-    # The script's own --partition is the one that will run; pricing another
-    # returns a consistent answer about an allocation that will not happen.
-    from o2mcp import billing
-
-    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
-    billing.save_weight_cache(
-        billing.parse_weight_table(
-            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"
-            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0\n"
-        ),
-        captured_at=1000.0,
-    )
-    payload = await _call(
-        "o2_price_job",
-        {"params": {"partition": "short", "script_text": "#SBATCH --partition=gpu_quad\n#SBATCH --mem=31G\n"}},
-    )
-    assert payload["ok"] is False
-    assert payload["error"] == "partition_conflict"
-    assert "gpu_quad" in payload["message"]
 
 
 @pytest.mark.anyio

@@ -64,7 +64,6 @@ from o2mcp import (
     transfer_tools,
 )
 from o2mcp.policy import LoginTarget
-from o2mcp.slurm import _quote_remote_path
 
 mcp = FastMCP("o2_mcp")
 
@@ -333,17 +332,16 @@ class QueueInput(BaseModel):
 class PriceJobInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     partition: str = Field(..., description="Partition the job would run on.", min_length=1)
-    script_text: str | None = Field(
+    cpus: float = Field(..., description="Total CPUs the allocation will hold.", gt=0)
+    mem_gb: float | None = Field(
         default=None,
-        description="Submission script contents; its #SBATCH directives are read.",
+        description=(
+            "Memory in GB. Omit only to price the partition's configured "
+            "default; omitting it does not mean a request for no memory."
+        ),
+        ge=0,
     )
-    remote_script_path: str | None = Field(
-        default=None,
-        description="Path to a script already on O2. Needs a ready login broker to read it.",
-    )
-    cpus: float | None = Field(default=None, description="CPUs, when not giving a script.", gt=0)
-    mem_gb: float | None = Field(default=None, description="Memory in GB, when not giving a script.", ge=0)
-    gpus: float | None = Field(default=None, description="GPUs, when not giving a script.", ge=0)
+    gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
     refresh_weights: bool = Field(
         default=False,
         description=(
@@ -953,23 +951,32 @@ def main() -> None:
     annotations={"title": "Price a submission before submitting", "readOnlyHint": True, "openWorldHint": False},
 )
 async def o2_price_job(params: PriceJobInput) -> str:
-    """Compute what a submission will cost in Slurm billing units, before it runs.
+    """Compute what an allocation will cost in Slurm billing units, before it runs.
 
     Fair share is bought with ALLOCATED resources, and the weighted TRES sum is
-    floored -- so memory is sold in whole blocks and a request sitting exactly on
-    a block edge pays for a full block while forfeiting the headroom inside it.
-    Nothing in a job's own output reveals this, so the moment to check is while
-    the request is being written.
+    floored -- so memory is sold in whole blocks and a request sitting exactly
+    on a block edge pays for a full block while forfeiting the headroom inside
+    it. Nothing in a job's own output reveals that, so the moment to check is
+    while the request is being written.
+
+    Takes a resource SHAPE, not a script. Reading a script means reimplementing
+    sbatch's option semantics -- per-task and per-GPU forms, GRES grammar,
+    attached short options, --mem=0 meaning "everything", partition caps that
+    silently raise the CPU count -- and any subtle error there produces a
+    confident wrong number with nothing to catch it. Read the directives
+    yourself, state the shape you found in the plan the user approves, and price
+    that: your reading is then visible and can be challenged.
 
     Pure arithmetic over a cached weight table: no SSH and no Slurm call unless
     refresh_weights is set, so this answers while the O2 policy is disabled and
-    before any broker exists. Returns the price, the breakdown, the nearest
-    memory boundary, and cheaper partitions for the identical request.
+    before any broker exists. Returns the price, a breakdown that reconciles to
+    the floored units, the nearest memory boundary, and cheaper partitions for
+    the identical allocation.
 
     Advisory only. It never submits, never edits a request, and does not
-    recommend reducing memory below what a job already holds -- an OOM kill
-    bills its full elapsed time AND forces a rerun, so a request trimmed too
-    close is a net loss, not a smaller win.
+    recommend holding less memory than a job already has -- an OOM kill bills
+    its full elapsed time AND forces a rerun, so a request trimmed too close is
+    a net loss, not a smaller win.
     """
 
     def work() -> dict[str, Any]:
@@ -1002,56 +1009,21 @@ async def o2_price_job(params: PriceJobInput) -> str:
             table = billing.cache_to_table(cached)
             captured_at = cached.get("captured_at")
 
-        script = params.script_text
-        if script is None and params.remote_script_path:
-            result = _connection().run(
-                f"cat -- {_quote_remote_path(params.remote_script_path)}",
-                timeout=30.0,
-            )
-            if not result.ok:
-                return {"ok": False, "error": "script_unreadable", "message": (result.stderr or "").strip()[:200]}
-            script = result.stdout
-
-        if script is not None:
-            request = billing.parse_sbatch(script)
-        elif params.cpus is not None:
-            # Omitting mem_gb means the request names no memory, which is not
-            # the same as requesting none: the partition default applies.
-            request = billing.Request(
-                cpus=params.cpus,
-                mem_gb=params.mem_gb or 0.0,
-                gpus=params.gpus or 0.0,
-                mem_specified=params.mem_gb is not None,
-            )
-        else:
-            return {
-                "ok": False,
-                "error": "bad_input",
-                "message": "Give script_text, remote_script_path, or cpus/mem_gb/gpus.",
-            }
-
-        # A script naming its own partition is the one that will run. Pricing it
-        # against a different partition returns the wrong weights, defaults,
-        # boundaries and alternatives -- all internally consistent, all about an
-        # allocation that will not happen.
-        if request.partition and request.partition != params.partition:
-            return {
-                "ok": False,
-                "error": "partition_conflict",
-                "message": (
-                    f"The script sets --partition={request.partition} but this "
-                    f"call asked to price {params.partition!r}. Slurm will use "
-                    f"{request.partition}; re-price against that, or remove the "
-                    "directive from the script."
-                ),
-            }
+        request = billing.Request(
+            cpus=params.cpus,
+            mem_gb=params.mem_gb or 0.0,
+            gpus=params.gpus or 0.0,
+            # Omitting mem_gb means the shape names no memory, which is not the
+            # same as requesting none: the partition default applies.
+            mem_specified=params.mem_gb is not None,
+        )
 
         try:
             request = billing.resolve_request(request, table, params.partition)
             payload = billing.price(request, table, params.partition, captured_at)
         except billing.BillingError as exc:
             return {"ok": False, "error": "unpriceable", "message": str(exc)}
-        # Compare the SAME concrete allocation elsewhere; using the unresolved
+        # Compare the SAME concrete allocation elsewhere; using an unresolved
         # request priced every alternative with zero memory.
         payload["alternatives"] = billing.alternatives(request, table, params.partition)
         payload["ok"] = True
