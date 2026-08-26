@@ -885,7 +885,12 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
                 f"{label}={value:g} is not a whole number, and Slurm allocates "
                 f"whole {label}. Give the count the allocation will actually hold."
             )
-    if req.mem_specified and req.mem_gb <= 0:
+    # mem_unknown marks a size that was never established but does not matter
+    # here, and resolve_request() sets it WITH mem_specified so the request is
+    # settled. price() resolves again, so this guard has to let its own output
+    # back through -- otherwise the sentinel reads as an explicit --mem=0 on
+    # the second pass and the tool refuses a price it had already computed.
+    if req.mem_specified and req.mem_gb <= 0 and not req.mem_unknown:
         raise BillingError(
             "a memory size of zero is not an allocation Slurm makes: sbatch "
             "reads --mem=0 as all memory on every allocated node, which depends "

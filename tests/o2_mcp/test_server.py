@@ -956,3 +956,49 @@ async def test_price_job_always_labels_alternatives_as_prices(tmp_path, monkeypa
         await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16, nodes=1))
     )
     assert "NOT verified" in pinned["alternatives_note"]
+
+
+@pytest.mark.anyio
+async def test_price_job_prices_a_cpu_only_partition_through_the_tool(tmp_path, monkeypatch):
+    """Through o2_price_job, not through resolve_request alone.
+
+    The unit tests for this exercised resolve_request directly and passed while
+    the tool still returned unpriceable: price() resolves a second time, and
+    the mem_unknown sentinel read as an explicit --mem=0 on that pass. Only a
+    test at this level sees the whole path.
+    """
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=plain State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+            "PartitionName=billed TRESBillingWeights=CPU=0.1,Mem=0.00625G State=UP"
+            " AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="plain", cpus=8)))
+    assert payload["ok"] is True
+    assert payload["billing_units"] == 8
+    assert payload["request"]["mem_source"] == "not billed on plain"
+    # The comparison is withheld, and the response says which reason applies.
+    assert payload["alternatives"] == []
+    assert "does not bill memory" in payload["alternatives_note"]
+
+
+@pytest.mark.anyio
+async def test_price_job_still_refuses_an_explicit_zero(tmp_path, monkeypatch):
+    """The sentinel must not become a way for a real --mem=0 to slip through."""
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP"
+            " AllowGroups=ALL TotalCPUs=400 TotalNodes=10"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="p", cpus=8, mem_gb=0)))
+    assert payload["ok"] is False
+    assert payload["error"] == "unpriceable"
+    assert "all memory on every allocated node" in payload["message"]
