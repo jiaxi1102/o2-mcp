@@ -345,3 +345,56 @@ class TestShapeOnlySurface:
             finally:
                 with contextlib.suppress(OSError):
                     os.chdir(cwd)
+
+
+class TestSuggestionFidelity:
+    """Round nine: a suggestion has to survive being priced again."""
+
+    FINE = billing.Weights(cpu=1.0, mem_per_gb=1024.0)  # Mem=1M: 1/1024 GB blocks
+
+    def test_suggested_memory_reprices_to_the_quoted_units(self):
+        # Rounding to a fixed precision moved the value back over the edge:
+        # with a 1/1024 GB block the cheaper size is 0.99951171875 GB, and three
+        # decimals returned 1.0 -- the request being priced down from.
+        req = billing.Request(cpus=1, mem_gb=1.0)
+        info = billing.boundary(req, self.FINE)
+        nc = info["next_cheaper"]
+        repriced = billing.billing_units(billing.Request(cpus=1, mem_gb=nc["mem_gb"]), self.FINE)
+        assert repriced == nc["units"]
+        assert repriced < billing.billing_units(req, self.FINE)
+
+    def test_coarse_blocks_still_read_cleanly(self):
+        info = billing.boundary(billing.Request(cpus=4, mem_gb=32), SHORT)
+        assert info["next_cheaper"]["mem_gb"] == pytest.approx(31.0)
+        assert info["largest_same_price_mem_gb"] == pytest.approx(47.0)
+
+    def test_rounding_never_rounds_up(self):
+        assert billing._round_below(0.99951171875) < 1.0
+        assert billing._round_below(31.0) == pytest.approx(31.0)
+        assert billing._round_below(0.0) == 0.0
+
+    @pytest.mark.parametrize(
+        "restriction,expected",
+        [
+            ("AllowGroups=ALL", True),
+            ("AllowGroups=labonly", False),
+            ("AllowAccounts=x", False),
+            ("AllowQos=high", False),
+            ("DenyQos=low", False),
+            ("DenyAccounts=x", False),
+        ],
+    )
+    def test_every_access_restriction_marks_a_partition_uncertain(self, restriction, expected):
+        # Advertising a cheaper partition the caller will be rejected from
+        # wastes a resubmission; this tool cannot evaluate membership, so any
+        # restriction at all means "unknown", never "available".
+        table = billing.parse_weight_table(f"PartitionName=p TRESBillingWeights=CPU=1.0,Mem=0.0625G {restriction}\n")
+        assert table["p"].unrestricted is expected
+
+    def test_restricted_partitions_stay_out_of_alternatives(self):
+        table = billing.parse_weight_table(
+            "PartitionName=here TRESBillingWeights=CPU=1.0,Mem=0.0625G AllowGroups=ALL\n"
+            "PartitionName=qos TRESBillingWeights=CPU=0.1,Mem=0.00625G AllowQos=high\n"
+            "PartitionName=deny TRESBillingWeights=CPU=0.1,Mem=0.00625G DenyAccounts=x\n"
+        )
+        assert billing.alternatives(billing.Request(cpus=8, mem_gb=32), table, "here") == []

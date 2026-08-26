@@ -185,6 +185,20 @@ def parse_weight_table(scontrol_output: str) -> dict[str, Weights]:
                 value = token[len("AllowAccounts=") :]
                 if value and value.upper() != "ALL":
                     unrestricted = False
+            elif token.startswith("AllowQos="):
+                value = token[len("AllowQos=") :]
+                if value and value.upper() != "ALL":
+                    unrestricted = False
+            elif token.startswith("DenyQos="):
+                # Any deny list at all means some callers are turned away, and
+                # this tool cannot tell whether the caller is one of them.
+                value = token[len("DenyQos=") :]
+                if value and value.upper() not in ("", "(NULL)", "NONE"):
+                    unrestricted = False
+            elif token.startswith("DenyAccounts="):
+                value = token[len("DenyAccounts=") :]
+                if value and value.upper() not in ("", "(NULL)", "NONE"):
+                    unrestricted = False
             elif token.startswith("MaxMemPerCPU="):
                 value = token[len("MaxMemPerCPU=") :]
                 if value.isdigit() and int(value) > 0:
@@ -273,6 +287,20 @@ def billing_units(req: Request, w: Weights) -> int:
     return int(math.floor(weighted_sum(req, w)))
 
 
+def _round_below(value: float, places: int = 9) -> float:
+    """Round DOWN, so a suggested memory size cannot drift back over an edge.
+
+    Rounding to a fixed precision is not safe here: where a billing block is
+    smaller than that precision, the nearest value sits on the far side of the
+    transition. With Mem=1M the cheaper size is 0.99951171875 GB, and rounding
+    to three places returns 1.0 -- the very request being priced down from.
+    """
+    if value <= 0:
+        return 0.0
+    scale = 10**places
+    return math.floor(value * scale) / scale
+
+
 def _step_for(w: Weights) -> float:
     """How far below a transition to sit.
 
@@ -321,8 +349,8 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
         # True when the request sits exactly on a transition, i.e. it just
         # bought a whole unit and holds none of the band it paid for.
         "on_price_edge": band_start > 0 and abs(req.mem_gb - band_start) < 1e-6,
-        "largest_same_price_mem_gb": round(band_end - _step_for(w), 3),
-        "free_headroom_gb": round(max(0.0, band_end - _step_for(w) - req.mem_gb), 3),
+        "largest_same_price_mem_gb": _round_below(band_end - _step_for(w)),
+        "free_headroom_gb": _round_below(max(0.0, band_end - _step_for(w) - req.mem_gb)),
     }
 
     # The step must stay inside the band it is stepping out of: on a partition
@@ -334,12 +362,16 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
         cheaper_units = billing_units(cheaper, w)
         if cheaper_units < units:
             given_up = req.mem_gb - cheaper_gb
+            suggested = _round_below(cheaper_gb)
+            # A suggestion that does not reprice lower is worse than none.
+            if billing_units(Request(cpus=req.cpus, mem_gb=suggested, gpus=req.gpus), w) >= units:
+                suggested = cheaper_gb
             result["next_cheaper"] = {
-                "mem_gb": round(cheaper_gb, 3),
+                "mem_gb": suggested,
                 "units": cheaper_units,
                 "units_now": units,
                 "reduction_pct": (round(100.0 * (units - cheaper_units) / units, 1) if units else 0.0),
-                "mem_given_up_gb": round(given_up, 3),
+                "mem_given_up_gb": _round_below(given_up),
                 # An edge shave gives up ~nothing and is close to free. Anything
                 # larger is a genuine reduction in what the job can hold, and an
                 # OOM kill bills full elapsed AND forces a rerun -- so the two
