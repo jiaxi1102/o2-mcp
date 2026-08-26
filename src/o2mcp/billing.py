@@ -162,6 +162,10 @@ class Request:
     # because this partition does not bill memory. The price is exact; any
     # comparison against a partition that DOES bill memory is not.
     mem_unknown: bool = False
+    # The --mem-per-cpu value, when the submission used one. MaxMemPerCPU acts
+    # on THAT and not on an absolute --mem, and AllocTRES cannot tell them
+    # apart -- so the caller has to say, or the cap cannot be applied honestly.
+    mem_per_cpu_gb: float | None = None
     partition: str | None = None
     # Recorded because --mem-per-cpu multiplies out to a round total and so
     # lands on a block edge far more often than an absolute --mem does.
@@ -901,25 +905,29 @@ def parse_priority_flags(text: str) -> list[str]:
 def _apply_cpu_floor(req: Request, w: Weights) -> Request:
     """Raise the CPU count where MaxMemPerCPU forces Slurm to.
 
-    Slurm will not give a job more memory per CPU than MaxMemPerCPU allows: it
-    keeps the memory and adds CPUs until the ratio fits. One CPU asking 64 GB
-    under an 8 GB cap is allocated -- and BILLED -- as eight CPUs.
+    Slurm applies this to a --mem-per-cpu request and ONLY to that one: where
+    the per-CPU value exceeds MaxMemPerCPU it lowers the per-CPU figure and
+    adds CPUs to preserve the total. An absolute --mem is not adjusted, so
+    `-c 1 --mem=64G` under an 8 GB cap allocates one CPU.
 
-    The field recording that has been parsed and cached since it was first
-    added and never consulted by any calculation, which is the third time a
-    captured weight sat unused here. Pricing the requested CPU count instead of
-    the allocated one understated those jobs by the whole difference.
+    AllocTRES cannot tell the two apart, and neither can a shape. So the
+    adjustment runs only when the caller states the per-CPU value it applies
+    to -- inferring it from a total inflated every absolute --mem eightfold,
+    which is the commoner request and the wrong answer for it.
     """
     cap = w.max_mem_per_cpu_gb
-    if not cap or cap <= 0 or req.mem_gb <= 0:
+    per_cpu = req.mem_per_cpu_gb
+    if not cap or cap <= 0 or not per_cpu or per_cpu <= cap or req.cpus <= 0:
         return req
-    needed = math.ceil(_exact(req.mem_gb) / _exact(cap))
+    # Total memory is preserved; the per-CPU figure drops to the cap and the
+    # count rises to match.
+    needed = math.ceil(_exact(req.cpus) * _exact(per_cpu) / _exact(cap))
     if needed <= req.cpus:
         return req
     note = (
-        f"CPUs raised {req.cpus:g} -> {needed:g}: {req.mem_gb:g} GB exceeds "
-        f"MaxMemPerCPU ({cap:g} GB/CPU), and Slurm adds CPUs rather than "
-        "trimming the memory"
+        f"CPUs raised {req.cpus:g} -> {needed:g}: --mem-per-cpu {per_cpu:g} GB "
+        f"exceeds MaxMemPerCPU ({cap:g} GB/CPU), and Slurm adds CPUs rather "
+        "than trimming the memory"
     )
     return replace(req, cpus=float(needed), warnings=[*req.warnings, note])
 

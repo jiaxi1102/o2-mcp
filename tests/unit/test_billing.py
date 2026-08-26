@@ -1423,30 +1423,39 @@ def test_the_exclusive_flag_survives_the_cache():
     assert back["excl"].exclusive is True
 
 
+CAPPED = (
+    "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=8192"
+    " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+)
+
+
 def test_max_mem_per_cpu_raises_the_billed_cpu_count():
-    # Slurm will not give a job more memory per CPU than MaxMemPerCPU allows:
-    # it keeps the memory and adds CPUs until the ratio fits. One CPU asking
-    # 64 GB under an 8 GB cap is allocated -- and BILLED -- as eight.
-    #
-    # The field recording this was parsed and cached from the round it was
-    # added and never consulted, so those jobs were priced at the requested CPU
-    # count: 5 units here instead of 12.
-    table = billing.parse_weight_table(
-        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=8192"
-        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
-    )
-    resolved = billing.resolve_request(billing.Request(cpus=1, mem_gb=64), table, "p")
+    # Slurm lowers a --mem-per-cpu value that exceeds MaxMemPerCPU and adds
+    # CPUs to preserve the total, so one CPU at 64 GB/CPU under an 8 GB cap is
+    # allocated -- and BILLED -- as eight.
+    table = billing.parse_weight_table(CAPPED)
+    req = billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64)
+    resolved = billing.resolve_request(req, table, "p")
     assert resolved.cpus == 8
     assert billing.billing_units(resolved, table["p"]) == 12
     assert any("MaxMemPerCPU" in note for note in resolved.warnings)
 
 
+def test_an_absolute_mem_request_is_never_inflated():
+    # Slurm applies that adjustment to --mem-per-cpu and only to it. AllocTRES
+    # cannot tell an absolute --mem from a per-CPU one, so inferring the cap
+    # from a total priced `-c 1 --mem=64G` as eight CPUs -- the commoner
+    # request, and the wrong answer for it.
+    table = billing.parse_weight_table(CAPPED)
+    resolved = billing.resolve_request(billing.Request(cpus=1, mem_gb=64), table, "p")
+    assert resolved.cpus == 1
+    assert resolved.warnings == []
+
+
 def test_a_request_inside_the_per_cpu_cap_is_untouched():
-    table = billing.parse_weight_table(
-        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=8192"
-        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
-    )
-    resolved = billing.resolve_request(billing.Request(cpus=8, mem_gb=32), table, "p")
+    table = billing.parse_weight_table(CAPPED)
+    req = billing.Request(cpus=8, mem_gb=32, mem_per_cpu_gb=4)
+    resolved = billing.resolve_request(req, table, "p")
     assert resolved.cpus == 8
     assert resolved.warnings == []
 
@@ -1457,8 +1466,8 @@ def test_no_declared_per_cpu_cap_leaves_the_count_alone():
         "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G"
         " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
     )
-    resolved = billing.resolve_request(billing.Request(cpus=1, mem_gb=64), table, "p")
-    assert resolved.cpus == 1
+    req = billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64)
+    assert billing.resolve_request(req, table, "p").cpus == 1
 
 
 def test_the_raised_count_is_what_the_boundary_is_computed_from():
@@ -1467,6 +1476,6 @@ def test_the_raised_count_is_what_the_boundary_is_computed_from():
         "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerCPU=8192"
         " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
     )
-    out = billing.price(billing.Request(cpus=1, mem_gb=64), table, "p")
+    out = billing.price(billing.Request(cpus=1, mem_gb=64, mem_per_cpu_gb=64), table, "p")
     assert out["request"]["cpus"] == 8
     assert out["breakdown"]["cpu"] == pytest.approx(8.0)

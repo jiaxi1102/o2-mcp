@@ -346,6 +346,18 @@ class PriceJobInput(BaseModel):
         ),
         ge=0,
     )
+    mem_per_cpu_gb: float | None = Field(
+        default=None,
+        description=(
+            "The --mem-per-cpu value in GB, when the submission used one. Give "
+            "it IN ADDITION to mem_gb: MaxMemPerCPU acts on the per-CPU figure "
+            "and not on an absolute --mem, so without it a partition that caps "
+            "per-CPU memory cannot be priced correctly -- Slurm lowers the "
+            "per-CPU value and adds CPUs to keep the total, which raises the "
+            "bill. Omit it for an absolute --mem."
+        ),
+        gt=0,
+    )
     gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
     gpu_model: str | None = Field(
         default=None,
@@ -1043,6 +1055,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
             nodes=params.nodes or 1.0,
             nodes_stated=params.nodes is not None,
             gpu_model=params.gpu_model,
+            mem_per_cpu_gb=params.mem_per_cpu_gb,
         )
 
         try:
