@@ -457,15 +457,20 @@ class TestModelWeightsAndWholeCounts:
         assert billing.gpu_weight_for(resolved, self.TYPED["p"]) == 5.0
         assert billing.billing_units(resolved, self.TYPED["p"]) == 10
 
-    def test_a_typed_only_partition_still_refuses_an_unlisted_model(self):
-        # With no generic entry there is nothing to fall back to, so the
-        # accelerators would be charged nothing at all.
+    def test_a_typed_only_partition_prices_an_unlisted_model_as_free(self):
+        # An unweighted TRES contributes zero, so with no generic entry and
+        # none for this model the GPU term is exactly nothing -- that IS what
+        # the declared weights produce. Refusing was reading intent into a
+        # config: assuming the site meant to charge and omitted the rate.
         typed_only = billing.parse_weight_table(
             "PartitionName=q TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu:a100=10.0\n"
         )
         req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="h100")
-        with pytest.raises(billing.BillingError, match="only per model"):
-            billing.resolve_request(req, typed_only, "q")
+        resolved = billing.resolve_request(req, typed_only, "q")
+        # 4 CPU + 1 mem + 0 GPU
+        assert billing.billing_units(resolved, typed_only["q"]) == 5
+        # Surprising enough to say out loud, not wrong enough to withhold.
+        assert any("contribute nothing" in note for note in resolved.warnings)
 
     def test_model_is_ignored_where_the_site_prices_gpus_uniformly(self):
         req = billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100")
@@ -631,17 +636,20 @@ def test_the_reported_weight_is_the_one_the_charge_used():
     assert out["breakdown"]["gpu"] == out["weights"]["gpu"] * req.gpus
 
 
-def test_untyped_gpus_are_refused_where_only_models_are_priced():
-    # gpu_by_model={"a100": 10} with no generic entry means the generic weight
-    # is 0, so an untyped GPU request would price every accelerator as free --
-    # 2 units for 1 CPU + 16 GB + 1 GPU, with the GPU charge silently absent.
+def test_untyped_gpus_are_priced_as_free_but_flagged():
+    # No generic entry means an absent weight, and an absent weight contributes
+    # zero -- so 2 units for 1 CPU + 16 GB + 1 GPU is the price this
+    # configuration declares. It is stated rather than withheld.
     table = {"gpu": billing.Weights(cpu=1.0, mem_per_gb=0.0625, gpu=0.0, gpu_by_model={"a100": 10.0})}
     req = billing.Request(cpus=1, mem_gb=16, gpus=1)
-    with pytest.raises(billing.BillingError, match="only per model"):
-        billing.resolve_request(req, table, "gpu")
-    # Naming the model makes it priceable, at the model's rate.
+    resolved = billing.resolve_request(req, table, "gpu")
+    assert billing.billing_units(resolved, table["gpu"]) == 2
+    assert any("contribute nothing" in note for note in resolved.warnings)
+    # Naming a priced model charges that model's rate, with nothing to flag.
     named = billing.Request(cpus=1, mem_gb=16, gpus=1, gpu_model="a100")
-    assert billing.billing_units(billing.resolve_request(named, table, "gpu"), table["gpu"]) == 12
+    settled = billing.resolve_request(named, table, "gpu")
+    assert billing.billing_units(settled, table["gpu"]) == 12
+    assert settled.warnings == []
 
 
 def test_a_declared_generic_rate_still_prices_an_untyped_request():

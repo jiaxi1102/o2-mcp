@@ -330,7 +330,10 @@ class QueueInput(BaseModel):
 
 
 class PriceJobInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    # allow_inf_nan=False: a JSON number that overflows to inf satisfies gt/ge
+    # and then reaches int(), which raises OverflowError outside the
+    # BillingError handler -- the tool call crashes rather than answering.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", allow_inf_nan=False)
     partition: str = Field(..., description="Partition the job would run on.", min_length=1)
     cpus: float = Field(
         ...,

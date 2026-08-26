@@ -467,44 +467,27 @@ UNPRICEABLE_OPTIONS = {
 }
 
 
-def _unpriceable_gpu_reason(req: Request, w: Weights) -> str | None:
-    """Why this partition cannot price the request's GPUs, or None if it can.
+def _free_gpu_warning(req: Request, w: Weights) -> str | None:
+    """A note when the declared weights charge nothing for the accelerators.
 
-    A typed allocation holds the generic GRES too, so gpu_weight_for() adds the
-    typed weight to the generic one and an UNLISTED model correctly contributes
-    the generic rate alone -- exactly what Slurm would charge given the declared
-    weights. That case is priceable, and refusing it was over-refusal.
+    Not a refusal. An unweighted TRES contributes zero, so where a partition
+    declares no generic GPU weight and none for the model named, zero IS the
+    price its configuration produces -- the CPU and memory charge is exact and
+    the GPU term is exactly nothing.
 
-    What is not priceable is a partition declaring ONLY per-model rates: there
-    the generic entry is zero, so an unlisted or untyped request would price
-    every GPU as free. That is a confident number, which is the failure that
-    matters here.
-
-    So the question is settled once, before any number is produced, and by ONE
-    predicate -- alternatives() and resolve_request() disagreeing about it has
-    already produced both an advertised move that could not be priced on
-    arrival and a partition hidden as GPU-less while pricing perfectly well.
+    Refusing that was this module reading intent into a config: assuming the
+    site meant to charge and had merely omitted the rate. It is surprising
+    enough to say out loud, and not wrong enough to withhold a price for.
     """
-    if req.gpus <= 0 or not w.gpu_by_model:
+    if req.gpus <= 0 or gpu_weight_for(req, w) > 0:
         return None
-    if req.gpu_model:
-        if _model_key(req.gpu_model) in w.gpu_by_model or w.gpu > 0:
-            return None
-        known = ", ".join(sorted(w.gpu_by_model)) or "none"
-        return (
-            f"prices GPUs only per model (priced: {known}), has no generic GPU "
-            f"weight, and none for {req.gpu_model!r} -- so this allocation would "
-            "be charged nothing for its accelerators. Name a priced model."
-        )
-    if w.gpu > 0:
-        # A declared generic rate is a real rate, so an untyped request is
-        # priceable even where models are also listed.
-        return None
-    known = ", ".join(sorted(w.gpu_by_model)) or "none"
+    named = f" or for {req.gpu_model!r}" if req.gpu_model else ""
+    priced = ", ".join(sorted(w.gpu_by_model or {})) or "none"
     return (
-        f"prices GPUs only per model (priced: {known}) and has no generic GPU "
-        "weight, so an untyped GPU request would be charged nothing for its "
-        "accelerators. Name the model the allocation will hold."
+        f"GPUs contribute nothing to this price: the partition declares no "
+        f"generic GRES/gpu weight{named} (per-model weights: {priced}). That is "
+        "what its TRESBillingWeights produces, but confirm it is intended "
+        "before relying on a GPU job being free here."
     )
 
 
@@ -984,9 +967,9 @@ def resolve_request(req: Request, table: dict[str, Weights], partition: str) -> 
             f"for ({listed}). Every figure for it would be understated by that "
             "amount, so no price is offered rather than a low one."
         )
-    reason = _unpriceable_gpu_reason(req, table[partition])
-    if reason:
-        raise BillingError(f"{partition!r} {reason}")
+    free_gpus = _free_gpu_warning(req, table[partition])
+    if free_gpus and free_gpus not in req.warnings:
+        req = replace(req, warnings=[*req.warnings, free_gpus])
     # The same proven impossibilities that remove a partition from the
     # alternatives list apply to the one being PRICED. This ran on every other
     # partition and not on the chosen one, so a two-node request on a

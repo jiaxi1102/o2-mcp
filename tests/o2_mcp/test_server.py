@@ -18,6 +18,7 @@ pytest.importorskip("mcp")
 pytest.importorskip("anyio")
 
 from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
@@ -1020,3 +1021,28 @@ async def test_the_price_job_schema_states_what_its_numbers_mean():
     assert "MaxNodes" in nodes
     cpus = o2server.PriceJobInput.model_fields["cpus"].description
     assert "Total CPUs" in cpus
+
+
+@pytest.mark.anyio
+async def test_price_job_rejects_non_finite_numbers(tmp_path, monkeypatch):
+    """A JSON number that overflows to inf satisfied gt/ge and then hit int().
+
+    OverflowError is not BillingError, so it escaped the handler and the tool
+    call crashed rather than answering.
+    """
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G" " TRES=cpu=400,mem=4000G,node=10"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    for field in ("cpus", "mem_gb", "gpus", "nodes"):
+        with pytest.raises(ValidationError):
+            o2server.PriceJobInput(**{"partition": "short", "cpus": 4, field: float("inf")})
+    with pytest.raises(ValidationError):
+        o2server.PriceJobInput(partition="short", cpus=float("nan"))
+    # A finite request still prices.
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16)))
+    assert payload["ok"] is True
