@@ -1177,3 +1177,49 @@ def test_an_undeclared_cap_does_not_shrink_the_band():
     w = billing.Weights(cpu=1.0, mem_per_gb=0.0625)
     out = billing.boundary(billing.Request(cpus=4, mem_gb=17), w)
     assert out["free_headroom_gb"] > 0
+
+
+def test_combined_job_caps_apply_without_a_stated_node_count():
+    # MaxNodes x MaxCPUsPerNode bounds what the partition gives ANY job, so it
+    # proves a shape impossible under every layout -- no node count needed.
+    # Gating this on nodes_stated let the commonest request form, which states
+    # none, past every combined limit.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxNodes=1"
+        " MaxCPUsPerNode=32 MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    with pytest.raises(billing.BillingError, match="at most 1 node"):
+        billing.price(billing.Request(cpus=64, mem_gb=16), table, "p")
+    with pytest.raises(billing.BillingError, match="at most 1 node"):
+        billing.price(billing.Request(cpus=8, mem_gb=64), table, "p")
+    # Inside the combined ceiling it prices normally.
+    assert billing.price(billing.Request(cpus=32, mem_gb=32), table, "p")["billing_units"] == 34
+
+
+def test_no_combined_ceiling_without_maxnodes():
+    # A per-node cap alone says nothing about a total when the job may spread.
+    table = billing.parse_weight_table(
+        "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G MaxCPUsPerNode=32"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    assert billing.cannot_hold_reason(billing.Request(cpus=64, mem_gb=16), table["p"]) is None
+
+
+def test_the_memory_clamp_needs_a_provable_total_ceiling():
+    # mem_gb is the allocation TOTAL. Assuming one node where none was stated
+    # clamped a 64 GB request to 32 -- a "largest at this price" BELOW the
+    # request, which contradicts what the field means.
+    no_cap = billing.parse_weight_table(
+        "PartitionName=q TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerNode=32768"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    out = billing.boundary(billing.Request(cpus=4, mem_gb=64), no_cap["q"])
+    assert out["largest_same_price_mem_gb"] >= 64.0
+    # With MaxNodes the total ceiling IS provable, so the clamp applies again.
+    capped = billing.parse_weight_table(
+        "PartitionName=q TRESBillingWeights=CPU=1,Mem=0.0625G MaxMemPerNode=32768"
+        " MaxNodes=2 TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    out2 = billing.boundary(billing.Request(cpus=4, mem_gb=64), capped["q"])
+    assert out2["largest_same_price_mem_gb"] <= 64.0

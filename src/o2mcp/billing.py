@@ -610,9 +610,16 @@ def boundary(req: Request, w: Weights) -> dict[str, Any]:
     # A band can run past what the partition will allocate. Suggesting 47 GB
     # where MaxMemPerNode is 32 is advice that cannot be taken, and the
     # "free headroom" beside it is memory no submission could request.
+    # mem_gb is the allocation TOTAL, so a per-node cap only bounds it once the
+    # node count is known -- or, failing that, via MaxNodes, which bounds what
+    # any job can get. Assuming one node where none was stated clamped a 64 GB
+    # request to 32 and reported a "largest at this price" below the request.
     cap = None
     if w.max_mem_per_node_gb is not None:
-        cap = w.max_mem_per_node_gb * (req.nodes if req.nodes_stated and req.nodes > 0 else 1)
+        if req.nodes_stated and req.nodes > 0:
+            cap = w.max_mem_per_node_gb * req.nodes
+        elif w.max_nodes is not None:
+            cap = w.max_mem_per_node_gb * w.max_nodes
     if cap is not None:
         band_end = min(band_end, cap)
     largest_same_price = _largest_at_same_price(req, w, band_end)
@@ -1060,6 +1067,24 @@ def cannot_hold_reason(req: Request, w: Weights) -> str | None:
         return f"holds {stock['cpu']:g} CPUs and the request wants {req.cpus:g}"
     if req.mem_gb > 0 and "mem" in stock and stock["mem"] < req.mem_gb:
         return f"holds {stock['mem']:g} GB and the request wants {req.mem_gb:g}"
+    # MaxNodes multiplied by a per-node cap bounds what the partition will
+    # give ANY job, so it proves a shape impossible whether or not the caller
+    # pinned a node count: MaxNodes=1 with MaxCPUsPerNode=32 cannot produce 64
+    # CPUs under any layout. Gating this on nodes_stated let the commonest
+    # form of the request -- no node count at all -- past every combined limit.
+    if w.max_nodes is not None:
+        if w.max_cpus_per_node is not None and req.cpus > w.max_nodes * w.max_cpus_per_node:
+            return (
+                f"gives one job at most {w.max_nodes:g} node(s) x "
+                f"{w.max_cpus_per_node:g} CPUs = {w.max_nodes * w.max_cpus_per_node:g}; "
+                f"the request wants {req.cpus:g}"
+            )
+        if w.max_mem_per_node_gb is not None and req.mem_gb > w.max_nodes * w.max_mem_per_node_gb:
+            return (
+                f"gives one job at most {w.max_nodes:g} node(s) x "
+                f"{w.max_mem_per_node_gb:g} GB = "
+                f"{w.max_nodes * w.max_mem_per_node_gb:g}; the request wants {req.mem_gb:g}"
+            )
     if req.nodes_stated and req.nodes > 0:
         if "node" in stock and stock["node"] < req.nodes:
             return f"holds {stock['node']:g} nodes and the request wants {req.nodes:g}"
