@@ -356,14 +356,9 @@ class PriceJobInput(BaseModel):
         ),
         gt=0,
     )
-    refresh_weights: bool = Field(
-        default=False,
-        description=(
-            "Re-read TRESBillingWeights from the cluster before pricing. This is "
-            "the only path that needs a ready broker; leave false to price from "
-            "the cache, which works with no connection at all."
-        ),
-    )
+    # No refresh flag: refreshing WRITES the weight cache, and a tool that can
+    # write must not advertise readOnlyHint. o2_refresh_billing_weights owns
+    # that operation so this one's hint stays true.
 
 
 class JobIdInput(BaseModel):
@@ -964,10 +959,12 @@ def main() -> None:
     name="o2_price_job",
     annotations={
         "title": "Price an allocation before submitting",
+        # True in both senses now: this reads a local cache and writes nothing.
+        # Refreshing that cache lives in o2_refresh_billing_weights, because a
+        # tool that can write must not claim to be read-only at the point a
+        # client decides whether to auto-approve it.
         "readOnlyHint": True,
-        # refresh_weights reads scontrol through the broker, so this is not a
-        # closed-world tool even though the common path answers from cache.
-        "openWorldHint": True,
+        "openWorldHint": False,
     },
 )
 async def o2_price_job(params: PriceJobInput) -> str:
@@ -987,9 +984,9 @@ async def o2_price_job(params: PriceJobInput) -> str:
     yourself, state the shape you found in the plan the user approves, and price
     that: your reading is then visible and can be challenged.
 
-    Pure arithmetic over a cached weight table: no SSH and no Slurm call unless
-    refresh_weights is set, so this answers while the O2 policy is disabled and
-    before any broker exists. Returns the price, a breakdown that reconciles to
+    Pure arithmetic over a cached weight table: no SSH and no Slurm call at all,
+    so this answers while the O2 policy is disabled and before any broker
+    exists. Populate the cache once with o2_refresh_billing_weights. Returns the price, a breakdown that reconciles to
     the floored units, the nearest memory boundary, and cheaper partitions for
     the identical allocation.
 
@@ -1003,31 +1000,19 @@ async def o2_price_job(params: PriceJobInput) -> str:
         table: dict[str, billing.Weights] = {}
         captured_at: float | None = None
 
-        if params.refresh_weights:
-            result = _connection().run("scontrol show partition -o", timeout=30.0)
-            if not result.ok:
-                return {
-                    "ok": False,
-                    "error": "weights_unavailable",
-                    "message": "Could not read partition weights: {}".format((result.stderr or "").strip()[:200]),
-                }
-            table = billing.parse_weight_table(result.stdout)
-            captured_at = time.time()
-            billing.save_weight_cache(table, captured_at)
-        else:
-            cached = billing.load_weight_cache()
-            if not cached:
-                return {
-                    "ok": False,
-                    "error": "no_weight_cache",
-                    "message": (
-                        "No cached TRESBillingWeights. Call once with "
-                        "refresh_weights=true while a login broker is ready; "
-                        "afterwards pricing needs no connection."
-                    ),
-                }
-            table = billing.cache_to_table(cached)
-            captured_at = cached.get("captured_at")
+        cached = billing.load_weight_cache()
+        if not cached:
+            return {
+                "ok": False,
+                "error": "no_weight_cache",
+                "message": (
+                    "No cached TRESBillingWeights. Run o2_refresh_billing_weights "
+                    "once while a login broker is ready; afterwards pricing needs "
+                    "no connection at all."
+                ),
+            }
+        table = billing.cache_to_table(cached)
+        captured_at = cached.get("captured_at")
 
         request = billing.Request(
             cpus=params.cpus,
@@ -1051,6 +1036,63 @@ async def o2_price_job(params: PriceJobInput) -> str:
         payload["alternatives"] = billing.alternatives(request, table, params.partition)
         payload["ok"] = True
         return payload
+
+    return await _run_tool(work)
+
+
+class RefreshWeightsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+@mcp.tool(
+    name="o2_refresh_billing_weights",
+    annotations={
+        "title": "Refresh the cached Slurm billing weights",
+        # This REPLACES the local weight cache, so it is not read-only. Saying
+        # otherwise would let a client auto-approve a write.
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def o2_refresh_billing_weights(params: RefreshWeightsInput) -> str:
+    """Re-read TRESBillingWeights from the cluster and replace the local cache.
+
+    Split out from o2_price_job so that tool can honestly claim readOnlyHint:
+    pricing reads the cache and writes nothing, while this reads scontrol
+    through the broker and replaces what pricing reads. Weights change rarely,
+    so this is run once and then not again for a long time.
+
+    Needs a ready login broker. It queries only partition configuration -- no
+    job data, and nothing about the cluster is modified.
+    """
+
+    def work() -> dict[str, Any]:
+        result = _connection().run("scontrol show partition -o", timeout=30.0)
+        if not result.ok:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": "Could not read partition weights: {}".format((result.stderr or "").strip()[:200]),
+            }
+        table = billing.parse_weight_table(result.stdout)
+        if not table:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": (
+                    "scontrol returned no partitions with billing weights; the " "existing cache was left untouched."
+                ),
+            }
+        captured_at = time.time()
+        billing.save_weight_cache(table, captured_at)
+        return {
+            "ok": True,
+            "captured_at": captured_at,
+            "partitions": sorted(table),
+            "unpriceable": {name: w.unpriceable_tres for name, w in sorted(table.items()) if w.unpriceable_tres},
+        }
 
     return await _run_tool(work)
 

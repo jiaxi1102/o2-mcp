@@ -31,6 +31,7 @@ from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
 from o2mcp import (
     O2Connection as _ProductionO2Connection,
 )
+from o2mcp import billing  # noqa: E402
 from o2mcp import server as o2server  # noqa: E402
 
 
@@ -172,6 +173,7 @@ async def test_tool_registry_and_annotations():
         "o2_place",
         # pre-submission pricing
         "o2_price_job",
+        "o2_refresh_billing_weights",
     }
     assert tools["o2_status"].annotations.readOnlyHint is True
     assert tools["o2_status"].annotations.openWorldHint is False
@@ -190,9 +192,13 @@ async def test_tool_registry_and_annotations():
     # only when explicitly asked to refresh, so it must never look like a tool
     # that mutates or that requires a connection to answer.
     assert tools["o2_price_job"].annotations.readOnlyHint is True
-    # refresh_weights reads scontrol through the broker, so the tool reaches
-    # outside itself even though the common path answers from cache.
-    assert tools["o2_price_job"].annotations.openWorldHint is True
+    # Pricing reads a local cache and nothing else, so it neither writes nor
+    # reaches outside itself. Refreshing that cache is a separate tool, because
+    # a tool that can write must not claim to be read-only at the point a
+    # client decides whether to auto-approve it.
+    assert tools["o2_price_job"].annotations.openWorldHint is False
+    assert tools["o2_refresh_billing_weights"].annotations.readOnlyHint is False
+    assert tools["o2_refresh_billing_weights"].annotations.openWorldHint is True
 
 
 @pytest.mark.anyio
@@ -823,7 +829,7 @@ async def test_price_job_without_a_cache_says_how_to_get_one(monkeypatch, tmp_pa
     payload = await _call("o2_price_job", {"params": {"partition": "short", "cpus": 4}})
     assert payload["ok"] is False
     assert payload["error"] == "no_weight_cache"
-    assert "refresh_weights=true" in payload["message"]
+    assert "o2_refresh_billing_weights" in payload["message"]
 
 
 @pytest.mark.anyio
@@ -898,3 +904,15 @@ async def test_price_job_registers_under_python_dash_m(monkeypatch):
     monkeypatch.setattr(FastMCP, "run", fake_run, raising=False)
     runpy.run_module("o2mcp.server", run_name="__main__", alter_sys=True)
     assert "o2_price_job" in served.get("tools", set())
+
+
+@pytest.mark.anyio
+async def test_pricing_never_writes_the_weight_cache(tmp_path, monkeypatch):
+    """The readOnly claim, checked against behaviour rather than the annotation."""
+    cache = tmp_path / "weights.json"
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(cache))
+    billing.save_weight_cache({"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}, 1.0, str(cache))
+    before = cache.read_bytes()
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=2, mem_gb=16)))
+    assert payload["ok"] is True
+    assert cache.read_bytes() == before
