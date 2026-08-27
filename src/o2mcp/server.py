@@ -34,6 +34,7 @@ import json
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -59,6 +60,7 @@ from o2mcp import (
     O2Slurm,
     O2UnsafeTransportError,
     O2Workspace,
+    billing,
     transfer_tools,
 )
 from o2mcp.policy import LoginTarget
@@ -325,6 +327,85 @@ class SubmitInput(BaseModel):
 class QueueInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     user: str | None = Field(default=None, description="Username for squeue -u (defaults to remote $USER).")
+
+
+class PriceJobInput(BaseModel):
+    # allow_inf_nan=False: a JSON number that overflows to inf satisfies gt/ge
+    # and then reaches int(), which raises OverflowError outside the
+    # BillingError handler -- the tool call crashes rather than answering.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", allow_inf_nan=False)
+    partition: str = Field(..., description="Partition the job would run on.", min_length=1)
+    cpus: float = Field(
+        ...,
+        description=(
+            "Total CPUs the submission REQUESTS, across all tasks: --ntasks "
+            "multiplied by --cpus-per-task. Give what the directives ask for, "
+            "not what you expect Slurm to allocate -- where mem_per_cpu_gb "
+            "exceeds a partition's MaxMemPerCPU this raises the count itself, "
+            "and passing an already-raised number would raise it again. The "
+            "allocated count comes back in the response."
+        ),
+        gt=0,
+    )
+    mem_gb: float | None = Field(
+        default=None,
+        description=(
+            "TOTAL memory in GB across the whole allocation. sbatch's --mem is "
+            "per NODE, so a two-node job written --mem=32G holds 64 here; "
+            "--mem-per-cpu multiplies out the same way. Passing the directive "
+            "unchanged halves the charge and moves every boundary. Omit only to "
+            "price the partition's configured default; omitting it does not "
+            "mean a request for no memory, and 0 is not accepted because sbatch "
+            "reads --mem=0 as all memory on every node."
+        ),
+        ge=0,
+    )
+    mem_per_cpu_gb: float | None = Field(
+        default=None,
+        description=(
+            "The --mem-per-cpu value in GB, when the submission used one. Give "
+            "it IN ADDITION to mem_gb: MaxMemPerCPU acts on the per-CPU figure "
+            "and not on an absolute --mem, so without it a partition that caps "
+            "per-CPU memory cannot be priced correctly -- Slurm lowers the "
+            "per-CPU value and adds CPUs to keep the total, which raises the "
+            "bill. Omit it for an absolute --mem."
+        ),
+        gt=0,
+    )
+    ntasks: float | None = Field(
+        default=None,
+        description=(
+            "Tasks the allocation runs (--ntasks), when the submission states "
+            "one. Slurm raises --cpus-per-task, so a MaxMemPerCPU adjustment "
+            "is rounded up for EACH task and the grouping changes the total: "
+            "two tasks of one CPU is not the same allocation as one task of "
+            "two. Defaults to Slurm's own default of one, for which the "
+            "arithmetic is the same either way."
+        ),
+        gt=0,
+    )
+    gpus: float | None = Field(default=None, description="GPUs the allocation will hold.", ge=0)
+    gpu_model: str | None = Field(
+        default=None,
+        description=(
+            "GPU model, when the partition prices models separately " "(TRESBillingWeights GRES/gpu:<model>)."
+        ),
+    )
+    nodes: float | None = Field(
+        default=None,
+        description=(
+            "Nodes the allocation will hold. Give it whenever the submission "
+            "pins a node count: it is what lets MinNodes, MaxNodes and the "
+            "per-node CPU and memory caps be checked, and what bounds the "
+            "headroom this reports. Required when the partition defaults "
+            "memory per node and mem_gb is omitted, since that default is per "
+            "node and cannot be multiplied out without it."
+        ),
+        gt=0,
+    )
+    # No refresh flag: refreshing WRITES the weight cache, and a tool that can
+    # write must not advertise readOnlyHint. o2_refresh_billing_weights owns
+    # that operation so this one's hint stays true.
 
 
 class JobIdInput(BaseModel):
@@ -919,6 +1000,196 @@ transfer_tools.register(mcp, sys.modules[__name__])
 def main() -> None:
     """Console-script / module entry point: run the stdio MCP server."""
     mcp.run()
+
+
+@mcp.tool(
+    name="o2_price_job",
+    annotations={
+        "title": "Price an allocation before submitting",
+        # True in both senses now: this reads a local cache and writes nothing.
+        # Refreshing that cache lives in o2_refresh_billing_weights, because a
+        # tool that can write must not claim to be read-only at the point a
+        # client decides whether to auto-approve it.
+        "readOnlyHint": True,
+        "openWorldHint": False,
+    },
+)
+async def o2_price_job(params: PriceJobInput) -> str:
+    """Compute what an allocation will cost in Slurm billing units, before it runs.
+
+    Fair share is bought with ALLOCATED resources, and the weighted TRES sum is
+    floored -- so memory is sold in whole blocks and a request sitting exactly
+    on a block edge pays for a full block while forfeiting the headroom inside
+    it. Nothing in a job's own output reveals that, so the moment to check is
+    while the request is being written.
+
+    Takes a resource SHAPE, not a script. Reading a script means reimplementing
+    sbatch's option semantics -- per-task and per-GPU forms, GRES grammar,
+    attached short options, --mem=0 meaning "everything", partition caps that
+    silently raise the CPU count -- and any subtle error there produces a
+    confident wrong number with nothing to catch it. Read the directives
+    yourself, state the shape you found in the plan the user approves, and price
+    that: your reading is then visible and can be challenged.
+
+    Pure arithmetic over a cached weight table: no SSH and no Slurm call at all,
+    so this answers while the O2 policy is disabled and before any broker
+    exists. Populate the cache once with o2_refresh_billing_weights. Returns the price, a breakdown that reconciles to
+    the floored units, the nearest memory boundary, and cheaper partitions for
+    the identical allocation.
+
+    Advisory only. It never submits, never edits a request, and does not
+    recommend holding less memory than a job already has -- an OOM kill bills
+    its full elapsed time AND forces a rerun, so a request trimmed too close is
+    a net loss, not a smaller win.
+    """
+
+    def work() -> dict[str, Any]:
+        table: dict[str, billing.Weights] = {}
+        captured_at: float | None = None
+
+        cached = billing.load_weight_cache()
+        if not cached:
+            return {
+                "ok": False,
+                "error": "no_weight_cache",
+                "message": (
+                    "No cached TRESBillingWeights. Run o2_refresh_billing_weights "
+                    "once while a login broker is ready; afterwards pricing needs "
+                    "no connection at all."
+                ),
+            }
+        unsupported = billing.unsupported_billing_model(cached)
+        if unsupported:
+            # Refused before any number is produced: a price computed under the
+            # wrong model is not a smaller error than no price, it is a
+            # confident one that reaches an approval.
+            return {
+                "ok": False,
+                "error": "unsupported_billing_model",
+                "message": unsupported,
+            }
+        table = billing.cache_to_table(cached)
+        captured_at = cached.get("captured_at")
+
+        unresolved = billing.Request(
+            cpus=params.cpus,
+            mem_gb=params.mem_gb or 0.0,
+            gpus=params.gpus or 0.0,
+            # Omitting mem_gb means the shape names no memory, which is not the
+            # same as requesting none: the partition default applies.
+            mem_specified=params.mem_gb is not None,
+            nodes=params.nodes or 1.0,
+            nodes_stated=params.nodes is not None,
+            gpu_model=params.gpu_model,
+            mem_per_cpu_gb=params.mem_per_cpu_gb,
+            ntasks=params.ntasks or 1.0,
+        )
+
+        try:
+            request = billing.resolve_request(unresolved, table, params.partition)
+            payload = billing.price(request, table, params.partition, captured_at)
+        except billing.BillingError as exc:
+            return {"ok": False, "error": "unpriceable", "message": str(exc)}
+        # Compare the SAME concrete allocation elsewhere; using an unresolved
+        # request priced every alternative with zero memory.
+        # `original` is the request as the caller stated it: resolving a
+        # candidate from the shape THIS partition produced cannot undo a CPU
+        # count its own cap forced.
+        payload["alternatives"] = billing.alternatives(request, table, params.partition, original=unresolved)
+        # Always, not conditionally: the rows are a price comparison, and a
+        # caller who reads them as "partitions that can run this" has been told
+        # something this cache cannot know.
+        payload["alternatives_note"] = billing.alternatives_caveat()
+        if request.mem_unknown:
+            # An empty list here has a specific cause worth naming: the price
+            # stands, the comparison cannot.
+            payload["alternatives_note"] = (
+                "Not compared: this partition does not bill memory, so the size "
+                "was never established -- but any partition that DOES bill it "
+                "would be priced as holding none. The price above is exact; "
+                "state mem_gb to compare partitions. "
+            ) + payload["alternatives_note"]
+        payload["ok"] = True
+        return payload
+
+    return await _run_tool(work)
+
+
+class RefreshWeightsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+@mcp.tool(
+    name="o2_refresh_billing_weights",
+    annotations={
+        "title": "Refresh the cached Slurm billing weights",
+        # This REPLACES the local weight cache, so it is not read-only. Saying
+        # otherwise would let a client auto-approve a write.
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def o2_refresh_billing_weights(params: RefreshWeightsInput) -> str:
+    """Re-read TRESBillingWeights from the cluster and replace the local cache.
+
+    Split out from o2_price_job so that tool can honestly claim readOnlyHint:
+    pricing reads the cache and writes nothing, while this reads scontrol
+    through the broker and replaces what pricing reads. Weights change rarely,
+    so this is run once and then not again for a long time.
+
+    Needs a ready login broker. It queries only partition configuration -- no
+    job data, and nothing about the cluster is modified.
+    """
+
+    def work() -> dict[str, Any]:
+        result = _connection().run("scontrol show partition -o", timeout=30.0)
+        if not result.ok:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": "Could not read partition weights: {}".format((result.stderr or "").strip()[:200]),
+            }
+        table = billing.parse_weight_table(result.stdout)
+        if not table:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": (
+                    "scontrol returned no partitions with billing weights; the " "existing cache was left untouched."
+                ),
+            }
+        # PriorityFlags is cluster-global and decides whether Billing is the SUM
+        # of weighted TRES or their MAX. Weights alone cannot reveal it, and the
+        # two imply opposite advice about memory, so the flags are captured with
+        # the weights or the cache is not written at all.
+        flags_result = _connection().run("scontrol show config", timeout=30.0)
+        if not flags_result.ok:
+            return {
+                "ok": False,
+                "error": "weights_unavailable",
+                "message": (
+                    "Read the partition weights but not PriorityFlags ({}), which "
+                    "decides whether billing sums or maximises the weighted TRES. "
+                    "The existing cache was left untouched.".format((flags_result.stderr or "").strip()[:120])
+                ),
+            }
+        priority_flags = billing.parse_priority_flags(flags_result.stdout)
+        captured_at = time.time()
+        billing.save_weight_cache(table, captured_at, priority_flags=priority_flags)
+        return {
+            "ok": True,
+            "captured_at": captured_at,
+            "priority_flags": priority_flags,
+            # Same predicate the refusal uses: an exact-match copy here once
+            # reported "sum" for a cluster the very next price call refused.
+            "billing_model": "max" if billing.max_based_flags(priority_flags) else "sum",
+            "partitions": sorted(table),
+            "unpriceable": {name: w.unpriceable_tres for name, w in sorted(table.items()) if w.unpriceable_tres},
+        }
+
+    return await _run_tool(work)
 
 
 if __name__ == "__main__":  # pragma: no cover

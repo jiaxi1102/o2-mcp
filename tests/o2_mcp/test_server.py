@@ -18,6 +18,7 @@ pytest.importorskip("mcp")
 pytest.importorskip("anyio")
 
 from mcp.server.fastmcp.exceptions import ToolError  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from o2mcp import (  # noqa: E402
     CommandResult,
@@ -25,6 +26,7 @@ from o2mcp import (  # noqa: E402
     O2BrokerCommandOutcomeUnknownError,  # noqa: E402
     O2Config,
     async_transfer,  # noqa: E402
+    billing,  # noqa: E402
     transfer_tools,  # noqa: E402
 )
 from o2mcp import O2AsyncTransfer as _RealAsyncTransfer  # noqa: E402
@@ -170,6 +172,9 @@ async def test_tool_registry_and_annotations():
         "o2_disk_report",
         "o2_workspace_gc",
         "o2_place",
+        # pre-submission pricing
+        "o2_price_job",
+        "o2_refresh_billing_weights",
     }
     assert tools["o2_status"].annotations.readOnlyHint is True
     assert tools["o2_status"].annotations.openWorldHint is False
@@ -184,6 +189,17 @@ async def test_tool_registry_and_annotations():
     assert tools["o2_push_async"].annotations.readOnlyHint is False
     assert tools["o2_transfer_status"].annotations.readOnlyHint is True
     assert tools["o2_transfer_cancel"].annotations.destructiveHint is True
+    # Pricing is arithmetic over a cached weight table: it reaches the cluster
+    # only when explicitly asked to refresh, so it must never look like a tool
+    # that mutates or that requires a connection to answer.
+    assert tools["o2_price_job"].annotations.readOnlyHint is True
+    # Pricing reads a local cache and nothing else, so it neither writes nor
+    # reaches outside itself. Refreshing that cache is a separate tool, because
+    # a tool that can write must not claim to be read-only at the point a
+    # client decides whether to auto-approve it.
+    assert tools["o2_price_job"].annotations.openWorldHint is False
+    assert tools["o2_refresh_billing_weights"].annotations.readOnlyHint is False
+    assert tools["o2_refresh_billing_weights"].annotations.openWorldHint is True
 
 
 @pytest.mark.anyio
@@ -803,3 +819,230 @@ async def test_transfer_status_reports_done_and_lists(monkeypatch, tmp_path):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# --- pre-submission pricing --------------------------------------------------
+@pytest.mark.anyio
+async def test_price_job_without_a_cache_says_how_to_get_one(monkeypatch, tmp_path):
+    # Pricing must be usable before any connection exists, so a missing cache is
+    # a normal state with a clear next step -- not an error about SSH.
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "absent.json"))
+    payload = await _call("o2_price_job", {"params": {"partition": "short", "cpus": 4}})
+    assert payload["ok"] is False
+    assert payload["error"] == "no_weight_cache"
+    assert "o2_refresh_billing_weights" in payload["message"]
+
+
+@pytest.mark.anyio
+async def test_price_job_reports_cheaper_partitions_for_the_same_request(monkeypatch, tmp_path):
+    from o2mcp import billing
+
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "weights.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=gpu_quad TRESBillingWeights=CPU=1.0,Mem=0.0625G,GRES/gpu=5.0"
+            " TRES=cpu=400,mem=4000G,node=10,gres/gpu=40\n"
+            "PartitionName=gpu_requeue TRESBillingWeights=CPU=0.1,Mem=0.00625G,GRES/gpu=0.1"
+            " TRES=cpu=1080,mem=10000G,node=27,gres/gpu=108\n"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = await _call(
+        "o2_price_job",
+        {"params": {"partition": "gpu_quad", "cpus": 4, "mem_gb": 6, "gpus": 1}},
+    )
+    assert payload["billing_units"] == 9
+    assert payload["alternatives"][0]["partition"] == "gpu_requeue"
+    assert payload["alternatives"][0]["units"] < 9
+
+
+@pytest.mark.anyio
+async def test_price_job_direct_call_without_memory_uses_the_partition_default(monkeypatch, tmp_path):
+    # `cpus=4` with no mem_gb is a request that names no memory, not a request
+    # for none: Slurm applies DefMemPerCPU and bills it.
+    from o2mcp import billing
+
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table("PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G DefMemPerCPU=4096\n"),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = await _call("o2_price_job", {"params": {"partition": "short", "cpus": 4}})
+    assert payload["ok"] is True
+    assert payload["request"]["mem_gb"] == pytest.approx(16.0)
+    assert "partition default" in payload["request"]["mem_source"]
+    assert payload["billing_units"] == 5
+
+
+@pytest.mark.anyio
+async def test_price_job_refuses_an_unknown_partition(monkeypatch, tmp_path):
+    from o2mcp import billing
+
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "weights.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table("PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G\n"),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = await _call("o2_price_job", {"params": {"partition": "made_up", "cpus": 1}})
+    assert payload["ok"] is False
+    assert payload["error"] == "unpriceable"
+
+
+@pytest.mark.anyio
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+async def test_price_job_registers_under_python_dash_m(monkeypatch):
+    # A @mcp.tool below the `if __name__ == "__main__"` block never executes
+    # under `python -m o2mcp.server`: main() blocks in mcp.run() first, so the
+    # tool is absent for the server's whole lifetime. Import-based entry points
+    # and tests mask it, because they finish importing before calling main.
+    import runpy
+
+    from mcp.server.fastmcp import FastMCP
+
+    served: dict = {}
+
+    def fake_run(self, *args, **kwargs):
+        served["tools"] = {t.name for t in self._tool_manager.list_tools()}
+
+    monkeypatch.setattr(FastMCP, "run", fake_run, raising=False)
+    runpy.run_module("o2mcp.server", run_name="__main__", alter_sys=True)
+    assert "o2_price_job" in served.get("tools", set())
+
+
+@pytest.mark.anyio
+async def test_pricing_never_writes_the_weight_cache(tmp_path, monkeypatch):
+    """The readOnly claim, checked against behaviour rather than the annotation."""
+    cache = tmp_path / "weights.json"
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(cache))
+    billing.save_weight_cache(
+        {"short": billing.Weights(cpu=1.0, mem_per_gb=0.0625)}, 1.0, str(cache), priority_flags=[]
+    )
+    before = cache.read_bytes()
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=2, mem_gb=16)))
+    assert payload["ok"] is True
+    assert cache.read_bytes() == before
+
+
+@pytest.mark.anyio
+async def test_price_job_always_labels_alternatives_as_prices(tmp_path, monkeypatch):
+    """The rows are a price comparison, and every response has to say so.
+
+    Whether a job may actually run on a partition is Slurm's admission control,
+    which the cached partition configuration cannot settle -- so a caller
+    reading these as "partitions that can run this" has been told something
+    this tool does not know.
+    """
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G"
+            " TRES=cpu=4000,mem=40000G,node=10\n"
+            "PartitionName=cheap TRESBillingWeights=CPU=0.1,Mem=0.00625G"
+            " TRES=cpu=4000,mem=40000G,node=10\n"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=64, mem_gb=128)))
+    assert payload["ok"] is True
+    assert payload["alternatives"]
+    assert "NOT verified" in payload["alternatives_note"]
+
+    # Present even when nothing survived the filters, so an empty list is not
+    # read as "nothing cheaper exists" either.
+    pinned = json.loads(
+        await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16, nodes=1))
+    )
+    assert "NOT verified" in pinned["alternatives_note"]
+
+
+@pytest.mark.anyio
+async def test_price_job_prices_a_cpu_only_partition_through_the_tool(tmp_path, monkeypatch):
+    """Through o2_price_job, not through resolve_request alone.
+
+    The unit tests for this exercised resolve_request directly and passed while
+    the tool still returned unpriceable: price() resolves a second time, and
+    the mem_unknown sentinel read as an explicit --mem=0 on that pass. Only a
+    test at this level sees the whole path.
+    """
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=plain State=UP AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+            "PartitionName=billed TRESBillingWeights=CPU=0.1,Mem=0.00625G State=UP"
+            " AllowGroups=ALL TotalCPUs=400 TotalNodes=10\n"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="plain", cpus=8)))
+    assert payload["ok"] is True
+    assert payload["billing_units"] == 8
+    assert payload["request"]["mem_source"] == "not billed on plain"
+    # The comparison is withheld, and the response says which reason applies.
+    assert payload["alternatives"] == []
+    assert "does not bill memory" in payload["alternatives_note"]
+
+
+@pytest.mark.anyio
+async def test_price_job_still_refuses_an_explicit_zero(tmp_path, monkeypatch):
+    """The sentinel must not become a way for a real --mem=0 to slip through."""
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=p TRESBillingWeights=CPU=1,Mem=0.0625G State=UP"
+            " AllowGroups=ALL TotalCPUs=400 TotalNodes=10"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="p", cpus=8, mem_gb=0)))
+    assert payload["ok"] is False
+    assert payload["error"] == "unpriceable"
+    assert "all memory on every allocated node" in payload["message"]
+
+
+@pytest.mark.anyio
+async def test_the_price_job_schema_states_what_its_numbers_mean():
+    """The schema is what an agent reads at the call site.
+
+    Lives here, not in tests/unit: that suite is dependency-free and runs on a
+    Python where the MCP extras are not installed, so importing the server
+    there broke the whole lane.
+    """
+    mem = o2server.PriceJobInput.model_fields["mem_gb"].description
+    assert "TOTAL" in mem
+    assert "per NODE" in mem
+    nodes = o2server.PriceJobInput.model_fields["nodes"].description
+    assert "whenever the submission" in nodes
+    assert "MaxNodes" in nodes
+    cpus = o2server.PriceJobInput.model_fields["cpus"].description
+    assert "Total CPUs" in cpus
+
+
+@pytest.mark.anyio
+async def test_price_job_rejects_non_finite_numbers(tmp_path, monkeypatch):
+    """A JSON number that overflows to inf satisfied gt/ge and then hit int().
+
+    OverflowError is not BillingError, so it escaped the handler and the tool
+    call crashed rather than answering.
+    """
+    monkeypatch.setenv("O2_BILLING_WEIGHTS_CACHE", str(tmp_path / "w.json"))
+    billing.save_weight_cache(
+        billing.parse_weight_table(
+            "PartitionName=short TRESBillingWeights=CPU=1.0,Mem=0.0625G" " TRES=cpu=400,mem=4000G,node=10"
+        ),
+        captured_at=1000.0,
+        priority_flags=[],
+    )
+    for field in ("cpus", "mem_gb", "gpus", "nodes"):
+        with pytest.raises(ValidationError):
+            o2server.PriceJobInput(**{"partition": "short", "cpus": 4, field: float("inf")})
+    with pytest.raises(ValidationError):
+        o2server.PriceJobInput(partition="short", cpus=float("nan"))
+    # A finite request still prices.
+    payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16)))
+    assert payload["ok"] is True
