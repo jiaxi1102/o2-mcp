@@ -477,6 +477,10 @@ UNPRICEABLE_OPTIONS = {
     # TRES this module has no input for at all. Each can carry its own
     # TRESBillingWeights entry, so a site that weights them bills for them, and
     # o2_price_job cannot ask about them -- refusing is the honest answer.
+    # Not a TRES: a QoS carries a UsageFactor that MULTIPLIES the charge, so
+    # the partition-weight price is not the cost. Accounts and reservations are
+    # deliberately absent -- an account selects who is charged, not how much.
+    "--qos": "selects a QoS whose UsageFactor multiplies the charge, which no weight table records",
     "--licenses": "requests cluster licenses, a TRES that can carry its own billing weight",
     "--bb": "requests burst buffer, a TRES that can carry its own billing weight",
     "--bbf": "requests burst buffer from a file, a TRES that can carry its own billing weight",
@@ -490,6 +494,7 @@ UNPRICEABLE_OPTIONS = {
 # have one. Kept beside the table rather than in the scanner, so an option
 # added there is looked up in the same place its alias would be.
 UNPRICEABLE_ALIASES = {
+    "--qos": "-q",
     "--licenses": "-L",
     "--overcommit": "-O",
     "--extra-node-info": "-B",

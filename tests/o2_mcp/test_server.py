@@ -1153,6 +1153,9 @@ _ALLOCATION_OPTIONS = (
     "-L",
     "--bb",
     "--bbf",
+    # Not a resource: a QoS UsageFactor multiplies the charge itself.
+    "--qos",
+    "-q",
 )
 
 
