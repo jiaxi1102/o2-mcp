@@ -1012,7 +1012,13 @@ def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] 
             # the reader out of an option that costs them nothing extra.
             found = "--exclusive" in tokens
         else:
+            # A short alias is the same option: `-O` is --overcommit and
+            # `-B2:8:2` is --extra-node-info, and checking only the long
+            # spelling let either through with no warning at all.
             found = _flag_is_set(option, tokens)
+            alias = billing.UNPRICEABLE_ALIASES.get(option)
+            if alias and _flag_is_set(alias, tokens):
+                found = True
         if found:
             seen.add(option)
     return sorted(seen)

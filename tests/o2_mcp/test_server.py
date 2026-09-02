@@ -1106,6 +1106,31 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_short_aliases_of_unpriceable_options_are_caught():
+    """`-O` is --overcommit and `-B` is --extra-node-info, per sbatch(1).
+
+    Checking only the long spelling let either through with no warning -- a
+    MISSED warning, which is the direction that matters.
+    """
+
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("-O")) == ["--overcommit"]
+    for spelling in ("-B2:8:2", "-B 2:8:2", "--extra-node-info=2:8:2"):
+        assert o2server._unpriceable_options_seen(mk(spelling)) == ["--extra-node-info"], spelling
+    # Case matters: -o is --output and -b is --begin, neither unpriceable.
+    assert o2server._unpriceable_options_seen(mk("-o out.txt")) == []
+    assert o2server._unpriceable_options_seen(mk("-b now+1hour")) == []
+
+
+def test_every_alias_names_an_option_in_the_table():
+    # The alias map sits beside UNPRICEABLE_OPTIONS; a typo there would fail
+    # silently, since the scanner only ever looks aliases up by long name.
+    for option in billing.UNPRICEABLE_ALIASES:
+        assert option in billing.UNPRICEABLE_OPTIONS, option
+
+
 def test_a_directive_below_the_script_body_is_inert():
     """sbatch stops reading directives at the first line of actual code.
 

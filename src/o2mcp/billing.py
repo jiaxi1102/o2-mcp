@@ -480,6 +480,14 @@ UNPRICEABLE_OPTIONS = {
     ),
 }
 
+# The short spellings of the options above, per sbatch(1). Only two of them
+# have one. Kept beside the table rather than in the scanner, so an option
+# added there is looked up in the same place its alias would be.
+UNPRICEABLE_ALIASES = {
+    "--overcommit": "-O",
+    "--extra-node-info": "-B",
+}
+
 
 def _free_gpu_warning(req: Request, w: Weights) -> str | None:
     """A note when the declared weights charge nothing for the accelerators.
