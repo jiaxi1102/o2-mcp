@@ -186,8 +186,7 @@ def remote_helper_source() -> str:
     # Keep constants literal in the generated program. Importing ``o2mcp`` on
     # the remote host would require a deployment step and could silently select
     # a different package version than the workstation broker.
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         import json
         import math
         import os
@@ -428,5 +427,4 @@ def remote_helper_source() -> str:
                 "stderr_truncated": stderr_truncated,
             }}
             write_frame(response)
-        """
-    )
+        """)

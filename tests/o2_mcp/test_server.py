@@ -1132,3 +1132,20 @@ def test_short_flags_do_not_match_inside_long_ones():
     # there and stops being worth reading.
     params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --nodes=2\n", remote_path="/n/x.sh")
     assert o2server._pricing_record(params)["resource_flags_seen"] == ["--nodes"]
+
+
+def test_short_flags_with_attached_values_are_detected():
+    # "-c4", "-N2" and "-pshort" are ordinary sbatch. Requiring whitespace or
+    # "=" after a short flag missed all of them, so a fully specified
+    # submission looked resourceless and the warning stayed silent.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH -c4\n#SBATCH -N2\n#SBATCH -pshort\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["-N", "-c", "-p"]
+
+
+def test_long_flags_still_end_at_the_token():
+    # The attached-value allowance must not let "--mem" match "--mem-per-cpu".
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --mem-per-cpu=4G\n", remote_path="/n/x.sh")
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["--mem-per-cpu"]

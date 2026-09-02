@@ -1691,3 +1691,24 @@ def test_a_model_priced_receipt_carries_the_model():
     back = billing.parse_price_receipt(billing.price_receipt(payload))
     assert back["gpu_model"] == "a100"
     assert back["gpus"] == 1
+
+
+def test_a_receipt_must_be_exactly_version_one_and_complete():
+    # startswith() accepted "o2price/10" -- a version this cannot read -- as
+    # though it were version 1, and any single field at all counted as a price,
+    # so a truncated token reported priced=true for something carrying none.
+    for bogus in (
+        "o2price/10 partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        "o2price/1 foo=bar",
+        "o2price/1 partition=short cpus=4",  # truncated
+        "o2price/1 partition=short cpus=x mem_gb=16 gpus=0 units=5",  # non-numeric
+        "o2price/2 partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+    ):
+        assert billing.parse_price_receipt(bogus) is None, bogus
+    # A complete one still reads.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    good = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    assert billing.parse_price_receipt(good)["partition"] == "short"

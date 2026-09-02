@@ -1370,18 +1370,30 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
     Tolerant by design: a receipt that cannot be read is reported as absent
     rather than raising, since its only job is to enrich a submission record.
     """
-    if not token or not str(token).startswith(_RECEIPT_PREFIX):
+    fields = str(token or "").split()
+    # Exact, not a prefix: startswith() accepted "o2price/10", a version this
+    # cannot read, as though it were version 1.
+    if not fields or fields[0] != _RECEIPT_PREFIX:
         return None
     out: dict[str, Any] = {}
-    for part in str(token).split()[1:]:
+    for part in fields[1:]:
         if "=" not in part:
             continue
         key, value = part.split("=", 1)
-        try:
-            out[key] = float(value) if key not in ("partition", "gpu_model") else value
-        except ValueError:
+        if key in ("partition", "gpu_model"):
             out[key] = value
-    return out or None
+            continue
+        try:
+            out[key] = float(value)
+        except ValueError:
+            return None
+    # Every field price_receipt() writes has to be present and numeric.
+    # Accepting a partial token reported `priced: true` for something that
+    # carried no price, which is worse than reporting no receipt at all.
+    required = ("partition", "cpus", "mem_gb", "gpus", "units")
+    if any(key not in out for key in required):
+        return None
+    return out
 
 
 def alternatives_caveat() -> str:

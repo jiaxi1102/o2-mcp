@@ -869,12 +869,17 @@ def _remote_directives(path: str) -> list[str] | None:
     """
     try:
         result = _connection().run(
-            f"grep -E '^[[:space:]]*#SBATCH' -- {_quote_remote_path(path)} || true",
+            f"grep -E '^[[:space:]]*#SBATCH' -- {_quote_remote_path(path)}",
             timeout=15.0,
         )
     except Exception:
         return None
-    if not result.ok:
+    # grep: 0 = matched, 1 = no match, 2+ = could not read it. The first two are
+    # answers; the third is not. `|| true` collapsed all three into success, so
+    # a missing or unreadable script came back as an empty list and was
+    # reported as a script with no resource flags -- the precise claim this
+    # function exists to avoid making.
+    if result.returncode not in (0, 1):
         return None
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
@@ -889,8 +894,13 @@ def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | Non
         haystacks += remote_directives
     for text in haystacks:
         for flag in _RESOURCE_FLAGS:
-            # Word-boundaried so "-n" does not match inside "--nodes".
-            if re.search(rf"(?<![\w-]){re.escape(flag)}(?=[\s=]|$)", text):
+            # Long flags must end at the token, so "--mem" does not match
+            # inside "--mem-per-cpu". Short ones may carry their value attached
+            # -- "-c4", "-N2", "-pshort" are all ordinary sbatch -- so they
+            # accept a following alphanumeric. The lookbehind keeps "-n" from
+            # matching inside "--nodes" either way.
+            tail = r"(?=[\s=]|$)" if flag.startswith("--") else r"(?=[\s=]|$|[A-Za-z0-9])"
+            if re.search(rf"(?<![\w-]){re.escape(flag)}{tail}", text):
                 seen.add(flag)
     return sorted(seen)
 
