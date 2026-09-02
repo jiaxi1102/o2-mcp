@@ -1735,6 +1735,9 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         # A name this version does not write is a token assembled elsewhere.
         "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 foo=1",
         "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 nodes=4",
+        # price_receipt() omits an absent text field rather than writing it
+        # empty, so a bare name with nothing behind it came from elsewhere.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 gpu_model=",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.

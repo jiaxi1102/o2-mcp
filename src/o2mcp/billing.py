@@ -1444,6 +1444,11 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
         if key in out or key not in _RECEIPT_FIELDS:
             return None
         if key in _RECEIPT_TEXT_FIELDS:
+            # price_receipt() omits a text field rather than writing it empty,
+            # so `gpu_model=` is a name with nothing behind it. The partition
+            # check below covers the required one; this covers the optional.
+            if not value:
+                return None
             out[key] = value
             continue
         try:
