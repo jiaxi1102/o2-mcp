@@ -1074,12 +1074,36 @@ def test_a_submission_with_no_resource_flags_is_not_nagged():
     assert "note" not in record
 
 
-def test_a_remote_script_says_it_could_not_look():
-    """Only sbatch_args are visible for a script already on O2 -- say so rather
-    than implying the script has no resource directives."""
-    record = o2server._pricing_record(o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"))
+def test_an_unreadable_remote_script_says_so_rather_than_guessing():
+    """A script whose directives could not be read is UNKNOWN, not resourceless.
+
+    Saying it has no resource flags would be a claim the call cannot support.
+    """
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"), remote_directives=None
+    )
     assert record["priced"] is False
-    assert "not read here" in record["note"]
+    assert "could not be read" in record["note"]
+
+
+def test_a_remote_script_gets_the_same_check_as_an_inlined_one():
+    # The directives come back from one cheap grep, so a submission by path is
+    # no longer a blind spot.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --mem=64G", "#SBATCH --gres=gpu:1", "#SBATCH -t 4:00:00"],
+    )
+    assert record["resource_flags_seen"] == ["--gres", "--mem"]
+    assert "carries no price" in record["note"]
+
+
+def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --job-name=x", "#SBATCH -t 1:00:00"],
+    )
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
 
 
 def test_a_receipt_is_recorded_beside_the_job():

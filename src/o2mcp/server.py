@@ -65,6 +65,7 @@ from o2mcp import (
     transfer_tools,
 )
 from o2mcp.policy import LoginTarget
+from o2mcp.slurm import _quote_remote_path
 
 mcp = FastMCP("o2_mcp")
 
@@ -854,12 +855,38 @@ _RESOURCE_FLAGS = (
 )
 
 
-def _resource_flags_seen(params: SubmitInput) -> list[str]:
+def _remote_directives(path: str) -> list[str] | None:
+    """The #SBATCH lines of a script already on O2, or None if unreadable.
+
+    One cheap read, so a remote submission gets the same check as an inlined
+    one. Only the directive lines come back, never the script body: this looks
+    for which flags are SET, and the rest of the file is the user's code with
+    no reason to be pulled here.
+
+    None on any failure. An unreadable script must not block a submission --
+    the check exists to enrich a record, and a submission that would otherwise
+    succeed cannot be made to fail by it.
+    """
+    try:
+        result = _connection().run(
+            f"grep -E '^[[:space:]]*#SBATCH' -- {_quote_remote_path(path)} || true",
+            timeout=15.0,
+        )
+    except Exception:
+        return None
+    if not result.ok:
+        return None
+    return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
     """Which resource-bearing flags appear in what this call can actually see."""
     seen = set()
     haystacks = [" ".join(params.sbatch_args or [])]
     if params.script_text:
         haystacks += [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
+    if remote_directives:
+        haystacks += remote_directives
     for text in haystacks:
         for flag in _RESOURCE_FLAGS:
             # Word-boundaried so "-n" does not match inside "--nodes".
@@ -868,7 +895,7 @@ def _resource_flags_seen(params: SubmitInput) -> list[str]:
     return sorted(seen)
 
 
-def _pricing_record(params: SubmitInput) -> dict[str, Any]:
+def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = None) -> dict[str, Any]:
     """What this submission can say about having been priced.
 
     Advisory only -- it never blocks. A receipt proves a price was obtained and
@@ -880,7 +907,7 @@ def _pricing_record(params: SubmitInput) -> dict[str, Any]:
     receipt = billing.parse_price_receipt(params.priced or "")
     if receipt:
         return {"priced": True, "receipt": receipt}
-    seen = _resource_flags_seen(params)
+    seen = _resource_flags_seen(params, remote_directives)
     record: dict[str, Any] = {"priced": False, "resource_flags_seen": seen}
     if params.priced:
         record["note"] = (
@@ -895,11 +922,11 @@ def _pricing_record(params: SubmitInput) -> dict[str, Any]:
             "job's output to reveal it. Price the shape with o2_price_job and "
             "pass its `receipt` to record what was priced."
         )
-    elif params.remote_script_path:
+    elif params.remote_script_path and remote_directives is None:
         record["note"] = (
-            "The script lives on O2 and was not read here, so its resource "
-            "directives are not visible to this call and no price accompanied "
-            "it. Price the shape with o2_price_job if it requests resources."
+            "The script lives on O2 and its #SBATCH lines could not be read, so "
+            "whether it requests resources is unknown here and no price "
+            "accompanied it. Price the shape with o2_price_job if it does."
         )
     return record
 
@@ -918,6 +945,13 @@ async def o2_submit_job(params: SubmitInput) -> str:
 
     def work() -> dict[str, Any]:
         slurm = O2Slurm(_connection())
+        # Read the remote script's directives BEFORE submitting, so an
+        # unreadable script surfaces as "unknown" rather than as a submission
+        # that already happened. Skipped when a receipt was supplied, since
+        # there is then nothing the flags would add.
+        directives = None
+        if params.remote_script_path and not billing.parse_price_receipt(params.priced or ""):
+            directives = _remote_directives(params.remote_script_path)
         if params.script_text is not None:
             if not params.remote_path:
                 return {"ok": False, "error": "bad_input", "message": "remote_path is required with script_text."}
@@ -934,7 +968,7 @@ async def o2_submit_job(params: SubmitInput) -> str:
             "ok": res.submitted,
             "submitted": res.submitted,
             "job_id": res.job_id,
-            "pricing": _pricing_record(params),
+            "pricing": _pricing_record(params, directives),
             **_command_payload(res.command),
         }
 
