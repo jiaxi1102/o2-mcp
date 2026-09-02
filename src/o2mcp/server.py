@@ -837,23 +837,43 @@ async def o2_exec(params: RunInput) -> str:
 # deciding it means 32 GB total is the sbatch parser o2_price_job deliberately
 # does not have. A warning that names what it saw is useful; one that fires on
 # every submission is noise, and noise is ignored.
+# Every sbatch option that states or shapes the resources a job is allocated,
+# audited against the sbatch(1) option list in one pass rather than added one
+# at a time as each is noticed missing. A flag absent here is a job recorded as
+# carrying no resource request -- a MISSED warning, the direction that costs
+# someone real fair share.
+#
+# Not here on purpose:
+#   --oversubscribe   permits sharing a node, does not grow the allocation
+#   --exclusive and the socket/core topology options live in
+#     billing.UNPRICEABLE_OPTIONS instead, because they cannot be priced at all
+#
+# Short forms are included only where sbatch(1) documents one: -c, -n, -N, -p,
+# -G and -S. The remaining long names have none.
 _RESOURCE_FLAGS = (
     "--mem",
-    # -G is --gpus, per sbatch(1). The other long names here have no short
-    # form; -c, -n, -N and -p below are the rest of the ones that do.
-    "-G",
     "--mem-per-cpu",
     "--mem-per-gpu",
+    "--mincpus",
     "--cpus-per-task",
     "-c",
+    "--cpus-per-gpu",
     "--ntasks",
     "-n",
+    "--ntasks-per-node",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
     "--nodes",
     "-N",
     "--gres",
     "--gpus",
+    "-G",
     "--gpus-per-task",
     "--gpus-per-node",
+    "--tres-per-task",
+    "--core-spec",
+    "-S",
+    "--thread-spec",
     "--partition",
     "-p",
 )

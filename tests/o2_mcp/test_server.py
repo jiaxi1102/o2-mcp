@@ -1106,6 +1106,79 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+# Every sbatch option that changes what a job is allocated, from the sbatch(1)
+# option list. Kept as data so the audit is repeatable: a flag added to sbatch,
+# or dropped from _RESOURCE_FLAGS, shows up here rather than as a silent gap.
+_RESOURCE_FLAGS = o2server._RESOURCE_FLAGS
+
+_ALLOCATION_OPTIONS = (
+    "-n",
+    "--ntasks",
+    "-c",
+    "--cpus-per-task",
+    "--ntasks-per-node",
+    "--ntasks-per-socket",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
+    "-N",
+    "--nodes",
+    "--overcommit",
+    "--exclusive",
+    "--mem",
+    "--mem-per-cpu",
+    "--mem-per-gpu",
+    "-G",
+    "--gpus",
+    "--gpus-per-node",
+    "--gpus-per-socket",
+    "--gpus-per-task",
+    "--gres",
+    "--cpus-per-gpu",
+    "-B",
+    "--extra-node-info",
+    "--sockets-per-node",
+    "--cores-per-socket",
+    "--threads-per-core",
+    "--mincpus",
+    "--tres-per-task",
+    "--core-spec",
+    "--thread-spec",
+)
+
+
+def test_no_allocation_option_goes_unnoticed():
+    """Each of these is either a resource flag or an unpriceable one.
+
+    A flag in neither list is a job recorded as requesting nothing -- a MISSED
+    warning. These were found nine at a time by auditing the option list, after
+    being reported one at a time.
+    """
+    known = set(_RESOURCE_FLAGS) | set(billing.UNPRICEABLE_OPTIONS) | set(billing.UNPRICEABLE_ALIASES.values())
+    assert [opt for opt in _ALLOCATION_OPTIONS if opt not in known] == []
+
+
+def test_an_allocation_option_is_reported_however_it_is_written():
+    # Through the scanner, not just the tuple: each has to survive tokenising.
+    for option in _ALLOCATION_OPTIONS:
+        # --exclusive takes only user/mcs/topo, and a SCOPED one is
+        # deliberately not flagged -- it allocates what was asked for. Only the
+        # bare spelling is the whole-node case.
+        spellings = (option,) if option == "--exclusive" else (option, f"{option}=1", f"{option} 1")
+        for directive in spellings:
+            params = o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+            reported = o2server._resource_flags_seen(params) + o2server._unpriceable_options_seen(params)
+            assert reported, directive
+
+
+def test_oversubscribe_is_not_a_resource_request():
+    # It permits sharing a node; it does not grow the allocation. Warning about
+    # it would send someone to price a shape that has not changed.
+    for directive in ("--oversubscribe", "-s"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+        assert o2server._resource_flags_seen(params) == [], directive
+        assert o2server._unpriceable_options_seen(params) == [], directive
+
+
 def test_the_short_gpu_flag_is_a_resource_request():
     # -G is --gpus. Missing it recorded a GPU job as carrying no resource
     # flags at all -- a missed warning on the most expensive TRES there is.
