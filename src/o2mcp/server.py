@@ -1082,7 +1082,13 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
     receipt = billing.parse_price_receipt(params.priced or "")
     unpriceable = _unpriceable_options_seen(params, remote_directives)
     if receipt:
-        record: dict[str, Any] = {"priced": True, "receipt": receipt}
+        # `priced` answers "was THIS submission's shape priced?", so an
+        # unpriceable option makes it false however valid the receipt is: the
+        # branch below proves o2_price_job cannot have priced this allocation.
+        # The receipt is still reported -- it is evidence about some shape, and
+        # discarding it would lose that -- but a client gating on the boolean
+        # must not read it as this job having a price.
+        record: dict[str, Any] = {"priced": not unpriceable, "receipt": receipt}
         if unpriceable:
             # A receipt cannot describe THIS allocation: price() refuses every
             # option in that table, so whatever was priced, it was a different

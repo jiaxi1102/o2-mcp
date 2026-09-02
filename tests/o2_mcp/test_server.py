@@ -1349,7 +1349,11 @@ def test_a_receipt_cannot_silence_an_unpriceable_option():
     record = o2server._pricing_record(
         o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh", priced=receipt)
     )
-    assert record["priced"] is True
+    # `priced` answers "was THIS shape priced?" -- and it provably was not,
+    # however valid the receipt is. A client gating on the boolean must not
+    # read a receipt for some other shape as this job having a price.
+    assert record["priced"] is False
+    assert record["receipt"] is not None
     assert record["unpriceable_options_seen"] == ["--exclusive"]
     assert "describes a different shape" in record["note"]
 
