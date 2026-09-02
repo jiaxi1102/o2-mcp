@@ -1046,3 +1046,65 @@ async def test_price_job_rejects_non_finite_numbers(tmp_path, monkeypatch):
     # A finite request still prices.
     payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16)))
     assert payload["ok"] is True
+
+
+def test_submitting_without_a_price_names_the_flags_it_saw():
+    """A warning that fires on every submission is noise, so it must be specific.
+
+    Presence of a resource flag is safe to detect; its VALUE is the sbatch
+    parser o2_price_job deliberately does not have.
+    """
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --mem=32G\n#SBATCH -c 4\n#SBATCH --gres=gpu:1\nsrun x\n",
+        remote_path="/n/scratch/x.sh",
+    )
+    record = o2server._pricing_record(params)
+    assert record["priced"] is False
+    assert record["resource_flags_seen"] == ["--gres", "--mem", "-c"]
+    assert "carries no price" in record["note"]
+
+
+def test_a_submission_with_no_resource_flags_is_not_nagged():
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --job-name=x\nsrun hostname\n",
+        remote_path="/n/scratch/x.sh",
+    )
+    record = o2server._pricing_record(params)
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
+
+
+def test_a_remote_script_says_it_could_not_look():
+    """Only sbatch_args are visible for a script already on O2 -- say so rather
+    than implying the script has no resource directives."""
+    record = o2server._pricing_record(o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"))
+    assert record["priced"] is False
+    assert "not read here" in record["note"]
+
+
+def test_a_receipt_is_recorded_beside_the_job():
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16), table, "short")
+    params = o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=billing.price_receipt(payload))
+    record = o2server._pricing_record(params)
+    assert record["priced"] is True
+    assert record["receipt"]["partition"] == "short"
+    assert record["receipt"]["units"] == payload["billing_units"]
+
+
+def test_an_unrecognised_priced_value_is_reported_not_swallowed():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/x.sh", priced="hand-written nonsense")
+    )
+    assert record["priced"] is False
+    assert "not a recognisable" in record["note"]
+
+
+def test_short_flags_do_not_match_inside_long_ones():
+    # "-n" must not fire on "--nodes", or the warning names flags that are not
+    # there and stops being worth reading.
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --nodes=2\n", remote_path="/n/x.sh")
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["--nodes"]

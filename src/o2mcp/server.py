@@ -31,6 +31,7 @@ unit-tested without it.
 from __future__ import annotations
 
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -320,6 +321,16 @@ class SubmitInput(BaseModel):
     )
     remote_path: str | None = Field(
         default=None, description="Where to stage script_text on O2 (required when script_text is given)."
+    )
+    priced: str | None = Field(
+        default=None,
+        description=(
+            "The `receipt` string from an o2_price_job call for this "
+            "submission's resource shape. Optional and never blocking, but "
+            "passing it records WHAT was priced alongside the job id, so a "
+            "submission that skipped pricing is visible in its own receipt "
+            "rather than indistinguishable from one that did not."
+        ),
     )
     sbatch_args: list[str] = Field(default_factory=list, description="Extra sbatch flags, e.g. ['--time=02:00:00'].")
 
@@ -819,6 +830,80 @@ async def o2_exec(params: RunInput) -> str:
     return await _run_tool(work)
 
 
+# Flags that carry a resource shape. Their PRESENCE is what is detected here,
+# never their values: spotting that "--mem" occurs is trivial and safe, while
+# deciding it means 32 GB total is the sbatch parser o2_price_job deliberately
+# does not have. A warning that names what it saw is useful; one that fires on
+# every submission is noise, and noise is ignored.
+_RESOURCE_FLAGS = (
+    "--mem",
+    "--mem-per-cpu",
+    "--mem-per-gpu",
+    "--cpus-per-task",
+    "-c",
+    "--ntasks",
+    "-n",
+    "--nodes",
+    "-N",
+    "--gres",
+    "--gpus",
+    "--gpus-per-task",
+    "--gpus-per-node",
+    "--partition",
+    "-p",
+)
+
+
+def _resource_flags_seen(params: SubmitInput) -> list[str]:
+    """Which resource-bearing flags appear in what this call can actually see."""
+    seen = set()
+    haystacks = [" ".join(params.sbatch_args or [])]
+    if params.script_text:
+        haystacks += [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
+    for text in haystacks:
+        for flag in _RESOURCE_FLAGS:
+            # Word-boundaried so "-n" does not match inside "--nodes".
+            if re.search(rf"(?<![\w-]){re.escape(flag)}(?=[\s=]|$)", text):
+                seen.add(flag)
+    return sorted(seen)
+
+
+def _pricing_record(params: SubmitInput) -> dict[str, Any]:
+    """What this submission can say about having been priced.
+
+    Advisory only -- it never blocks. A receipt proves a price was obtained and
+    what for; it cannot prove the price describes THIS script, which would need
+    the parser that was kept out of o2_price_job on purpose. Recording it puts
+    the shape beside the job id so a skipped price is visible afterwards rather
+    than silent.
+    """
+    receipt = billing.parse_price_receipt(params.priced or "")
+    if receipt:
+        return {"priced": True, "receipt": receipt}
+    seen = _resource_flags_seen(params)
+    record: dict[str, Any] = {"priced": False, "resource_flags_seen": seen}
+    if params.priced:
+        record["note"] = (
+            "A `priced` value was given but is not a recognisable o2_price_job "
+            "receipt, so nothing about the price is recorded here."
+        )
+    elif seen:
+        record["note"] = (
+            "This submission sets " + ", ".join(seen) + " and carries no price. "
+            "Fair share is charged on the ALLOCATION, so an ordinary-looking "
+            "--mem can overcharge by a whole billing unit with nothing in the "
+            "job's output to reveal it. Price the shape with o2_price_job and "
+            "pass its `receipt` to record what was priced."
+        )
+    elif params.remote_script_path:
+        record["note"] = (
+            "The script lives on O2 and was not read here, so its resource "
+            "directives are not visible to this call and no price accompanied "
+            "it. Price the shape with o2_price_job if it requests resources."
+        )
+    return record
+
+
 @mcp.tool(
     name="o2_submit_job",
     annotations={"title": "Submit a Slurm job", "readOnlyHint": False, "openWorldHint": True},
@@ -845,7 +930,13 @@ async def o2_submit_job(params: SubmitInput) -> str:
                 "error": "bad_input",
                 "message": "Provide remote_script_path or script_text+remote_path.",
             }
-        return {"ok": res.submitted, "submitted": res.submitted, "job_id": res.job_id, **_command_payload(res.command)}
+        return {
+            "ok": res.submitted,
+            "submitted": res.submitted,
+            "job_id": res.job_id,
+            "pricing": _pricing_record(params),
+            **_command_payload(res.command),
+        }
 
     return await _run_tool(work)
 
@@ -1099,6 +1190,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
         # Always, not conditionally: the rows are a price comparison, and a
         # caller who reads them as "partitions that can run this" has been told
         # something this cache cannot know.
+        payload["receipt"] = billing.price_receipt(payload)
         payload["alternatives_note"] = billing.alternatives_caveat()
         if request.mem_unknown:
             # An empty list here has a specific cause worth naming: the price

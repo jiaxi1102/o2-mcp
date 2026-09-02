@@ -1656,3 +1656,38 @@ def test_the_adjustment_preserves_the_memory_each_task_asked_for():
     assert resolved.cpus == 3
     assert resolved.mem_gb == 20
     assert resolved.cpus * resolved.mem_per_cpu_gb >= req.mem_gb
+
+
+def test_a_price_receipt_round_trips():
+    # The receipt travels in the RESPONSE rather than on disk: o2_price_job
+    # advertises readOnlyHint, and a receipt file would make that claim false --
+    # the same failure that split the weight refresh out of it.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16), table, "short", captured_at=1756000000.0)
+    token = billing.price_receipt(payload)
+    back = billing.parse_price_receipt(token)
+    assert back["partition"] == "short"
+    assert back["cpus"] == 4
+    assert back["mem_gb"] == 16
+    assert back["units"] == payload["billing_units"]
+
+
+def test_an_unreadable_receipt_reads_as_absent():
+    # Tolerant by design: its only job is to enrich a submission record, so a
+    # malformed one must not raise into the submission path.
+    for junk in ("", "garbage", "o2price/1", "not-a-receipt cpus=4"):
+        assert billing.parse_price_receipt(junk) in (None, {})
+
+
+def test_a_model_priced_receipt_carries_the_model():
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5,GRES/gpu:a100=10"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=8,gres/gpu:a100=8 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100"), table, "gpu")
+    back = billing.parse_price_receipt(billing.price_receipt(payload))
+    assert back["gpu_model"] == "a100"
+    assert back["gpus"] == 1

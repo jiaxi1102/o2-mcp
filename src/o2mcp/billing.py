@@ -1332,6 +1332,58 @@ def alternatives(
 # this parser does not recognise leaves the row in place.
 
 
+# A price receipt travels in the RESPONSE, not on disk. o2_price_job advertises
+# readOnlyHint, and a receipt file would make that claim false -- the same
+# failure that split the weight refresh out of it. A self-describing token
+# keeps pricing read-only while still letting a submission record what was
+# priced.
+#
+# It is an audit aid, not a credential: nothing here proves the receipt
+# describes the script it accompanies, only that a price was obtained and what
+# it was for. Verifying the match needs the script parser this module
+# deliberately does not have.
+_RECEIPT_PREFIX = "o2price/1"
+
+
+def price_receipt(payload: dict[str, Any]) -> str:
+    """A compact, self-describing record of one price."""
+    req = payload.get("request") or {}
+    weights = payload.get("weights") or {}
+    fields = [
+        _RECEIPT_PREFIX,
+        f"partition={payload.get('partition', '?')}",
+        f"cpus={req.get('cpus', 0):g}",
+        f"mem_gb={req.get('mem_gb', 0):g}",
+        f"gpus={req.get('gpus', 0):g}",
+        f"units={payload.get('billing_units', 0)}",
+    ]
+    if req.get("gpu_model"):
+        fields.append(f"gpu_model={req['gpu_model']}")
+    if weights.get("captured_at") is not None:
+        fields.append(f"weights_at={weights['captured_at']:.0f}")
+    return " ".join(fields)
+
+
+def parse_price_receipt(token: str) -> dict[str, Any] | None:
+    """Read a receipt back, or None if it is not one.
+
+    Tolerant by design: a receipt that cannot be read is reported as absent
+    rather than raising, since its only job is to enrich a submission record.
+    """
+    if not token or not str(token).startswith(_RECEIPT_PREFIX):
+        return None
+    out: dict[str, Any] = {}
+    for part in str(token).split()[1:]:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        try:
+            out[key] = float(value) if key not in ("partition", "gpu_model") else value
+        except ValueError:
+            out[key] = value
+    return out or None
+
+
 def alternatives_caveat() -> str:
     """What the alternatives list is, stated every time it is returned.
 
