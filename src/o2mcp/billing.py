@@ -1368,6 +1368,13 @@ def alternatives(
 # deliberately does not have.
 _RECEIPT_PREFIX = "o2price/1"
 
+# Exactly the fields price_receipt() writes. With required-fields,
+# no-duplicates, no-bare-words and this, the parser accepts the v1 grammar and
+# nothing else -- so a token carrying anything more was assembled elsewhere and
+# is not evidence of a price.
+_RECEIPT_TEXT_FIELDS = ("partition", "gpu_model")
+_RECEIPT_FIELDS = ("partition", "cpus", "mem_gb", "gpus", "units", "gpu_model", "weights_at")
+
 
 def _receipt_number(value: Any) -> str:
     """The shortest text for `value` that reads back as the same number.
@@ -1426,12 +1433,12 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
         if "=" not in part:
             return None
         key, value = part.split("=", 1)
-        # price_receipt() writes each field once. A repeat means the token was
-        # assembled somewhere else, and taking the last silently picked which
-        # of two answers to record.
-        if key in out:
+        # price_receipt() writes each field once, and writes no others. A
+        # repeat, or a name this version does not know, means the token was
+        # assembled somewhere else.
+        if key in out or key not in _RECEIPT_FIELDS:
             return None
-        if key in ("partition", "gpu_model"):
+        if key in _RECEIPT_TEXT_FIELDS:
             out[key] = value
             continue
         try:

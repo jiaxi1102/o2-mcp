@@ -1732,6 +1732,9 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         # rest of the string is not a receipt either.
         "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 garbage",
         "o2price/1 garbage partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        # A name this version does not write is a token assembled elsewhere.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 foo=1",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 nodes=4",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.
@@ -1761,6 +1764,25 @@ def test_a_model_name_cannot_smuggle_a_field_into_the_receipt():
     # An ordinary model name still travels.
     payload["request"]["gpu_model"] = "a100"
     assert billing.parse_price_receipt(billing.price_receipt(payload))["gpu_model"] == "a100"
+
+
+def test_the_optional_fields_still_read():
+    # gpu_model and weights_at are written when present; restricting the field
+    # set must not turn them into unknown names.
+    good = "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5"
+    assert billing.parse_price_receipt(good + " gpu_model=a100")["gpu_model"] == "a100"
+    assert billing.parse_price_receipt(good + " weights_at=1756000000") is not None
+    # Every name the writer can emit is one the reader accepts.
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=400,mem=4000G,gres/gpu=40,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16, gpus=1), table, "gpu")
+    payload["weights"] = {"captured_at": 1756000000}
+    token = billing.price_receipt(payload)
+    for field in token.split()[1:]:
+        assert field.split("=", 1)[0] in billing._RECEIPT_FIELDS, field
+    assert billing.parse_price_receipt(token) is not None
 
 
 def test_a_receipt_records_the_shape_it_was_given():
