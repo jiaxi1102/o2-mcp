@@ -1147,6 +1147,12 @@ _ALLOCATION_OPTIONS = (
     # submission naming one and carrying no price is the same warning.
     "-p",
     "--partition",
+    # TRES with no input on o2_price_job at all: a weighted site bills for
+    # these and nothing here can ask about them.
+    "--licenses",
+    "-L",
+    "--bb",
+    "--bbf",
 )
 
 

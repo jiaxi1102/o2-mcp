@@ -474,6 +474,12 @@ UNPRICEABLE_OPTIONS = {
     "--extra-node-info": "specifies sockets/cores/threads of the chosen nodes",
     "--overcommit": "decouples the CPU allocation from the task count",
     "--mem=0": "means all memory on every allocated node, which needs node sizes",
+    # TRES this module has no input for at all. Each can carry its own
+    # TRESBillingWeights entry, so a site that weights them bills for them, and
+    # o2_price_job cannot ask about them -- refusing is the honest answer.
+    "--licenses": "requests cluster licenses, a TRES that can carry its own billing weight",
+    "--bb": "requests burst buffer, a TRES that can carry its own billing weight",
+    "--bbf": "requests burst buffer from a file, a TRES that can carry its own billing weight",
     "hetjob": (
         "separates heterogeneous components, each with its own allocation; "
         "folding them into one set of numbers prices neither"
@@ -484,6 +490,7 @@ UNPRICEABLE_OPTIONS = {
 # have one. Kept beside the table rather than in the scanner, so an option
 # added there is looked up in the same place its alias would be.
 UNPRICEABLE_ALIASES = {
+    "--licenses": "-L",
     "--overcommit": "-O",
     "--extra-node-info": "-B",
 }
