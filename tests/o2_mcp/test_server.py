@@ -1180,6 +1180,35 @@ def test_an_allocation_option_is_reported_however_it_is_written():
             assert reported, directive
 
 
+def test_a_hash_inside_a_directive_value_is_not_a_comment():
+    # sbatch reads a directive's arguments directly, so `#` in a value is part
+    # of it. Splitting on comments ended the line at the hash and silently
+    # dropped every option after it.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --comment=issue#123 --exclusive\n", remote_path="/n/x.sh"
+    )
+    assert o2server._unpriceable_options_seen(params) == ["--exclusive"]
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --comment=issue#123 --mem=64G\n", remote_path="/n/x.sh"
+    )
+    assert o2server._resource_flags_seen(params) == ["--mem"]
+
+
+def test_a_disabled_directive_is_not_a_directive():
+    """`#SBATCH_DISABLED` is how a directive gets switched off.
+
+    Matching the marker without a boundary read it as live and, after slicing
+    seven characters, reported the option it was meant to disable.
+    """
+    for marker in ("#SBATCH_DISABLED", "#SBATCHFOO", "#SBATCH-OLD"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n{marker} --exclusive\n", remote_path="/n/x.sh")
+        assert o2server._unpriceable_options_seen(params) == [], marker
+    # The real marker still works, with any leading or extra whitespace.
+    for line in ("#SBATCH --exclusive", "  #SBATCH --exclusive", "#SBATCH\t--exclusive"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n{line}\n", remote_path="/n/x.sh")
+        assert o2server._unpriceable_options_seen(params) == ["--exclusive"], line
+
+
 def test_a_colon_separated_hetjob_is_recognised():
     # Slurm separates heterogeneous components with `hetjob` OR a lone `:`,
     # and the wrapper forwards that colon through as its own argument.

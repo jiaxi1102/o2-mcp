@@ -911,7 +911,7 @@ def _remote_directives(path: str) -> list[str] | None:
             # Redirected, not passed as an argument: awk has no `--` end-of-
             # options marker, so a path is safer arriving through the shell,
             # which also keeps a leading dash from reading as an option.
-            "awk '/^[[:space:]]*#SBATCH/{print; next} "
+            "awk '/^[[:space:]]*#SBATCH([[:space:]]|$)/{print; next} "
             "/^[[:space:]]*($|#)/{next} {exit}' "
             f"< {_quote_remote_path(path)}",
             timeout=15.0,
@@ -933,6 +933,12 @@ def _remote_directives(path: str) -> list[str] | None:
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+# `#SBATCH` must end at a boundary. Without it `#SBATCH_DISABLED --exclusive`
+# -- an ordinary way to switch a directive off -- reads as a live directive,
+# and slicing seven characters leaves the option behind to be reported.
+_SBATCH_LINE = re.compile(r"^\s*#SBATCH(?=\s|$)")
+
+
 def _leading_directives(script: str) -> list[str]:
     """The #SBATCH lines sbatch will actually read.
 
@@ -944,7 +950,7 @@ def _leading_directives(script: str) -> list[str]:
     for line in script.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
-            if stripped.startswith("#SBATCH"):
+            if _SBATCH_LINE.match(line):
                 lines.append(line)
             continue
         break
@@ -971,9 +977,16 @@ def _option_tokens(params: SubmitInput, remote_directives: list[str] | None = No
     else:
         lines = []
     for line in lines:
-        body = line.lstrip()[len("#SBATCH") :]
+        match = _SBATCH_LINE.match(line)
+        if not match:
+            continue
+        body = line[match.end() :]
         try:
-            tokens += shlex.split(body, comments=True)
+            # comments=False: sbatch reads a directive's arguments directly, so
+            # a `#` inside a value is part of it. Splitting on comments turned
+            # `--comment=issue#123 --exclusive` into a line ending at the hash
+            # and dropped the option after it.
+            tokens += shlex.split(body)
         except ValueError:
             # An unbalanced quote is not ours to resolve; take the words as
             # they fall rather than dropping the line and reporting silence.
