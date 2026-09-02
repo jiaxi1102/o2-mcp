@@ -1024,7 +1024,11 @@ def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] 
     seen = set()
     for option in billing.UNPRICEABLE_OPTIONS:
         if option == "hetjob":
-            found = "hetjob" in tokens
+            # Slurm separates heterogeneous components either with the `hetjob`
+            # directive or with a lone `:` between argument groups, and the
+            # wrapper forwards that colon through as its own argument. A value
+            # containing a colon (--gres=gpu:1) is never a lone token.
+            found = "hetjob" in tokens or ":" in tokens
         elif option == "--mem=0":
             value = _value_after("--mem", tokens)
             found = value is not None and bool(_ZERO_MEM.match(value))

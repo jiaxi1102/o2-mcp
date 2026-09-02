@@ -1387,8 +1387,14 @@ def price_receipt(payload: dict[str, Any]) -> str:
         f"gpus={_receipt_number(req.get('gpus', 0))}",
         f"units={payload.get('billing_units', 0)}",
     ]
-    if req.get("gpu_model"):
-        fields.append(f"gpu_model={req['gpu_model']}")
+    # A space-separated record cannot carry a value containing spaces: the
+    # second half would read back as another field. price() refuses a model the
+    # partition does not declare, so this is not reachable through the tool,
+    # but price_receipt() takes a plain dict and should not emit a record it
+    # cannot read back.
+    model = str(req.get("gpu_model") or "")
+    if model and not any(ch.isspace() for ch in model):
+        fields.append(f"gpu_model={model}")
     if weights.get("captured_at") is not None:
         fields.append(f"weights_at={weights['captured_at']:.0f}")
     return " ".join(fields)
@@ -1410,6 +1416,11 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
         if "=" not in part:
             continue
         key, value = part.split("=", 1)
+        # price_receipt() writes each field once. A repeat means the token was
+        # assembled somewhere else, and taking the last silently picked which
+        # of two answers to record.
+        if key in out:
+            return None
         if key in ("partition", "gpu_model"):
             out[key] = value
             continue

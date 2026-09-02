@@ -1724,6 +1724,10 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         # o2_price_job declares cpus gt=0, so no receipt was ever issued with
         # none -- even though billing.price() alone would compute the shape.
         "o2price/1 partition=short cpus=0 mem_gb=16 gpus=0 units=1",
+        # price_receipt() writes each field once. A repeat means the token was
+        # assembled elsewhere, and last-wins silently picked an answer.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 units=999",
+        "o2price/1 partition=short partition=other cpus=4 mem_gb=16 gpus=0 units=5",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.
@@ -1733,6 +1737,26 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
     )
     good = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
     assert billing.parse_price_receipt(good)["partition"] == "short"
+
+
+def test_a_model_name_cannot_smuggle_a_field_into_the_receipt():
+    """The record is space-separated, so a value with a space is two fields.
+
+    price() refuses a model the partition does not declare, so this is not
+    reachable through o2_price_job -- but price_receipt() takes a plain dict
+    and must not write a record it cannot read back.
+    """
+    payload = {
+        "partition": "gpu",
+        "billing_units": 10,
+        "request": {"cpus": 4, "mem_gb": 16, "gpus": 1, "gpu_model": "a100 units=999999"},
+    }
+    token = billing.price_receipt(payload)
+    assert "999999" not in token
+    assert billing.parse_price_receipt(token)["units"] == 10
+    # An ordinary model name still travels.
+    payload["request"]["gpu_model"] = "a100"
+    assert billing.parse_price_receipt(billing.price_receipt(payload))["gpu_model"] == "a100"
 
 
 def test_a_receipt_records_the_shape_it_was_given():

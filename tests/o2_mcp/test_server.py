@@ -1143,6 +1143,10 @@ _ALLOCATION_OPTIONS = (
     "--tres-per-task",
     "--core-spec",
     "--thread-spec",
+    # Not a size, but it picks the weights the size is priced with, so a
+    # submission naming one and carrying no price is the same warning.
+    "-p",
+    "--partition",
 )
 
 
@@ -1168,6 +1172,19 @@ def test_an_allocation_option_is_reported_however_it_is_written():
             params = o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
             reported = o2server._resource_flags_seen(params) + o2server._unpriceable_options_seen(params)
             assert reported, directive
+
+
+def test_a_colon_separated_hetjob_is_recognised():
+    # Slurm separates heterogeneous components with `hetjob` OR a lone `:`,
+    # and the wrapper forwards that colon through as its own argument.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--nodes=1", ":", "--nodes=2"]
+    )
+    assert o2server._unpriceable_options_seen(params) == ["hetjob"]
+    # A colon INSIDE a value is not a separator.
+    plain = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --gres=gpu:1\n", remote_path="/n/x.sh")
+    assert o2server._unpriceable_options_seen(plain) == []
+    assert o2server._resource_flags_seen(plain) == ["--gres"]
 
 
 def test_oversubscribe_is_not_a_resource_request():
