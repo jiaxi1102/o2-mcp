@@ -885,19 +885,47 @@ def _remote_directives(path: str) -> list[str] | None:
     """
     try:
         result = _connection().run(
-            f"grep -E '^[[:space:]]*#SBATCH' -- {_quote_remote_path(path)}",
+            # Redirected, not passed as an argument: awk has no `--` end-of-
+            # options marker, so a path is safer arriving through the shell,
+            # which also keeps a leading dash from reading as an option.
+            "awk '/^[[:space:]]*#SBATCH/{print; next} "
+            "/^[[:space:]]*($|#)/{next} {exit}' "
+            f"< {_quote_remote_path(path)}",
             timeout=15.0,
         )
     except Exception:
         return None
-    # grep: 0 = matched, 1 = no match, 2+ = could not read it. The first two are
-    # answers; the third is not. `|| true` collapsed all three into success, so
-    # a missing or unreadable script came back as an empty list and was
-    # reported as a script with no resource flags -- the precise claim this
-    # function exists to avoid making.
-    if result.returncode not in (0, 1):
+    # awk rather than grep, because sbatch stops reading directives at the first
+    # line that is neither blank nor a comment: a #SBATCH sitting below the
+    # script's code is inert, and reporting it warns about an option the job
+    # does not have. This stops where sbatch stops.
+    #
+    # awk exits 0 whether or not it printed anything -- "no directives" is an
+    # answer -- and nonzero when it could not read the file, which is not. An
+    # earlier `|| true` collapsed the two, so a missing script came back as a
+    # script with no resource flags: the precise claim this function exists to
+    # avoid making.
+    if result.returncode != 0:
         return None
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _leading_directives(script: str) -> list[str]:
+    """The #SBATCH lines sbatch will actually read.
+
+    sbatch stops processing directives at the first line that is neither blank
+    nor a comment, so a #SBATCH below the script's code is inert. Collecting it
+    warns about an option the job does not have.
+    """
+    lines = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if stripped.startswith("#SBATCH"):
+                lines.append(line)
+            continue
+        break
+    return lines
 
 
 def _option_tokens(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
@@ -914,7 +942,7 @@ def _option_tokens(params: SubmitInput, remote_directives: list[str] | None = No
     """
     tokens = list(params.sbatch_args or [])
     if params.script_text is not None:
-        lines = [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
+        lines = _leading_directives(params.script_text)
     elif remote_directives:
         lines = list(remote_directives)
     else:
@@ -1088,8 +1116,7 @@ async def o2_submit_job(params: SubmitInput) -> str:
         slurm = O2Slurm(_connection())
         # Read the remote script's directives BEFORE submitting, so an
         # unreadable script surfaces as "unknown" rather than as a submission
-        # that already happened. Skipped when a receipt was supplied, since
-        # there is then nothing the flags would add.
+        # that already happened.
         directives = None
         submitted_path = _submitted_remote_path(params)
         if submitted_path:

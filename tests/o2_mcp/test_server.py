@@ -1106,6 +1106,26 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_a_directive_below_the_script_body_is_inert():
+    """sbatch stops reading directives at the first line of actual code.
+
+    A #SBATCH sitting under the script's commands is never applied, so warning
+    about it describes an option the job does not have.
+    """
+    below = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --mem=4G\n\nsrun ./run.sh\n#SBATCH --exclusive\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._unpriceable_options_seen(below) == []
+    assert o2server._resource_flags_seen(below) == ["--mem"]
+    # Comments and blank lines do not end the block, so this one IS applied.
+    above = o2server.SubmitInput(
+        script_text="#!/bin/bash\n# a note\n\n#SBATCH --exclusive\nsrun ./run.sh\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._unpriceable_options_seen(above) == ["--exclusive"]
+
+
 def test_a_scoped_exclusive_is_not_warned_about():
     """--exclusive=user does NOT take the whole node, so it prices normally.
 
