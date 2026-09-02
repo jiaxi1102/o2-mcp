@@ -1721,6 +1721,9 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         "o2price/1 partition=short cpus=2.5 mem_gb=16 gpus=0 units=5",
         # Slurm allocates whole devices; price() refuses a fractional count.
         "o2price/1 partition=x cpus=4 mem_gb=16 gpus=0.5 units=5",
+        # o2_price_job declares cpus gt=0, so no receipt was ever issued with
+        # none -- even though billing.price() alone would compute the shape.
+        "o2price/1 partition=short cpus=0 mem_gb=16 gpus=0 units=1",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.

@@ -1417,6 +1417,11 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
         return None
     if any(out[key] < 0 for key in ("cpus", "mem_gb", "gpus", "units")):
         return None
+    # cpus is stricter than non-negative. price() itself would compute a shape
+    # with none, but a receipt only ever comes from o2_price_job, whose input
+    # schema declares cpus gt=0 -- so a zero-CPU receipt was never issued.
+    if out["cpus"] == 0:
+        return None
     if out["units"] != int(out["units"]):
         return None
     # cpus is an allocation total, ntasks x --cpus-per-task, and price()
