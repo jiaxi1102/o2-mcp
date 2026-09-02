@@ -1137,6 +1137,12 @@ def test_an_ordinary_mem_request_is_not_called_unpriceable():
     assert o2server._unpriceable_options_seen(mk("--mem=4G")) == []
     assert o2server._unpriceable_options_seen(mk("--mem=0")) == ["--mem=0"]
     assert o2server._unpriceable_options_seen(mk("--mem=0G")) == ["--mem=0"]
+    # sbatch takes the value attached or separated, and both mean every byte.
+    assert o2server._unpriceable_options_seen(mk("--mem 0")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem 0GB")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem 4G")) == []
+    # And --mem must not match inside --mem-per-cpu either way.
+    assert o2server._unpriceable_options_seen(mk("--mem-per-cpu 0")) == []
 
 
 def test_unpriceable_options_are_found_in_a_remote_script_too():

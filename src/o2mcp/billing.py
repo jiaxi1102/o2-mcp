@@ -1399,6 +1399,25 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
     required = ("partition", "cpus", "mem_gb", "gpus", "units")
     if any(key not in out for key in required):
         return None
+    # Present and finite is not yet possible. A receipt records a price that
+    # was actually computed, so it cannot carry a nameless partition or a
+    # negative count of anything, and billing_units comes out of floor() and is
+    # always whole. Reporting `priced: true` over -4 CPUs would put a shape in
+    # the submission record that no price() call could have produced.
+    if not out["partition"]:
+        return None
+    if any(out[key] < 0 for key in ("cpus", "mem_gb", "gpus", "units")):
+        return None
+    if out["units"] != int(out["units"]):
+        return None
+    # cpus is an allocation total, ntasks x --cpus-per-task, and price()
+    # refuses a shape that does not divide evenly into whole CPUs per task --
+    # so a fractional one never came from here either.
+    if out["cpus"] != int(out["cpus"]):
+        return None
+    # mem_gb is deliberately left fractional: 0.25 is 256 MB, an ordinary
+    # request that price() accepts. This rejects only what it can prove
+    # impossible, since an over-tight parser discards real receipts.
     return out
 
 

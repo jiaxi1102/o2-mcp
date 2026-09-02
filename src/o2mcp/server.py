@@ -933,8 +933,11 @@ def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] 
             if option == "hetjob":
                 pattern = r"(?<![\w-])hetjob(?=[\s]|$)"
             elif option == "--mem=0":
-                # 0, 0G, 0GB -- all of them mean every byte on every node.
-                pattern = r"(?<![\w-])--mem=0[KMGT]?B?(?=[\s]|$)"
+                # 0, 0G, 0GB -- all of them mean every byte on every node, and
+                # sbatch takes the value attached or separated, so both
+                # spellings have to match or `--mem 0` reads as an ordinary
+                # request and sends the reader to a tool that refuses it.
+                pattern = r"(?<![\w-])--mem[=\s]+0[KMGT]?B?(?=[\s]|$)"
             else:
                 pattern = rf"(?<![\w-]){re.escape(option)}(?=[\s=]|$)"
             if re.search(pattern, text):

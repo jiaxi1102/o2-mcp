@@ -1709,6 +1709,16 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         "o2price/1 partition=short cpus=inf mem_gb=16 gpus=0 units=5",
         "o2price/1 partition=short cpus=4 mem_gb=-inf gpus=0 units=5",
         "o2price/1 partition=short cpus=4 mem_gb=16 gpus=Infinity units=5",
+        # A receipt records a price that was computed. No price() call yields a
+        # nameless partition, a negative count, or fractional billing units --
+        # floor() produces the last one.
+        "o2price/1 partition=x cpus=-4 mem_gb=-16 gpus=-1 units=-2",
+        "o2price/1 partition= cpus=4 mem_gb=16 gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5.5",
+        "o2price/1 partition=short cpus=4 mem_gb=-0.5 gpus=0 units=5",
+        # price() refuses a CPU count that will not divide into whole CPUs per
+        # task, so a fractional one never came from a real price.
+        "o2price/1 partition=short cpus=2.5 mem_gb=16 gpus=0 units=5",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.
@@ -1718,3 +1728,30 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
     )
     good = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
     assert billing.parse_price_receipt(good)["partition"] == "short"
+
+
+def test_every_receipt_this_module_writes_reads_back():
+    """The constraints must reject only what price() cannot produce.
+
+    Tightening a parser risks rejecting valid input, so the guard is a
+    round-trip over real prices rather than a list of hand-picked good tokens.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    # Shapes price() actually accepts -- it refuses zero memory and any CPU
+    # count that will not divide into whole CPUs per task, so neither belongs
+    # in a round-trip. Fractional MEMORY does: 0.25 GB is an ordinary 256 MB.
+    shapes = [
+        billing.Request(cpus=1, mem_gb=4),
+        billing.Request(cpus=32, mem_gb=250),
+        billing.Request(cpus=1, mem_gb=0.25),
+        billing.Request(cpus=3, mem_gb=7),
+        billing.Request(cpus=4, mem_gb=16, nodes=4, nodes_stated=True),
+    ]
+    for req in shapes:
+        token = billing.price_receipt(billing.price(req, table, "short"))
+        back = billing.parse_price_receipt(token)
+        assert back is not None, token
+        assert back["cpus"] == req.cpus, token
