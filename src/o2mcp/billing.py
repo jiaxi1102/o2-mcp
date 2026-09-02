@@ -456,7 +456,16 @@ _SBATCH = re.compile(r"^\s*#SBATCH\s+(.*?)\s*$")
 # the weight cache holds no topology. Refusing is a complete answer; a price
 # derived from a guessed socket count is not.
 UNPRICEABLE_OPTIONS = {
-    "--exclusive": "bills every TRES on the allocated nodes, not what was asked for",
+    # sbatch(1): "the job is allocated all CPUs and GRES on all nodes in the
+    # allocation, but is only allocated as much memory as it requested."
+    # Memory is therefore the one term that stays as asked; CPUs and GPUs
+    # become the nodes' own counts, which the weight cache has no topology to
+    # supply. Saying "every TRES" overstated it and would talk a reader out of
+    # a memory request that is in fact billed exactly as written.
+    "--exclusive": (
+        "allocates every CPU and GRES on the nodes it lands on, whatever their size, "
+        "though memory is still billed as requested"
+    ),
     "--ntasks-per-socket": "needs the sockets-per-node of the chosen hardware",
     "--gpus-per-socket": "needs the sockets-per-node of the chosen hardware",
     "--sockets-per-node": "constrains node selection by hardware layout",

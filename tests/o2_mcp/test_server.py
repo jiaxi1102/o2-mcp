@@ -1116,7 +1116,9 @@ def test_an_exclusive_script_is_not_silent():
     record = o2server._pricing_record(params)
     assert record["resource_flags_seen"] == []
     assert record["unpriceable_options_seen"] == ["--exclusive"]
-    assert "every TRES on the allocated nodes" in record["note"]
+    # sbatch(1) is specific: all CPUs and GRES on the node, memory as requested.
+    assert "every CPU and GRES on the nodes it lands on" in record["note"]
+    assert "memory is still billed as requested" in record["note"]
     # Not the ordinary advice: o2_price_job answers `unpriceable` for these.
     assert "cannot price these" in record["note"]
 
