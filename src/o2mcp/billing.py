@@ -1362,6 +1362,19 @@ def alternatives(
 _RECEIPT_PREFIX = "o2price/1"
 
 
+def _receipt_number(value: Any) -> str:
+    """The shortest text for `value` that reads back as the same number.
+
+    `:g` carries six significant digits, so a shape priced at mem_gb=16.000009
+    was recorded as 16 -- a receipt describing something other than what was
+    priced, which is the one thing a receipt must not do. The pretty form is
+    kept wherever it round-trips, and only the awkward cases pay for repr().
+    """
+    number = float(value)
+    text = f"{number:g}"
+    return text if float(text) == number else repr(number)
+
+
 def price_receipt(payload: dict[str, Any]) -> str:
     """A compact, self-describing record of one price."""
     req = payload.get("request") or {}
@@ -1369,9 +1382,9 @@ def price_receipt(payload: dict[str, Any]) -> str:
     fields = [
         _RECEIPT_PREFIX,
         f"partition={payload.get('partition', '?')}",
-        f"cpus={req.get('cpus', 0):g}",
-        f"mem_gb={req.get('mem_gb', 0):g}",
-        f"gpus={req.get('gpus', 0):g}",
+        f"cpus={_receipt_number(req.get('cpus', 0))}",
+        f"mem_gb={_receipt_number(req.get('mem_gb', 0))}",
+        f"gpus={_receipt_number(req.get('gpus', 0))}",
         f"units={payload.get('billing_units', 0)}",
     ]
     if req.get("gpu_model"):

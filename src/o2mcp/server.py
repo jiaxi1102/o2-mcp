@@ -839,6 +839,9 @@ async def o2_exec(params: RunInput) -> str:
 # every submission is noise, and noise is ignored.
 _RESOURCE_FLAGS = (
     "--mem",
+    # -G is --gpus, per sbatch(1). The other long names here have no short
+    # form; -c, -n, -N and -p below are the rest of the ones that do.
+    "-G",
     "--mem-per-cpu",
     "--mem-per-gpu",
     "--cpus-per-task",

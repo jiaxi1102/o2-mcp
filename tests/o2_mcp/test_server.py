@@ -1106,6 +1106,19 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_the_short_gpu_flag_is_a_resource_request():
+    # -G is --gpus. Missing it recorded a GPU job as carrying no resource
+    # flags at all -- a missed warning on the most expensive TRES there is.
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._resource_flags_seen(mk("-G1")) == ["-G"]
+    assert o2server._resource_flags_seen(mk("-G 2")) == ["-G"]
+    assert o2server._resource_flags_seen(mk("--gpus=1")) == ["--gpus"]
+    # Lowercase -g is not an sbatch resource flag.
+    assert o2server._resource_flags_seen(mk("-g x")) == []
+
+
 def test_short_aliases_of_unpriceable_options_are_caught():
     """`-O` is --overcommit and `-B` is --extra-node-info, per sbatch(1).
 

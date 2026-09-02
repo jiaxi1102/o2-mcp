@@ -1735,6 +1735,20 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
     assert billing.parse_price_receipt(good)["partition"] == "short"
 
 
+def test_a_receipt_records_the_shape_it_was_given():
+    """`:g` carries six significant digits and silently rounded the shape.
+
+    A receipt describing something other than what was priced is the one thing
+    it must not do, however unlikely the input.
+    """
+    for value in (16, 16.0, 0.25, 16.000009, 1 / 3, 1e-7, 123456789.5):
+        text = billing._receipt_number(value)
+        assert float(text) == float(value), (value, text)
+    # The common shapes stay readable rather than turning into repr() noise.
+    assert billing._receipt_number(16.0) == "16"
+    assert billing._receipt_number(0.25) == "0.25"
+
+
 def test_every_receipt_this_module_writes_reads_back():
     """The constraints must reject only what price() cannot produce.
 
