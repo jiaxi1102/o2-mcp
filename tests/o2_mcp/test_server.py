@@ -1106,6 +1106,51 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_a_scoped_exclusive_is_not_warned_about():
+    """--exclusive=user does NOT take the whole node, so it prices normally.
+
+    sbatch(1) applies the whole-node rule only "if user/mcs/topo are not
+    specified". Warning about the scoped forms would talk a reader out of an
+    option that costs them nothing extra.
+    """
+
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("--exclusive")) == ["--exclusive"]
+    for scope in ("user", "mcs", "topo"):
+        assert o2server._unpriceable_options_seen(mk(f"--exclusive={scope}")) == [], scope
+
+
+def test_an_option_named_inside_another_options_value_is_not_set():
+    # submit() quotes each sbatch_args element into one argument, so this is a
+    # --comment whose text mentions --exclusive, not a job taking whole nodes.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--comment=do not use --exclusive"]
+    )
+    assert o2server._unpriceable_options_seen(params) == []
+    assert o2server._resource_flags_seen(params) == []
+    # ...but a real option beside it still registers.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--comment=see --mem notes", "--mem=64G"]
+    )
+    assert o2server._resource_flags_seen(params) == ["--mem"]
+
+
+def test_a_malformed_receipt_cannot_silence_an_unpriceable_option():
+    # The valid-receipt path was fixed first; a garbage string reached the same
+    # silence through the malformed-receipt branch.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh", priced="typo-not-a-receipt"
+        )
+    )
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    assert "cannot price these" in record["note"]
+    # And it still says the receipt was unreadable.
+    assert "not a recognisable" in record["note"]
+
+
 def test_a_receipt_cannot_silence_an_unpriceable_option():
     """Passing a valid receipt must not buy silence about --exclusive.
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -899,19 +900,61 @@ def _remote_directives(path: str) -> list[str] | None:
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def _directive_haystacks(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
-    """Every place this call can see an sbatch option, for the script that runs.
+def _option_tokens(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """The sbatch options this call can see, split the way sbatch sees them.
+
+    Tokenised, not scanned as text. submit() shell-quotes each sbatch_args
+    element into one argument, so an option name sitting inside another
+    option's VALUE -- `--comment=do not use --exclusive` -- is not an option
+    being set, and a substring scan of the joined string called it one.
 
     Built once and shared, so a second scan cannot re-derive the script_text /
     remote_script_path precedence and get it wrong. `is not None`, not
     truthiness -- an empty script_text is still what submit_text() sends.
     """
-    haystacks = [" ".join(params.sbatch_args or [])]
+    tokens = list(params.sbatch_args or [])
     if params.script_text is not None:
-        haystacks += [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
+        lines = [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
     elif remote_directives:
-        haystacks += remote_directives
-    return haystacks
+        lines = list(remote_directives)
+    else:
+        lines = []
+    for line in lines:
+        body = line.lstrip()[len("#SBATCH") :]
+        try:
+            tokens += shlex.split(body, comments=True)
+        except ValueError:
+            # An unbalanced quote is not ours to resolve; take the words as
+            # they fall rather than dropping the line and reporting silence.
+            tokens += body.split()
+    return tokens
+
+
+def _value_after(flag: str, tokens: list[str]) -> str | None:
+    """The value given to `flag`, attached or separated, or None if unset."""
+    for index, token in enumerate(tokens):
+        if token == flag:
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            return "" if following.startswith("-") else following
+        if token.startswith(flag + "="):
+            return token[len(flag) + 1 :]
+    return None
+
+
+def _flag_is_set(flag: str, tokens: list[str]) -> bool:
+    """Whether `flag` appears as an option, not inside another one's value."""
+    for token in tokens:
+        if token == flag or token.startswith(flag + "="):
+            return True
+        # Short flags may carry the value attached -- -c4, -N2, -pshort are all
+        # ordinary sbatch. Long ones may not, so "--mem" never matches
+        # "--mem-per-cpu".
+        if not flag.startswith("--") and len(token) > len(flag) and token.startswith(flag):
+            return True
+    return False
+
+
+_ZERO_MEM = re.compile(r"^0[KMGT]?B?$", re.IGNORECASE)
 
 
 def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
@@ -920,45 +963,37 @@ def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] 
     Derived from billing.UNPRICEABLE_OPTIONS rather than a second hand-kept
     list, so an option added there is caught here without a matching edit.
 
-    These matter more than the priceable ones, not less: --exclusive bills
-    every TRES on the allocated nodes, so a script whose only directive is
-    --exclusive is among the most expensive things submittable and drew no
-    warning at all while this scan looked only for resource flags. They need
-    their own note too -- o2_price_job answers `unpriceable` for these, so
+    These matter more than the priceable ones, not less: a script whose only
+    directive is --exclusive is among the most expensive things submittable and
+    drew no warning at all while this scan looked only for resource flags. They
+    need their own note too -- o2_price_job answers `unpriceable` for these, so
     telling the reader to go and price the shape sends them nowhere.
     """
+    tokens = _option_tokens(params, remote_directives)
     seen = set()
-    for text in _directive_haystacks(params, remote_directives):
-        for option in billing.UNPRICEABLE_OPTIONS:
-            if option == "hetjob":
-                pattern = r"(?<![\w-])hetjob(?=[\s]|$)"
-            elif option == "--mem=0":
-                # 0, 0G, 0GB -- all of them mean every byte on every node, and
-                # sbatch takes the value attached or separated, so both
-                # spellings have to match or `--mem 0` reads as an ordinary
-                # request and sends the reader to a tool that refuses it.
-                pattern = r"(?<![\w-])--mem[=\s]+0[KMGT]?B?(?=[\s]|$)"
-            else:
-                pattern = rf"(?<![\w-]){re.escape(option)}(?=[\s=]|$)"
-            if re.search(pattern, text):
-                seen.add(option)
+    for option in billing.UNPRICEABLE_OPTIONS:
+        if option == "hetjob":
+            found = "hetjob" in tokens
+        elif option == "--mem=0":
+            value = _value_after("--mem", tokens)
+            found = value is not None and bool(_ZERO_MEM.match(value))
+        elif option == "--exclusive":
+            # sbatch(1) applies the whole-node rule only when no scope is
+            # given: with --exclusive=user or =mcs the job is allocated what it
+            # asked for, so it prices normally and warning about it would talk
+            # the reader out of an option that costs them nothing extra.
+            found = "--exclusive" in tokens
+        else:
+            found = _flag_is_set(option, tokens)
+        if found:
+            seen.add(option)
     return sorted(seen)
 
 
 def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
     """Which resource-bearing flags appear in what this call can actually see."""
-    seen = set()
-    for text in _directive_haystacks(params, remote_directives):
-        for flag in _RESOURCE_FLAGS:
-            # Long flags must end at the token, so "--mem" does not match
-            # inside "--mem-per-cpu". Short ones may carry their value attached
-            # -- "-c4", "-N2", "-pshort" are all ordinary sbatch -- so they
-            # accept a following alphanumeric. The lookbehind keeps "-n" from
-            # matching inside "--nodes" either way.
-            tail = r"(?=[\s=]|$)" if flag.startswith("--") else r"(?=[\s=]|$|[A-Za-z0-9])"
-            if re.search(rf"(?<![\w-]){re.escape(flag)}{tail}", text):
-                seen.add(flag)
-    return sorted(seen)
+    tokens = _option_tokens(params, remote_directives)
+    return sorted(flag for flag in _RESOURCE_FLAGS if _flag_is_set(flag, tokens))
 
 
 def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = None) -> dict[str, Any]:
@@ -995,10 +1030,13 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
     record = {"priced": False, "resource_flags_seen": seen}
     if unpriceable:
         record["unpriceable_options_seen"] = unpriceable
-    if unpriceable and not params.priced:
-        # Ahead of the ordinary warning: these are the costly ones, and the
-        # advice differs. o2_price_job answers `unpriceable` for them, so
-        # "price the shape" would send the reader to a refusal.
+    if unpriceable:
+        # Ahead of the ordinary warning AND ahead of the malformed-receipt one:
+        # these are the costly options, and the advice differs. o2_price_job
+        # answers `unpriceable` for them, so "price the shape" would send the
+        # reader to a refusal. Gating this on `not params.priced` let an
+        # unreadable `priced` string suppress it -- the same silencing a valid
+        # receipt used to buy, reached through the other branch.
         record["note"] = (
             "This submission sets "
             + ", ".join(f"{opt} ({billing.UNPRICEABLE_OPTIONS[opt]})" for opt in unpriceable)
@@ -1007,6 +1045,11 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
             "picks; if that is not what was intended, drop the option and price the "
             "shape instead."
         )
+        if params.priced:
+            record["note"] += (
+                " The `priced` value supplied is also not a recognisable o2_price_job "
+                "receipt, so nothing about a price is recorded here either."
+            )
     elif params.priced:
         record["note"] = (
             "A `priced` value was given but is not a recognisable o2_price_job "
