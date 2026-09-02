@@ -1105,6 +1105,17 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
                 + "; ".join(f"{opt} {billing.UNPRICEABLE_OPTIONS[opt]}" for opt in unpriceable)
                 + "."
             )
+        elif _submitted_remote_path(params) and remote_directives is None:
+            # Unknown is not absent -- the principle this whole record is built
+            # on, and the receipt branch was quietly breaking it. A valid
+            # receipt says a price was obtained; it cannot say the script has
+            # no option that would invalidate it, and here the script could not
+            # be read to check.
+            record["note"] = (
+                "A receipt was supplied, but the script's #SBATCH lines could not be read "
+                "on O2, so whether it sets an option that cannot be priced -- --exclusive "
+                "and the like -- is unknown here. The receipt is recorded as given."
+            )
         return record
     seen = _resource_flags_seen(params, remote_directives)
     record = {"priced": False, "resource_flags_seen": seen}

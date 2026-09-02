@@ -1358,6 +1358,30 @@ def test_a_receipt_cannot_silence_an_unpriceable_option():
     assert "describes a different shape" in record["note"]
 
 
+def test_a_receipt_does_not_turn_an_unreadable_script_into_a_clean_one():
+    """Unknown is not absent -- including on the receipt path.
+
+    A receipt says a price was obtained. It cannot say the script has no
+    option that would invalidate it, and here the script could not be read.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=receipt), remote_directives=None
+    )
+    assert record["priced"] is True
+    assert "could not be read" in record["note"]
+    # A script that WAS read and sets nothing stays quiet.
+    quiet = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=receipt),
+        remote_directives=["#SBATCH -t 1:00:00"],
+    )
+    assert "note" not in quiet
+
+
 def test_an_ordinary_receipt_still_records_nothing_extra():
     # The warning above must not fire for a submission that has no such option.
     table = billing.parse_weight_table(
