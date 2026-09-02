@@ -855,6 +855,21 @@ _RESOURCE_FLAGS = (
 )
 
 
+def _submitted_remote_path(params: SubmitInput) -> str | None:
+    """The remote script this call will actually submit, if it submits one.
+
+    SubmitInput permits script_text and remote_script_path together, and the
+    submit path prefers script_text. Both the directive read and the record it
+    feeds have to follow that same precedence, or a submission carrying both
+    reports the flags of a script that never runs -- or calls one unreadable
+    while submitting a script read perfectly well. One predicate, so the two
+    paths cannot answer this differently.
+    """
+    if params.script_text is not None:
+        return None
+    return params.remote_script_path
+
+
 def _remote_directives(path: str) -> list[str] | None:
     """The #SBATCH lines of a script already on O2, or None if unreadable.
 
@@ -888,9 +903,13 @@ def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | Non
     """Which resource-bearing flags appear in what this call can actually see."""
     seen = set()
     haystacks = [" ".join(params.sbatch_args or [])]
-    if params.script_text:
+    # Same precedence as the submit path, enforced here too: the caller passes
+    # directives in, so this must not merge a remote script's flags into a
+    # record for the text that displaced it. `is not None`, not truthiness --
+    # an empty script_text is still the thing submit_text() sends.
+    if params.script_text is not None:
         haystacks += [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
-    if remote_directives:
+    elif remote_directives:
         haystacks += remote_directives
     for text in haystacks:
         for flag in _RESOURCE_FLAGS:
@@ -932,7 +951,7 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
             "job's output to reveal it. Price the shape with o2_price_job and "
             "pass its `receipt` to record what was priced."
         )
-    elif params.remote_script_path and remote_directives is None:
+    elif _submitted_remote_path(params) and remote_directives is None:
         record["note"] = (
             "The script lives on O2 and its #SBATCH lines could not be read, so "
             "whether it requests resources is unknown here and no price "
@@ -960,8 +979,9 @@ async def o2_submit_job(params: SubmitInput) -> str:
         # that already happened. Skipped when a receipt was supplied, since
         # there is then nothing the flags would add.
         directives = None
-        if params.remote_script_path and not billing.parse_price_receipt(params.priced or ""):
-            directives = _remote_directives(params.remote_script_path)
+        submitted_path = _submitted_remote_path(params)
+        if submitted_path and not billing.parse_price_receipt(params.priced or ""):
+            directives = _remote_directives(submitted_path)
         if params.script_text is not None:
             if not params.remote_path:
                 return {"ok": False, "error": "bad_input", "message": "remote_path is required with script_text."}

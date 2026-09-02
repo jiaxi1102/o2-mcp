@@ -1703,6 +1703,12 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         "o2price/1 partition=short cpus=4",  # truncated
         "o2price/1 partition=short cpus=x mem_gb=16 gpus=0 units=5",  # non-numeric
         "o2price/2 partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        # float() reads these happily; a price is neither, and `priced: true`
+        # over a NaN would put unusable JSON in the submission record.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=nan",
+        "o2price/1 partition=short cpus=inf mem_gb=16 gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=-inf gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=Infinity units=5",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.

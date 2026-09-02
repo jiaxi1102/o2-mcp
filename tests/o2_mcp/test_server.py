@@ -1106,6 +1106,48 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_only_the_script_that_will_run_is_inspected():
+    """script_text wins over remote_script_path, so the record follows it.
+
+    SubmitInput permits both. The submit path sends the text; a record built
+    from the OTHER script's directives would list flags this job does not set.
+    """
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --job-name=x\n",
+            remote_path="/n/x.sh",
+            remote_script_path="/n/scratch/other.sh",
+        ),
+        remote_directives=["#SBATCH --mem=64G", "#SBATCH --gres=gpu:1"],
+    )
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
+
+
+def test_an_unreadable_path_is_not_reported_when_text_is_what_ships():
+    # The submitted script was read perfectly well -- it is right here. Calling
+    # it unknown because a displaced path could not be read is a false alarm.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --job-name=x\n",
+            remote_path="/n/x.sh",
+            remote_script_path="/n/scratch/gone.sh",
+        ),
+        remote_directives=None,
+    )
+    assert "note" not in record
+
+
+def test_submitted_remote_path_follows_the_submit_precedence():
+    # The predicate itself, so the read and the record cannot drift apart.
+    assert o2server._submitted_remote_path(o2server.SubmitInput(remote_script_path="/n/a.sh")) == "/n/a.sh"
+    both = o2server.SubmitInput(script_text="#!/bin/bash\n", remote_path="/n/x.sh", remote_script_path="/n/a.sh")
+    assert o2server._submitted_remote_path(both) is None
+    # An empty script_text is still what submit_text() sends, so it still wins.
+    empty = o2server.SubmitInput(script_text="", remote_path="/n/x.sh", remote_script_path="/n/a.sh")
+    assert o2server._submitted_remote_path(empty) is None
+
+
 def test_a_receipt_is_recorded_beside_the_job():
     table = billing.parse_weight_table(
         "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"

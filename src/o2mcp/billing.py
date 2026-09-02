@@ -1384,9 +1384,15 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
             out[key] = value
             continue
         try:
-            out[key] = float(value)
+            number = float(value)
         except ValueError:
             return None
+        # float() reads "nan" and "inf" without complaint. Neither is a price,
+        # and both would reach the submission record as JSON no reader can use,
+        # under a `priced: true` that claims a price was obtained.
+        if not math.isfinite(number):
+            return None
+        out[key] = number
     # Every field price_receipt() writes has to be present and numeric.
     # Accepting a partial token reported `priced: true` for something that
     # carried no price, which is worse than reporting no receipt at all.
