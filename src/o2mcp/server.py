@@ -971,11 +971,28 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
     than silent.
     """
     receipt = billing.parse_price_receipt(params.priced or "")
-    if receipt:
-        return {"priced": True, "receipt": receipt}
-    seen = _resource_flags_seen(params, remote_directives)
     unpriceable = _unpriceable_options_seen(params, remote_directives)
-    record: dict[str, Any] = {"priced": False, "resource_flags_seen": seen}
+    if receipt:
+        record: dict[str, Any] = {"priced": True, "receipt": receipt}
+        if unpriceable:
+            # A receipt cannot describe THIS allocation: price() refuses every
+            # option in that table, so whatever was priced, it was a different
+            # shape. Returning early on any valid receipt made the warning
+            # silenceable by passing an unrelated one -- the reverse of what a
+            # receipt is for.
+            record["unpriceable_options_seen"] = unpriceable
+            record["note"] = (
+                "A receipt was supplied, but this submission also sets "
+                + ", ".join(unpriceable)
+                + " -- and o2_price_job refuses to price those, so the receipt describes a "
+                "different shape than the one being submitted. Read the price as a floor, "
+                "not as this job's cost: "
+                + "; ".join(f"{opt} {billing.UNPRICEABLE_OPTIONS[opt]}" for opt in unpriceable)
+                + "."
+            )
+        return record
+    seen = _resource_flags_seen(params, remote_directives)
+    record = {"priced": False, "resource_flags_seen": seen}
     if unpriceable:
         record["unpriceable_options_seen"] = unpriceable
     if unpriceable and not params.priced:
@@ -1032,7 +1049,11 @@ async def o2_submit_job(params: SubmitInput) -> str:
         # there is then nothing the flags would add.
         directives = None
         submitted_path = _submitted_remote_path(params)
-        if submitted_path and not billing.parse_price_receipt(params.priced or ""):
+        if submitted_path:
+            # Read them even when a receipt was supplied. A receipt does not
+            # rule out an unpriceable option -- it cannot describe one -- so
+            # skipping the read here would have left that warning reachable for
+            # an inline script and silent for a remote one.
             directives = _remote_directives(submitted_path)
         if params.script_text is not None:
             if not params.remote_path:

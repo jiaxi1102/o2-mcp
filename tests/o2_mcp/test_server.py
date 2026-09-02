@@ -1106,6 +1106,50 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_a_receipt_cannot_silence_an_unpriceable_option():
+    """Passing a valid receipt must not buy silence about --exclusive.
+
+    o2_price_job refuses every option in that table, so a receipt necessarily
+    describes some OTHER shape. Returning early on any valid receipt made the
+    warning silenceable by supplying an unrelated one.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh", priced=receipt)
+    )
+    assert record["priced"] is True
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    assert "describes a different shape" in record["note"]
+
+
+def test_an_ordinary_receipt_still_records_nothing_extra():
+    # The warning above must not fire for a submission that has no such option.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --mem=4G\n", remote_path="/n/x.sh", priced=receipt)
+    )
+    assert record["priced"] is True
+    assert "unpriceable_options_seen" not in record
+    assert "note" not in record
+
+
+def test_receipt_counts_read_back_as_whole_numbers():
+    # They land in the submission JSON; "4.0 CPUs" invites a wrong question.
+    back = billing.parse_price_receipt("o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5")
+    assert (back["cpus"], back["gpus"], back["units"]) == (4, 0, 5)
+    assert all(isinstance(back[k], int) for k in ("cpus", "gpus", "units"))
+    # mem_gb stays float: 0.25 GB is an ordinary 256 MB request.
+    assert isinstance(back["mem_gb"], float)
+
+
 def test_an_exclusive_script_is_not_silent():
     """--exclusive bills the whole node, and set alone it drew no warning.
 

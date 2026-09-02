@@ -1424,9 +1424,19 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
     # so a fractional one never came from here either.
     if out["cpus"] != int(out["cpus"]):
         return None
+    # Same for GPUs: price() refuses a fractional count outright, since Slurm
+    # allocates whole devices.
+    if out["gpus"] != int(out["gpus"]):
+        return None
     # mem_gb is deliberately left fractional: 0.25 is 256 MB, an ordinary
     # request that price() accepts. This rejects only what it can prove
     # impossible, since an over-tight parser discards real receipts.
+    #
+    # The whole-valued fields read back as int. They land in the submission
+    # record as JSON, where a count of "4.0 CPUs" invites a reader to wonder
+    # what the fraction meant.
+    for key in ("cpus", "gpus", "units"):
+        out[key] = int(out[key])
     return out
 
 

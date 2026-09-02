@@ -1719,6 +1719,8 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         # price() refuses a CPU count that will not divide into whole CPUs per
         # task, so a fractional one never came from a real price.
         "o2price/1 partition=short cpus=2.5 mem_gb=16 gpus=0 units=5",
+        # Slurm allocates whole devices; price() refuses a fractional count.
+        "o2price/1 partition=x cpus=4 mem_gb=16 gpus=0.5 units=5",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.
