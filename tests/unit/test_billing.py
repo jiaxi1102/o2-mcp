@@ -1728,6 +1728,10 @@ def test_a_receipt_must_be_exactly_version_one_and_complete():
         # assembled elsewhere, and last-wins silently picked an answer.
         "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 units=999",
         "o2price/1 partition=short partition=other cpus=4 mem_gb=16 gpus=0 units=5",
+        # Every token this module writes is key=value. A bare word means the
+        # rest of the string is not a receipt either.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 garbage",
+        "o2price/1 garbage partition=short cpus=4 mem_gb=16 gpus=0 units=5",
     ):
         assert billing.parse_price_receipt(bogus) is None, bogus
     # A complete one still reads.

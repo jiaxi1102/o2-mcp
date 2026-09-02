@@ -1420,8 +1420,11 @@ def parse_price_receipt(token: str) -> dict[str, Any] | None:
         return None
     out: dict[str, Any] = {}
     for part in fields[1:]:
+        # Every token price_receipt() writes is a key=value pair. Skipping the
+        # ones that are not accepted a token this module never produced and
+        # read a price out of the rest of it.
         if "=" not in part:
-            continue
+            return None
         key, value = part.split("=", 1)
         # price_receipt() writes each field once. A repeat means the token was
         # assembled somewhere else, and taking the last silently picked which
