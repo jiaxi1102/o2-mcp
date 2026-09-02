@@ -899,19 +899,53 @@ def _remote_directives(path: str) -> list[str] | None:
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
-    """Which resource-bearing flags appear in what this call can actually see."""
-    seen = set()
+def _directive_haystacks(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """Every place this call can see an sbatch option, for the script that runs.
+
+    Built once and shared, so a second scan cannot re-derive the script_text /
+    remote_script_path precedence and get it wrong. `is not None`, not
+    truthiness -- an empty script_text is still what submit_text() sends.
+    """
     haystacks = [" ".join(params.sbatch_args or [])]
-    # Same precedence as the submit path, enforced here too: the caller passes
-    # directives in, so this must not merge a remote script's flags into a
-    # record for the text that displaced it. `is not None`, not truthiness --
-    # an empty script_text is still the thing submit_text() sends.
     if params.script_text is not None:
         haystacks += [line for line in params.script_text.splitlines() if line.lstrip().startswith("#SBATCH")]
     elif remote_directives:
         haystacks += remote_directives
-    for text in haystacks:
+    return haystacks
+
+
+def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """Which options appear that o2_price_job refuses to price at all.
+
+    Derived from billing.UNPRICEABLE_OPTIONS rather than a second hand-kept
+    list, so an option added there is caught here without a matching edit.
+
+    These matter more than the priceable ones, not less: --exclusive bills
+    every TRES on the allocated nodes, so a script whose only directive is
+    --exclusive is among the most expensive things submittable and drew no
+    warning at all while this scan looked only for resource flags. They need
+    their own note too -- o2_price_job answers `unpriceable` for these, so
+    telling the reader to go and price the shape sends them nowhere.
+    """
+    seen = set()
+    for text in _directive_haystacks(params, remote_directives):
+        for option in billing.UNPRICEABLE_OPTIONS:
+            if option == "hetjob":
+                pattern = r"(?<![\w-])hetjob(?=[\s]|$)"
+            elif option == "--mem=0":
+                # 0, 0G, 0GB -- all of them mean every byte on every node.
+                pattern = r"(?<![\w-])--mem=0[KMGT]?B?(?=[\s]|$)"
+            else:
+                pattern = rf"(?<![\w-]){re.escape(option)}(?=[\s=]|$)"
+            if re.search(pattern, text):
+                seen.add(option)
+    return sorted(seen)
+
+
+def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """Which resource-bearing flags appear in what this call can actually see."""
+    seen = set()
+    for text in _directive_haystacks(params, remote_directives):
         for flag in _RESOURCE_FLAGS:
             # Long flags must end at the token, so "--mem" does not match
             # inside "--mem-per-cpu". Short ones may carry their value attached
@@ -937,8 +971,23 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
     if receipt:
         return {"priced": True, "receipt": receipt}
     seen = _resource_flags_seen(params, remote_directives)
+    unpriceable = _unpriceable_options_seen(params, remote_directives)
     record: dict[str, Any] = {"priced": False, "resource_flags_seen": seen}
-    if params.priced:
+    if unpriceable:
+        record["unpriceable_options_seen"] = unpriceable
+    if unpriceable and not params.priced:
+        # Ahead of the ordinary warning: these are the costly ones, and the
+        # advice differs. o2_price_job answers `unpriceable` for them, so
+        # "price the shape" would send the reader to a refusal.
+        record["note"] = (
+            "This submission sets "
+            + ", ".join(f"{opt} ({billing.UNPRICEABLE_OPTIONS[opt]})" for opt in unpriceable)
+            + ". o2_price_job cannot price these from the directives alone, so no receipt "
+            "is possible and none is expected. Their cost depends on the nodes Slurm "
+            "picks; if that is not what was intended, drop the option and price the "
+            "shape instead."
+        )
+    elif params.priced:
         record["note"] = (
             "A `priced` value was given but is not a recognisable o2_price_job "
             "receipt, so nothing about the price is recorded here."

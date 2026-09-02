@@ -1106,6 +1106,47 @@ def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
     assert "note" not in record
 
 
+def test_an_exclusive_script_is_not_silent():
+    """--exclusive bills the whole node, and set alone it drew no warning.
+
+    The scan looked only for resource flags, so the single most expensive
+    directive in sbatch produced an empty list and no note at all.
+    """
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh")
+    record = o2server._pricing_record(params)
+    assert record["resource_flags_seen"] == []
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    assert "every TRES on the allocated nodes" in record["note"]
+    # Not the ordinary advice: o2_price_job answers `unpriceable` for these.
+    assert "cannot price these" in record["note"]
+
+
+def test_every_unpriceable_option_is_covered_by_the_scan():
+    # Derived from the table, so an option added there needs no edit here.
+    for option in billing.UNPRICEABLE_OPTIONS:
+        text = "#!/bin/bash\n#SBATCH " + ("hetjob" if option == "hetjob" else f"{option}\n")
+        params = o2server.SubmitInput(script_text=text, remote_path="/n/x.sh")
+        assert option in o2server._unpriceable_options_seen(params), option
+
+
+def test_an_ordinary_mem_request_is_not_called_unpriceable():
+    # --mem=0 means every byte on every node; --mem=4G is just a request.
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("--mem=4G")) == []
+    assert o2server._unpriceable_options_seen(mk("--mem=0")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem=0G")) == ["--mem=0"]
+
+
+def test_unpriceable_options_are_found_in_a_remote_script_too():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --exclusive", "#SBATCH -t 8:00:00"],
+    )
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+
+
 def test_only_the_script_that_will_run_is_inspected():
     """script_text wins over remote_script_path, so the record follows it.
 
