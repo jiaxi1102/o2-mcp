@@ -757,6 +757,82 @@ def test_an_unknown_schema_is_still_refused(tmp_path):
     assert "Unsupported O2 policy schema" in (snapshot.error or "")
 
 
+def _policy_with_mints(tmp_path, mints):
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "generation": "00000000-0000-4000-8000-000000000001",
+                "revision": 1,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+                "launch_evidence_mints": mints,
+            }
+        )
+    )
+    policy.chmod(0o600)
+    return O2PolicyStore(policy, client_id="client-a")
+
+
+def _valid_mint(**overrides):
+    entry = {
+        "at": 1000.0,
+        "client_id": "1234-abcd",
+        "approval_reference": "operator approved",
+        "stage": "platform-canary",
+        "job_id": "52085188",
+        "package": "/pkg/attempt-002",
+        "evidence_sha256": "a" * 64,
+        "plan_sha256": "b" * 64,
+        "policy_revision": 3,
+        "policy_generation": "00000000-0000-4000-8000-000000000001",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_a_complete_mint_entry_is_accepted(tmp_path):
+    assert _policy_with_mints(tmp_path, [_valid_mint()]).snapshot().valid is True
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {},
+        _valid_mint(evidence_sha256="not a digest"),
+        _valid_mint(plan_sha256="b" * 63),
+        _valid_mint(at="recently"),
+        _valid_mint(at=float("inf")),
+        _valid_mint(policy_revision=-1),
+        _valid_mint(policy_revision="3"),
+        _valid_mint(policy_generation="not-a-uuid"),
+        _valid_mint(approval_reference=""),
+        _valid_mint(stage=None),
+    ],
+)
+def test_a_damaged_mint_entry_is_refused(entry, tmp_path):
+    """These entries authenticate evidence records, so a hollow one is not valid.
+
+    An object missing fields would be surfaced through status and preserved
+    across writes while authenticating nothing, and a record checked against it
+    could pass on absent-equals-absent.
+    """
+
+    snapshot = _policy_with_mints(tmp_path, [entry]).snapshot()
+    assert snapshot.valid is False
+    assert "launch_evidence_mints" in (snapshot.error or "")
+
+
+def test_a_ledger_longer_than_its_bound_is_refused(tmp_path):
+    mints = [_valid_mint(evidence_sha256=f"{index:064x}") for index in range(MAX_LAUNCH_EVIDENCE_MINTS + 1)]
+    snapshot = _policy_with_mints(tmp_path, mints).snapshot()
+    assert snapshot.valid is False
+    assert "maximum" in (snapshot.error or "")
+
+
 def test_a_malformed_mint_ledger_is_refused(tmp_path):
     policy = tmp_path / "O2_POLICY.json"
     policy.write_text(

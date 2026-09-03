@@ -797,9 +797,7 @@ class O2PolicyStore:
             self._validate_login_attempt(payload["login_attempt"])
         if not isinstance(payload.get("events", []), list):
             raise O2PolicyInvalidError("events must be an array")
-        mints = payload.get("launch_evidence_mints", [])
-        if not isinstance(mints, list) or any(not isinstance(entry, dict) for entry in mints):
-            raise O2PolicyInvalidError("launch_evidence_mints must be an array of objects")
+        self._validate_launch_evidence_mints(payload.get("launch_evidence_mints", []))
         return payload
 
     @staticmethod
@@ -1168,6 +1166,55 @@ class O2PolicyStore:
         if len(cleaned) > 240:
             raise O2PolicyInvalidError(f"{field} must be at most 240 characters")
         return cleaned
+
+    @staticmethod
+    def _validate_launch_evidence_mints(mints: Any) -> None:
+        """Validate the durable ledger, not merely its shape.
+
+        These entries are the sole durable authenticators for evidence records:
+        `verify_launch_evidence` compares a record field by field against one of
+        them. An entry that is a JSON object but missing fields, or carrying a
+        malformed digest, would therefore be surfaced through status and
+        preserved across writes while authenticating nothing -- and a record
+        checked against it could pass on absent-equals-absent. Refusing makes a
+        damaged ledger loud rather than quietly useless.
+        """
+
+        if not isinstance(mints, list):
+            raise O2PolicyInvalidError("launch_evidence_mints must be an array")
+        if len(mints) > MAX_LAUNCH_EVIDENCE_MINTS:
+            raise O2PolicyInvalidError(
+                f"launch_evidence_mints holds {len(mints)} entries, more than the {MAX_LAUNCH_EVIDENCE_MINTS} maximum"
+            )
+        for index, entry in enumerate(mints):
+            if not isinstance(entry, dict):
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}] must be an object")
+            for field in ("approval_reference", "stage", "job_id", "package", "client_id", "policy_generation"):
+                value = entry.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].{field} must be a non-empty string")
+            for field in ("evidence_sha256", "plan_sha256"):
+                value = entry.get(field)
+                if not isinstance(value, str) or len(value) != 64 or value.strip(_HEX_DIGITS):
+                    raise O2PolicyInvalidError(
+                        f"launch_evidence_mints[{index}].{field} must be a 64-character SHA-256 hex digest"
+                    )
+            recorded_at = entry.get("at")
+            if not isinstance(recorded_at, (int, float)) or isinstance(recorded_at, bool):
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].at must be a number")
+            if not math.isfinite(float(recorded_at)) or float(recorded_at) < 0:
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].at must be a finite, non-negative time")
+            revision = entry.get("policy_revision")
+            if type(revision) is not int or revision < 0:
+                raise O2PolicyInvalidError(
+                    f"launch_evidence_mints[{index}].policy_revision must be a non-negative integer"
+                )
+            try:
+                uuid.UUID(entry["policy_generation"])
+            except ValueError as exc:
+                raise O2PolicyInvalidError(
+                    f"launch_evidence_mints[{index}].policy_generation must be a valid UUID"
+                ) from exc
 
     @staticmethod
     def _clean_literal(value: str, *, field: str, max_length: int) -> str:
