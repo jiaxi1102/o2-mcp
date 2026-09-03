@@ -71,7 +71,6 @@ from o2mcp import (
 from o2mcp.broker_protocol import MAX_COMMAND_BYTES
 from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
-    SYMLINK_SCAN_OK,
     LaunchEvidenceError,
     build_launch_evidence,
     claimed_job_id,
@@ -81,8 +80,6 @@ from o2mcp.launch_evidence import (
     parse_encoded_json_artifact,
     parse_json_artifact,
     parse_scheduler_record,
-    parse_sha256_lines,
-    refuse_package_symlinks,
     required_package_files,
 )
 from o2mcp.policy import LoginTarget
@@ -1252,32 +1249,112 @@ _MARKER_PLAN_SIZE = "===PLANSIZE==="
 _MARKER_OWNER = "===OWNER==="
 _MARKER_MANIFEST_SIZE = "===MANIFESTSIZE==="
 _MARKER_RESOLVED = "===RESOLVED==="
-_MARKER_SYMLINKS = "===SYMLINKS==="
-# Bracket the hashing in one command: scan, digests, scan again.
-_MARKER_PAYLOAD_DIGESTS = "===PAYLOADDIGESTS==="
-_MARKER_PAYLOAD_RESCAN = "===PAYLOADRESCAN==="
-_MARKER_DIGESTS = "===DIGESTS==="
 _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_DIAGNOSTIC_SIZE,
     _MARKER_PLAN_SIZE,
     _MARKER_OWNER,
     _MARKER_MANIFEST_SIZE,
     _MARKER_RESOLVED,
-    _MARKER_SYMLINKS,
-    _MARKER_DIGESTS,
 )
 
 
-def _symlink_scan(package_path: str) -> str:
-    """One symlink inventory that announces its own success.
+# Opening each payload with O_NOFOLLOW and hashing that descriptor is the only
+# way to make identity and content one act. `sha256sum` has no no-follow mode and
+# a shell cannot hold a descriptor across two commands, so this runs a small
+# program on the cluster instead -- a command like any other, staging nothing.
+# It walks each relative path component by component with openat(O_NOFOLLOW), so
+# a symlinked ancestor is refused as well as a symlinked leaf, and reports the
+# package directory's inode from the very descriptor it read through.
+#
+# /usr/bin/python3 on O2 is 3.9, so this stays 3.9 syntax.
+_NOFOLLOW_HASHER = """
+import errno, hashlib, json, os, stat, sys
+root = sys.argv[1]
+names = [n for n in sys.stdin.read().split(chr(10)) if n]
+out = {"digests": {}, "errors": {}}
+rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    out["package_inode"] = os.fstat(rfd).st_ino
+    for name in names:
+        parts = name.split("/")
+        opened = []
+        try:
+            cur = rfd
+            for part in parts[:-1]:
+                cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+                opened.append(cur)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+            opened.append(fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                out["errors"][name] = "not a regular file"
+                continue
+            h = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1048576)
+                if not chunk:
+                    break
+                h.update(chunk)
+            out["digests"][name] = h.hexdigest()
+        except OSError as exc:
+            out["errors"][name] = (
+                "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+            )
+        finally:
+            for f in opened:
+                os.close(f)
+finally:
+    os.close(rfd)
+sys.stdout.write(json.dumps(out))
+"""
 
-    `find` exits non-zero when it cannot enumerate a directory, and a directory
-    that is searchable but not readable still lets its known files be opened --
-    so without the chained sentinel a scan that failed because it could not look
-    is indistinguishable from a package that genuinely has no symlinks.
+# The interpreter is named absolutely so no PATH or module environment can
+# substitute another one; it is present on O2 without sourcing anything.
+_NOFOLLOW_PYTHON = "/usr/bin/python3"
+
+
+def _hash_without_following(*, package_path: str, names: list[str], timeout: float) -> tuple[dict[str, str], int]:
+    """Hash each name through an O_NOFOLLOW descriptor, and report the package inode.
+
+    Returns the digests and the inode of the directory the hashes were read
+    through, so the caller can bind that identity to the one the run recorded.
     """
 
-    return f"find {shlex.quote(package_path)} -type l -print && printf '%s\\n' {shlex.quote(SYMLINK_SCAN_OK)}"
+    program = shlex.quote(_NOFOLLOW_HASHER)
+    command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
+    digests: dict[str, str] = {}
+    inodes: set[int] = set()
+    for batch in _hash_batches(names):
+        result = _connection().run(command, timeout=timeout, input_text="\n".join(batch) + "\n")
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not hash the package on O2 without following links: {}".format(
+                    (result.stderr or "").strip()[:400]
+                )
+            )
+        _refuse_truncated_read(result, label="the package hash read")
+        payload = parse_json_artifact(result.stdout, label="the no-follow hash output")
+        errors = payload.get("errors") or {}
+        if errors:
+            shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
+            more = f" (and {len(errors) - 5} more)" if len(errors) > 5 else ""
+            raise LaunchEvidenceError(
+                "refusing to mint launch evidence; these package entries could not be read as ordinary "
+                f"files through a no-follow open, so the package is not one this can attest: {shown}{more}"
+            )
+        inode = payload.get("package_inode")
+        if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
+            raise LaunchEvidenceError("the package directory reported no usable inode")
+        inodes.add(inode)
+        for name, digest in (payload.get("digests") or {}).items():
+            if name not in batch:
+                raise LaunchEvidenceError(f"the hash output named {name!r}, which was not requested")
+            digests[name] = digest
+    missing = [name for name in names if name not in digests]
+    if missing:
+        raise LaunchEvidenceError("the package hash returned nothing for: {}".format(", ".join(sorted(missing)[:5])))
+    if len(inodes) != 1:
+        raise LaunchEvidenceError("the package directory changed identity while it was being read")
+    return digests, inodes.pop()
 
 
 def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
@@ -1304,29 +1381,17 @@ def _read_launch_artifacts(
     needs a second one, because that list only exists once this has returned.
     """
 
-    owner_path = str(PurePosixPath(package_path) / "PUBLICATION_OWNER.json")
     manifest_path = str(PurePosixPath(package_path) / "SHA256SUMS")
-    # Remember which required file each operand stands for: sha256sum echoes the
-    # operand back, and mapping by that is exact even when a path has spaces.
-    digest_targets = {str(PurePosixPath(package_path) / name): name for name in required_package_files()}
     command = "; ".join(
         [
             f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC_SIZE)}",
             f"stat -c %s -- {shlex.quote(diagnostic_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN_SIZE)}",
             f"stat -c %s -- {shlex.quote(plan_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
-            f"base64 {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST_SIZE)}",
             f"stat -c %s -- {shlex.quote(manifest_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_RESOLVED)}",
             f"realpath -- {shlex.quote(package_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_MARKER_SYMLINKS)}",
-            # `find` does not follow links by default, so a package path that is
-            # itself a symlink is reported here rather than descended into.
-            _symlink_scan(package_path),
-            f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
-            "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
     )
     # This one is not batched, so a package path long enough to overrun the
@@ -1357,12 +1422,11 @@ def _read_launch_artifacts(
     if missing:
         raise LaunchEvidenceError("artifact read returned no {} section".format(", ".join(missing)))
 
-    package_digests: dict[str, str] = {}
-    for operand, digest in parse_sha256_lines(sections[_MARKER_DIGESTS], label="the package digest output").items():
-        name = digest_targets.get(operand)
-        if name is None:
-            raise LaunchEvidenceError(f"the package digest output named {operand!r}, which was not requested")
-        package_digests[name] = digest
+    # The required package files are hashed through no-follow descriptors, which
+    # is also where the package directory's own inode is observed.
+    package_digests, package_inode = _hash_without_following(
+        package_path=package_path, names=list(required_package_files()), timeout=timeout
+    )
     # The manifest is read and hashed by different commands, so the bytes that
     # choose the payloads must be proven to be the file whose digest the record
     # reports. That check lives in parse_encoded_checksum_manifest.
@@ -1376,15 +1440,11 @@ def _read_launch_artifacts(
         ),
         expected_sha256=package_digests.get("SHA256SUMS"),
     )
-    # `cat` and `sha256sum` follow links, so the record has to say what the
-    # cluster actually opened, not what the caller spelled.
+    # The pathname the caller spelled can reach a different directory than it
+    # names, so the record says what the cluster resolved it to.
     resolved = [line.strip() for line in sections[_MARKER_RESOLVED].splitlines() if line.strip()]
     if len(resolved) != 1:
         raise LaunchEvidenceError("the package directory did not resolve to exactly one path on the cluster")
-    # A published package holds no symlinks, so one appearing means the package
-    # is already invalid by its publisher's own rules. Refusing here removes the
-    # object a resolve-then-hash sequence would otherwise have to race.
-    refuse_package_symlinks(sections[_MARKER_SYMLINKS], package_path=package_path)
     # The diagnostic and the plan are read the same way. Neither has a size
     # bound in its own schema, and together they shared the artifact read's one
     # 1 MiB stream, so a large but legitimate plan made a package unmintable.
@@ -1399,6 +1459,7 @@ def _read_launch_artifacts(
     )
     return {
         "resolved_package_path": resolved[0],
+        "package_inode": package_inode,
         "diagnostic": parse_json_artifact(diagnostic_text, label="run diagnostic"),
         "plan": parse_json_artifact(plan_text, label="execution plan"),
         # The owner marker is the artifact tying the package to this plan, so
@@ -1413,32 +1474,36 @@ def _read_launch_artifacts(
     }
 
 
-def _payload_batch_command(package_path: str, operands: str) -> str:
-    """Compose one payload batch: scan, hash, scan again, chained with &&."""
+def _hash_package_payloads(
+    *, package_path: str, manifest: dict[str, str], timeout: float
+) -> tuple[dict[str, str], int]:
+    """Hash every payload SHA256SUMS names through a no-follow descriptor.
 
-    scan = _symlink_scan(package_path)
-    marker = shlex.quote(_MARKER_PAYLOAD_DIGESTS)
-    rescan = shlex.quote(_MARKER_PAYLOAD_RESCAN)
-    return (
-        f"{scan} && printf '\\n%s\\n' {marker}"
-        f" && sha256sum -- {operands}"
-        f" && printf '\\n%s\\n' {rescan} && {scan}"
-    )
+    This is a second pass because it has to be: the payload list only exists
+    once the manifest has been read. Running ``sha256sum -c`` remotely would
+    avoid it at the cost of putting the comparison back inside a process whose
+    verdict this record exists to check, so the digests come back raw and
+    ``build_launch_evidence`` decides.
+
+    The package inode comes back with them, observed through the same descriptor
+    the payloads were read under, so the caller can confirm the directory did not
+    change identity between the two passes.
+    """
+
+    return _hash_without_following(package_path=package_path, names=sorted(manifest), timeout=timeout)
 
 
-# base64 expands by 4/3, and the broker caps captured output at 1 MiB, so a
-# manifest read whole overruns it somewhere above ~750 KiB. Packages with several
-# thousand files reach that, and the payload hashing is already batched for
-# exactly this reason, so the manifest is chunked rather than being the one thing
-# that makes a large package unmintable.
+# base64 expands by 4/3, and the broker caps captured output at 1 MiB, so a file
+# read whole overruns it somewhere above ~750 KiB. Packages with several thousand
+# files reach that for SHA256SUMS, and a plan with a large dataset list reaches it
+# too, so both are chunked rather than being the thing that makes a large but
+# legitimate package unmintable.
 _ARTIFACT_CHUNK_BYTES = 384 * 1024
-# The size that drives the loop below comes from `stat` on a file the package
+# The size that drives the read loop comes from `stat` on a file the package
 # controls, so it is untrusted input to a resource decision. A sparse manifest
-# claiming a terabyte would otherwise mean millions of sequential broker
-# commands and an attempt to accumulate that much base64 in memory -- one mint
-# monopolising the shared channel indefinitely. 8 MiB is about 30,000 manifest
-# entries at typical path lengths, far beyond any real package, and bounds the
-# read at ~22 commands.
+# claiming a terabyte would otherwise mean millions of sequential broker commands
+# and an attempt to accumulate that much base64 in memory. 8 MiB is about 30,000
+# manifest entries at typical path lengths, far beyond any real package.
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 # A run diagnostic or a frozen plan is JSON describing one stage; 4 MiB of it is
 # already far past anything a stage legitimately produces.
@@ -1501,84 +1566,35 @@ def _decoded_artifact(*, path: str, size_section: str, timeout: float, label: st
         raise LaunchEvidenceError(f"{label} did not come back as decodable UTF-8: {error}") from error
 
 
-def _hash_batches(paths: list[str], *, package_path: str) -> Iterator[list[str]]:
-    """Group quoted payload paths into commands the broker will accept.
+# One call per payload would be correct but would take a hold on the shared
+# channel per file. Batching bounds what comes back instead: each name costs its
+# own length plus a 64-character digest and a little JSON, and the broker caps
+# captured output at 1 MiB. The names go out on stdin, which has its own 1 MiB
+# cap and is the smaller side, so bounding the reply bounds both.
+_HASH_REPLY_BUDGET = 600 * 1024
 
-    A package with a few hundred image files overruns the broker's command limit
-    in one command, and `BrokerClient.execute` rejects it before it runs -- so an
-    entirely legitimate package could never mint.
 
-    The allowance is measured from the command actually composed rather than
-    reserved as a constant: the scaffolding embeds the package path twice, once
-    per symlink scan, so a deeply nested package makes a fixed reserve wrong by
-    kilobytes and reintroduces exactly the rejection this batching exists to
-    avoid.
+def _hash_batches(names: list[str]) -> Iterator[list[str]]:
+    """Group payload names into calls whose replies the broker will carry.
+
+    A package with thousands of files overruns the output cap in one call and
+    the whole reply is truncated, so an entirely legitimate package could never
+    be attested.
     """
 
-    budget = MAX_COMMAND_BYTES - len(_payload_batch_command(package_path, "").encode("utf-8"))
-    if budget <= 0:
-        raise LaunchEvidenceError(f"the package path is too long to hash through the broker at all: {package_path!r}")
     batch: list[str] = []
     used = 0
-    for path in paths:
-        quoted = shlex.quote(path)
-        cost = len(quoted.encode("utf-8")) + 1
-        if cost > budget:
-            raise LaunchEvidenceError(f"payload path is too long for one broker command: {path!r}")
-        if batch and used + cost > budget:
+    for name in names:
+        cost = len(name.encode("utf-8")) * 2 + 80
+        if cost > _HASH_REPLY_BUDGET:
+            raise LaunchEvidenceError(f"payload name is too long to hash in one call: {name!r}")
+        if batch and used + cost > _HASH_REPLY_BUDGET:
             yield batch
             batch, used = [], 0
-        batch.append(quoted)
+        batch.append(name)
         used += cost
     if batch:
         yield batch
-
-
-def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeout: float) -> dict[str, str]:
-    """Hash every payload SHA256SUMS names, on the cluster, and return the digests.
-
-    This is a second hold on the channel because it has to be: the payload list
-    only exists once the manifest has been read. Running ``sha256sum -c``
-    remotely would avoid that at the cost of putting the comparison back inside
-    a process whose verdict this record exists to check, so the digests come
-    back raw and ``build_launch_evidence`` decides.
-
-    A manifest name is refused if it is absolute or traversing, so the only way
-    a lexically internal name could escape is through a link -- and each batch
-    therefore rescans the package for symlinks either side of its own hashing,
-    rather than relying on a scan from an earlier round trip.
-    """
-
-    targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
-    if len(targets) != len(manifest):
-        raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
-    payload_digests: dict[str, str] = {}
-    for batch in _hash_batches(sorted(targets), package_path=package_path):
-        # Scan, hash, scan -- all in one command and all chained with &&. The
-        # scan in the artifact read happens a round trip earlier, so on its own
-        # it proves nothing about the instant these paths are opened. Bracketing
-        # the hashing does not make the two atomic, but it does mean a link has
-        # to be created and removed inside a single command rather than in the
-        # gap between broker requests.
-        command = _payload_batch_command(package_path, " ".join(batch))
-        result = _connection().run(command, timeout=timeout)
-        if not result.ok:
-            raise LaunchEvidenceError(
-                "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
-            )
-        _refuse_truncated_read(result, label="the package payload digest read")
-        before, separator, remainder = result.stdout.partition(f"\n{_MARKER_PAYLOAD_DIGESTS}\n")
-        digests, rescan_separator, after_listing = remainder.partition(f"\n{_MARKER_PAYLOAD_RESCAN}\n")
-        if not separator or not rescan_separator:
-            raise LaunchEvidenceError("the payload read did not return both symlink scans and the digests")
-        for listing in (before, after_listing):
-            refuse_package_symlinks(listing, package_path=package_path)
-        for operand, digest in parse_sha256_lines(digests, label="the payload digest output").items():
-            name = targets.get(operand)
-            if name is None:
-                raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")
-            payload_digests[name] = digest
-    return payload_digests
 
 
 def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
@@ -1589,9 +1605,14 @@ def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
     resolution -- and this is what stops the job identity from being the one
     exception. ``-X`` returns the allocation rather than its steps, so a normal
     job is exactly one row.
+
+    ``Comment`` is requested because the plan builder sets it to the plan digest.
+    It is not required: jobs submitted before that lands have none, and
+    ``build_launch_evidence`` treats an empty comment as an explicit unbound
+    field rather than as agreement. A non-empty one must match.
     """
 
-    fields = "JobID,State,Account,Partition"
+    fields = "JobID,State,Account,Partition,Comment"
     command = f"sacct -j {shlex.quote(job_id)} -X -n -P -o {shlex.quote(fields)}"
     result = _connection().run(command, timeout=timeout)
     if not result.ok:
@@ -1642,11 +1663,17 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             package_path=package_path,
             timeout=params.timeout_seconds,
         )
-        payload_digests = _hash_package_payloads(
+        payload_digests, payload_pass_inode = _hash_package_payloads(
             package_path=package_path,
             manifest=artifacts["checksum_manifest"],
             timeout=params.timeout_seconds,
         )
+        if payload_pass_inode != artifacts["package_inode"]:
+            raise LaunchEvidenceError(
+                "refusing to mint launch evidence; the package directory changed identity between the "
+                f"metadata read (inode {artifacts['package_inode']}) and the payload read "
+                f"(inode {payload_pass_inode})"
+            )
         scheduler_record = _read_scheduler_record(
             job_id=claimed_job_id(artifacts["diagnostic"]), timeout=params.timeout_seconds
         )
@@ -1663,6 +1690,7 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
                 stage=params.stage,
                 read_back_package_path=package_path,
                 resolved_package_path=artifacts["resolved_package_path"],
+                observed_package_inode=artifacts["package_inode"],
                 scheduler_record=scheduler_record,
             )
 
