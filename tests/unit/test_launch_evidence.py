@@ -869,3 +869,25 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         else:
             leaves.add((key,))
     assert leaves == accounted
+
+
+def test_an_extra_approval_field_fails_verification() -> None:
+    """The digest blanks this object, so an added claim would ride along free.
+
+    Comparing only the known keys let a holder of a valid record append an
+    unauthenticated claim, recompute the whole-record digest, and still verify.
+    """
+
+    record = _approved_record()
+    entry = _ledger_entry(record)
+    record["operator_approval"]["authorized_by"] = "Alice"
+    with pytest.raises(LaunchEvidenceError, match="not recorded in the ledger"):
+        verify_launch_evidence(record, entry)
+
+
+def test_a_missing_approval_field_fails_verification() -> None:
+    record = _approved_record()
+    entry = _ledger_entry(record)
+    del record["operator_approval"]["client_id"]
+    with pytest.raises(LaunchEvidenceError, match="client_id"):
+        verify_launch_evidence(record, entry)

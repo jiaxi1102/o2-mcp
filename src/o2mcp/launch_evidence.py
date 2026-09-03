@@ -708,7 +708,16 @@ def verify_launch_evidence(record: Mapping[str, Any], ledger_entry: Mapping[str,
         # record digests the same as the approved one it was built alongside.
         # Say that plainly rather than reporting every field as disagreeing.
         raise LaunchEvidenceError("this record carries no operator approval to verify")
+    # Comparing only the known keys would let an extra one ride along: the
+    # content digest blanks this object entirely, so a holder of a valid record
+    # could add "authorized_by": "Alice", recompute the whole-record digest, and
+    # still verify. The approval must be exactly the ledger-backed schema.
+    expected_fields = {field for field, _ in _APPROVAL_TO_LEDGER} | {"evidence_sha256"}
     disagreements = [
+        f"{field}: not recorded in the ledger, so it is not part of any approval"
+        for field in sorted(set(approval) - expected_fields)
+    ]
+    disagreements += [
         f"{field}: record={approval.get(field)!r} ledger={ledger_entry.get(key)!r}"
         for field, key in _APPROVAL_TO_LEDGER
         if approval.get(field) != ledger_entry.get(key)
