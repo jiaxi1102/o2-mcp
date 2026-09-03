@@ -1053,3 +1053,22 @@ def test_an_absent_comment_mints_and_says_the_job_is_not_bound_to_the_plan() -> 
     record = _build(scheduler_record=_scheduler_record(comment=""))
     assert record["binding_check"]["scheduler_comment_bound"] is False
     assert record["unbound_run_reported"]["scheduler_comment"] is None
+
+
+def test_a_comment_naming_another_attempt_refuses_to_mint() -> None:
+    """Retries of the same plan and stage differ only in the attempt index.
+
+    Without binding it, a diagnostic could name a completed job from a different
+    attempt and every other scheduler check would still pass.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="names attempt"):
+        _build(scheduler_record=_scheduler_record(comment=_engine_comment(attempt=3)))
+
+
+def test_the_attempt_is_matched_in_the_form_the_engine_writes_it() -> None:
+    """The engine zero-pads to three digits, as the plan's attempt_id does."""
+
+    record = _build(scheduler_record=_scheduler_record(comment=_engine_comment(attempt=2)))
+    assert record["approved_plan"]["attempt_id"] == "002"
+    assert record["binding_check"]["scheduler_comment_bound"] is True

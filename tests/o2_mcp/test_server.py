@@ -1595,6 +1595,7 @@ def _launch_evidence_responder(
     diagnostic_edit=None,
     stage_id="platform-canary",
     grown_by=None,
+    root_error=None,
     accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
@@ -1698,6 +1699,8 @@ def _launch_evidence_responder(
             known["PUBLICATION_OWNER.json"] = (
                 _hashlib.sha256(owner_bytes).hexdigest() if owner_sha256 is None else owner_sha256
             )
+            if root_error is not None:
+                return _json.dumps({"digests": {}, "errors": {package: root_error}, "package_inode": 0}), "", 0
             reply = {"digests": {}, "errors": {}, "package_inode": inode_reported}
             for name in asked:
                 if name in (unreadable or {}):
@@ -2452,6 +2455,25 @@ async def test_mint_refuses_a_manifest_that_grew_after_it_was_sized(monkeypatch,
     assert refused["ok"] is False
     assert refused["error"] == "launch_evidence_refused"
     assert "grew while it was being read" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_package_path_replaced_by_a_symlink(monkeypatch, tmp_path):
+    """`realpath` runs earlier, so the root is opened O_NOFOLLOW as well.
+
+    A package directory renamed away and replaced with a symlink to it after the
+    resolution would otherwise be followed, and the target's inode reported as
+    though it were the package's.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(root_error="symlink"))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "symlink" in refused["message"] and _PACKAGE in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 

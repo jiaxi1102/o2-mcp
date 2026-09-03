@@ -1264,15 +1264,25 @@ _LAUNCH_EVIDENCE_MARKERS = (
 # program on the cluster instead -- a command like any other, staging nothing.
 # It walks each relative path component by component with openat(O_NOFOLLOW), so
 # a symlinked ancestor is refused as well as a symlinked leaf, and reports the
-# package directory's inode from the very descriptor it read through.
+# package directory's inode from the very descriptor it read through. The root
+# is opened O_NOFOLLOW too: `realpath` runs earlier, so a package path replaced
+# with a symlink after that would otherwise be followed here and report the
+# target's inode as though it were the package's.
 #
 # /usr/bin/python3 on O2 is 3.9, so this stays 3.9 syntax.
 _NOFOLLOW_HASHER = """
 import errno, hashlib, json, os, stat, sys
 root = sys.argv[1]
 names = [n for n in sys.stdin.read().split(chr(10)) if n]
-out = {"digests": {}, "errors": {}}
-rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+out = {"digests": {}, "errors": {}, "package_inode": 0}
+try:
+    rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as exc:
+    out["errors"][root] = (
+        "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+    )
+    sys.stdout.write(json.dumps(out))
+    raise SystemExit(0)
 try:
     out["package_inode"] = os.fstat(rfd).st_ino
     for name in names:

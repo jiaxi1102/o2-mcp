@@ -535,6 +535,18 @@ def build_launch_evidence(
                         f"scheduler comment: the job names stage {identity.stage_id!r} but this record "
                         f"attests {stage!r}"
                     )
+                # Retries of the same plan and stage differ only here, so without
+                # this a diagnostic could name a completed job from a different
+                # attempt and every other scheduler check would still pass. The
+                # engine writes the attempt zero-padded to three digits, which is
+                # the same form the plan's attempt_id and the package name use.
+                checks += 1
+                claimed_attempt = _dig(plan, ("attempt_id",))
+                if f"{identity.attempt:03d}" != claimed_attempt:
+                    mismatches.append(
+                        f"scheduler comment: the job names attempt {identity.attempt:03d} but this record "
+                        f"attests {claimed_attempt!r}"
+                    )
 
     checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
