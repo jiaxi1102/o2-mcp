@@ -1588,6 +1588,7 @@ def _launch_evidence_responder(
     n_payloads=None,
     resolved_package=None,
     symlinks=None,
+    scan_fails=False,
     accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
@@ -1667,24 +1668,24 @@ def _launch_evidence_responder(
 
     def responder(argv, input_text):
         command = argv[-1]
+        if command.startswith("find ") and "sha256sum" in command:
+            # Payload batch: scan, digests, scan again -- one command, all &&.
+            asked = shlex.split(command.split("sha256sum -- ")[1].split(" && printf")[0])
+            listing = "\n".join([*(symlinks or ()), "" if scan_fails else "===SYMLINK-SCAN-OK==="])
+            digested = "\n".join(
+                f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
+                for operand in asked
+                if operand[len(package) + 1 :] in on_disk
+            )
+            return (
+                f"{listing}\n===PAYLOADDIGESTS===\n{digested}\n===PAYLOADRESCAN===\n{listing}",
+                "",
+                0,
+            )
         if command.startswith("sacct "):
             # Slurm accounting, read through the broker rather than taken from
             # the diagnostic. One allocation row, `|`-separated, no header.
             return "" if accounting is None else accounting, "", 0
-        if command.startswith("sha256sum"):
-            # The later holds on the channel: the payloads the manifest named,
-            # in whatever batches the broker's command limit allowed. Answer only
-            # for the operands this batch actually asked about.
-            asked = shlex.split(command)[2:]
-            return (
-                "\n".join(
-                    f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
-                    for operand in asked
-                    if operand[len(package) + 1 :] in on_disk
-                ),
-                "",
-                0,
-            )
         payload = "\n".join(
             [
                 "===DIAGNOSTIC===",
@@ -1698,7 +1699,7 @@ def _launch_evidence_responder(
                 "===RESOLVED===",
                 package if resolved_package is None else resolved_package,
                 "===SYMLINKS===",
-                "\n".join(symlinks or ()),
+                "\n".join([*(symlinks or ()), "" if scan_fails else "===SYMLINK-SCAN-OK==="]),
                 "===DIGESTS===",
                 digests,
             ]
@@ -2041,6 +2042,59 @@ async def test_mint_refuses_a_package_containing_any_symlink(monkeypatch, tmp_pa
 
 
 @pytest.mark.anyio
+async def test_mint_refuses_when_the_symlink_scan_could_not_complete(monkeypatch, tmp_path):
+    """An unreadable directory reports no symlinks because it cannot look.
+
+    `find` is joined with `;` in the artifact read, so its failure does not fail
+    the command; without the chained sentinel a package chmodded to execute-only
+    would scan clean while its files stayed openable.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(scan_fails=True))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "did not complete" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_each_payload_batch_rescans_around_its_own_hashing(monkeypatch, tmp_path):
+    """A scan from an earlier round trip proves nothing about these opens."""
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    batches = [
+        call["argv"][-1]
+        for call in runner.calls
+        if call["argv"][-1].startswith("find ") and "sha256sum" in call["argv"][-1]
+    ]
+    assert batches, "the payloads should have been hashed"
+    for command in batches:
+        # Scan, hash, scan again -- and chained so any step failing aborts.
+        assert command.count("-type l -print") == 2
+        assert command.index("-type l -print") < command.index("sha256sum")
+        assert command.rindex("-type l -print") > command.index("sha256sum")
+        assert ";" not in command
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_job_slurm_says_failed(monkeypatch, tmp_path):
+    responder = _launch_evidence_responder(accounting="52085188|FAILED|tabin|short")
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "did not finish" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_package_path_that_is_itself_a_symlink(monkeypatch, tmp_path):
     """`find` reports a symlinked start point rather than descending into it."""
 
@@ -2143,7 +2197,11 @@ async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeyp
     assert minted["ok"] is True
     assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 800
 
-    hash_commands = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sha256sum")]
+    hash_commands = [
+        call["argv"][-1]
+        for call in runner.calls
+        if call["argv"][-1].startswith("find ") and "sha256sum" in call["argv"][-1]
+    ]
     assert len(hash_commands) > 1, "the payload list should have needed more than one command"
     assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in hash_commands)
 

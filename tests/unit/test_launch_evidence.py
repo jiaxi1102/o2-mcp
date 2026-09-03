@@ -16,6 +16,7 @@ from o2mcp.launch_evidence import (
     EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
     SACCT_RETENTION_DAYS,
+    SYMLINK_SCAN_OK,
     LaunchEvidenceError,
     build_launch_evidence,
     canonical_json,
@@ -516,16 +517,33 @@ def test_any_symlink_in_the_package_refuses_to_mint() -> None:
     """
 
     with pytest.raises(LaunchEvidenceError, match="contains symlinks"):
-        refuse_package_symlinks("/pkg/attempt-002/payloads/frame002.ims\n", package_path="/pkg/attempt-002")
+        refuse_package_symlinks(
+            f"/pkg/attempt-002/payloads/frame002.ims\n{SYMLINK_SCAN_OK}\n", package_path="/pkg/attempt-002"
+        )
 
 
 def test_a_package_with_no_symlinks_is_accepted() -> None:
-    refuse_package_symlinks("", package_path="/pkg/attempt-002")
-    refuse_package_symlinks("\n  \n", package_path="/pkg/attempt-002")
+    refuse_package_symlinks(SYMLINK_SCAN_OK, package_path="/pkg/attempt-002")
+    refuse_package_symlinks(f"\n  \n{SYMLINK_SCAN_OK}\n", package_path="/pkg/attempt-002")
+
+
+def test_a_scan_that_did_not_complete_is_not_an_empty_package() -> None:
+    """`find` exits non-zero when it cannot enumerate, and says nothing either way.
+
+    A package that is searchable but not readable still lets its known files be
+    opened, so a publisher could chmod it to execute-only and hide a payload
+    symlink behind a scan that reported nothing because it could not look. The
+    scan therefore has to announce its own success.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="did not complete"):
+        refuse_package_symlinks("", package_path="/pkg/attempt-002")
+    with pytest.raises(LaunchEvidenceError, match="did not complete"):
+        refuse_package_symlinks("/pkg/attempt-002/link", package_path="/pkg/attempt-002")
 
 
 def test_the_refusal_names_the_offending_links_without_dumping_all_of_them() -> None:
-    listing = "\n".join(f"/pkg/attempt-002/link{index}" for index in range(9))
+    listing = "\n".join([*(f"/pkg/attempt-002/link{index}" for index in range(9)), SYMLINK_SCAN_OK])
     with pytest.raises(LaunchEvidenceError, match="and 4 more") as caught:
         refuse_package_symlinks(listing, package_path="/pkg/attempt-002")
     assert "/pkg/attempt-002/link0" in str(caught.value)
@@ -615,3 +633,31 @@ def test_a_job_id_that_is_not_one_is_refused_before_any_command(job_id) -> None:
     diagnostic["slurm"]["scheduler"]["job_id"] = job_id
     with pytest.raises(LaunchEvidenceError):
         claimed_job_id(diagnostic)
+
+
+# --- a job the scheduler says failed cannot produce a record ------------------
+@pytest.mark.parametrize(
+    "state",
+    ["FAILED", "CANCELLED", "CANCELLED by 12345", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "BOOT_FAIL", "DEADLINE"],
+)
+def test_a_terminally_failed_job_refuses_to_mint(state) -> None:
+    """A record attests a finished stage, so Slurm saying otherwise ends it.
+
+    The diagnostic can be written before a later failure, or fabricated outright
+    under this threat model, so the scheduler's verdict is the one that counts.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="did not finish"):
+        parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")
+
+
+@pytest.mark.parametrize("state", ["COMPLETED", "RUNNING", "COMPLETING", "PENDING", "REQUEUED"])
+def test_a_transient_state_still_mints(state) -> None:
+    """The accounting race the record documents must stay allowed."""
+
+    assert parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")["state"] == state
+
+
+def test_an_unrecognised_state_refuses_rather_than_being_assumed_benign() -> None:
+    with pytest.raises(LaunchEvidenceError, match="did not finish"):
+        parse_scheduler_record("52085188|SOME_FUTURE_STATE|tabin|short\n", job_id="52085188")

@@ -69,6 +69,7 @@ from o2mcp import (
 from o2mcp.broker_protocol import MAX_COMMAND_BYTES
 from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
+    SYMLINK_SCAN_OK,
     LaunchEvidenceError,
     build_launch_evidence,
     claimed_job_id,
@@ -1250,6 +1251,9 @@ _MARKER_OWNER = "===OWNER==="
 _MARKER_MANIFEST = "===MANIFEST==="
 _MARKER_RESOLVED = "===RESOLVED==="
 _MARKER_SYMLINKS = "===SYMLINKS==="
+# Bracket the hashing in one command: scan, digests, scan again.
+_MARKER_PAYLOAD_DIGESTS = "===PAYLOADDIGESTS==="
+_MARKER_PAYLOAD_RESCAN = "===PAYLOADRESCAN==="
 _MARKER_DIGESTS = "===DIGESTS==="
 _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_DIAGNOSTIC,
@@ -1260,6 +1264,18 @@ _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_SYMLINKS,
     _MARKER_DIGESTS,
 )
+
+
+def _symlink_scan(package_path: str) -> str:
+    """One symlink inventory that announces its own success.
+
+    `find` exits non-zero when it cannot enumerate a directory, and a directory
+    that is searchable but not readable still lets its known files be opened --
+    so without the chained sentinel a scan that failed because it could not look
+    is indistinguishable from a package that genuinely has no symlinks.
+    """
+
+    return f"find {shlex.quote(package_path)} -type l -print && printf '%s\\n' {shlex.quote(SYMLINK_SCAN_OK)}"
 
 
 def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
@@ -1306,7 +1322,7 @@ def _read_launch_artifacts(
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_SYMLINKS)}",
             # `find` does not follow links by default, so a package path that is
             # itself a symlink is reported here rather than descended into.
-            f"find {shlex.quote(package_path)} -type l -print",
+            _symlink_scan(package_path),
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
             "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
@@ -1410,25 +1426,44 @@ def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeo
     a process whose verdict this record exists to check, so the digests come
     back raw and ``build_launch_evidence`` decides.
 
-    The operands need no per-path resolution: the artifact read has already
-    refused the package if it contains any symlink, and a manifest name is
-    refused if it is absolute or traversing, so a lexically internal name has
-    nothing left to escape through.
+    A manifest name is refused if it is absolute or traversing, so the only way
+    a lexically internal name could escape is through a link -- and each batch
+    therefore rescans the package for symlinks either side of its own hashing,
+    rather than relying on a scan from an earlier round trip.
     """
 
     targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
     if len(targets) != len(manifest):
         raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
+    scan = _symlink_scan(package_path)
     payload_digests: dict[str, str] = {}
     for batch in _hash_batches(sorted(targets)):
-        command = "sha256sum -- {}".format(" ".join(batch))
+        # Scan, hash, scan -- all in one command and all chained with &&. The
+        # scan in the artifact read happens a round trip earlier, so on its own
+        # it proves nothing about the instant these paths are opened. Bracketing
+        # the hashing does not make the two atomic, but it does mean a link has
+        # to be created and removed inside a single command rather than in the
+        # gap between broker requests.
+        marker = shlex.quote(_MARKER_PAYLOAD_DIGESTS)
+        after = shlex.quote(_MARKER_PAYLOAD_RESCAN)
+        command = (
+            f"{scan} && printf '\\n%s\\n' {marker}"
+            f" && sha256sum -- {' '.join(batch)}"
+            f" && printf '\\n%s\\n' {after} && {scan}"
+        )
         result = _connection().run(command, timeout=timeout)
         if not result.ok:
             raise LaunchEvidenceError(
                 "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
             )
         _refuse_truncated_read(result, label="the package payload digest read")
-        for operand, digest in parse_sha256_lines(result.stdout, label="the payload digest output").items():
+        before, separator, remainder = result.stdout.partition(f"\n{_MARKER_PAYLOAD_DIGESTS}\n")
+        digests, rescan_separator, after_listing = remainder.partition(f"\n{_MARKER_PAYLOAD_RESCAN}\n")
+        if not separator or not rescan_separator:
+            raise LaunchEvidenceError("the payload read did not return both symlink scans and the digests")
+        for listing in (before, after_listing):
+            refuse_package_symlinks(listing, package_path=package_path)
+        for operand, digest in parse_sha256_lines(digests, label="the payload digest output").items():
             name = targets.get(operand)
             if name is None:
                 raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")

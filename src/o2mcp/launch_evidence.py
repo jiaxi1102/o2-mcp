@@ -253,6 +253,13 @@ def _same_posix_path(left: Any, right: Any) -> bool:
 # from reaching a shell as anything but a job id.
 _JOB_ID = re.compile(r"^[0-9]+(_[0-9]+)?$")
 SACCT_RETENTION_DAYS = 366
+# States a finished governed stage can legitimately be reported in. COMPLETED is
+# the expected one; the rest are transient, and are allowed because a mint can
+# race a job's final accounting transition. Everything else -- FAILED, CANCELLED,
+# TIMEOUT, NODE_FAIL, OUT_OF_MEMORY, BOOT_FAIL, DEADLINE, PREEMPTED, REVOKED --
+# is a terminal failure, and an unrecognised state is refused rather than
+# assumed benign, so a future Slurm state cannot quietly become mintable.
+MINTABLE_JOB_STATES = frozenset({"COMPLETED", "RUNNING", "COMPLETING", "PENDING", "REQUEUED", "RESIZING", "SUSPENDED"})
 
 
 def claimed_job_id(diagnostic: Mapping[str, Any]) -> str:
@@ -306,11 +313,28 @@ def parse_scheduler_record(text: str, *, job_id: str) -> dict[str, str]:
             f"refusing to mint launch evidence; Slurm accounting answered for job {reported_id!r} "
             f"when asked about {job_id!r}"
         )
+    # sacct decorates some states, e.g. "CANCELLED by 12345", so compare the verb.
+    verb = state.split()[0] if state.split() else ""
+    if verb not in MINTABLE_JOB_STATES:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; Slurm reports job {job_id} as {state!r}. A record attests a "
+            "finished governed stage, so a job the scheduler says did not finish cannot produce one"
+        )
     return {"job_id": reported_id, "state": state, "account": account, "partition": partition}
 
 
+SYMLINK_SCAN_OK = "===SYMLINK-SCAN-OK==="
+
+
 def refuse_package_symlinks(listing: str, *, package_path: str) -> None:
-    """Refuse a package containing any symlink at all.
+    """Refuse a package containing any symlink at all -- or an unproven scan.
+
+    The scan must announce its own success. `find` exits non-zero when it cannot
+    enumerate a directory, and a directory that is searchable but not readable
+    still lets its known files be opened -- so a publisher could chmod the
+    package to execute-only and hide a payload symlink behind a scan that
+    reported nothing because it could not look, not because there was nothing
+    there. An empty listing is therefore only meaningful with the sentinel.
 
     Resolving each payload and requiring it to land inside the package was two
     independent pathname resolutions, and a run that toggled a link between them
@@ -326,7 +350,13 @@ def refuse_package_symlinks(listing: str, *, package_path: str) -> None:
     its own rules.
     """
 
-    offenders = [line.strip() for line in listing.splitlines() if line.strip()]
+    lines = [line.strip() for line in listing.splitlines() if line.strip()]
+    if SYMLINK_SCAN_OK not in lines:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; the symlink scan of {package_path!r} did not complete, "
+            "so an empty result proves nothing about what the package contains"
+        )
+    offenders = [line for line in lines if line != SYMLINK_SCAN_OK]
     if offenders:
         shown = ", ".join(repr(name) for name in offenders[:5])
         more = f" (and {len(offenders) - 5} more)" if len(offenders) > 5 else ""
@@ -631,7 +661,9 @@ __all__ = [
     "parse_json_artifact",
     "parse_sha256_lines",
     "refuse_package_symlinks",
+    "MINTABLE_JOB_STATES",
     "SACCT_RETENTION_DAYS",
+    "SYMLINK_SCAN_OK",
     "claimed_job_id",
     "parse_scheduler_record",
     "plan_digest",
