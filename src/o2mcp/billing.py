@@ -456,7 +456,16 @@ _SBATCH = re.compile(r"^\s*#SBATCH\s+(.*?)\s*$")
 # the weight cache holds no topology. Refusing is a complete answer; a price
 # derived from a guessed socket count is not.
 UNPRICEABLE_OPTIONS = {
-    "--exclusive": "bills every TRES on the allocated nodes, not what was asked for",
+    # sbatch(1): "the job is allocated all CPUs and GRES on all nodes in the
+    # allocation, but is only allocated as much memory as it requested."
+    # Memory is therefore the one term that stays as asked; CPUs and GPUs
+    # become the nodes' own counts, which the weight cache has no topology to
+    # supply. Saying "every TRES" overstated it and would talk a reader out of
+    # a memory request that is in fact billed exactly as written.
+    "--exclusive": (
+        "allocates every CPU and GRES on the nodes it lands on, whatever their size, "
+        "though memory is still billed as requested"
+    ),
     "--ntasks-per-socket": "needs the sockets-per-node of the chosen hardware",
     "--gpus-per-socket": "needs the sockets-per-node of the chosen hardware",
     "--sockets-per-node": "constrains node selection by hardware layout",
@@ -465,10 +474,30 @@ UNPRICEABLE_OPTIONS = {
     "--extra-node-info": "specifies sockets/cores/threads of the chosen nodes",
     "--overcommit": "decouples the CPU allocation from the task count",
     "--mem=0": "means all memory on every allocated node, which needs node sizes",
+    # TRES this module has no input for at all. Each can carry its own
+    # TRESBillingWeights entry, so a site that weights them bills for them, and
+    # o2_price_job cannot ask about them -- refusing is the honest answer.
+    # Not a TRES: a QoS carries a UsageFactor that MULTIPLIES the charge, so
+    # the partition-weight price is not the cost. Accounts and reservations are
+    # deliberately absent -- an account selects who is charged, not how much.
+    "--qos": "selects a QoS whose UsageFactor multiplies the charge, which no weight table records",
+    "--licenses": "requests cluster licenses, a TRES that can carry its own billing weight",
+    "--bb": "requests burst buffer, a TRES that can carry its own billing weight",
+    "--bbf": "requests burst buffer from a file, a TRES that can carry its own billing weight",
     "hetjob": (
         "separates heterogeneous components, each with its own allocation; "
         "folding them into one set of numbers prices neither"
     ),
+}
+
+# The short spellings of the options above, per sbatch(1). Only two of them
+# have one. Kept beside the table rather than in the scanner, so an option
+# added there is looked up in the same place its alias would be.
+UNPRICEABLE_ALIASES = {
+    "--qos": "-q",
+    "--licenses": "-L",
+    "--overcommit": "-O",
+    "--extra-node-info": "-B",
 }
 
 
@@ -1330,6 +1359,149 @@ def alternatives(
 # self-consistent and are NOT known to match what a given Slurm prints. That is
 # why they only ever remove partitions proven unusable, and why an inventory
 # this parser does not recognise leaves the row in place.
+
+
+# A price receipt travels in the RESPONSE, not on disk. o2_price_job advertises
+# readOnlyHint, and a receipt file would make that claim false -- the same
+# failure that split the weight refresh out of it. A self-describing token
+# keeps pricing read-only while still letting a submission record what was
+# priced.
+#
+# It is an audit aid, not a credential: nothing here proves the receipt
+# describes the script it accompanies, only that a price was obtained and what
+# it was for. Verifying the match needs the script parser this module
+# deliberately does not have.
+_RECEIPT_PREFIX = "o2price/1"
+
+# Exactly the fields price_receipt() writes. With required-fields,
+# no-duplicates, no-bare-words and this, the parser accepts the v1 grammar and
+# nothing else -- so a token carrying anything more was assembled elsewhere and
+# is not evidence of a price.
+_RECEIPT_TEXT_FIELDS = ("partition", "gpu_model")
+_RECEIPT_FIELDS = ("partition", "cpus", "mem_gb", "gpus", "units", "gpu_model", "weights_at")
+
+
+def _receipt_number(value: Any) -> str:
+    """The shortest text for `value` that reads back as the same number.
+
+    `:g` carries six significant digits, so a shape priced at mem_gb=16.000009
+    was recorded as 16 -- a receipt describing something other than what was
+    priced, which is the one thing a receipt must not do. The pretty form is
+    kept wherever it round-trips, and only the awkward cases pay for repr().
+    """
+    number = float(value)
+    text = f"{number:g}"
+    return text if float(text) == number else repr(number)
+
+
+def price_receipt(payload: dict[str, Any]) -> str:
+    """A compact, self-describing record of one price."""
+    req = payload.get("request") or {}
+    weights = payload.get("weights") or {}
+    fields = [
+        _RECEIPT_PREFIX,
+        f"partition={payload.get('partition', '?')}",
+        f"cpus={_receipt_number(req.get('cpus', 0))}",
+        f"mem_gb={_receipt_number(req.get('mem_gb', 0))}",
+        f"gpus={_receipt_number(req.get('gpus', 0))}",
+        f"units={payload.get('billing_units', 0)}",
+    ]
+    # A space-separated record cannot carry a value containing spaces: the
+    # second half would read back as another field. price() refuses a model the
+    # partition does not declare, so this is not reachable through the tool,
+    # but price_receipt() takes a plain dict and should not emit a record it
+    # cannot read back.
+    model = str(req.get("gpu_model") or "")
+    if model and not any(ch.isspace() for ch in model):
+        fields.append(f"gpu_model={model}")
+    if weights.get("captured_at") is not None:
+        fields.append(f"weights_at={weights['captured_at']:.0f}")
+    return " ".join(fields)
+
+
+def parse_price_receipt(token: str) -> dict[str, Any] | None:
+    """Read a receipt back, or None if it is not one.
+
+    Tolerant by design: a receipt that cannot be read is reported as absent
+    rather than raising, since its only job is to enrich a submission record.
+    """
+    fields = str(token or "").split()
+    # Exact, not a prefix: startswith() accepted "o2price/10", a version this
+    # cannot read, as though it were version 1.
+    if not fields or fields[0] != _RECEIPT_PREFIX:
+        return None
+    out: dict[str, Any] = {}
+    for part in fields[1:]:
+        # Every token price_receipt() writes is a key=value pair. Skipping the
+        # ones that are not accepted a token this module never produced and
+        # read a price out of the rest of it.
+        if "=" not in part:
+            return None
+        key, value = part.split("=", 1)
+        # price_receipt() writes each field once, and writes no others. A
+        # repeat, or a name this version does not know, means the token was
+        # assembled somewhere else.
+        if key in out or key not in _RECEIPT_FIELDS:
+            return None
+        if key in _RECEIPT_TEXT_FIELDS:
+            # price_receipt() omits a text field rather than writing it empty,
+            # so `gpu_model=` is a name with nothing behind it. The partition
+            # check below covers the required one; this covers the optional.
+            if not value:
+                return None
+            out[key] = value
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        # float() reads "nan" and "inf" without complaint. Neither is a price,
+        # and both would reach the submission record as JSON no reader can use,
+        # under a `priced: true` that claims a price was obtained.
+        if not math.isfinite(number):
+            return None
+        out[key] = number
+    # Every field price_receipt() writes has to be present and numeric.
+    # Accepting a partial token reported `priced: true` for something that
+    # carried no price, which is worse than reporting no receipt at all.
+    required = ("partition", "cpus", "mem_gb", "gpus", "units")
+    if any(key not in out for key in required):
+        return None
+    # Present and finite is not yet possible. A receipt records a price that
+    # was actually computed, so it cannot carry a nameless partition or a
+    # negative count of anything, and billing_units comes out of floor() and is
+    # always whole. Reporting `priced: true` over -4 CPUs would put a shape in
+    # the submission record that no price() call could have produced.
+    if not out["partition"]:
+        return None
+    if any(out[key] < 0 for key in ("cpus", "mem_gb", "gpus", "units")):
+        return None
+    # cpus is stricter than non-negative. price() itself would compute a shape
+    # with none, but a receipt only ever comes from o2_price_job, whose input
+    # schema declares cpus gt=0 -- so a zero-CPU receipt was never issued.
+    if out["cpus"] == 0:
+        return None
+    if out["units"] != int(out["units"]):
+        return None
+    # cpus is an allocation total, ntasks x --cpus-per-task, and price()
+    # refuses a shape that does not divide evenly into whole CPUs per task --
+    # so a fractional one never came from here either.
+    if out["cpus"] != int(out["cpus"]):
+        return None
+    # Same for GPUs: price() refuses a fractional count outright, since Slurm
+    # allocates whole devices.
+    if out["gpus"] != int(out["gpus"]):
+        return None
+    # mem_gb is deliberately left fractional: 0.25 is 256 MB, an ordinary
+    # request that price() accepts. This rejects only what it can prove
+    # impossible, since an over-tight parser discards real receipts.
+    #
+    # The whole-valued fields read back as int. They land in the submission
+    # record as JSON, where a count of "4.0 CPUs" invites a reader to wonder
+    # what the fraction meant.
+    for key in ("cpus", "gpus", "units"):
+        out[key] = int(out[key])
+    return out
 
 
 def alternatives_caveat() -> str:

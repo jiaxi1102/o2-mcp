@@ -31,6 +31,8 @@ unit-tested without it.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -64,6 +66,7 @@ from o2mcp import (
     transfer_tools,
 )
 from o2mcp.policy import LoginTarget
+from o2mcp.slurm import _quote_remote_path
 
 mcp = FastMCP("o2_mcp")
 
@@ -320,6 +323,16 @@ class SubmitInput(BaseModel):
     )
     remote_path: str | None = Field(
         default=None, description="Where to stage script_text on O2 (required when script_text is given)."
+    )
+    priced: str | None = Field(
+        default=None,
+        description=(
+            "The `receipt` string from an o2_price_job call for this "
+            "submission's resource shape. Optional and never blocking, but "
+            "passing it records WHAT was priced alongside the job id, so a "
+            "submission that skipped pricing is visible in its own receipt "
+            "rather than indistinguishable from one that did not."
+        ),
     )
     sbatch_args: list[str] = Field(default_factory=list, description="Extra sbatch flags, e.g. ['--time=02:00:00'].")
 
@@ -819,6 +832,344 @@ async def o2_exec(params: RunInput) -> str:
     return await _run_tool(work)
 
 
+# Flags that carry a resource shape. Their PRESENCE is what is detected here,
+# never their values: spotting that "--mem" occurs is trivial and safe, while
+# deciding it means 32 GB total is the sbatch parser o2_price_job deliberately
+# does not have. A warning that names what it saw is useful; one that fires on
+# every submission is noise, and noise is ignored.
+# Every sbatch option that states or shapes the resources a job is allocated,
+# audited against the sbatch(1) option list in one pass rather than added one
+# at a time as each is noticed missing. A flag absent here is a job recorded as
+# carrying no resource request -- a MISSED warning, the direction that costs
+# someone real fair share.
+#
+# Not here on purpose:
+#   --oversubscribe   permits sharing a node, does not grow the allocation
+#   --exclusive and the socket/core topology options live in
+#     billing.UNPRICEABLE_OPTIONS instead, because they cannot be priced at all
+#
+# Short forms are included only where sbatch(1) documents one: -c, -n, -N, -p,
+# -G and -S. The remaining long names have none.
+_RESOURCE_FLAGS = (
+    "--mem",
+    "--mem-per-cpu",
+    "--mem-per-gpu",
+    "--mincpus",
+    "--cpus-per-task",
+    "-c",
+    "--cpus-per-gpu",
+    "--ntasks",
+    "-n",
+    "--ntasks-per-node",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
+    "--nodes",
+    "-N",
+    "--gres",
+    "--gpus",
+    "-G",
+    "--gpus-per-task",
+    "--gpus-per-node",
+    "--tres-per-task",
+    "--core-spec",
+    "-S",
+    "--thread-spec",
+    # An explicit node list sets the node count when nothing else does --
+    # --nodelist=node[01-04] is four nodes -- so it sizes the allocation. -x /
+    # --exclude is not here: it removes candidates without changing the size.
+    "--nodelist",
+    "-w",
+    "--nodefile",
+    "-F",
+    "--partition",
+    "-p",
+)
+
+
+def _submitted_remote_path(params: SubmitInput) -> str | None:
+    """The remote script this call will actually submit, if it submits one.
+
+    SubmitInput permits script_text and remote_script_path together, and the
+    submit path prefers script_text. Both the directive read and the record it
+    feeds have to follow that same precedence, or a submission carrying both
+    reports the flags of a script that never runs -- or calls one unreadable
+    while submitting a script read perfectly well. One predicate, so the two
+    paths cannot answer this differently.
+    """
+    if params.script_text is not None:
+        return None
+    return params.remote_script_path
+
+
+def _remote_directives(path: str) -> list[str] | None:
+    """The #SBATCH lines of a script already on O2, or None if unreadable.
+
+    One cheap read, so a remote submission gets the same check as an inlined
+    one. Only the directive lines come back, never the script body: this looks
+    for which flags are SET, and the rest of the file is the user's code with
+    no reason to be pulled here.
+
+    None on any failure. An unreadable script must not block a submission --
+    the check exists to enrich a record, and a submission that would otherwise
+    succeed cannot be made to fail by it.
+    """
+    try:
+        result = _connection().run(
+            # Redirected, not passed as an argument: awk has no `--` end-of-
+            # options marker, so a path is safer arriving through the shell,
+            # which also keeps a leading dash from reading as an option.
+            "awk '/^[[:space:]]*#SBATCH([[:space:]]|$)/{print; next} "
+            "/^[[:space:]]*($|#)/{next} {exit}' "
+            f"< {_quote_remote_path(path)}",
+            timeout=15.0,
+        )
+    except Exception:
+        return None
+    # awk rather than grep, because sbatch stops reading directives at the first
+    # line that is neither blank nor a comment: a #SBATCH sitting below the
+    # script's code is inert, and reporting it warns about an option the job
+    # does not have. This stops where sbatch stops.
+    #
+    # awk exits 0 whether or not it printed anything -- "no directives" is an
+    # answer -- and nonzero when it could not read the file, which is not. An
+    # earlier `|| true` collapsed the two, so a missing script came back as a
+    # script with no resource flags: the precise claim this function exists to
+    # avoid making.
+    if result.returncode != 0:
+        return None
+    return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+# `#SBATCH` must end at a boundary. Without it `#SBATCH_DISABLED --exclusive`
+# -- an ordinary way to switch a directive off -- reads as a live directive,
+# and slicing seven characters leaves the option behind to be reported.
+_SBATCH_LINE = re.compile(r"^\s*#SBATCH(?=\s|$)")
+
+
+def _leading_directives(script: str) -> list[str]:
+    """The #SBATCH lines sbatch will actually read.
+
+    sbatch stops processing directives at the first line that is neither blank
+    nor a comment, so a #SBATCH below the script's code is inert. Collecting it
+    warns about an option the job does not have.
+    """
+    lines = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if _SBATCH_LINE.match(line):
+                lines.append(line)
+            continue
+        break
+    return lines
+
+
+def _option_tokens(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """The sbatch options this call can see, split the way sbatch sees them.
+
+    Tokenised, not scanned as text. submit() shell-quotes each sbatch_args
+    element into one argument, so an option name sitting inside another
+    option's VALUE -- `--comment=do not use --exclusive` -- is not an option
+    being set, and a substring scan of the joined string called it one.
+
+    Built once and shared, so a second scan cannot re-derive the script_text /
+    remote_script_path precedence and get it wrong. `is not None`, not
+    truthiness -- an empty script_text is still what submit_text() sends.
+    """
+    tokens = list(params.sbatch_args or [])
+    if params.script_text is not None:
+        lines = _leading_directives(params.script_text)
+    elif remote_directives:
+        lines = list(remote_directives)
+    else:
+        lines = []
+    for line in lines:
+        match = _SBATCH_LINE.match(line)
+        if not match:
+            continue
+        body = line[match.end() :]
+        try:
+            # comments=False: sbatch reads a directive's arguments directly, so
+            # a `#` inside a value is part of it. Splitting on comments turned
+            # `--comment=issue#123 --exclusive` into a line ending at the hash
+            # and dropped the option after it.
+            tokens += shlex.split(body)
+        except ValueError:
+            # An unbalanced quote is not ours to resolve; take the words as
+            # they fall rather than dropping the line and reporting silence.
+            tokens += body.split()
+    return tokens
+
+
+def _value_after(flag: str, tokens: list[str]) -> str | None:
+    """The value given to `flag`, attached or separated, or None if unset."""
+    for index, token in enumerate(tokens):
+        if token == flag:
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            return "" if following.startswith("-") else following
+        if token.startswith(flag + "="):
+            return token[len(flag) + 1 :]
+    return None
+
+
+def _flag_is_set(flag: str, tokens: list[str]) -> bool:
+    """Whether `flag` appears as an option, not inside another one's value."""
+    for token in tokens:
+        if token == flag or token.startswith(flag + "="):
+            return True
+        # Short flags may carry the value attached -- -c4, -N2, -pshort are all
+        # ordinary sbatch. Long ones may not, so "--mem" never matches
+        # "--mem-per-cpu".
+        if not flag.startswith("--") and len(token) > len(flag) and token.startswith(flag):
+            return True
+    return False
+
+
+_ZERO_MEM = re.compile(r"^0[KMGT]?B?$", re.IGNORECASE)
+
+
+def _unpriceable_options_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """Which options appear that o2_price_job refuses to price at all.
+
+    Derived from billing.UNPRICEABLE_OPTIONS rather than a second hand-kept
+    list, so an option added there is caught here without a matching edit.
+
+    These matter more than the priceable ones, not less: a script whose only
+    directive is --exclusive is among the most expensive things submittable and
+    drew no warning at all while this scan looked only for resource flags. They
+    need their own note too -- o2_price_job answers `unpriceable` for these, so
+    telling the reader to go and price the shape sends them nowhere.
+    """
+    tokens = _option_tokens(params, remote_directives)
+    seen = set()
+    for option in billing.UNPRICEABLE_OPTIONS:
+        if option == "hetjob":
+            # Slurm separates heterogeneous components either with the `hetjob`
+            # directive or with a lone `:` between argument groups, and the
+            # wrapper forwards that colon through as its own argument. A value
+            # containing a colon (--gres=gpu:1) is never a lone token.
+            found = "hetjob" in tokens or ":" in tokens
+        elif option == "--mem=0":
+            value = _value_after("--mem", tokens)
+            found = value is not None and bool(_ZERO_MEM.match(value))
+        elif option == "--exclusive":
+            # sbatch(1) applies the whole-node rule only when no scope is
+            # given: with --exclusive=user or =mcs the job is allocated what it
+            # asked for, so it prices normally and warning about it would talk
+            # the reader out of an option that costs them nothing extra.
+            found = "--exclusive" in tokens
+        else:
+            # A short alias is the same option: `-O` is --overcommit and
+            # `-B2:8:2` is --extra-node-info, and checking only the long
+            # spelling let either through with no warning at all.
+            found = _flag_is_set(option, tokens)
+            alias = billing.UNPRICEABLE_ALIASES.get(option)
+            if alias and _flag_is_set(alias, tokens):
+                found = True
+        if found:
+            seen.add(option)
+    return sorted(seen)
+
+
+def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | None = None) -> list[str]:
+    """Which resource-bearing flags appear in what this call can actually see."""
+    tokens = _option_tokens(params, remote_directives)
+    return sorted(flag for flag in _RESOURCE_FLAGS if _flag_is_set(flag, tokens))
+
+
+def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = None) -> dict[str, Any]:
+    """What this submission can say about having been priced.
+
+    Advisory only -- it never blocks. A receipt proves a price was obtained and
+    what for; it cannot prove the price describes THIS script, which would need
+    the parser that was kept out of o2_price_job on purpose. Recording it puts
+    the shape beside the job id so a skipped price is visible afterwards rather
+    than silent.
+    """
+    receipt = billing.parse_price_receipt(params.priced or "")
+    unpriceable = _unpriceable_options_seen(params, remote_directives)
+    if receipt:
+        # `priced` answers "was THIS submission's shape priced?", so an
+        # unpriceable option makes it false however valid the receipt is: the
+        # branch below proves o2_price_job cannot have priced this allocation.
+        # The receipt is still reported -- it is evidence about some shape, and
+        # discarding it would lose that -- but a client gating on the boolean
+        # must not read it as this job having a price.
+        record: dict[str, Any] = {"priced": not unpriceable, "receipt": receipt}
+        if unpriceable:
+            # A receipt cannot describe THIS allocation: price() refuses every
+            # option in that table, so whatever was priced, it was a different
+            # shape. Returning early on any valid receipt made the warning
+            # silenceable by passing an unrelated one -- the reverse of what a
+            # receipt is for.
+            record["unpriceable_options_seen"] = unpriceable
+            record["note"] = (
+                "A receipt was supplied, but this submission also sets "
+                + ", ".join(unpriceable)
+                + " -- and o2_price_job refuses to price those, so the receipt describes a "
+                "different shape than the one being submitted. Read the price as a floor, "
+                "not as this job's cost: "
+                + "; ".join(f"{opt} {billing.UNPRICEABLE_OPTIONS[opt]}" for opt in unpriceable)
+                + "."
+            )
+        elif _submitted_remote_path(params) and remote_directives is None:
+            # Unknown is not absent -- the principle this whole record is built
+            # on, and the receipt branch was quietly breaking it. A valid
+            # receipt says a price was obtained; it cannot say the script has
+            # no option that would invalidate it, and here the script could not
+            # be read to check.
+            record["note"] = (
+                "A receipt was supplied, but the script's #SBATCH lines could not be read "
+                "on O2, so whether it sets an option that cannot be priced -- --exclusive "
+                "and the like -- is unknown here. The receipt is recorded as given."
+            )
+        return record
+    seen = _resource_flags_seen(params, remote_directives)
+    record = {"priced": False, "resource_flags_seen": seen}
+    if unpriceable:
+        record["unpriceable_options_seen"] = unpriceable
+    if unpriceable:
+        # Ahead of the ordinary warning AND ahead of the malformed-receipt one:
+        # these are the costly options, and the advice differs. o2_price_job
+        # answers `unpriceable` for them, so "price the shape" would send the
+        # reader to a refusal. Gating this on `not params.priced` let an
+        # unreadable `priced` string suppress it -- the same silencing a valid
+        # receipt used to buy, reached through the other branch.
+        record["note"] = (
+            "This submission sets "
+            + ", ".join(f"{opt} ({billing.UNPRICEABLE_OPTIONS[opt]})" for opt in unpriceable)
+            + ". o2_price_job cannot price these from the directives alone, so no receipt "
+            "is possible and none is expected. Their cost depends on the nodes Slurm "
+            "picks; if that is not what was intended, drop the option and price the "
+            "shape instead."
+        )
+        if params.priced:
+            record["note"] += (
+                " The `priced` value supplied is also not a recognisable o2_price_job "
+                "receipt, so nothing about a price is recorded here either."
+            )
+    elif params.priced:
+        record["note"] = (
+            "A `priced` value was given but is not a recognisable o2_price_job "
+            "receipt, so nothing about the price is recorded here."
+        )
+    elif seen:
+        record["note"] = (
+            "This submission sets " + ", ".join(seen) + " and carries no price. "
+            "Fair share is charged on the ALLOCATION, so an ordinary-looking "
+            "--mem can overcharge by a whole billing unit with nothing in the "
+            "job's output to reveal it. Price the shape with o2_price_job and "
+            "pass its `receipt` to record what was priced."
+        )
+    elif _submitted_remote_path(params) and remote_directives is None:
+        record["note"] = (
+            "The script lives on O2 and its #SBATCH lines could not be read, so "
+            "whether it requests resources is unknown here and no price "
+            "accompanied it. Price the shape with o2_price_job if it does."
+        )
+    return record
+
+
 @mcp.tool(
     name="o2_submit_job",
     annotations={"title": "Submit a Slurm job", "readOnlyHint": False, "openWorldHint": True},
@@ -833,6 +1184,17 @@ async def o2_submit_job(params: SubmitInput) -> str:
 
     def work() -> dict[str, Any]:
         slurm = O2Slurm(_connection())
+        # Read the remote script's directives BEFORE submitting, so an
+        # unreadable script surfaces as "unknown" rather than as a submission
+        # that already happened.
+        directives = None
+        submitted_path = _submitted_remote_path(params)
+        if submitted_path:
+            # Read them even when a receipt was supplied. A receipt does not
+            # rule out an unpriceable option -- it cannot describe one -- so
+            # skipping the read here would have left that warning reachable for
+            # an inline script and silent for a remote one.
+            directives = _remote_directives(submitted_path)
         if params.script_text is not None:
             if not params.remote_path:
                 return {"ok": False, "error": "bad_input", "message": "remote_path is required with script_text."}
@@ -845,7 +1207,13 @@ async def o2_submit_job(params: SubmitInput) -> str:
                 "error": "bad_input",
                 "message": "Provide remote_script_path or script_text+remote_path.",
             }
-        return {"ok": res.submitted, "submitted": res.submitted, "job_id": res.job_id, **_command_payload(res.command)}
+        return {
+            "ok": res.submitted,
+            "submitted": res.submitted,
+            "job_id": res.job_id,
+            "pricing": _pricing_record(params, directives),
+            **_command_payload(res.command),
+        }
 
     return await _run_tool(work)
 
@@ -1099,6 +1467,7 @@ async def o2_price_job(params: PriceJobInput) -> str:
         # Always, not conditionally: the rows are a price comparison, and a
         # caller who reads them as "partitions that can run this" has been told
         # something this cache cannot know.
+        payload["receipt"] = billing.price_receipt(payload)
         payload["alternatives_note"] = billing.alternatives_caveat()
         if request.mem_unknown:
             # An empty list here has a specific cause worth naming: the price

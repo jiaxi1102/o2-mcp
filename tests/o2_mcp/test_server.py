@@ -1046,3 +1046,516 @@ async def test_price_job_rejects_non_finite_numbers(tmp_path, monkeypatch):
     # A finite request still prices.
     payload = json.loads(await o2server.o2_price_job(o2server.PriceJobInput(partition="short", cpus=4, mem_gb=16)))
     assert payload["ok"] is True
+
+
+def test_submitting_without_a_price_names_the_flags_it_saw():
+    """A warning that fires on every submission is noise, so it must be specific.
+
+    Presence of a resource flag is safe to detect; its VALUE is the sbatch
+    parser o2_price_job deliberately does not have.
+    """
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --mem=32G\n#SBATCH -c 4\n#SBATCH --gres=gpu:1\nsrun x\n",
+        remote_path="/n/scratch/x.sh",
+    )
+    record = o2server._pricing_record(params)
+    assert record["priced"] is False
+    assert record["resource_flags_seen"] == ["--gres", "--mem", "-c"]
+    assert "carries no price" in record["note"]
+
+
+def test_a_submission_with_no_resource_flags_is_not_nagged():
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --job-name=x\nsrun hostname\n",
+        remote_path="/n/scratch/x.sh",
+    )
+    record = o2server._pricing_record(params)
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
+
+
+def test_an_unreadable_remote_script_says_so_rather_than_guessing():
+    """A script whose directives could not be read is UNKNOWN, not resourceless.
+
+    Saying it has no resource flags would be a claim the call cannot support.
+    """
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"), remote_directives=None
+    )
+    assert record["priced"] is False
+    assert "could not be read" in record["note"]
+
+
+def test_a_remote_script_gets_the_same_check_as_an_inlined_one():
+    # The directives come back from one cheap grep, so a submission by path is
+    # no longer a blind spot.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --mem=64G", "#SBATCH --gres=gpu:1", "#SBATCH -t 4:00:00"],
+    )
+    assert record["resource_flags_seen"] == ["--gres", "--mem"]
+    assert "carries no price" in record["note"]
+
+
+def test_a_readable_remote_script_with_no_resource_flags_is_quiet():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --job-name=x", "#SBATCH -t 1:00:00"],
+    )
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
+
+
+# Every sbatch option that changes what a job is allocated, from the sbatch(1)
+# option list. Kept as data so the audit is repeatable: a flag added to sbatch,
+# or dropped from _RESOURCE_FLAGS, shows up here rather than as a silent gap.
+_RESOURCE_FLAGS = o2server._RESOURCE_FLAGS
+
+_ALLOCATION_OPTIONS = (
+    "-n",
+    "--ntasks",
+    "-c",
+    "--cpus-per-task",
+    "--ntasks-per-node",
+    "--ntasks-per-socket",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
+    "-N",
+    "--nodes",
+    "--overcommit",
+    "--exclusive",
+    "--mem",
+    "--mem-per-cpu",
+    "--mem-per-gpu",
+    "-G",
+    "--gpus",
+    "--gpus-per-node",
+    "--gpus-per-socket",
+    "--gpus-per-task",
+    "--gres",
+    "--cpus-per-gpu",
+    "-B",
+    "--extra-node-info",
+    "--sockets-per-node",
+    "--cores-per-socket",
+    "--threads-per-core",
+    "--mincpus",
+    "--tres-per-task",
+    "--core-spec",
+    "--thread-spec",
+    # Not a size, but it picks the weights the size is priced with, so a
+    # submission naming one and carrying no price is the same warning.
+    "-p",
+    "--partition",
+    # TRES with no input on o2_price_job at all: a weighted site bills for
+    # these and nothing here can ask about them.
+    "--licenses",
+    "-L",
+    "--bb",
+    "--bbf",
+    # Not a resource: a QoS UsageFactor multiplies the charge itself.
+    "--qos",
+    "-q",
+    # An explicit node list sets the node count when nothing else does.
+    "--nodelist",
+    "-w",
+    "--nodefile",
+    "-F",
+)
+
+
+def test_no_allocation_option_goes_unnoticed():
+    """Each of these is either a resource flag or an unpriceable one.
+
+    A flag in neither list is a job recorded as requesting nothing -- a MISSED
+    warning. These were found nine at a time by auditing the option list, after
+    being reported one at a time.
+    """
+    known = set(_RESOURCE_FLAGS) | set(billing.UNPRICEABLE_OPTIONS) | set(billing.UNPRICEABLE_ALIASES.values())
+    assert [opt for opt in _ALLOCATION_OPTIONS if opt not in known] == []
+
+
+def test_an_allocation_option_is_reported_however_it_is_written():
+    # Through the scanner, not just the tuple: each has to survive tokenising.
+    for option in _ALLOCATION_OPTIONS:
+        # --exclusive takes only user/mcs/topo, and a SCOPED one is
+        # deliberately not flagged -- it allocates what was asked for. Only the
+        # bare spelling is the whole-node case.
+        spellings = (option,) if option == "--exclusive" else (option, f"{option}=1", f"{option} 1")
+        for directive in spellings:
+            params = o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+            reported = o2server._resource_flags_seen(params) + o2server._unpriceable_options_seen(params)
+            assert reported, directive
+
+
+def test_a_hash_inside_a_directive_value_is_not_a_comment():
+    # sbatch reads a directive's arguments directly, so `#` in a value is part
+    # of it. Splitting on comments ended the line at the hash and silently
+    # dropped every option after it.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --comment=issue#123 --exclusive\n", remote_path="/n/x.sh"
+    )
+    assert o2server._unpriceable_options_seen(params) == ["--exclusive"]
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --comment=issue#123 --mem=64G\n", remote_path="/n/x.sh"
+    )
+    assert o2server._resource_flags_seen(params) == ["--mem"]
+
+
+def test_a_disabled_directive_is_not_a_directive():
+    """`#SBATCH_DISABLED` is how a directive gets switched off.
+
+    Matching the marker without a boundary read it as live and, after slicing
+    seven characters, reported the option it was meant to disable.
+    """
+    for marker in ("#SBATCH_DISABLED", "#SBATCHFOO", "#SBATCH-OLD"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n{marker} --exclusive\n", remote_path="/n/x.sh")
+        assert o2server._unpriceable_options_seen(params) == [], marker
+    # The real marker still works, with any leading or extra whitespace.
+    for line in ("#SBATCH --exclusive", "  #SBATCH --exclusive", "#SBATCH\t--exclusive"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n{line}\n", remote_path="/n/x.sh")
+        assert o2server._unpriceable_options_seen(params) == ["--exclusive"], line
+
+
+def test_a_colon_separated_hetjob_is_recognised():
+    # Slurm separates heterogeneous components with `hetjob` OR a lone `:`,
+    # and the wrapper forwards that colon through as its own argument.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--nodes=1", ":", "--nodes=2"]
+    )
+    assert o2server._unpriceable_options_seen(params) == ["hetjob"]
+    # A colon INSIDE a value is not a separator.
+    plain = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --gres=gpu:1\n", remote_path="/n/x.sh")
+    assert o2server._unpriceable_options_seen(plain) == []
+    assert o2server._resource_flags_seen(plain) == ["--gres"]
+
+
+def test_an_explicit_node_list_sizes_the_allocation():
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._resource_flags_seen(mk("--nodelist=node[01-04]")) == ["--nodelist"]
+    assert o2server._resource_flags_seen(mk("-w node01")) == ["-w"]
+    assert o2server._resource_flags_seen(mk("--nodefile=f.txt")) == ["--nodefile"]
+    # --exclude removes candidates without changing how much is allocated.
+    assert o2server._resource_flags_seen(mk("--exclude=node09")) == []
+
+
+def test_oversubscribe_is_not_a_resource_request():
+    # It permits sharing a node; it does not grow the allocation. Warning about
+    # it would send someone to price a shape that has not changed.
+    for directive in ("--oversubscribe", "-s"):
+        params = o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+        assert o2server._resource_flags_seen(params) == [], directive
+        assert o2server._unpriceable_options_seen(params) == [], directive
+
+
+def test_the_short_gpu_flag_is_a_resource_request():
+    # -G is --gpus. Missing it recorded a GPU job as carrying no resource
+    # flags at all -- a missed warning on the most expensive TRES there is.
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._resource_flags_seen(mk("-G1")) == ["-G"]
+    assert o2server._resource_flags_seen(mk("-G 2")) == ["-G"]
+    assert o2server._resource_flags_seen(mk("--gpus=1")) == ["--gpus"]
+    # Lowercase -g is not an sbatch resource flag.
+    assert o2server._resource_flags_seen(mk("-g x")) == []
+
+
+def test_short_aliases_of_unpriceable_options_are_caught():
+    """`-O` is --overcommit and `-B` is --extra-node-info, per sbatch(1).
+
+    Checking only the long spelling let either through with no warning -- a
+    MISSED warning, which is the direction that matters.
+    """
+
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("-O")) == ["--overcommit"]
+    for spelling in ("-B2:8:2", "-B 2:8:2", "--extra-node-info=2:8:2"):
+        assert o2server._unpriceable_options_seen(mk(spelling)) == ["--extra-node-info"], spelling
+    # Case matters: -o is --output and -b is --begin, neither unpriceable.
+    assert o2server._unpriceable_options_seen(mk("-o out.txt")) == []
+    assert o2server._unpriceable_options_seen(mk("-b now+1hour")) == []
+
+
+def test_every_alias_names_an_option_in_the_table():
+    # The alias map sits beside UNPRICEABLE_OPTIONS; a typo there would fail
+    # silently, since the scanner only ever looks aliases up by long name.
+    for option in billing.UNPRICEABLE_ALIASES:
+        assert option in billing.UNPRICEABLE_OPTIONS, option
+
+
+def test_a_directive_below_the_script_body_is_inert():
+    """sbatch stops reading directives at the first line of actual code.
+
+    A #SBATCH sitting under the script's commands is never applied, so warning
+    about it describes an option the job does not have.
+    """
+    below = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --mem=4G\n\nsrun ./run.sh\n#SBATCH --exclusive\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._unpriceable_options_seen(below) == []
+    assert o2server._resource_flags_seen(below) == ["--mem"]
+    # Comments and blank lines do not end the block, so this one IS applied.
+    above = o2server.SubmitInput(
+        script_text="#!/bin/bash\n# a note\n\n#SBATCH --exclusive\nsrun ./run.sh\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._unpriceable_options_seen(above) == ["--exclusive"]
+
+
+def test_a_scoped_exclusive_is_not_warned_about():
+    """--exclusive=user does NOT take the whole node, so it prices normally.
+
+    sbatch(1) applies the whole-node rule only "if user/mcs/topo are not
+    specified". Warning about the scoped forms would talk a reader out of an
+    option that costs them nothing extra.
+    """
+
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("--exclusive")) == ["--exclusive"]
+    for scope in ("user", "mcs", "topo"):
+        assert o2server._unpriceable_options_seen(mk(f"--exclusive={scope}")) == [], scope
+
+
+def test_an_option_named_inside_another_options_value_is_not_set():
+    # submit() quotes each sbatch_args element into one argument, so this is a
+    # --comment whose text mentions --exclusive, not a job taking whole nodes.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--comment=do not use --exclusive"]
+    )
+    assert o2server._unpriceable_options_seen(params) == []
+    assert o2server._resource_flags_seen(params) == []
+    # ...but a real option beside it still registers.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["--comment=see --mem notes", "--mem=64G"]
+    )
+    assert o2server._resource_flags_seen(params) == ["--mem"]
+
+
+def test_a_malformed_receipt_cannot_silence_an_unpriceable_option():
+    # The valid-receipt path was fixed first; a garbage string reached the same
+    # silence through the malformed-receipt branch.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh", priced="typo-not-a-receipt"
+        )
+    )
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    assert "cannot price these" in record["note"]
+    # And it still says the receipt was unreadable.
+    assert "not a recognisable" in record["note"]
+
+
+def test_a_receipt_cannot_silence_an_unpriceable_option():
+    """Passing a valid receipt must not buy silence about --exclusive.
+
+    o2_price_job refuses every option in that table, so a receipt necessarily
+    describes some OTHER shape. Returning early on any valid receipt made the
+    warning silenceable by supplying an unrelated one.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh", priced=receipt)
+    )
+    # `priced` answers "was THIS shape priced?" -- and it provably was not,
+    # however valid the receipt is. A client gating on the boolean must not
+    # read a receipt for some other shape as this job having a price.
+    assert record["priced"] is False
+    assert record["receipt"] is not None
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    assert "describes a different shape" in record["note"]
+
+
+def test_a_receipt_does_not_turn_an_unreadable_script_into_a_clean_one():
+    """Unknown is not absent -- including on the receipt path.
+
+    A receipt says a price was obtained. It cannot say the script has no
+    option that would invalidate it, and here the script could not be read.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=receipt), remote_directives=None
+    )
+    assert record["priced"] is True
+    assert "could not be read" in record["note"]
+    # A script that WAS read and sets nothing stays quiet.
+    quiet = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=receipt),
+        remote_directives=["#SBATCH -t 1:00:00"],
+    )
+    assert "note" not in quiet
+
+
+def test_an_ordinary_receipt_still_records_nothing_extra():
+    # The warning above must not fire for a submission that has no such option.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    receipt = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    record = o2server._pricing_record(
+        o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --mem=4G\n", remote_path="/n/x.sh", priced=receipt)
+    )
+    assert record["priced"] is True
+    assert "unpriceable_options_seen" not in record
+    assert "note" not in record
+
+
+def test_receipt_counts_read_back_as_whole_numbers():
+    # They land in the submission JSON; "4.0 CPUs" invites a wrong question.
+    back = billing.parse_price_receipt("o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5")
+    assert (back["cpus"], back["gpus"], back["units"]) == (4, 0, 5)
+    assert all(isinstance(back[k], int) for k in ("cpus", "gpus", "units"))
+    # mem_gb stays float: 0.25 GB is an ordinary 256 MB request.
+    assert isinstance(back["mem_gb"], float)
+
+
+def test_an_exclusive_script_is_not_silent():
+    """--exclusive bills the whole node, and set alone it drew no warning.
+
+    The scan looked only for resource flags, so the single most expensive
+    directive in sbatch produced an empty list and no note at all.
+    """
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --exclusive\n", remote_path="/n/x.sh")
+    record = o2server._pricing_record(params)
+    assert record["resource_flags_seen"] == []
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+    # sbatch(1) is specific: all CPUs and GRES on the node, memory as requested.
+    assert "every CPU and GRES on the nodes it lands on" in record["note"]
+    assert "memory is still billed as requested" in record["note"]
+    # Not the ordinary advice: o2_price_job answers `unpriceable` for these.
+    assert "cannot price these" in record["note"]
+
+
+def test_every_unpriceable_option_is_covered_by_the_scan():
+    # Derived from the table, so an option added there needs no edit here.
+    for option in billing.UNPRICEABLE_OPTIONS:
+        text = "#!/bin/bash\n#SBATCH " + ("hetjob" if option == "hetjob" else f"{option}\n")
+        params = o2server.SubmitInput(script_text=text, remote_path="/n/x.sh")
+        assert option in o2server._unpriceable_options_seen(params), option
+
+
+def test_an_ordinary_mem_request_is_not_called_unpriceable():
+    # --mem=0 means every byte on every node; --mem=4G is just a request.
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._unpriceable_options_seen(mk("--mem=4G")) == []
+    assert o2server._unpriceable_options_seen(mk("--mem=0")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem=0G")) == ["--mem=0"]
+    # sbatch takes the value attached or separated, and both mean every byte.
+    assert o2server._unpriceable_options_seen(mk("--mem 0")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem 0GB")) == ["--mem=0"]
+    assert o2server._unpriceable_options_seen(mk("--mem 4G")) == []
+    # And --mem must not match inside --mem-per-cpu either way.
+    assert o2server._unpriceable_options_seen(mk("--mem-per-cpu 0")) == []
+
+
+def test_unpriceable_options_are_found_in_a_remote_script_too():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/scratch/x.sh"),
+        remote_directives=["#SBATCH --exclusive", "#SBATCH -t 8:00:00"],
+    )
+    assert record["unpriceable_options_seen"] == ["--exclusive"]
+
+
+def test_only_the_script_that_will_run_is_inspected():
+    """script_text wins over remote_script_path, so the record follows it.
+
+    SubmitInput permits both. The submit path sends the text; a record built
+    from the OTHER script's directives would list flags this job does not set.
+    """
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --job-name=x\n",
+            remote_path="/n/x.sh",
+            remote_script_path="/n/scratch/other.sh",
+        ),
+        remote_directives=["#SBATCH --mem=64G", "#SBATCH --gres=gpu:1"],
+    )
+    assert record["resource_flags_seen"] == []
+    assert "note" not in record
+
+
+def test_an_unreadable_path_is_not_reported_when_text_is_what_ships():
+    # The submitted script was read perfectly well -- it is right here. Calling
+    # it unknown because a displaced path could not be read is a false alarm.
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --job-name=x\n",
+            remote_path="/n/x.sh",
+            remote_script_path="/n/scratch/gone.sh",
+        ),
+        remote_directives=None,
+    )
+    assert "note" not in record
+
+
+def test_submitted_remote_path_follows_the_submit_precedence():
+    # The predicate itself, so the read and the record cannot drift apart.
+    assert o2server._submitted_remote_path(o2server.SubmitInput(remote_script_path="/n/a.sh")) == "/n/a.sh"
+    both = o2server.SubmitInput(script_text="#!/bin/bash\n", remote_path="/n/x.sh", remote_script_path="/n/a.sh")
+    assert o2server._submitted_remote_path(both) is None
+    # An empty script_text is still what submit_text() sends, so it still wins.
+    empty = o2server.SubmitInput(script_text="", remote_path="/n/x.sh", remote_script_path="/n/a.sh")
+    assert o2server._submitted_remote_path(empty) is None
+
+
+def test_a_receipt_is_recorded_beside_the_job():
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16), table, "short")
+    params = o2server.SubmitInput(remote_script_path="/n/scratch/x.sh", priced=billing.price_receipt(payload))
+    record = o2server._pricing_record(params)
+    assert record["priced"] is True
+    assert record["receipt"]["partition"] == "short"
+    assert record["receipt"]["units"] == payload["billing_units"]
+
+
+def test_an_unrecognised_priced_value_is_reported_not_swallowed():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(remote_script_path="/n/x.sh", priced="hand-written nonsense")
+    )
+    assert record["priced"] is False
+    assert "not a recognisable" in record["note"]
+
+
+def test_short_flags_do_not_match_inside_long_ones():
+    # "-n" must not fire on "--nodes", or the warning names flags that are not
+    # there and stops being worth reading.
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --nodes=2\n", remote_path="/n/x.sh")
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["--nodes"]
+
+
+def test_short_flags_with_attached_values_are_detected():
+    # "-c4", "-N2" and "-pshort" are ordinary sbatch. Requiring whitespace or
+    # "=" after a short flag missed all of them, so a fully specified
+    # submission looked resourceless and the warning stayed silent.
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH -c4\n#SBATCH -N2\n#SBATCH -pshort\n",
+        remote_path="/n/x.sh",
+    )
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["-N", "-c", "-p"]
+
+
+def test_long_flags_still_end_at_the_token():
+    # The attached-value allowance must not let "--mem" match "--mem-per-cpu".
+    params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --mem-per-cpu=4G\n", remote_path="/n/x.sh")
+    assert o2server._pricing_record(params)["resource_flags_seen"] == ["--mem-per-cpu"]

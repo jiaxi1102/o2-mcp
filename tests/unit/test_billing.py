@@ -1656,3 +1656,174 @@ def test_the_adjustment_preserves_the_memory_each_task_asked_for():
     assert resolved.cpus == 3
     assert resolved.mem_gb == 20
     assert resolved.cpus * resolved.mem_per_cpu_gb >= req.mem_gb
+
+
+def test_a_price_receipt_round_trips():
+    # The receipt travels in the RESPONSE rather than on disk: o2_price_job
+    # advertises readOnlyHint, and a receipt file would make that claim false --
+    # the same failure that split the weight refresh out of it.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16), table, "short", captured_at=1756000000.0)
+    token = billing.price_receipt(payload)
+    back = billing.parse_price_receipt(token)
+    assert back["partition"] == "short"
+    assert back["cpus"] == 4
+    assert back["mem_gb"] == 16
+    assert back["units"] == payload["billing_units"]
+
+
+def test_an_unreadable_receipt_reads_as_absent():
+    # Tolerant by design: its only job is to enrich a submission record, so a
+    # malformed one must not raise into the submission path.
+    for junk in ("", "garbage", "o2price/1", "not-a-receipt cpus=4"):
+        assert billing.parse_price_receipt(junk) in (None, {})
+
+
+def test_a_model_priced_receipt_carries_the_model():
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5,GRES/gpu:a100=10"
+        " TRES=cpu=100,mem=1000G,node=4,gres/gpu=8,gres/gpu:a100=8 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16, gpus=1, gpu_model="a100"), table, "gpu")
+    back = billing.parse_price_receipt(billing.price_receipt(payload))
+    assert back["gpu_model"] == "a100"
+    assert back["gpus"] == 1
+
+
+def test_a_receipt_must_be_exactly_version_one_and_complete():
+    # startswith() accepted "o2price/10" -- a version this cannot read -- as
+    # though it were version 1, and any single field at all counted as a price,
+    # so a truncated token reported priced=true for something carrying none.
+    for bogus in (
+        "o2price/10 partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        "o2price/1 foo=bar",
+        "o2price/1 partition=short cpus=4",  # truncated
+        "o2price/1 partition=short cpus=x mem_gb=16 gpus=0 units=5",  # non-numeric
+        "o2price/2 partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        # float() reads these happily; a price is neither, and `priced: true`
+        # over a NaN would put unusable JSON in the submission record.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=nan",
+        "o2price/1 partition=short cpus=inf mem_gb=16 gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=-inf gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=Infinity units=5",
+        # A receipt records a price that was computed. No price() call yields a
+        # nameless partition, a negative count, or fractional billing units --
+        # floor() produces the last one.
+        "o2price/1 partition=x cpus=-4 mem_gb=-16 gpus=-1 units=-2",
+        "o2price/1 partition= cpus=4 mem_gb=16 gpus=0 units=5",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5.5",
+        "o2price/1 partition=short cpus=4 mem_gb=-0.5 gpus=0 units=5",
+        # price() refuses a CPU count that will not divide into whole CPUs per
+        # task, so a fractional one never came from a real price.
+        "o2price/1 partition=short cpus=2.5 mem_gb=16 gpus=0 units=5",
+        # Slurm allocates whole devices; price() refuses a fractional count.
+        "o2price/1 partition=x cpus=4 mem_gb=16 gpus=0.5 units=5",
+        # o2_price_job declares cpus gt=0, so no receipt was ever issued with
+        # none -- even though billing.price() alone would compute the shape.
+        "o2price/1 partition=short cpus=0 mem_gb=16 gpus=0 units=1",
+        # price_receipt() writes each field once. A repeat means the token was
+        # assembled elsewhere, and last-wins silently picked an answer.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 units=999",
+        "o2price/1 partition=short partition=other cpus=4 mem_gb=16 gpus=0 units=5",
+        # Every token this module writes is key=value. A bare word means the
+        # rest of the string is not a receipt either.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 garbage",
+        "o2price/1 garbage partition=short cpus=4 mem_gb=16 gpus=0 units=5",
+        # A name this version does not write is a token assembled elsewhere.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 foo=1",
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 nodes=4",
+        # price_receipt() omits an absent text field rather than writing it
+        # empty, so a bare name with nothing behind it came from elsewhere.
+        "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5 gpu_model=",
+    ):
+        assert billing.parse_price_receipt(bogus) is None, bogus
+    # A complete one still reads.
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    good = billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+    assert billing.parse_price_receipt(good)["partition"] == "short"
+
+
+def test_a_model_name_cannot_smuggle_a_field_into_the_receipt():
+    """The record is space-separated, so a value with a space is two fields.
+
+    price() refuses a model the partition does not declare, so this is not
+    reachable through o2_price_job -- but price_receipt() takes a plain dict
+    and must not write a record it cannot read back.
+    """
+    payload = {
+        "partition": "gpu",
+        "billing_units": 10,
+        "request": {"cpus": 4, "mem_gb": 16, "gpus": 1, "gpu_model": "a100 units=999999"},
+    }
+    token = billing.price_receipt(payload)
+    assert "999999" not in token
+    assert billing.parse_price_receipt(token)["units"] == 10
+    # An ordinary model name still travels.
+    payload["request"]["gpu_model"] = "a100"
+    assert billing.parse_price_receipt(billing.price_receipt(payload))["gpu_model"] == "a100"
+
+
+def test_the_optional_fields_still_read():
+    # gpu_model and weights_at are written when present; restricting the field
+    # set must not turn them into unknown names.
+    good = "o2price/1 partition=short cpus=4 mem_gb=16 gpus=0 units=5"
+    assert billing.parse_price_receipt(good + " gpu_model=a100")["gpu_model"] == "a100"
+    assert billing.parse_price_receipt(good + " weights_at=1756000000") is not None
+    # Every name the writer can emit is one the reader accepts.
+    table = billing.parse_weight_table(
+        "PartitionName=gpu TRESBillingWeights=CPU=1,Mem=0.0625G,GRES/gpu=5"
+        " TRES=cpu=400,mem=4000G,gres/gpu=40,node=10 State=UP AllowGroups=ALL"
+    )
+    payload = billing.price(billing.Request(cpus=4, mem_gb=16, gpus=1), table, "gpu")
+    payload["weights"] = {"captured_at": 1756000000}
+    token = billing.price_receipt(payload)
+    for field in token.split()[1:]:
+        assert field.split("=", 1)[0] in billing._RECEIPT_FIELDS, field
+    assert billing.parse_price_receipt(token) is not None
+
+
+def test_a_receipt_records_the_shape_it_was_given():
+    """`:g` carries six significant digits and silently rounded the shape.
+
+    A receipt describing something other than what was priced is the one thing
+    it must not do, however unlikely the input.
+    """
+    for value in (16, 16.0, 0.25, 16.000009, 1 / 3, 1e-7, 123456789.5):
+        text = billing._receipt_number(value)
+        assert float(text) == float(value), (value, text)
+    # The common shapes stay readable rather than turning into repr() noise.
+    assert billing._receipt_number(16.0) == "16"
+    assert billing._receipt_number(0.25) == "0.25"
+
+
+def test_every_receipt_this_module_writes_reads_back():
+    """The constraints must reject only what price() cannot produce.
+
+    Tightening a parser risks rejecting valid input, so the guard is a
+    round-trip over real prices rather than a list of hand-picked good tokens.
+    """
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    # Shapes price() actually accepts -- it refuses zero memory and any CPU
+    # count that will not divide into whole CPUs per task, so neither belongs
+    # in a round-trip. Fractional MEMORY does: 0.25 GB is an ordinary 256 MB.
+    shapes = [
+        billing.Request(cpus=1, mem_gb=4),
+        billing.Request(cpus=32, mem_gb=250),
+        billing.Request(cpus=1, mem_gb=0.25),
+        billing.Request(cpus=3, mem_gb=7),
+        billing.Request(cpus=4, mem_gb=16, nodes=4, nodes_stated=True),
+    ]
+    for req in shapes:
+        token = billing.price_receipt(billing.price(req, table, "short"))
+        back = billing.parse_price_receipt(token)
+        assert back is not None, token
+        assert back["cpus"] == req.cpus, token
