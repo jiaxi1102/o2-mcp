@@ -248,6 +248,67 @@ def _same_posix_path(left: Any, right: Any) -> bool:
     return str(PurePosixPath(left)) == str(PurePosixPath(right))
 
 
+# Slurm job ids are numeric, with an underscore-separated task index for array
+# members. Requiring the shape keeps a value read from the untrusted diagnostic
+# from reaching a shell as anything but a job id.
+_JOB_ID = re.compile(r"^[0-9]+(_[0-9]+)?$")
+SACCT_RETENTION_DAYS = 366
+
+
+def claimed_job_id(diagnostic: Mapping[str, Any]) -> str:
+    """Return the job the diagnostic claims, or refuse if it names none usably.
+
+    This is what the server must query accounting for, so it is extracted --
+    and shape-checked -- before any command is built from it.
+    """
+
+    job_id = _dig(diagnostic, ("slurm", "scheduler", "job_id"))
+    if isinstance(job_id, bool) or not isinstance(job_id, (str, int)) or not str(job_id).strip():
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; submission job_id is {job_id!r}, "
+            "so the record would bind no submitted job"
+        )
+    candidate = str(job_id).strip()
+    if not _JOB_ID.match(candidate):
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; submission job_id {candidate!r} is not a Slurm job id"
+        )
+    return candidate
+
+
+def parse_scheduler_record(text: str, *, job_id: str) -> dict[str, str]:
+    """Parse one ``sacct`` allocation row into the job identity it reports.
+
+    An empty result is refused rather than falling back to the diagnostic's own
+    claim: accounting is purged after 366 days, and a mint that quietly
+    trusted the run because its job had aged out is exactly the degradation this
+    record exists to prevent.
+    """
+
+    rows = [line for line in text.splitlines() if line.strip()]
+    if not rows:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; Slurm accounting has no record of job {job_id}. "
+            f"Accounting is purged after {SACCT_RETENTION_DAYS} days, so either the run is too old to "
+            "attest or the job never existed; either way the job identity cannot be confirmed here"
+        )
+    if len(rows) > 1:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; Slurm accounting returned {len(rows)} allocations for "
+            f"job {job_id}, so its identity is ambiguous"
+        )
+    fields = rows[0].split("|")
+    if len(fields) != 4:
+        raise LaunchEvidenceError(f"the Slurm accounting row for job {job_id} is not the four fields requested")
+    reported_id, state, account, partition = (field.strip() for field in fields)
+    if reported_id != job_id:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; Slurm accounting answered for job {reported_id!r} "
+            f"when asked about {job_id!r}"
+        )
+    return {"job_id": reported_id, "state": state, "account": account, "partition": partition}
+
+
 def refuse_package_symlinks(listing: str, *, package_path: str) -> None:
     """Refuse a package containing any symlink at all.
 
@@ -287,6 +348,7 @@ def build_launch_evidence(
     stage: str,
     read_back_package_path: str,
     resolved_package_path: str,
+    scheduler_record: Mapping[str, str],
 ) -> dict[str, Any]:
     """Verify every link and return the record, or raise naming what disagreed.
 
@@ -299,7 +361,9 @@ def build_launch_evidence(
     resolves to on the cluster; both must be the package the plan approved. A
     manifest entry cannot escape the package because the names are refused if
     they are absolute or traversing and the package is refused if it holds any
-    symlink at all; see ``refuse_package_symlinks``.
+    symlink at all; see ``refuse_package_symlinks``. ``scheduler_record`` is what
+    Slurm accounting reports for the claimed job, read through the broker rather
+    than taken from the diagnostic.
     """
 
     expected_plan_sha256 = plan_digest(plan)
@@ -355,6 +419,27 @@ def build_launch_evidence(
     job_id = _dig(diagnostic, ("slurm", "scheduler", "job_id"))
     if isinstance(job_id, bool) or not isinstance(job_id, (str, int)) or not str(job_id).strip():
         mismatches.append(f"submission job_id is {job_id!r}, so the record would bind no submitted job")
+    else:
+        # The job identity was the last field taken on the run's word, and a
+        # compromised run can put any plausible id here. Bind it to what the
+        # scheduler itself reports instead. The account and partition come from
+        # the job's own environment, so accounting must agree with them.
+        checks += 1
+        if scheduler_record.get("job_id") != str(job_id).strip():
+            mismatches.append(
+                f"scheduler job_id: diagnostic={str(job_id).strip()!r} "
+                f"accounting={scheduler_record.get('job_id')!r}"
+            )
+        for label, key, reported in (
+            ("account", "SLURM_JOB_ACCOUNT", "account"),
+            ("partition", "SLURM_JOB_PARTITION", "partition"),
+        ):
+            checks += 1
+            claimed = _dig(diagnostic, ("slurm", "environment", key))
+            if claimed != scheduler_record.get(reported):
+                mismatches.append(
+                    f"scheduler {label}: diagnostic={claimed!r} accounting={scheduler_record.get(reported)!r}"
+                )
 
     checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
@@ -425,6 +510,11 @@ def build_launch_evidence(
             "allocated_hostnames": scheduler.get("allocated_hostnames"),
             "account": environment.get("SLURM_JOB_ACCOUNT"),
             "partition": environment.get("SLURM_JOB_PARTITION"),
+            # What Slurm accounting reports, read through the broker. The state
+            # is recorded but deliberately not gated on: a mint can legitimately
+            # race a job's final accounting transition, and refusing on that
+            # would fail correct runs for their timing rather than their content.
+            "scheduler_accounting": dict(scheduler_record),
         },
         "runtime_identities": {
             "source_bundle_sha256": _dig(diagnostic, ("runtime", "source_bundle", "bundle_sha256")),
@@ -541,6 +631,9 @@ __all__ = [
     "parse_json_artifact",
     "parse_sha256_lines",
     "refuse_package_symlinks",
+    "SACCT_RETENTION_DAYS",
+    "claimed_job_id",
+    "parse_scheduler_record",
     "plan_digest",
     "required_package_files",
 ]

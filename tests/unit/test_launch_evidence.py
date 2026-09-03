@@ -15,15 +15,18 @@ import pytest
 from o2mcp.launch_evidence import (
     EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
+    SACCT_RETENTION_DAYS,
     LaunchEvidenceError,
     build_launch_evidence,
     canonical_json,
+    claimed_job_id,
     evidence_content_digest,
     launch_evidence_digest,
     parse_checksum_manifest,
     parse_encoded_checksum_manifest,
     parse_encoded_json_artifact,
     parse_json_artifact,
+    parse_scheduler_record,
     parse_sha256_lines,
     plan_digest,
     refuse_package_symlinks,
@@ -88,6 +91,14 @@ def _manifest() -> dict[str, str]:
     return dict(_MANIFEST)
 
 
+def _scheduler_record(**overrides) -> dict[str, str]:
+    """What Slurm accounting reports for the job the diagnostic claims."""
+
+    record = {"job_id": "52085188", "state": "COMPLETED", "account": "tabin", "partition": "short"}
+    record.update(overrides)
+    return record
+
+
 def _owner(plan: dict) -> dict:
     return {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
 
@@ -107,6 +118,7 @@ def _build(**overrides):
         stage=overrides.pop("stage", "platform-canary"),
         read_back_package_path=overrides.pop("read_back_package_path", "/pkg/attempt-002"),
         resolved_package_path=overrides.pop("resolved_package_path", "/pkg/attempt-002"),
+        scheduler_record=overrides.pop("scheduler_record", _scheduler_record()),
     )
 
 
@@ -523,3 +535,83 @@ def test_the_refusal_names_the_offending_links_without_dumping_all_of_them() -> 
 def test_the_resolved_package_is_recorded() -> None:
     record = _build()
     assert record["destination"]["resolved_package_path"] == "/pkg/attempt-002"
+
+
+# --- the job identity comes from the scheduler, not from the run --------------
+def test_a_fabricated_job_id_refuses_to_mint() -> None:
+    """The last field taken on the run's word is now anchored outside it.
+
+    A compromised run can put any plausible id in the diagnostic, so the record
+    binds what Slurm accounting reports rather than what the run claims.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="scheduler job_id"):
+        _build(scheduler_record=_scheduler_record(job_id="99999999"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [("account", "someone-else", "scheduler account"), ("partition", "priority", "scheduler partition")],
+)
+def test_a_job_belonging_to_another_allocation_refuses_to_mint(field, value, expected) -> None:
+    with pytest.raises(LaunchEvidenceError, match=expected):
+        _build(scheduler_record=_scheduler_record(**{field: value}))
+
+
+def test_the_accounting_row_is_recorded(_=None) -> None:
+    record = _build()
+    assert record["submission"]["scheduler_accounting"] == _scheduler_record()
+
+
+def test_a_job_state_that_is_not_completed_still_mints() -> None:
+    """A mint can legitimately race the job's final accounting transition.
+
+    The state is recorded, but gating on it would refuse correct runs for their
+    timing rather than for their content.
+    """
+
+    record = _build(scheduler_record=_scheduler_record(state="COMPLETING"))
+    assert record["submission"]["scheduler_accounting"]["state"] == "COMPLETING"
+
+
+def test_an_aged_out_job_refuses_rather_than_falling_back_to_the_diagnostic() -> None:
+    """Accounting purges after a year; silence must not become trust."""
+
+    with pytest.raises(LaunchEvidenceError, match=f"purged after {SACCT_RETENTION_DAYS} days"):
+        parse_scheduler_record("", job_id="52085188")
+
+
+def test_ambiguous_accounting_refuses_to_mint() -> None:
+    two = "52085188|COMPLETED|tabin|short\n52085188|FAILED|tabin|short\n"
+    with pytest.raises(LaunchEvidenceError, match="returned 2 allocations"):
+        parse_scheduler_record(two, job_id="52085188")
+
+
+def test_accounting_answering_about_another_job_refuses_to_mint() -> None:
+    with pytest.raises(LaunchEvidenceError, match="answered for job"):
+        parse_scheduler_record("99999999|COMPLETED|tabin|short\n", job_id="52085188")
+
+
+def test_a_malformed_accounting_row_refuses_to_mint() -> None:
+    with pytest.raises(LaunchEvidenceError, match="not the four fields"):
+        parse_scheduler_record("52085188|COMPLETED\n", job_id="52085188")
+
+
+def test_a_well_formed_accounting_row_parses() -> None:
+    assert parse_scheduler_record("52085188|COMPLETED|tabin|short\n", job_id="52085188") == _scheduler_record()
+
+
+# --- the claimed job id must be a job id before it reaches a shell ------------
+@pytest.mark.parametrize("job_id", ["52085188", "52085188_4", 52085188])
+def test_a_plausible_job_id_is_extracted(job_id) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["slurm"]["scheduler"]["job_id"] = job_id
+    assert claimed_job_id(diagnostic) == str(job_id)
+
+
+@pytest.mark.parametrize("job_id", ["; rm -rf /", "52085188; sacct", "abc", "", "   ", None, True, []])
+def test_a_job_id_that_is_not_one_is_refused_before_any_command(job_id) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["slurm"]["scheduler"]["job_id"] = job_id
+    with pytest.raises(LaunchEvidenceError):
+        claimed_job_id(diagnostic)

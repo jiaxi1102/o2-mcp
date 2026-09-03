@@ -71,11 +71,13 @@ from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
     LaunchEvidenceError,
     build_launch_evidence,
+    claimed_job_id,
     evidence_content_digest,
     launch_evidence_digest,
     parse_encoded_checksum_manifest,
     parse_encoded_json_artifact,
     parse_json_artifact,
+    parse_scheduler_record,
     parse_sha256_lines,
     refuse_package_symlinks,
     required_package_files,
@@ -1434,6 +1436,27 @@ def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeo
     return payload_digests
 
 
+def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
+    """Ask Slurm accounting who actually ran the job the diagnostic claims.
+
+    Every other field in the record is anchored outside the executed process --
+    the plan by digest, the package by rehashing, the directory by cluster-side
+    resolution -- and this is what stops the job identity from being the one
+    exception. ``-X`` returns the allocation rather than its steps, so a normal
+    job is exactly one row.
+    """
+
+    fields = "JobID,State,Account,Partition"
+    command = f"sacct -j {shlex.quote(job_id)} -X -n -P -o {shlex.quote(fields)}"
+    result = _connection().run(command, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not read Slurm accounting for job {}: {}".format(job_id, (result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the Slurm accounting read")
+    return parse_scheduler_record(result.stdout, job_id=job_id)
+
+
 @mcp.tool(
     name="o2_mint_launch_evidence",
     annotations={
@@ -1452,7 +1475,8 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
     publication owner marker, the package's SHA256SUMS, and the package digests
     back off the cluster through the authenticated broker, rehashes every
     payload the manifest names rather than trusting the run's own "verified"
-    verdict, checks that every link agrees -- including that the directory read
+    verdict, confirms the claimed job against Slurm accounting, checks that every
+    link agrees -- including that the directory read
     is the package the plan approved -- and records the mint, with the digest of
     the record it approves, in the policy audit ledger.
 
@@ -1475,6 +1499,9 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             manifest=artifacts["checksum_manifest"],
             timeout=params.timeout_seconds,
         )
+        scheduler_record = _read_scheduler_record(
+            job_id=claimed_job_id(artifacts["diagnostic"]), timeout=params.timeout_seconds
+        )
 
         def mint(approval: dict[str, Any]) -> dict[str, Any]:
             return build_launch_evidence(
@@ -1488,6 +1515,7 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
                 stage=params.stage,
                 read_back_package_path=package_path,
                 resolved_package_path=artifacts["resolved_package_path"],
+                scheduler_record=scheduler_record,
             )
 
         # Verify BEFORE recording an approval: a chain that does not agree must

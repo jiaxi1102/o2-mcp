@@ -1571,6 +1571,8 @@ def test_long_flags_still_end_at_the_token():
 
 # --- governed launch attestation ---------------------------------------------
 _PACKAGE = "/pkg/attempt-002"
+# Distinguishes "use the default accounting row" from "accounting knows nothing".
+_UNSET = object()
 _PAYLOADS = {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
 
 
@@ -1586,6 +1588,7 @@ def _launch_evidence_responder(
     n_payloads=None,
     resolved_package=None,
     symlinks=None,
+    accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
@@ -1604,6 +1607,8 @@ def _launch_evidence_responder(
     from o2mcp.launch_evidence import plan_digest
 
     listed = dict(_PAYLOADS if manifest_payloads is None else manifest_payloads)
+    if accounting is _UNSET:
+        accounting = f"{job_id}|COMPLETED|tabin|short"
     on_disk = dict(listed if payloads is None else payloads)
     named = package if approved_package is None else approved_package
     plan = {
@@ -1662,6 +1667,10 @@ def _launch_evidence_responder(
 
     def responder(argv, input_text):
         command = argv[-1]
+        if command.startswith("sacct "):
+            # Slurm accounting, read through the broker rather than taken from
+            # the diagnostic. One allocation row, `|`-separated, no header.
+            return "" if accounting is None else accounting, "", 0
         if command.startswith("sha256sum"):
             # The later holds on the channel: the payloads the manifest named,
             # in whatever batches the broker's command limit allowed. Answer only
@@ -2050,6 +2059,70 @@ async def test_mint_records_what_the_cluster_resolved(monkeypatch, tmp_path):
     minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert minted["ok"] is True
     assert minted["launch_evidence"]["destination"]["resolved_package_path"] == _PACKAGE
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_job_slurm_accounting_does_not_know(monkeypatch, tmp_path):
+    """A run too old to attest, or a job that never existed, must not mint.
+
+    Falling back to the diagnostic's own claim when accounting has aged out is
+    exactly the quiet degradation this record exists to prevent, so silence from
+    `sacct` refuses and names the retention window.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(accounting=""))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "purged after 366 days" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_job_belonging_to_another_allocation(monkeypatch, tmp_path):
+    """A real job id is not enough; it has to be this run's job."""
+
+    responder = _launch_evidence_responder(accounting="52085188|COMPLETED|someone-else|priority")
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "scheduler account" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_asks_accounting_about_the_claimed_job_and_records_the_answer(monkeypatch, tmp_path):
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["submission"]["scheduler_accounting"] == {
+        "job_id": "52085188",
+        "state": "COMPLETED",
+        "account": "tabin",
+        "partition": "short",
+    }
+    sacct = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sacct ")]
+    assert len(sacct) == 1 and "52085188" in sacct[0]
+
+
+@pytest.mark.anyio
+async def test_a_job_id_that_is_not_one_never_reaches_a_shell(monkeypatch, tmp_path):
+    """The id comes from the untrusted diagnostic, so its shape is checked first."""
+
+    def injected(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        return payload.replace('"52085188"', '"52085188; touch /tmp/pwned"'), err, rc
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=injected)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "is not a Slurm job id" in refused["message"]
+    assert not [call for call in runner.calls if call["argv"][-1].startswith("sacct ")]
 
 
 @pytest.mark.anyio
