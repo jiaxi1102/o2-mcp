@@ -1589,6 +1589,7 @@ def _launch_evidence_responder(
     resolved_package=None,
     symlinks=None,
     scan_fails=False,
+    diagnostic_edit=None,
     accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
@@ -1653,6 +1654,8 @@ def _launch_evidence_responder(
             },
         },
     }
+    if diagnostic_edit is not None:
+        diagnostic_edit(diagnostic)
     owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
     manifest_bytes = ("\n".join(f"{digest}  {name}" for name, digest in sorted(listed.items())) + "\n").encode()
     # The server proves the manifest it parsed is the file it recorded a digest
@@ -1683,21 +1686,28 @@ def _launch_evidence_responder(
                 0,
             )
         if command.startswith("tail -c +"):
-            # SHA256SUMS is read in bounded pieces so a large one still fits the
+            # Every large artifact is read in bounded pieces so it still fits the
             # broker's output cap; serve exactly the slice that was asked for.
             start = int(command.split("tail -c +")[1].split(" ")[0]) - 1
             count = int(command.split("head -c ")[1].split(" ")[0])
-            return _base64.b64encode(manifest_bytes[start : start + count]).decode(), "", 0
+            operand = shlex.split(command.split("tail -c +")[1].split(" -- ")[1].split(" |")[0])[0]
+            if operand.endswith("diag.json"):
+                body = _json.dumps(diagnostic).encode()
+            elif operand.endswith("plan.json"):
+                body = _json.dumps(plan).encode()
+            else:
+                body = manifest_bytes
+            return _base64.b64encode(body[start : start + count]).decode(), "", 0
         if command.startswith("sacct "):
             # Slurm accounting, read through the broker rather than taken from
             # the diagnostic. One allocation row, `|`-separated, no header.
             return "" if accounting is None else accounting, "", 0
         payload = "\n".join(
             [
-                "===DIAGNOSTIC===",
-                _json.dumps(diagnostic),
-                "===PLAN===",
-                _json.dumps(plan),
+                "===DIAGNOSTICSIZE===",
+                str(len(_json.dumps(diagnostic).encode())),
+                "===PLANSIZE===",
+                str(len(_json.dumps(plan).encode())),
                 "===OWNER===",
                 _base64.b64encode(owner_bytes).decode(),
                 "===MANIFESTSIZE===",
@@ -1963,11 +1973,10 @@ async def test_mint_refuses_an_owner_marker_that_changed_while_it_was_read(monke
 async def test_mint_refuses_a_diagnostic_with_no_job_id(monkeypatch, tmp_path):
     """A record that binds no submitted job is not the thing this tool issues."""
 
-    def without_job(argv, input_text):
-        payload, err, rc = _launch_evidence_responder()(argv, input_text)
-        return payload.replace('"job_id": "52085188"', '"job_id": null'), err, rc
+    def drop_job(diagnostic):
+        diagnostic["slurm"]["scheduler"]["job_id"] = None
 
-    _patch_connection(monkeypatch, tmp_path, responder=without_job)
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(diagnostic_edit=drop_job))
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
@@ -2000,11 +2009,10 @@ async def test_mint_refuses_a_manifest_shortened_after_the_run(monkeypatch, tmp_
 
 @pytest.mark.anyio
 async def test_mint_refuses_a_run_whose_own_outcome_is_not_success(monkeypatch, tmp_path):
-    def failed(argv, input_text):
-        payload, err, rc = _launch_evidence_responder()(argv, input_text)
-        return payload.replace('"diagnostic_success"', '"diagnostic_failed"'), err, rc
+    def fail(diagnostic):
+        diagnostic["status"] = "diagnostic_failed"
 
-    _patch_connection(monkeypatch, tmp_path, responder=failed)
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(diagnostic_edit=fail))
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
@@ -2219,11 +2227,10 @@ async def test_mint_asks_accounting_about_the_claimed_job_and_records_the_answer
 async def test_a_job_id_that_is_not_one_never_reaches_a_shell(monkeypatch, tmp_path):
     """The id comes from the untrusted diagnostic, so its shape is checked first."""
 
-    def injected(argv, input_text):
-        payload, err, rc = _launch_evidence_responder()(argv, input_text)
-        return payload.replace('"52085188"', '"52085188; touch /tmp/pwned"'), err, rc
+    def inject(diagnostic):
+        diagnostic["slurm"]["scheduler"]["job_id"] = "52085188; touch /tmp/pwned"
 
-    runner = _patch_connection(monkeypatch, tmp_path, responder=injected)
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(diagnostic_edit=inject))
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
@@ -2260,6 +2267,48 @@ async def test_mint_reads_a_manifest_larger_than_the_broker_output_cap(monkeypat
 
 
 @pytest.mark.anyio
+async def test_mint_reads_a_large_plan_and_diagnostic_in_pieces(monkeypatch, tmp_path):
+    """Neither JSON artifact has a size bound, and they shared one 1 MiB stream.
+
+    A plan with a large dataset list could therefore truncate the artifact read
+    and make an otherwise valid package unmintable.
+    """
+
+    def inflate(diagnostic):
+        diagnostic["padding"] = ["x" * 512] * 3000
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(diagnostic_edit=inflate))
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+
+    reads = [call["argv"][-1] for call in runner.calls if "diag.json" in call["argv"][-1]]
+    chunked = [command for command in reads if command.startswith("tail -c +")]
+    assert len(chunked) > 1, "a diagnostic this size should have needed more than one read"
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_diagnostic_too_large_to_be_one(monkeypatch, tmp_path):
+    """The size driving the loop is untrusted for these artifacts too."""
+
+    def enormous(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        if argv[-1].startswith("tail -c +") and "diag.json" in argv[-1]:
+            raise AssertionError("the ceiling should have refused before any chunk was read")
+        marker = "===DIAGNOSTICSIZE===\n"
+        head, found, tail = payload.partition(marker)
+        if not found:
+            return payload, err, rc
+        return f"{head}{marker}{1024**4}\n{tail.split(chr(10), 1)[1]}", err, rc
+
+    _patch_connection(monkeypatch, tmp_path, responder=enormous)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "byte ceiling" in refused["message"]
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_manifest_too_large_to_be_a_package(monkeypatch, tmp_path):
     """The size driving the chunk loop is untrusted, so it must be bounded.
 
@@ -2273,8 +2322,10 @@ async def test_mint_refuses_a_manifest_too_large_to_be_a_package(monkeypatch, tm
         if argv[-1].startswith("tail -c +"):
             raise AssertionError("the size ceiling should have refused before any chunk was read")
         marker = "===MANIFESTSIZE===\n"
-        head, _, tail = payload.partition(marker)
-        return f"{head}{marker}{1024 ** 4}\n{tail.split(chr(10), 1)[1]}", err, rc
+        head, found, tail = payload.partition(marker)
+        if not found:
+            return payload, err, rc
+        return f"{head}{marker}{1024**4}\n{tail.split(chr(10), 1)[1]}", err, rc
 
     runner = _patch_connection(monkeypatch, tmp_path, responder=enormous)
     snapshot = await _call("o2_local_status", {})
@@ -2378,11 +2429,10 @@ async def test_mint_binds_a_package_whose_path_contains_spaces(monkeypatch, tmp_
 async def test_mint_refuses_a_drifted_chain_without_recording_an_approval(monkeypatch, tmp_path):
     """A refused mint must leave no audit entry implying the chain agreed."""
 
-    def drifted(argv, input_text):
-        payload, err, rc = _launch_evidence_responder()(argv, input_text)
-        return payload.replace('"' + "b" * 64 + '"', '"' + "0" * 64 + '"', 1), err, rc
+    def drift(diagnostic):
+        diagnostic["runtime"]["source_bundle"]["bundle_sha256"] = "0" * 64
 
-    _patch_connection(monkeypatch, tmp_path, responder=drifted)
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(diagnostic_edit=drift))
     snapshot = await _call("o2_local_status", {})
     policy = snapshot["policy"]
     refused = await _call(

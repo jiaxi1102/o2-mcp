@@ -30,6 +30,8 @@ unit-tested without it.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import shlex
@@ -1245,8 +1247,8 @@ def _absolute_remote_path(value: str, *, label: str) -> str:
     return cleaned
 
 
-_MARKER_DIAGNOSTIC = "===DIAGNOSTIC==="
-_MARKER_PLAN = "===PLAN==="
+_MARKER_DIAGNOSTIC_SIZE = "===DIAGNOSTICSIZE==="
+_MARKER_PLAN_SIZE = "===PLANSIZE==="
 _MARKER_OWNER = "===OWNER==="
 _MARKER_MANIFEST_SIZE = "===MANIFESTSIZE==="
 _MARKER_RESOLVED = "===RESOLVED==="
@@ -1256,8 +1258,8 @@ _MARKER_PAYLOAD_DIGESTS = "===PAYLOADDIGESTS==="
 _MARKER_PAYLOAD_RESCAN = "===PAYLOADRESCAN==="
 _MARKER_DIGESTS = "===DIGESTS==="
 _LAUNCH_EVIDENCE_MARKERS = (
-    _MARKER_DIAGNOSTIC,
-    _MARKER_PLAN,
+    _MARKER_DIAGNOSTIC_SIZE,
+    _MARKER_PLAN_SIZE,
     _MARKER_OWNER,
     _MARKER_MANIFEST_SIZE,
     _MARKER_RESOLVED,
@@ -1309,10 +1311,10 @@ def _read_launch_artifacts(
     digest_targets = {str(PurePosixPath(package_path) / name): name for name in required_package_files()}
     command = "; ".join(
         [
-            f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC)}",
-            f"cat {shlex.quote(diagnostic_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN)}",
-            f"cat {shlex.quote(plan_path)}",
+            f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC_SIZE)}",
+            f"stat -c %s -- {shlex.quote(diagnostic_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN_SIZE)}",
+            f"stat -c %s -- {shlex.quote(plan_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
             f"base64 {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST_SIZE)}",
@@ -1365,10 +1367,12 @@ def _read_launch_artifacts(
     # choose the payloads must be proven to be the file whose digest the record
     # reports. That check lives in parse_encoded_checksum_manifest.
     manifest = parse_encoded_checksum_manifest(
-        _read_manifest_base64(
-            manifest_path=manifest_path,
+        _read_artifact_base64(
+            path=manifest_path,
             size_section=sections[_MARKER_MANIFEST_SIZE],
             timeout=timeout,
+            label="SHA256SUMS",
+            ceiling=_MAX_MANIFEST_BYTES,
         ),
         expected_sha256=package_digests.get("SHA256SUMS"),
     )
@@ -1381,10 +1385,22 @@ def _read_launch_artifacts(
     # is already invalid by its publisher's own rules. Refusing here removes the
     # object a resolve-then-hash sequence would otherwise have to race.
     refuse_package_symlinks(sections[_MARKER_SYMLINKS], package_path=package_path)
+    # The diagnostic and the plan are read the same way. Neither has a size
+    # bound in its own schema, and together they shared the artifact read's one
+    # 1 MiB stream, so a large but legitimate plan made a package unmintable.
+    diagnostic_text = _decoded_artifact(
+        path=diagnostic_path,
+        size_section=sections[_MARKER_DIAGNOSTIC_SIZE],
+        timeout=timeout,
+        label="run diagnostic",
+    )
+    plan_text = _decoded_artifact(
+        path=plan_path, size_section=sections[_MARKER_PLAN_SIZE], timeout=timeout, label="execution plan"
+    )
     return {
         "resolved_package_path": resolved[0],
-        "diagnostic": parse_json_artifact(sections[_MARKER_DIAGNOSTIC], label="run diagnostic"),
-        "plan": parse_json_artifact(sections[_MARKER_PLAN], label="execution plan"),
+        "diagnostic": parse_json_artifact(diagnostic_text, label="run diagnostic"),
+        "plan": parse_json_artifact(plan_text, label="execution plan"),
         # The owner marker is the artifact tying the package to this plan, so
         # like SHA256SUMS the bytes parsed must be the file that was hashed.
         "owner": parse_encoded_json_artifact(
@@ -1415,7 +1431,7 @@ def _payload_batch_command(package_path: str, operands: str) -> str:
 # thousand files reach that, and the payload hashing is already batched for
 # exactly this reason, so the manifest is chunked rather than being the one thing
 # that makes a large package unmintable.
-_MANIFEST_CHUNK_BYTES = 384 * 1024
+_ARTIFACT_CHUNK_BYTES = 384 * 1024
 # The size that drives the loop below comes from `stat` on a file the package
 # controls, so it is untrusted input to a resource decision. A sparse manifest
 # claiming a terabyte would otherwise mean millions of sequential broker
@@ -1424,40 +1440,65 @@ _MANIFEST_CHUNK_BYTES = 384 * 1024
 # entries at typical path lengths, far beyond any real package, and bounds the
 # read at ~22 commands.
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+# A run diagnostic or a frozen plan is JSON describing one stage; 4 MiB of it is
+# already far past anything a stage legitimately produces.
+_MAX_JSON_ARTIFACT_BYTES = 4 * 1024 * 1024
 
 
-def _read_manifest_base64(*, manifest_path: str, size_section: str, timeout: float) -> str:
-    """Read SHA256SUMS in bounded pieces and return its base64.
+def _read_artifact_base64(*, path: str, size_section: str, timeout: float, label: str, ceiling: int) -> str:
+    """Read one artifact in bounded pieces and return its base64.
 
-    Chunking is safe without any per-chunk check because the caller verifies the
-    reassembled bytes against the digest recorded for that filename: a manifest
-    that changed between chunks, or a chunk that came back wrong, fails there.
+    Every artifact read this way is larger than the broker's 1 MiB output cap
+    for some legitimate input -- a package with thousands of payloads, a plan
+    with a large dataset list -- and reading one whole turns that into an
+    unmintable package rather than a slower read. The size comes from `stat` on
+    a file the package controls, so it is bounded before it drives the loop.
+
+    No per-chunk check is needed: SHA256SUMS is verified against the digest
+    recorded for that filename and the plan against `diagnostic.plan_sha256`, so
+    anything that changed mid-read fails where a whole-file read would have.
     """
 
     reported = [line.strip() for line in size_section.splitlines() if line.strip()]
     if len(reported) != 1 or not reported[0].isdigit():
-        raise LaunchEvidenceError("the size of SHA256SUMS could not be read from the cluster")
+        raise LaunchEvidenceError(f"the size of {label} could not be read from the cluster")
     size = int(reported[0])
     if size == 0:
-        raise LaunchEvidenceError("SHA256SUMS is empty, so there is nothing to reverify")
-    if size > _MAX_MANIFEST_BYTES:
+        raise LaunchEvidenceError(f"{label} is empty")
+    if size > ceiling:
         raise LaunchEvidenceError(
-            f"SHA256SUMS is {size} bytes, over the {_MAX_MANIFEST_BYTES}-byte ceiling this reads. A manifest "
-            "that large is not a package this tool can attest, and reading it would hold the shared channel "
-            "for thousands of commands"
+            f"{label} is {size} bytes, over the {ceiling}-byte ceiling this reads. Something that large is "
+            "not part of a package this tool can attest, and reading it would hold the shared channel for "
+            "thousands of commands"
         )
     encoded: list[str] = []
-    for start in range(0, size, _MANIFEST_CHUNK_BYTES):
-        count = min(_MANIFEST_CHUNK_BYTES, size - start)
-        command = f"tail -c +{start + 1} -- {shlex.quote(manifest_path)}" f" | head -c {count} | base64"
+    for start in range(0, size, _ARTIFACT_CHUNK_BYTES):
+        count = min(_ARTIFACT_CHUNK_BYTES, size - start)
+        command = f"tail -c +{start + 1} -- {shlex.quote(path)} | head -c {count} | base64"
         result = _connection().run(command, timeout=timeout)
         if not result.ok:
             raise LaunchEvidenceError(
-                "could not read SHA256SUMS from O2: {}".format((result.stderr or "").strip()[:400])
+                "could not read {} from O2: {}".format(label, (result.stderr or "").strip()[:400])
             )
-        _refuse_truncated_read(result, label="the SHA256SUMS read")
+        _refuse_truncated_read(result, label=f"the {label} read")
         encoded.append("".join(result.stdout.split()))
     return "".join(encoded)
+
+
+def _decoded_artifact(*, path: str, size_section: str, timeout: float, label: str) -> str:
+    """Read one JSON artifact in bounded pieces and return its text."""
+
+    encoded = _read_artifact_base64(
+        path=path,
+        size_section=size_section,
+        timeout=timeout,
+        label=label,
+        ceiling=_MAX_JSON_ARTIFACT_BYTES,
+    )
+    try:
+        return base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError) as error:
+        raise LaunchEvidenceError(f"{label} did not come back as decodable UTF-8: {error}") from error
 
 
 def _hash_batches(paths: list[str], *, package_path: str) -> Iterator[list[str]]:
