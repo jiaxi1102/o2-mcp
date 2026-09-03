@@ -2107,6 +2107,29 @@ async def test_a_minted_record_verifies_against_its_own_ledger_entry(monkeypatch
 
 
 @pytest.mark.anyio
+async def test_a_stage_with_whitespace_still_verifies_against_its_ledger_entry(monkeypatch, tmp_path):
+    """A record must never fail the verification it was just issued under.
+
+    The stage is stored verbatim in the record and compared exactly against the
+    ledger, so collapsing its whitespace on the way into the ledger would make a
+    freshly minted record fail its own check.
+    """
+
+    from o2mcp.launch_evidence import verify_launch_evidence
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"], stage="platform  canary"))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["stage"] == "platform  canary"
+
+    after = await _call("o2_local_status", {})
+    entry = after["policy"]["recent_launch_evidence_mints"][-1]
+    assert entry["stage"] == "platform  canary"
+    verify_launch_evidence(minted["launch_evidence"], entry)
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_job_slurm_says_failed(monkeypatch, tmp_path):
     responder = _launch_evidence_responder(accounting="52085188|FAILED|tabin|short")
     _patch_connection(monkeypatch, tmp_path, responder=responder)

@@ -886,3 +886,28 @@ def test_an_unusable_package_path_is_refused(package, tmp_path):
             evidence_sha256="a" * 64,
             plan_sha256="b" * 64,
         )
+
+
+def test_the_ledger_files_a_stage_exactly_as_given(tmp_path):
+    """The stage is compared exactly by verify_launch_evidence, so it must match.
+
+    Collapsing it here while the evidence record keeps the caller's value would
+    make a freshly minted record fail the verification it was just issued under.
+    """
+
+    store = _reuse_store(tmp_path)
+    state = store.snapshot().state
+    store.record_launch_evidence_mint(
+        expected_revision=state["revision"],
+        expected_generation=state["generation"],
+        approval_reference="operator   approved",
+        stage="platform  canary",
+        job_id="52085188",
+        package="/pkg/attempt-002",
+        evidence_sha256="a" * 64,
+        plan_sha256="b" * 64,
+    )
+    entry = store.snapshot().state["launch_evidence_mints"][-1]
+    assert entry["stage"] == "platform  canary"
+    # Only the free-text approval note is still collapsed.
+    assert entry["approval_reference"] == "operator approved"

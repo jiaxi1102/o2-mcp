@@ -358,15 +358,15 @@ class O2PolicyStore:
         a finished run is not authority to start another one.
         """
 
+        # The approval reference is free text and only ever lives here, so
+        # collapsing its whitespace is right. The other three are also stored
+        # verbatim in the evidence record and compared exactly by
+        # verify_launch_evidence, so normalizing them here would make a freshly
+        # minted record fail its own verification.
         reference = self._clean_reference(approval_reference, field="approval_reference")
-        clean_stage = self._clean_reference(stage, field="stage")
-        clean_job = self._clean_reference(job_id, field="job_id")
-        # NOT _clean_reference: that collapses runs of whitespace, which is right
-        # for a free-text note and wrong for a pathname. A package whose path
-        # holds two spaces would otherwise be filed in the ledger under a name
-        # that is not the one the record attests, and the two could no longer be
-        # correlated exactly -- while the hashing path supports such paths fine.
-        clean_package = self._clean_path(package, field="package")
+        clean_stage = self._clean_literal(stage, field="stage", max_length=240)
+        clean_job = self._clean_literal(job_id, field="job_id", max_length=240)
+        clean_package = self._clean_literal(package, field="package", max_length=4096)
         evidence_digest = self._clean_digest(evidence_sha256, field="evidence_sha256")
         approved_plan_digest = self._clean_digest(plan_sha256, field="plan_sha256")
         with self._locked():
@@ -1170,20 +1170,23 @@ class O2PolicyStore:
         return cleaned
 
     @staticmethod
-    def _clean_path(value: str, *, field: str) -> str:
-        """Validate an audited pathname without normalizing the characters in it.
+    def _clean_literal(value: str, *, field: str, max_length: int) -> str:
+        """Validate an audited value without normalizing the characters in it.
 
-        Unlike `_clean_reference` this preserves whitespace runs, so the ledger
-        files a mint under exactly the path the record attests. Control
-        characters are still refused: they cannot appear in a path this server
-        accepted and would corrupt an audit line.
+        `_clean_reference` collapses runs of whitespace, which is right for a
+        free-text approval note and wrong for anything the evidence record also
+        stores verbatim: the ledger would file the mint under a value the record
+        does not carry, and `verify_launch_evidence` compares them exactly, so a
+        freshly minted record would fail its own verification. Control
+        characters are still refused -- they cannot appear in a value this
+        server accepted, and would corrupt an audit line.
         """
 
         if not isinstance(value, str) or not value.strip():
             raise O2PolicyInvalidError(f"{field} must be a non-empty string")
         cleaned = value.strip()
-        if len(cleaned) > 4096:
-            raise O2PolicyInvalidError(f"{field} must be at most 4096 characters")
+        if len(cleaned) > max_length:
+            raise O2PolicyInvalidError(f"{field} must be at most {max_length} characters")
         if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
             raise O2PolicyInvalidError(f"{field} must not contain control characters")
         return cleaned
