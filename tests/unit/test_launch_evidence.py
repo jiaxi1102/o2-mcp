@@ -861,6 +861,7 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         ("verified_package", "n_payloads"),
         # computed or observed by the server itself
         ("schema",),
+        # Supplied by the approving operator, and said to be so in binding_check.
         ("stage",),
         ("approved_plan", "sha256"),
         ("destination", "read_back_package_path"),
@@ -868,6 +869,7 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         ("destination", "device_note"),
         ("binding_check", "all_links_agree"),
         ("binding_check", "checked"),
+        ("binding_check", "stage_is_operator_supplied"),
     }
     record = _build()
     leaves = set()
@@ -961,3 +963,18 @@ def test_an_uppercase_digest_is_refused_so_comparisons_stay_exact() -> None:
     diagnostic["runtime"]["approved_interpreter"]["sha256"] = "B2" * 32
     with pytest.raises(LaunchEvidenceError, match="is not a well-formed sha256"):
         _build(plan=plan, diagnostic=diagnostic)
+
+
+def test_the_record_says_the_stage_is_not_bound_to_the_artifacts() -> None:
+    """The same artifacts mint under a different label if an operator approves it.
+
+    The stage comes from the approval, not from the plan or diagnostic, and
+    nothing here ties the two -- so the record says so where a reader looks for
+    what was checked, rather than presenting it as derived.
+    """
+
+    canary = _build(stage="platform-canary")
+    acquisition = _build(stage="acquisition")
+    assert canary["stage"] != acquisition["stage"]
+    note = canary["binding_check"]["stage_is_operator_supplied"]
+    assert "not from the plan or the diagnostic" in note

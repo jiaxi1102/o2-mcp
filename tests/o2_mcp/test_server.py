@@ -205,7 +205,8 @@ async def test_tool_registry_and_annotations():
     # not be told it is destructive either.
     assert tools["o2_mint_launch_evidence"].annotations.readOnlyHint is False
     assert tools["o2_mint_launch_evidence"].annotations.destructiveHint is False
-    assert tools["o2_mint_launch_evidence"].annotations.openWorldHint is False
+    # It reads O2 files and queries Slurm through the broker, so it is not closed-world.
+    assert tools["o2_mint_launch_evidence"].annotations.openWorldHint is True
     assert tools["o2_refresh_billing_weights"].annotations.readOnlyHint is False
     assert tools["o2_refresh_billing_weights"].annotations.openWorldHint is True
 

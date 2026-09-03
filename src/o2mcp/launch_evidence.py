@@ -668,7 +668,20 @@ def build_launch_evidence(
             "diagnostic_schema_version": diagnostic.get("schema_version"),
         },
         "operator_approval": dict(approval),
-        "binding_check": {"all_links_agree": True, "checked": checks},
+        "binding_check": {
+            "all_links_agree": True,
+            "checked": checks,
+            # The stage names which governed stage this record is for, and it
+            # comes from the approving operator rather than from the artifacts.
+            # Nothing here ties it to the plan or the diagnostic, so the same
+            # artifacts would mint under a different label if an operator
+            # approved that. Said here because binding_check is where a reader
+            # looks for what was and was not checked.
+            "stage_is_operator_supplied": (
+                "the stage label comes from the operator's approval, not from the plan or the "
+                "diagnostic; nothing in this record binds it to the artifacts"
+            ),
+        },
     }
 
     # The ledger records the approval against this content digest, so a record

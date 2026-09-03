@@ -1608,7 +1608,10 @@ def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
         "title": "Mint authenticated O2 launch evidence",
         "readOnlyHint": False,
         "destructiveHint": False,
-        "openWorldHint": False,
+        # This reads files from O2 and queries Slurm through the broker, so it
+        # does interact with entities outside this process, whatever the local
+        # policy write alongside it might suggest.
+        "openWorldHint": True,
     },
 )
 async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
