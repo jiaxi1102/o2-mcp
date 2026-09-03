@@ -1248,7 +1248,7 @@ def _absolute_remote_path(value: str, *, label: str) -> str:
 _MARKER_DIAGNOSTIC = "===DIAGNOSTIC==="
 _MARKER_PLAN = "===PLAN==="
 _MARKER_OWNER = "===OWNER==="
-_MARKER_MANIFEST = "===MANIFEST==="
+_MARKER_MANIFEST_SIZE = "===MANIFESTSIZE==="
 _MARKER_RESOLVED = "===RESOLVED==="
 _MARKER_SYMLINKS = "===SYMLINKS==="
 # Bracket the hashing in one command: scan, digests, scan again.
@@ -1259,7 +1259,7 @@ _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_DIAGNOSTIC,
     _MARKER_PLAN,
     _MARKER_OWNER,
-    _MARKER_MANIFEST,
+    _MARKER_MANIFEST_SIZE,
     _MARKER_RESOLVED,
     _MARKER_SYMLINKS,
     _MARKER_DIGESTS,
@@ -1315,8 +1315,8 @@ def _read_launch_artifacts(
             f"cat {shlex.quote(plan_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
             f"base64 {shlex.quote(owner_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST)}",
-            f"base64 {shlex.quote(manifest_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST_SIZE)}",
+            f"stat -c %s -- {shlex.quote(manifest_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_RESOLVED)}",
             f"realpath -- {shlex.quote(package_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_SYMLINKS)}",
@@ -1361,10 +1361,16 @@ def _read_launch_artifacts(
         if name is None:
             raise LaunchEvidenceError(f"the package digest output named {operand!r}, which was not requested")
         package_digests[name] = digest
-    # The manifest is read and hashed by two commands, so the bytes that choose
-    # the payloads must be proven to be the file whose digest the record reports.
+    # The manifest is read and hashed by different commands, so the bytes that
+    # choose the payloads must be proven to be the file whose digest the record
+    # reports. That check lives in parse_encoded_checksum_manifest.
     manifest = parse_encoded_checksum_manifest(
-        sections[_MARKER_MANIFEST], expected_sha256=package_digests.get("SHA256SUMS")
+        _read_manifest_base64(
+            manifest_path=manifest_path,
+            size_section=sections[_MARKER_MANIFEST_SIZE],
+            timeout=timeout,
+        ),
+        expected_sha256=package_digests.get("SHA256SUMS"),
     )
     # `cat` and `sha256sum` follow links, so the record has to say what the
     # cluster actually opened, not what the caller spelled.
@@ -1402,6 +1408,42 @@ def _payload_batch_command(package_path: str, operands: str) -> str:
         f" && sha256sum -- {operands}"
         f" && printf '\\n%s\\n' {rescan} && {scan}"
     )
+
+
+# base64 expands by 4/3, and the broker caps captured output at 1 MiB, so a
+# manifest read whole overruns it somewhere above ~750 KiB. Packages with several
+# thousand files reach that, and the payload hashing is already batched for
+# exactly this reason, so the manifest is chunked rather than being the one thing
+# that makes a large package unmintable.
+_MANIFEST_CHUNK_BYTES = 384 * 1024
+
+
+def _read_manifest_base64(*, manifest_path: str, size_section: str, timeout: float) -> str:
+    """Read SHA256SUMS in bounded pieces and return its base64.
+
+    Chunking is safe without any per-chunk check because the caller verifies the
+    reassembled bytes against the digest recorded for that filename: a manifest
+    that changed between chunks, or a chunk that came back wrong, fails there.
+    """
+
+    reported = [line.strip() for line in size_section.splitlines() if line.strip()]
+    if len(reported) != 1 or not reported[0].isdigit():
+        raise LaunchEvidenceError("the size of SHA256SUMS could not be read from the cluster")
+    size = int(reported[0])
+    if size == 0:
+        raise LaunchEvidenceError("SHA256SUMS is empty, so there is nothing to reverify")
+    encoded: list[str] = []
+    for start in range(0, size, _MANIFEST_CHUNK_BYTES):
+        count = min(_MANIFEST_CHUNK_BYTES, size - start)
+        command = f"tail -c +{start + 1} -- {shlex.quote(manifest_path)}" f" | head -c {count} | base64"
+        result = _connection().run(command, timeout=timeout)
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not read SHA256SUMS from O2: {}".format((result.stderr or "").strip()[:400])
+            )
+        _refuse_truncated_read(result, label="the SHA256SUMS read")
+        encoded.append("".join(result.stdout.split()))
+    return "".join(encoded)
 
 
 def _hash_batches(paths: list[str], *, package_path: str) -> Iterator[list[str]]:

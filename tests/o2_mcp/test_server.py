@@ -1682,6 +1682,12 @@ def _launch_evidence_responder(
                 "",
                 0,
             )
+        if command.startswith("tail -c +"):
+            # SHA256SUMS is read in bounded pieces so a large one still fits the
+            # broker's output cap; serve exactly the slice that was asked for.
+            start = int(command.split("tail -c +")[1].split(" ")[0]) - 1
+            count = int(command.split("head -c ")[1].split(" ")[0])
+            return _base64.b64encode(manifest_bytes[start : start + count]).decode(), "", 0
         if command.startswith("sacct "):
             # Slurm accounting, read through the broker rather than taken from
             # the diagnostic. One allocation row, `|`-separated, no header.
@@ -1694,8 +1700,8 @@ def _launch_evidence_responder(
                 _json.dumps(plan),
                 "===OWNER===",
                 _base64.b64encode(owner_bytes).decode(),
-                "===MANIFEST===",
-                _base64.b64encode(manifest_bytes).decode(),
+                "===MANIFESTSIZE===",
+                str(len(manifest_bytes)),
                 "===RESOLVED===",
                 package if resolved_package is None else resolved_package,
                 "===SYMLINKS===",
@@ -2224,6 +2230,33 @@ async def test_a_job_id_that_is_not_one_never_reaches_a_shell(monkeypatch, tmp_p
     assert refused["error"] == "launch_evidence_refused"
     assert "is not a Slurm job id" in refused["message"]
     assert not [call for call in runner.calls if call["argv"][-1].startswith("sacct ")]
+
+
+@pytest.mark.anyio
+async def test_mint_reads_a_manifest_larger_than_the_broker_output_cap(monkeypatch, tmp_path):
+    """base64 expansion put a big SHA256SUMS over the 1 MiB cap in one read.
+
+    The payload hashing is already batched for large packages, so the manifest
+    must not be the one thing that makes them unmintable. Chunking needs no
+    per-chunk check: the reassembled bytes are verified against the digest
+    recorded for that filename.
+    """
+
+    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
+
+    payloads = {f"payloads/{'segment-' * 12}{index:05d}.ome.tif": f"{index:064d}" for index in range(9000)}
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_payloads=payloads))
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    reverified = minted["launch_evidence"]["verified_package"]["payload_reverification"]
+    assert reverified["n_payloads_reverified"] == 9000
+
+    reads = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("tail -c +")]
+    assert len(reads) > 1, "a manifest this size should have needed more than one read"
+    # Whole in one read, base64 would have overrun the broker's output cap.
+    manifest_bytes = sum(len(name) + 66 + 1 for name in payloads)
+    assert manifest_bytes * 4 / 3 > MAX_OUTPUT_BYTES
 
 
 @pytest.mark.anyio
