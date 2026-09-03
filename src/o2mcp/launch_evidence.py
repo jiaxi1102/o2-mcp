@@ -32,7 +32,9 @@ Two properties are deliberate and should survive future edits:
   and compared in this module.
 
 This module is pure stdlib on purpose so the binding logic stays testable
-without the MCP SDK.
+without the MCP SDK. The one in-repo import -- the scheduler's success states --
+is itself stdlib-only, and exists so this does not restate a vocabulary the
+repository already defines.
 """
 
 from __future__ import annotations
@@ -45,6 +47,8 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 from typing import Any
+
+from o2mcp.runorg.execution_models import SUCCESS_SLURM_STATES
 
 LAUNCH_EVIDENCE_SCHEMA = "o2-launch-evidence-v1"
 # The canary emits exactly two status strings -- "success" for package
@@ -253,13 +257,20 @@ def _same_posix_path(left: Any, right: Any) -> bool:
 # from reaching a shell as anything but a job id.
 _JOB_ID = re.compile(r"^[0-9]+(_[0-9]+)?$")
 SACCT_RETENTION_DAYS = 366
-# States a finished governed stage can legitimately be reported in. COMPLETED is
-# the expected one; the rest are transient, and are allowed because a mint can
-# race a job's final accounting transition. Everything else -- FAILED, CANCELLED,
-# TIMEOUT, NODE_FAIL, OUT_OF_MEMORY, BOOT_FAIL, DEADLINE, PREEMPTED, REVOKED --
-# is a terminal failure, and an unrecognised state is refused rather than
-# assumed benign, so a future Slurm state cannot quietly become mintable.
-MINTABLE_JOB_STATES = frozenset({"COMPLETED", "RUNNING", "COMPLETING", "PENDING", "REQUEUED", "RESIZING", "SUSPENDED"})
+# States a finished governed stage can legitimately be reported in. The
+# allowance exists for one reason only -- a mint can arrive before accounting
+# settles -- so it covers just the states a job passes through *after it has
+# run*: RUNNING, because the diagnostic is written before the process exits, and
+# COMPLETING, the final transition. The success state itself comes from this
+# repo's own scheduler vocabulary rather than being restated here.
+#
+# PENDING and REQUEUED are excluded even though runorg classes them as active: a
+# job that has not started cannot have produced the diagnostic being attested,
+# and allowing them would let a compromised diagnostic name any queued job in
+# the same account and partition. Everything else -- every terminal failure, and
+# any state neither this code nor Slurm's vocabulary recognises -- refuses, so a
+# future state cannot quietly become mintable.
+MINTABLE_JOB_STATES = SUCCESS_SLURM_STATES | frozenset({"RUNNING", "COMPLETING"})
 
 
 def claimed_job_id(diagnostic: Mapping[str, Any]) -> str:
@@ -628,6 +639,64 @@ def evidence_content_digest(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(content).encode("utf-8")).hexdigest()
 
 
+# Every field of a record's ``operator_approval`` and the ledger entry it must
+# equal. ``evidence_sha256`` is the digest itself, so it is checked separately.
+_APPROVAL_TO_LEDGER: tuple[tuple[str, str], ...] = (
+    ("approval_reference", "approval_reference"),
+    ("plan_sha256", "plan_sha256"),
+    ("policy_revision", "policy_revision"),
+    ("policy_generation", "policy_generation"),
+    ("client_id", "client_id"),
+    ("approved_at", "at"),
+)
+
+
+def verify_launch_evidence(record: Mapping[str, Any], ledger_entry: Mapping[str, Any]) -> None:
+    """Check a record in hand against the ledger entry that approved it.
+
+    The content digest deliberately excludes the whole ``operator_approval``
+    object, because none of it exists when the digest is taken. That leaves the
+    approval fields themselves unprotected by the digest: a holder of a valid
+    record could rewrite the reference, the approving client, the revision or
+    the time, recompute the record's own digest, and still match the ledger.
+
+    The ledger entry carries all of those fields, so the check is to compare
+    them -- which is what this does. It is the supported way to verify a
+    persisted record, and it is why the entry records more than the digest.
+    """
+
+    observed = evidence_content_digest(record)
+    if observed != ledger_entry.get("evidence_sha256"):
+        raise LaunchEvidenceError(
+            f"this record's content digests to {observed}, but the ledger entry approved "
+            f"{ledger_entry.get('evidence_sha256')!r}"
+        )
+    approval = record.get("operator_approval")
+    if not isinstance(approval, Mapping) or not approval:
+        # The content digest ignores this object by design, so an unapproved
+        # record digests the same as the approved one it was built alongside.
+        # Say that plainly rather than reporting every field as disagreeing.
+        raise LaunchEvidenceError("this record carries no operator approval to verify")
+    disagreements = [
+        f"{field}: record={approval.get(field)!r} ledger={ledger_entry.get(key)!r}"
+        for field, key in _APPROVAL_TO_LEDGER
+        if approval.get(field) != ledger_entry.get(key)
+    ]
+    if approval.get("evidence_sha256") != ledger_entry.get("evidence_sha256"):
+        disagreements.append(
+            f"evidence_sha256: record={approval.get('evidence_sha256')!r} "
+            f"ledger={ledger_entry.get('evidence_sha256')!r}"
+        )
+    for field, key in (("stage", "stage"), ("package", "package")):
+        claimed = record.get(field) if field == "stage" else _dig(record, ("destination", "package"))
+        if claimed != ledger_entry.get(key):
+            disagreements.append(f"{field}: record={claimed!r} ledger={ledger_entry.get(key)!r}")
+    if disagreements:
+        raise LaunchEvidenceError(
+            "this record does not match the approval recorded for it: " + "; ".join(disagreements)
+        )
+
+
 def parse_json_artifact(text: str, *, label: str) -> dict[str, Any]:
     """Parse one artifact read off the cluster, naming it when it is not JSON."""
 
@@ -661,6 +730,7 @@ __all__ = [
     "parse_json_artifact",
     "parse_sha256_lines",
     "refuse_package_symlinks",
+    "verify_launch_evidence",
     "MINTABLE_JOB_STATES",
     "SACCT_RETENTION_DAYS",
     "SYMLINK_SCAN_OK",

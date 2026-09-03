@@ -820,3 +820,69 @@ def test_a_schema_1_file_survives_the_repair_path_rather_than_being_replaced(tmp
     persisted = json.loads(policy.read_text())
     assert persisted["schema_version"] == SCHEMA_VERSION
     assert persisted["launch_evidence_mints"] == []
+
+
+def test_the_ledger_records_every_field_the_approval_carries(tmp_path):
+    """The content digest cannot cover the approval, so the ledger must.
+
+    A holder of a valid record could otherwise rewrite the reference, client,
+    revision or time, recompute the record's own digest, and still match. Each
+    of those fields therefore has to be recoverable from the durable entry.
+    """
+
+    store = _reuse_store(tmp_path)
+    before = store.snapshot().state
+    approval = _mint(store, before, reference="operator approved canary 002")
+
+    entry = store.snapshot().state["launch_evidence_mints"][-1]
+    assert entry["approval_reference"] == approval["approval_reference"] == "operator approved canary 002"
+    assert entry["client_id"] == approval["client_id"]
+    assert entry["evidence_sha256"] == approval["evidence_sha256"]
+    assert entry["plan_sha256"] == approval["plan_sha256"]
+    assert entry["policy_revision"] == approval["policy_revision"] == before["revision"] + 1
+    assert entry["policy_generation"] == approval["policy_generation"] == before["generation"]
+    assert entry["at"] == approval["approved_at"]
+    # The recorded revision is the one the mint's own write produced.
+    assert store.snapshot().state["revision"] == entry["policy_revision"]
+
+
+def test_the_ledger_files_a_package_path_exactly_as_given(tmp_path):
+    """`_clean_reference` collapses whitespace runs; a pathname must not be.
+
+    Such paths are accepted by the server and hash fine, so collapsing here
+    would file the mint under a name that is not the one the record attests.
+    """
+
+    store = _reuse_store(tmp_path)
+    spaced = "/n/scratch/attempt  002/published  package"
+    store.record_launch_evidence_mint(
+        expected_revision=store.snapshot().state["revision"],
+        expected_generation=store.snapshot().state["generation"],
+        approval_reference="operator   approved",
+        stage="platform-canary",
+        job_id="52085188",
+        package=spaced,
+        evidence_sha256="a" * 64,
+        plan_sha256="b" * 64,
+    )
+    entry = store.snapshot().state["launch_evidence_mints"][-1]
+    assert entry["package"] == spaced
+    # The free-text reference is still collapsed; only the path is preserved.
+    assert entry["approval_reference"] == "operator approved"
+
+
+@pytest.mark.parametrize("package", ["", "   ", "/n/scratch/a\nb", "/n/scratch/a\tb", None])
+def test_an_unusable_package_path_is_refused(package, tmp_path):
+    store = _reuse_store(tmp_path)
+    state = store.snapshot().state
+    with pytest.raises(O2PolicyInvalidError, match="package"):
+        store.record_launch_evidence_mint(
+            expected_revision=state["revision"],
+            expected_generation=state["generation"],
+            approval_reference="operator approved",
+            stage="platform-canary",
+            job_id="52085188",
+            package=package,
+            evidence_sha256="a" * 64,
+            plan_sha256="b" * 64,
+        )

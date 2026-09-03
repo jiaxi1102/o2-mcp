@@ -32,6 +32,7 @@ from o2mcp.launch_evidence import (
     plan_digest,
     refuse_package_symlinks,
     required_package_files,
+    verify_launch_evidence,
 )
 
 _PLAN = {
@@ -651,13 +652,109 @@ def test_a_terminally_failed_job_refuses_to_mint(state) -> None:
         parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")
 
 
-@pytest.mark.parametrize("state", ["COMPLETED", "RUNNING", "COMPLETING", "PENDING", "REQUEUED"])
-def test_a_transient_state_still_mints(state) -> None:
+@pytest.mark.parametrize("state", ["COMPLETED", "RUNNING", "COMPLETING"])
+def test_a_state_reachable_after_the_job_ran_still_mints(state) -> None:
     """The accounting race the record documents must stay allowed."""
 
     assert parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")["state"] == state
 
 
+@pytest.mark.parametrize("state", ["PENDING", "REQUEUED", "REQUEUE_HOLD", "CONFIGURING", "SUSPENDED", "RESIZING"])
+def test_a_job_that_has_not_run_refuses_to_mint(state) -> None:
+    """The allowance is for accounting settling, not for jobs that never started.
+
+    runorg classes these as active, but a queued job cannot have produced the
+    diagnostic being attested -- and allowing them would let a compromised
+    diagnostic name any queued job in the same account and partition.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="did not finish"):
+        parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")
+
+
 def test_an_unrecognised_state_refuses_rather_than_being_assumed_benign() -> None:
     with pytest.raises(LaunchEvidenceError, match="did not finish"):
         parse_scheduler_record("52085188|SOME_FUTURE_STATE|tabin|short\n", job_id="52085188")
+
+
+# --- the approval fields are verified against the ledger, not just the digest --
+def _ledger_entry(record, **overrides):
+    """The durable mint entry the policy store would have written for a record."""
+
+    approval = record["operator_approval"]
+    entry = {
+        "at": approval["approved_at"],
+        "client_id": approval["client_id"],
+        "approval_reference": approval["approval_reference"],
+        "stage": record["stage"],
+        "job_id": str(record["submission"]["job_id"]),
+        "package": record["destination"]["package"],
+        "evidence_sha256": approval["evidence_sha256"],
+        "plan_sha256": approval["plan_sha256"],
+        "policy_revision": approval["policy_revision"],
+        "policy_generation": approval["policy_generation"],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _approved_record(**overrides):
+    """A record carrying a complete approval, as the server builds one."""
+
+    approval = {
+        "approval_reference": "operator approved canary 002",
+        "plan_sha256": plan_digest(_PLAN),
+        "policy_revision": 12,
+        "policy_generation": "00000000-0000-4000-8000-000000000001",
+        "client_id": "1234-abcd",
+        "approved_at": 1000.0,
+    }
+    approval["evidence_sha256"] = evidence_content_digest(_build(approval={}))
+    approval.update(overrides)
+    return _build(approval=approval)
+
+
+def test_an_untouched_record_verifies_against_its_ledger_entry() -> None:
+    record = _approved_record()
+    verify_launch_evidence(record, _ledger_entry(record))
+
+
+def test_edited_content_fails_verification() -> None:
+    record = _approved_record()
+    entry = _ledger_entry(record)
+    record["runtime_identities"]["interpreter_sha256"] = "0" * 64
+    with pytest.raises(LaunchEvidenceError, match="the ledger entry approved"):
+        verify_launch_evidence(record, entry)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["approval_reference", "client_id", "policy_revision", "policy_generation", "approved_at"],
+)
+def test_a_rewritten_approval_field_fails_verification(field) -> None:
+    """The content digest cannot cover these, so the ledger entry must.
+
+    They do not exist when the digest is taken, so a holder of a valid record
+    could otherwise rewrite who approved it, under what revision, and when --
+    recompute the record's own digest, and still match the ledger.
+    """
+
+    record = _approved_record()
+    entry = _ledger_entry(record)
+    record["operator_approval"][field] = "tampered" if isinstance(record["operator_approval"][field], str) else 999
+    with pytest.raises(LaunchEvidenceError, match=field):
+        verify_launch_evidence(record, entry)
+
+
+def test_a_record_reassigned_to_another_stage_or_package_fails_verification() -> None:
+    record = _approved_record()
+    with pytest.raises(LaunchEvidenceError, match="stage"):
+        verify_launch_evidence(record, _ledger_entry(record, stage="acquisition"))
+    with pytest.raises(LaunchEvidenceError, match="package"):
+        verify_launch_evidence(record, _ledger_entry(record, package="/pkg/other"))
+
+
+def test_a_record_without_an_approval_cannot_be_verified() -> None:
+    record = _build(approval={})
+    with pytest.raises(LaunchEvidenceError, match="no operator approval"):
+        verify_launch_evidence(record, _ledger_entry(_approved_record()))

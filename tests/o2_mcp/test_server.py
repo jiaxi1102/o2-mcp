@@ -2083,6 +2083,30 @@ async def test_each_payload_batch_rescans_around_its_own_hashing(monkeypatch, tm
 
 
 @pytest.mark.anyio
+async def test_a_minted_record_verifies_against_its_own_ledger_entry(monkeypatch, tmp_path):
+    """End to end: what the tool returns is what the ledger says was approved."""
+
+    from o2mcp.launch_evidence import verify_launch_evidence
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    record = minted["launch_evidence"]
+
+    after = await _call("o2_local_status", {})
+    entry = after["policy"]["recent_launch_evidence_mints"][-1]
+    verify_launch_evidence(record, entry)
+
+    # Rewriting who approved it now disagrees with the ledger, even though the
+    # content digest is untouched.
+    forged = json.loads(json.dumps(record))
+    forged["operator_approval"]["approval_reference"] = "someone else approved this"
+    with pytest.raises(o2server.LaunchEvidenceError, match="approval_reference"):
+        verify_launch_evidence(forged, entry)
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_job_slurm_says_failed(monkeypatch, tmp_path):
     responder = _launch_evidence_responder(accounting="52085188|FAILED|tabin|short")
     _patch_connection(monkeypatch, tmp_path, responder=responder)

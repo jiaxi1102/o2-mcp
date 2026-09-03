@@ -361,35 +361,54 @@ class O2PolicyStore:
         reference = self._clean_reference(approval_reference, field="approval_reference")
         clean_stage = self._clean_reference(stage, field="stage")
         clean_job = self._clean_reference(job_id, field="job_id")
-        clean_package = self._clean_reference(package, field="package")
+        # NOT _clean_reference: that collapses runs of whitespace, which is right
+        # for a free-text note and wrong for a pathname. A package whose path
+        # holds two spaces would otherwise be filed in the ledger under a name
+        # that is not the one the record attests, and the two could no longer be
+        # correlated exactly -- while the hashing path supports such paths fine.
+        clean_package = self._clean_path(package, field="package")
         evidence_digest = self._clean_digest(evidence_sha256, field="evidence_sha256")
         approved_plan_digest = self._clean_digest(plan_sha256, field="plan_sha256")
         with self._locked():
             state = self._read_valid_state()
             self._require_revision(state, expected_revision, expected_generation)
-            details = {
+            # Every field the returned approval carries is built from this one
+            # entry, so the record's operator_approval cannot name a reference,
+            # client, revision or time the ledger does not also record. Editing
+            # any of them in a record in hand then disagrees with the ledger.
+            entry = {
+                "at": self._clock(),
+                "client_id": self.client_id,
                 "approval_reference": reference,
                 "stage": clean_stage,
                 "job_id": clean_job,
                 "package": clean_package,
                 "evidence_sha256": evidence_digest,
                 "plan_sha256": approved_plan_digest,
+                # The revision this write is about to produce, so the entry names
+                # the policy state the approval belongs to.
+                "policy_revision": int(state.get("revision", 0)) + 1,
+                "policy_generation": state.get("generation"),
             }
             # The durable ledger first: if it is full this raises before anything
             # is written, so a refused mint leaves no event claiming otherwise.
-            self._append_launch_evidence_mint(state, **details)
+            self._append_launch_evidence_mint(state, entry)
             # The rolling event stays as the operational log; the ledger above is
             # what a record is verified against.
-            self._append_event(state, "launch_evidence_minted", **details)
-            snapshot = self._write_next_revision(state)
+            self._append_event(
+                state,
+                "launch_evidence_minted",
+                **{key: value for key, value in entry.items() if key not in {"at", "client_id"}},
+            )
+            self._write_next_revision(state)
         return {
-            "approval_reference": reference,
-            "evidence_sha256": evidence_digest,
-            "plan_sha256": approved_plan_digest,
-            "policy_revision": snapshot["revision"] if isinstance(snapshot, dict) else None,
-            "policy_generation": snapshot["generation"] if isinstance(snapshot, dict) else None,
-            "client_id": self.client_id,
-            "approved_at": self._clock(),
+            "approval_reference": entry["approval_reference"],
+            "evidence_sha256": entry["evidence_sha256"],
+            "plan_sha256": entry["plan_sha256"],
+            "policy_revision": entry["policy_revision"],
+            "policy_generation": entry["policy_generation"],
+            "client_id": entry["client_id"],
+            "approved_at": entry["at"],
         }
 
     def authorize_login(
@@ -1116,7 +1135,7 @@ class O2PolicyStore:
         events.append({"at": self._clock(), "event": event, "client_id": self.client_id, **details})
         del events[:-MAX_EVENTS]
 
-    def _append_launch_evidence_mint(self, state: dict[str, Any], **details: Any) -> None:
+    def _append_launch_evidence_mint(self, state: dict[str, Any], entry: dict[str, Any]) -> None:
         """Append one mint to the ledger that ordinary event eviction never touches.
 
         Deliberately not `_append_event`. That list is a rolling buffer capped at
@@ -1137,7 +1156,7 @@ class O2PolicyStore:
                 f"Archive and prune {self.path} before minting again: evicting an older attestation to make "
                 "room would silently make that record unverifiable."
             )
-        mints.append({"at": self._clock(), "client_id": self.client_id, **details})
+        mints.append(dict(entry))
 
     @staticmethod
     def _clean_reference(value: str, *, field: str) -> str:
@@ -1148,6 +1167,25 @@ class O2PolicyStore:
         cleaned = " ".join(value.split())
         if len(cleaned) > 240:
             raise O2PolicyInvalidError(f"{field} must be at most 240 characters")
+        return cleaned
+
+    @staticmethod
+    def _clean_path(value: str, *, field: str) -> str:
+        """Validate an audited pathname without normalizing the characters in it.
+
+        Unlike `_clean_reference` this preserves whitespace runs, so the ledger
+        files a mint under exactly the path the record attests. Control
+        characters are still refused: they cannot appear in a path this server
+        accepted and would corrupt an audit line.
+        """
+
+        if not isinstance(value, str) or not value.strip():
+            raise O2PolicyInvalidError(f"{field} must be a non-empty string")
+        cleaned = value.strip()
+        if len(cleaned) > 4096:
+            raise O2PolicyInvalidError(f"{field} must be at most 4096 characters")
+        if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+            raise O2PolicyInvalidError(f"{field} must not contain control characters")
         return cleaned
 
     @staticmethod
