@@ -221,10 +221,31 @@ def test_canonical_json_is_stable_and_sorted() -> None:
 
 
 def test_parse_json_artifact_names_the_bad_artifact() -> None:
-    with pytest.raises(LaunchEvidenceError, match="run diagnostic is not valid JSON"):
+    with pytest.raises(LaunchEvidenceError, match="run diagnostic is malformed JSON"):
         parse_json_artifact("{not json", label="run diagnostic")
     with pytest.raises(LaunchEvidenceError, match="must be a JSON object"):
         parse_json_artifact("[1, 2]", label="execution plan")
+
+
+def test_a_duplicate_member_name_refuses_rather_than_picking_one() -> None:
+    """`json.loads` keeps the last value silently, leaving the bytes ambiguous.
+
+    An artifact carrying `attempt_id` twice would be bound on one reading while
+    a reviewer opening the same file could reasonably take the other, and the
+    record does not retain the bytes to settle it afterwards.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="duplicate key"):
+        parse_json_artifact('{"attempt_id": "002", "attempt_id": "003"}', label="execution plan")
+    with pytest.raises(LaunchEvidenceError, match="duplicate key"):
+        parse_json_artifact('{"destination": {"expected_package": "/a", "expected_package": "/b"}}', label="plan")
+
+
+def test_a_non_finite_number_refuses_too() -> None:
+    """Digesting a record containing NaN would fail later; refuse at the source."""
+
+    with pytest.raises(LaunchEvidenceError, match="malformed JSON"):
+        parse_json_artifact('{"n_payloads": NaN}', label="run diagnostic")
 
 
 # --- the read-back directory must be the package the plan approved ------------

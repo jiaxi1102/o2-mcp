@@ -32,9 +32,9 @@ Two properties are deliberate and should survive future edits:
   and compared in this module.
 
 This module is pure stdlib on purpose so the binding logic stays testable
-without the MCP SDK. The one in-repo import -- the scheduler's success states --
-is itself stdlib-only, and exists so this does not restate a vocabulary the
-repository already defines.
+without the MCP SDK. The two in-repo imports -- the scheduler's success states
+and the duplicate-rejecting JSON decoder -- are themselves stdlib-only, and
+exist so this does not restate rules the repository already defines.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from o2mcp.runorg.execution_models import SUCCESS_SLURM_STATES
+from o2mcp.runorg.strict_json import strict_json_object
 
 LAUNCH_EVIDENCE_SCHEMA = "o2-launch-evidence-v1"
 # The canary emits exactly two status strings -- "success" for package
@@ -728,15 +729,21 @@ def verify_launch_evidence(record: Mapping[str, Any], ledger_entry: Mapping[str,
 
 
 def parse_json_artifact(text: str, *, label: str) -> dict[str, Any]:
-    """Parse one artifact read off the cluster, naming it when it is not JSON."""
+    """Parse one artifact read off the cluster, naming it when it is not JSON.
+
+    Parsed strictly: `json.loads` resolves a duplicate member name to the last
+    value and says nothing, so an artifact carrying `attempt_id` twice would be
+    bound on one interpretation while a reviewer opening the same bytes -- or
+    any other parser -- could reasonably read the other. The record does not
+    retain the original bytes, so that ambiguity would be unresolvable after the
+    fact. The repository already has a decoder that refuses duplicates and
+    non-finite numbers; this uses it rather than restating the rule.
+    """
 
     try:
-        payload = json.loads(text)
+        return strict_json_object(text, label)
     except ValueError as error:
-        raise LaunchEvidenceError(f"{label} is not valid JSON: {error}") from error
-    if not isinstance(payload, dict):
-        raise LaunchEvidenceError(f"{label} must be a JSON object")
-    return payload
+        raise LaunchEvidenceError(str(error)) from error
 
 
 def required_package_files() -> tuple[str, ...]:
