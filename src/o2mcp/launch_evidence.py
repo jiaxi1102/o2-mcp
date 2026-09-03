@@ -344,9 +344,9 @@ def parse_scheduler_record(text: str, *, job_id: str) -> dict[str, str]:
             f"job {job_id}, so its identity is ambiguous"
         )
     fields = rows[0].split("|")
-    if len(fields) != 4:
-        raise LaunchEvidenceError(f"the Slurm accounting row for job {job_id} is not the four fields requested")
-    reported_id, state, account, partition = (field.strip() for field in fields)
+    if len(fields) != 5:
+        raise LaunchEvidenceError(f"the Slurm accounting row for job {job_id} is not the five fields requested")
+    reported_id, state, account, partition, comment = (field.strip() for field in fields)
     if reported_id != job_id:
         raise LaunchEvidenceError(
             f"refusing to mint launch evidence; Slurm accounting answered for job {reported_id!r} "
@@ -359,50 +359,13 @@ def parse_scheduler_record(text: str, *, job_id: str) -> dict[str, str]:
             f"refusing to mint launch evidence; Slurm reports job {job_id} as {state!r}. A record attests a "
             "finished governed stage, so a job the scheduler says did not finish cannot produce one"
         )
-    return {"job_id": reported_id, "state": state, "account": account, "partition": partition}
-
-
-SYMLINK_SCAN_OK = "===SYMLINK-SCAN-OK==="
-
-
-def refuse_package_symlinks(listing: str, *, package_path: str) -> None:
-    """Refuse a package containing any symlink at all -- or an unproven scan.
-
-    The scan must announce its own success. `find` exits non-zero when it cannot
-    enumerate a directory, and a directory that is searchable but not readable
-    still lets its known files be opened -- so a publisher could chmod the
-    package to execute-only and hide a payload symlink behind a scan that
-    reported nothing because it could not look, not because there was nothing
-    there. An empty listing is therefore only meaningful with the sentinel.
-
-    Resolving each payload and requiring it to land inside the package was two
-    independent pathname resolutions, and a run that toggled a link between them
-    could pass the containment check while the digest came from elsewhere.
-    There is no way to make two shell commands share a descriptor, so this
-    removes the thing being raced instead: a published package contains no
-    symlinks, so any link found is grounds to refuse rather than to reason
-    about.
-
-    That is not a conservative approximation. The publisher hard-links and
-    passes ``follow_symlinks=False`` at every site, and the package verifier
-    rejects symlinks outright, so a package containing one is already invalid by
-    its own rules.
-    """
-
-    lines = [line.strip() for line in listing.splitlines() if line.strip()]
-    if SYMLINK_SCAN_OK not in lines:
-        raise LaunchEvidenceError(
-            f"refusing to mint launch evidence; the symlink scan of {package_path!r} did not complete, "
-            "so an empty result proves nothing about what the package contains"
-        )
-    offenders = [line for line in lines if line != SYMLINK_SCAN_OK]
-    if offenders:
-        shown = ", ".join(repr(name) for name in offenders[:5])
-        more = f" (and {len(offenders) - 5} more)" if len(offenders) > 5 else ""
-        raise LaunchEvidenceError(
-            f"refusing to mint launch evidence; {package_path!r} contains symlinks, which a published "
-            f"package never does and its own verifier rejects: {shown}{more}"
-        )
+    return {
+        "job_id": reported_id,
+        "state": state,
+        "account": account,
+        "partition": partition,
+        "comment": comment,
+    }
 
 
 def build_launch_evidence(
@@ -417,6 +380,7 @@ def build_launch_evidence(
     stage: str,
     read_back_package_path: str,
     resolved_package_path: str,
+    observed_package_inode: int,
     scheduler_record: Mapping[str, str],
 ) -> dict[str, Any]:
     """Verify every link and return the record, or raise naming what disagreed.
@@ -470,6 +434,28 @@ def build_launch_evidence(
     # A lexical comparison is not enough on its own: `cat` and `sha256sum` follow
     # links, so a pathname that spells the approved package can still open a
     # substituted directory. Bind what the cluster actually resolved it to.
+    # The stage names which governed stage this record is for, and it arrives
+    # with the operator's approval. The plan names it too, so the two must agree
+    # -- otherwise the same artifacts would mint under any label an operator
+    # happened to approve.
+    bind("stage_id", stage, _dig(plan, ("stage_id",)), "text")
+
+    # Resolving the pathname does not settle identity: a different directory
+    # renamed into the approved path resolves the same. The run recorded the
+    # package's own inode, and the server observed it through the descriptor it
+    # actually read; requiring the two to agree is what closes that.
+    # `destination.inode` is NOT this -- it names the parent directory -- so both
+    # are bound, separately.
+    checks += 1
+    recorded_inode = _dig(diagnostic, ("output", "package_inode"))
+    if not _well_formed("inode", recorded_inode):
+        mismatches.append(f"package_inode: the run recorded {recorded_inode!r}, which is not an inode")
+    elif recorded_inode != observed_package_inode:
+        mismatches.append(
+            f"package_inode: run={recorded_inode} observed={observed_package_inode}; the directory read is "
+            "not the one the run wrote"
+        )
+
     checks += 1
     if not _same_posix_path(resolved_package_path, approved_package):
         mismatches.append(
@@ -515,6 +501,20 @@ def build_launch_evidence(
                 mismatches.append(
                     f"scheduler {label}: diagnostic={claimed!r} accounting={scheduler_record.get(reported)!r}"
                 )
+        # The plan builder sets the job's Slurm comment to the plan digest, which
+        # is the only field that ties the accounting row to *this* plan rather
+        # than to any job of the same account and partition. It is checked when
+        # present and recorded as unbound when absent, so the binding is live the
+        # moment submissions carry it without making every job submitted before
+        # then unattestable. That asymmetry is deliberate.
+        comment = (scheduler_record.get("comment") or "").strip()
+        if comment:
+            checks += 1
+            if comment != expected_plan_sha256:
+                mismatches.append(
+                    f"scheduler comment: accounting={comment!r} plan={expected_plan_sha256}; that job did "
+                    "not submit this plan"
+                )
 
     checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
@@ -542,10 +542,27 @@ def build_launch_evidence(
         checks += 1
         mismatches.append("SHA256SUMS lists no payloads, so nothing could be reverified")
 
+    # The run recorded digests of the two files it built the package around, so
+    # the bytes the server read can be bound to the bytes the run verified. This
+    # is what the payload count could only approximate: an equal-size manifest
+    # replacement passes a cardinality check and fails this one.
+    for label, name, run_path in (
+        ("sha256sums_sha256", "SHA256SUMS", ("output", "sha256sums_sha256")),
+        ("conversion_manifest_sha256", "conversion_manifest.json", ("output", "conversion_manifest_sha256")),
+    ):
+        checks += 1
+        recorded = _dig(diagnostic, run_path)
+        observed = package_digests.get(name)
+        if not _well_formed("sha256", recorded):
+            mismatches.append(f"{label}: the run recorded {recorded!r}, which is not a digest")
+        elif recorded != observed:
+            mismatches.append(f"{label}: run={recorded} read={observed!r}; {name} is not the file the run verified")
+
     # SHA256SUMS covers exactly the payloads the run counted: it cannot list
     # itself, and SUCCESS.json is written after it. So a manifest replaced after
     # the run with a valid but shorter one -- payloads deleted from disk and
-    # from the manifest together -- is caught here and nowhere else.
+    # from the manifest together -- is caught here as well, on a different
+    # failure than the digest binding above.
     checks += 1
     n_payloads = _dig(diagnostic, ("output", "verification", "n_payloads"))
     if not isinstance(n_payloads, int) or isinstance(n_payloads, bool):
@@ -612,7 +629,12 @@ def build_launch_evidence(
             "package": _dig(diagnostic, ("output", "package")),
             "read_back_package_path": read_back_package_path,
             "resolved_package_path": resolved_package_path,
+            # The parent directory's inode, bound plan-to-diagnostic.
             "inode": binding.get("inode"),
+            # The package directory's own inode, observed by the server through
+            # the descriptor it read the package under and bound to the one the
+            # run recorded.
+            "package_inode": observed_package_inode,
             "mount_point": mountinfo.get("mount_point"),
             # st_dev is assigned per host for network filesystems -- the same NFS
             # mount reports different numbers on the login and compute nodes --
@@ -658,6 +680,9 @@ def build_launch_evidence(
             "allocated_hostnames": scheduler.get("allocated_hostnames"),
             # The mount point is bound; the source backing it is not observed.
             "mount_source": mountinfo.get("mount_source"),
+            # Empty until the plan builder sets the job's Slurm comment to the
+            # plan digest; non-empty it is bound, and this says which happened.
+            "scheduler_comment": (scheduler_record.get("comment") or "").strip() or None,
             # Never recomputed here -- the payloads are rehashed against
             # SHA256SUMS instead, which is what the package's integrity rests on.
             "reopened_output_sha256": _dig(diagnostic, ("output", "reopened_output_sha256")),
@@ -671,16 +696,12 @@ def build_launch_evidence(
         "binding_check": {
             "all_links_agree": True,
             "checked": checks,
-            # The stage names which governed stage this record is for, and it
-            # comes from the approving operator rather than from the artifacts.
-            # Nothing here ties it to the plan or the diagnostic, so the same
-            # artifacts would mint under a different label if an operator
-            # approved that. Said here because binding_check is where a reader
-            # looks for what was and was not checked.
-            "stage_is_operator_supplied": (
-                "the stage label comes from the operator's approval, not from the plan or the "
-                "diagnostic; nothing in this record binds it to the artifacts"
-            ),
+            # Whether the accounting row could be tied to this plan. The plan
+            # builder sets the job's Slurm comment to the plan digest; jobs
+            # submitted before that carry none, and for those the job identity
+            # rests on id, account, partition and state alone. Said here because
+            # binding_check is where a reader looks for what was checked.
+            "scheduler_comment_bound": bool((scheduler_record.get("comment") or "").strip()),
         },
     }
 
@@ -834,11 +855,9 @@ __all__ = [
     "parse_encoded_json_artifact",
     "parse_json_artifact",
     "parse_sha256_lines",
-    "refuse_package_symlinks",
     "verify_launch_evidence",
     "MINTABLE_JOB_STATES",
     "SACCT_RETENTION_DAYS",
-    "SYMLINK_SCAN_OK",
     "claimed_job_id",
     "parse_scheduler_record",
     "plan_digest",

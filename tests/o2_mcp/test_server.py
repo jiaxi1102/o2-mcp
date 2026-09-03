@@ -1574,6 +1574,7 @@ def test_long_flags_still_end_at_the_token():
 _PACKAGE = "/pkg/attempt-002"
 # Distinguishes "use the default accounting row" from "accounting knows nothing".
 _UNSET = object()
+_REQUIRED_FILES = ("PUBLICATION_OWNER.json", "SUCCESS.json", "SHA256SUMS", "conversion_manifest.json")
 _PAYLOADS = {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
 
 
@@ -1588,9 +1589,11 @@ def _launch_evidence_responder(
     owner_sha256=None,
     n_payloads=None,
     resolved_package=None,
-    symlinks=None,
-    scan_fails=False,
+    unreadable=None,
+    package_inode=None,
+    observed_inode=None,
     diagnostic_edit=None,
+    stage_id="platform-canary",
     accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
@@ -1610,15 +1613,20 @@ def _launch_evidence_responder(
     from o2mcp.launch_evidence import plan_digest
 
     listed = dict(_PAYLOADS if manifest_payloads is None else manifest_payloads)
+    inode_reported = (
+        (7483730113644355164 if package_inode is None else package_inode) if observed_inode is None else observed_inode
+    )
     if accounting is _UNSET:
-        accounting = f"{job_id}|COMPLETED|tabin|short"
+        accounting = f"{job_id}|COMPLETED|tabin|short|"
     on_disk = dict(listed if payloads is None else payloads)
     named = package if approved_package is None else approved_package
+    manifest_bytes = ("\n".join(f"{digest}  {name}" for name, digest in sorted(listed.items())) + "\n").encode()
     plan = {
         "attempt_id": "002",
         "software": {"bundle": {"bundle_sha256": "b" * 64}},
         "runtime_wrapper": {"sha256": "a1" * 32},
         "interpreter": {"sha256": "b2" * 32, "closure_sha256": "c" * 64, "context_sha256": "c3" * 32},
+        "stage_id": stage_id,
         "destination": {"inode": 42, "mount": "/n/scratch", "expected_package": named},
     }
     diagnostic = {
@@ -1648,6 +1656,9 @@ def _launch_evidence_responder(
         "launch": {"loaded_library_closure": {"loaded_closure_sha256": "d4" * 32}},
         "output": {
             "package": named,
+            "package_inode": 7483730113644355164 if package_inode is None else package_inode,
+            "sha256sums_sha256": _hashlib.sha256(manifest_bytes).hexdigest(),
+            "conversion_manifest_sha256": "d" * 64,
             "reopened_output_sha256": "e5" * 32,
             "verification": {
                 "status": "success",
@@ -1658,34 +1669,34 @@ def _launch_evidence_responder(
     if diagnostic_edit is not None:
         diagnostic_edit(diagnostic)
     owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
-    manifest_bytes = ("\n".join(f"{digest}  {name}" for name, digest in sorted(listed.items())) + "\n").encode()
     # The server proves the manifest it parsed is the file it recorded a digest
     # for, so the fixture's SHA256SUMS digest has to be the real one.
     owner_bytes = _json.dumps(owner).encode()
-    file_digests = {
-        "PUBLICATION_OWNER.json": (_hashlib.sha256(owner_bytes).hexdigest() if owner_sha256 is None else owner_sha256),
-        "SUCCESS.json": "d" * 64,
-        "conversion_manifest.json": "d" * 64,
-        "SHA256SUMS": _hashlib.sha256(manifest_bytes).hexdigest() if manifest_sha256 is None else manifest_sha256,
-    }
-    digests = "\n".join(f"{digest}  {package}/{name}" for name, digest in sorted(file_digests.items()))
 
     def responder(argv, input_text):
         command = argv[-1]
-        if command.startswith("find ") and "sha256sum" in command:
-            # Payload batch: scan, digests, scan again -- one command, all &&.
-            asked = shlex.split(command.split("sha256sum -- ")[1].split(" && printf")[0])
-            listing = "\n".join([*(symlinks or ()), "" if scan_fails else "===SYMLINK-SCAN-OK==="])
-            digested = "\n".join(
-                f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
-                for operand in asked
-                if operand[len(package) + 1 :] in on_disk
+        if command.startswith("/usr/bin/python3 -c "):
+            # The no-follow hasher: names arrive on stdin, JSON comes back.
+            asked = [name for name in (input_text or "").split("\n") if name]
+            known = dict(on_disk)
+            known.update({name: "d" * 64 for name in _REQUIRED_FILES})
+            # These two are also read for their contents, and those bytes are
+            # verified against the digest reported here, so they must agree.
+            known["SHA256SUMS"] = (
+                _hashlib.sha256(manifest_bytes).hexdigest() if manifest_sha256 is None else manifest_sha256
             )
-            return (
-                f"{listing}\n===PAYLOADDIGESTS===\n{digested}\n===PAYLOADRESCAN===\n{listing}",
-                "",
-                0,
+            known["PUBLICATION_OWNER.json"] = (
+                _hashlib.sha256(owner_bytes).hexdigest() if owner_sha256 is None else owner_sha256
             )
+            reply = {"digests": {}, "errors": {}, "package_inode": inode_reported}
+            for name in asked:
+                if name in (unreadable or {}):
+                    reply["errors"][name] = (unreadable or {})[name]
+                elif name in known:
+                    reply["digests"][name] = known[name]
+                else:
+                    reply["errors"][name] = "ENOENT"
+            return _json.dumps(reply), "", 0
         if command.startswith("tail -c +"):
             # Every large artifact is read in bounded pieces so it still fits the
             # broker's output cap; serve exactly the slice that was asked for.
@@ -1715,10 +1726,6 @@ def _launch_evidence_responder(
                 str(len(manifest_bytes)),
                 "===RESOLVED===",
                 package if resolved_package is None else resolved_package,
-                "===SYMLINKS===",
-                "\n".join([*(symlinks or ()), "" if scan_fails else "===SYMLINK-SCAN-OK==="]),
-                "===DIGESTS===",
-                digests,
             ]
         )
         return payload, "", 0
@@ -1875,7 +1882,8 @@ async def test_mint_refuses_a_payload_the_package_no_longer_holds(monkeypatch, t
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
-    assert "was not hashed on the cluster" in refused["message"]
+    assert "could not be read as ordinary files" in refused["message"]
+    assert "ENOENT" in refused["message"]
 
 
 @pytest.mark.anyio
@@ -2038,63 +2046,86 @@ async def test_mint_refuses_a_package_pathname_that_resolves_elsewhere(monkeypat
 
 
 @pytest.mark.anyio
-async def test_mint_refuses_a_package_containing_any_symlink(monkeypatch, tmp_path):
-    """A published package holds none, so one appearing ends the mint.
+async def test_mint_refuses_a_payload_that_is_a_symlink(monkeypatch, tmp_path):
+    """The payload is opened with O_NOFOLLOW, so a link never gets hashed.
 
-    The link need not point anywhere interesting: it is refused for existing,
-    which is what removes the object a resolve-then-hash sequence would race.
+    The previous `find`-based scan and the hashing were separate commands, so a
+    link created between them was hashed anyway. Opening and hashing are now one
+    act on one descriptor.
     """
 
-    responder = _launch_evidence_responder(symlinks=[f"{_PACKAGE}/payloads/frame002.ims"])
+    responder = _launch_evidence_responder(unreadable={"payloads/frame002.ims": "symlink"})
     _patch_connection(monkeypatch, tmp_path, responder=responder)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
     assert refused["error"] == "launch_evidence_refused"
-    assert "contains symlinks" in refused["message"]
+    assert "symlink" in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 
 
 @pytest.mark.anyio
-async def test_mint_refuses_when_the_symlink_scan_could_not_complete(monkeypatch, tmp_path):
-    """An unreadable directory reports no symlinks because it cannot look.
+async def test_mint_refuses_a_package_it_cannot_open_as_ordinary_files(monkeypatch, tmp_path):
+    """An unreadable or non-regular entry ends the mint rather than being skipped.
 
-    `find` is joined with `;` in the artifact read, so its failure does not fail
-    the command; without the chained sentinel a package chmodded to execute-only
-    would scan clean while its files stayed openable.
+    The old `;`-joined `find` swallowed its own failure, so an execute-only
+    package scanned clean; now every entry has to be opened and hashed, and
+    anything that cannot be is named.
     """
 
-    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(scan_fails=True))
+    responder = _launch_evidence_responder(
+        unreadable={"payloads/frame002.ims": "EACCES", "payloads/frame 001.ims": "not a regular file"}
+    )
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
-    assert refused["error"] == "launch_evidence_refused"
-    assert "did not complete" in refused["message"]
+    assert "EACCES" in refused["message"] and "not a regular file" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_package_renamed_under_the_approved_path(monkeypatch, tmp_path):
+    """A different directory moved into place resolves the same and has a new inode.
+
+    `destination.inode` names the parent, so it never caught this; the run
+    records the package directory's own inode and the server observes it through
+    the descriptor it read the package under.
+    """
+
+    responder = _launch_evidence_responder(observed_inode=1234567890)
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "package_inode" in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 
 
 @pytest.mark.anyio
-async def test_each_payload_batch_rescans_around_its_own_hashing(monkeypatch, tmp_path):
-    """A scan from an earlier round trip proves nothing about these opens."""
+async def test_the_payload_hash_opens_and_reads_in_one_act(monkeypatch, tmp_path):
+    """No pathname is resolved separately from the read it justifies.
+
+    The previous design scanned for symlinks and hashed in different commands,
+    so a link created between them was hashed anyway. Every payload is now
+    opened with O_NOFOLLOW and hashed through that descriptor, and nothing
+    shells out to `find` or `sha256sum` for the package at all.
+    """
 
     runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
     snapshot = await _call("o2_local_status", {})
     minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert minted["ok"] is True
-    batches = [
-        call["argv"][-1]
-        for call in runner.calls
-        if call["argv"][-1].startswith("find ") and "sha256sum" in call["argv"][-1]
-    ]
-    assert batches, "the payloads should have been hashed"
-    for command in batches:
-        # Scan, hash, scan again -- and chained so any step failing aborts.
-        assert command.count("-type l -print") == 2
-        assert command.index("-type l -print") < command.index("sha256sum")
-        assert command.rindex("-type l -print") > command.index("sha256sum")
-        assert ";" not in command
+
+    commands = [call["argv"][-1] for call in runner.calls]
+    assert any(command.startswith("/usr/bin/python3 -c ") for command in commands)
+    assert not [command for command in commands if "sha256sum" in command]
+    assert not [command for command in commands if command.startswith("find ")]
+    # The names travel on stdin, so no package path is embedded per payload.
+    for call in runner.calls:
+        if call["argv"][-1].startswith("/usr/bin/python3 -c "):
+            assert call["input"], "the hasher takes its names on stdin"
 
 
 @pytest.mark.anyio
@@ -2132,10 +2163,11 @@ async def test_a_stage_with_whitespace_still_verifies_against_its_ledger_entry(m
 
     from o2mcp.launch_evidence import verify_launch_evidence
 
-    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    # The plan names the stage, so the plan under test names this one.
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(stage_id="platform  canary"))
     snapshot = await _call("o2_local_status", {})
     minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"], stage="platform  canary"))
-    assert minted["ok"] is True
+    assert minted["ok"] is True, minted
     assert minted["launch_evidence"]["stage"] == "platform  canary"
 
     after = await _call("o2_local_status", {})
@@ -2146,7 +2178,7 @@ async def test_a_stage_with_whitespace_still_verifies_against_its_ledger_entry(m
 
 @pytest.mark.anyio
 async def test_mint_refuses_a_job_slurm_says_failed(monkeypatch, tmp_path):
-    responder = _launch_evidence_responder(accounting="52085188|FAILED|tabin|short")
+    responder = _launch_evidence_responder(accounting="52085188|FAILED|tabin|short|")
     _patch_connection(monkeypatch, tmp_path, responder=responder)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
@@ -2157,23 +2189,11 @@ async def test_mint_refuses_a_job_slurm_says_failed(monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_mint_refuses_a_package_path_that_is_itself_a_symlink(monkeypatch, tmp_path):
-    """`find` reports a symlinked start point rather than descending into it."""
-
-    responder = _launch_evidence_responder(symlinks=[_PACKAGE])
-    _patch_connection(monkeypatch, tmp_path, responder=responder)
-    snapshot = await _call("o2_local_status", {})
-    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
-    assert refused["ok"] is False
-    assert "contains symlinks" in refused["message"]
-
-
-@pytest.mark.anyio
 async def test_mint_records_what_the_cluster_resolved(monkeypatch, tmp_path):
     _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
     snapshot = await _call("o2_local_status", {})
     minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
-    assert minted["ok"] is True
+    assert minted["ok"] is True, minted
     assert minted["launch_evidence"]["destination"]["resolved_package_path"] == _PACKAGE
 
 
@@ -2200,7 +2220,7 @@ async def test_mint_refuses_a_job_slurm_accounting_does_not_know(monkeypatch, tm
 async def test_mint_refuses_a_job_belonging_to_another_allocation(monkeypatch, tmp_path):
     """A real job id is not enough; it has to be this run's job."""
 
-    responder = _launch_evidence_responder(accounting="52085188|COMPLETED|someone-else|priority")
+    responder = _launch_evidence_responder(accounting="52085188|COMPLETED|someone-else|priority|")
     _patch_connection(monkeypatch, tmp_path, responder=responder)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
@@ -2219,6 +2239,7 @@ async def test_mint_asks_accounting_about_the_claimed_job_and_records_the_answer
         "state": "COMPLETED",
         "account": "tabin",
         "partition": "short",
+        "comment": "",
     }
     sacct = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sacct ")]
     assert len(sacct) == 1 and "52085188" in sacct[0]
@@ -2340,6 +2361,50 @@ async def test_mint_refuses_a_manifest_too_large_to_be_a_package(monkeypatch, tm
 
 
 @pytest.mark.anyio
+async def test_mint_refuses_a_stage_the_plan_did_not_name(monkeypatch, tmp_path):
+    """The label arrives with the approval, and the plan names it too."""
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"], stage="acquisition"))
+    assert refused["ok"] is False
+    assert "stage_id" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_swapped_manifest_of_the_same_size(monkeypatch, tmp_path):
+    """The run recorded SHA256SUMS's digest, so a same-size swap is caught."""
+
+    responder = _launch_evidence_responder(manifest_sha256="0" * 64)
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "SHA256SUMS" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_binds_a_comment_naming_the_plan(monkeypatch, tmp_path):
+    """Present, it must be the plan digest; absent, the record says it is not bound."""
+
+    unbound = _launch_evidence_responder()
+    _patch_connection(monkeypatch, tmp_path, responder=unbound)
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["binding_check"]["scheduler_comment_bound"] is False
+
+    wrong = _launch_evidence_responder(accounting="52085188|COMPLETED|tabin|short|" + "0" * 64)
+    _patch_connection(monkeypatch, tmp_path, responder=wrong)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "did not submit this plan" in refused["message"]
+
+
+@pytest.mark.anyio
 async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeypatch, tmp_path):
     """A package with many payloads must still mint.
 
@@ -2348,59 +2413,51 @@ async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeyp
     legitimate package could never be attested.
     """
 
-    from o2mcp.broker_protocol import MAX_COMMAND_BYTES
+    from o2mcp.broker_protocol import MAX_COMMAND_BYTES, MAX_STDIN_BYTES
 
-    payloads = {f"payloads/{'segment-' * 16}{index:04d}.ims": f"{index:064d}" for index in range(800)}
+    payloads = {f"payloads/{'segment-' * 16}{index:04d}.ims": f"{index:064d}" for index in range(3000)}
     runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_payloads=payloads))
     snapshot = await _call("o2_local_status", {})
     minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert minted["ok"] is True
-    assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 800
+    assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 3000
 
-    hash_commands = [
-        call["argv"][-1]
-        for call in runner.calls
-        if call["argv"][-1].startswith("find ") and "sha256sum" in call["argv"][-1]
-    ]
-    assert len(hash_commands) > 1, "the payload list should have needed more than one command"
-    assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in hash_commands)
+    hashes = [call for call in runner.calls if call["argv"][-1].startswith("/usr/bin/python3 -c ")]
+    # One call for the required metadata files, then two or more payload batches.
+    assert len(hashes) > 2, "3000 payloads should have needed more than one batch"
+    assert all(len(call["input"].encode("utf-8")) <= MAX_STDIN_BYTES for call in hashes)
+    assert all(len(call["argv"][-1].encode("utf-8")) <= MAX_COMMAND_BYTES for call in hashes)
 
 
-def test_hash_batches_refuses_a_single_path_it_can_never_send():
-    with pytest.raises(o2server.LaunchEvidenceError, match="too long for one broker command"):
-        list(o2server._hash_batches(["/n/scratch/" + "x" * 70000], package_path="/pkg"))
+def test_hash_batches_refuses_a_name_it_can_never_send():
+    with pytest.raises(o2server.LaunchEvidenceError, match="too long to hash in one call"):
+        list(o2server._hash_batches(["x" * 700000]))
 
 
-def test_hash_batches_keeps_one_command_when_it_fits():
-    assert list(o2server._hash_batches(["/a", "/b", "/c"], package_path="/pkg")) == [["/a", "/b", "/c"]]
+def test_hash_batches_keeps_one_call_when_the_reply_fits():
+    assert list(o2server._hash_batches(["a", "b", "c"])) == [["a", "b", "c"]]
 
 
-def test_hash_batches_counts_the_package_path_the_scans_embed():
-    """The budget must come from the command composed, not a fixed reserve.
+def test_hash_batches_bounds_the_reply_not_the_command():
+    """The names go out on stdin, so the reply is what has to be bounded.
 
-    Each batch names the package twice, once per symlink scan, so a deeply
-    nested package makes a constant reserve wrong by kilobytes -- and the broker
-    then rejects a batch that batching existed to make acceptable.
+    Each name costs its own length twice -- once on the way out, once echoed in
+    the JSON -- plus a digest, and the broker caps captured output at 1 MiB.
     """
 
-    from o2mcp.broker_protocol import MAX_COMMAND_BYTES
+    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES, MAX_STDIN_BYTES
 
-    package = "/n/scratch/users/" + "/".join("d" * 40 for _ in range(66))
-    paths = [f"{package}/payload-{index:04d}.ome.tif" for index in range(22)]
-
-    commands = [
-        o2server._payload_batch_command(package, " ".join(batch))
-        for batch in o2server._hash_batches(paths, package_path=package)
-    ]
-    assert len(commands) > 1, "the scan paths should have forced a split"
-    assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in commands)
-    # One command for all of them is what the old fixed reserve would have sent.
-    assert len(o2server._payload_batch_command(package, " ".join(paths)).encode("utf-8")) > MAX_COMMAND_BYTES
-
-
-def test_a_package_path_too_long_to_scan_at_all_is_named():
-    with pytest.raises(o2server.LaunchEvidenceError, match="too long to hash through the broker"):
-        list(o2server._hash_batches(["/a"], package_path="/n/scratch/" + "x" * 70000))
+    names = [f"payloads/{'segment-' * 16}{index:05d}.ims" for index in range(3000)]
+    batches = list(o2server._hash_batches(names))
+    assert len(batches) > 1, "3000 names should not fit in one reply"
+    assert sum(len(batch) for batch in batches) == len(names)
+    assert [name for batch in batches for name in batch] == names
+    for batch in batches:
+        stdin = "\n".join(batch) + "\n"
+        assert len(stdin.encode("utf-8")) <= MAX_STDIN_BYTES
+        # The reply carries every name back plus a 64-character digest each.
+        reply = sum(len(name.encode("utf-8")) + 70 for name in batch)
+        assert reply <= MAX_OUTPUT_BYTES
 
 
 @pytest.mark.anyio

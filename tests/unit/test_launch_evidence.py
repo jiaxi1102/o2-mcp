@@ -17,7 +17,6 @@ from o2mcp.launch_evidence import (
     EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
     SACCT_RETENTION_DAYS,
-    SYMLINK_SCAN_OK,
     LaunchEvidenceError,
     build_launch_evidence,
     canonical_json,
@@ -31,7 +30,6 @@ from o2mcp.launch_evidence import (
     parse_scheduler_record,
     parse_sha256_lines,
     plan_digest,
-    refuse_package_symlinks,
     required_package_files,
     verify_launch_evidence,
 )
@@ -41,6 +39,7 @@ _PLAN = {
     "software": {"bundle": {"bundle_sha256": "b" * 64}},
     "runtime_wrapper": {"sha256": "a1" * 32},
     "interpreter": {"sha256": "b2" * 32, "closure_sha256": "c" * 64, "context_sha256": "c3" * 32},
+    "stage_id": "platform-canary",
     "destination": {"inode": 6411787343743799620, "mount": "/n/scratch", "expected_package": "/pkg/attempt-002"},
 }
 
@@ -78,6 +77,9 @@ def _diagnostic(plan: dict) -> dict:
         "launch": {"loaded_library_closure": {"loaded_closure_sha256": "d4" * 32}},
         "output": {
             "package": "/pkg/attempt-002",
+            "package_inode": 7483730113644355164,
+            "sha256sums_sha256": "d" * 64,
+            "conversion_manifest_sha256": "d" * 64,
             "reopened_output_sha256": "e5" * 32,
             "verification": {"status": "success", "n_payloads": len(_MANIFEST)},
         },
@@ -97,7 +99,13 @@ def _manifest() -> dict[str, str]:
 def _scheduler_record(**overrides) -> dict[str, str]:
     """What Slurm accounting reports for the job the diagnostic claims."""
 
-    record = {"job_id": "52085188", "state": "COMPLETED", "account": "tabin", "partition": "short"}
+    record = {
+        "job_id": "52085188",
+        "state": "COMPLETED",
+        "account": "tabin",
+        "partition": "short",
+        "comment": "",
+    }
     record.update(overrides)
     return record
 
@@ -121,6 +129,7 @@ def _build(**overrides):
         stage=overrides.pop("stage", "platform-canary"),
         read_back_package_path=overrides.pop("read_back_package_path", "/pkg/attempt-002"),
         resolved_package_path=overrides.pop("resolved_package_path", "/pkg/attempt-002"),
+        observed_package_inode=overrides.pop("observed_package_inode", 7483730113644355164),
         scheduler_record=overrides.pop("scheduler_record", _scheduler_record()),
     )
 
@@ -139,7 +148,7 @@ def test_intact_chain_mints_a_record() -> None:
 def test_digest_is_reproducible_and_content_dependent() -> None:
     first = launch_evidence_digest(_build())
     assert first == launch_evidence_digest(_build())
-    assert first != launch_evidence_digest(_build(stage="acquisition"))
+    assert first != launch_evidence_digest(_build(package_digests={**_digests(), "SUCCESS.json": "0" * 64}))
 
 
 @pytest.mark.parametrize(
@@ -376,8 +385,8 @@ def test_content_digest_ignores_the_approval_that_was_recorded_against_it() -> N
 
 def test_content_digest_moves_when_any_bound_field_moves() -> None:
     baseline = evidence_content_digest(_build())
-    assert evidence_content_digest(_build(stage="acquisition")) != baseline
     assert evidence_content_digest(_build(package_digests={**_digests(), "SUCCESS.json": "0" * 64})) != baseline
+    assert evidence_content_digest(_build(observed_package_inode=7483730113644355164)) == baseline
 
 
 def test_an_approval_recorded_against_another_record_refuses_to_mint() -> None:
@@ -535,51 +544,6 @@ def test_a_package_pathname_that_resolves_elsewhere_refuses_to_mint() -> None:
         _build(resolved_package_path="/pkg/somewhere-else")
 
 
-def test_any_symlink_in_the_package_refuses_to_mint() -> None:
-    """A published package contains none, so one appearing is grounds to refuse.
-
-    This replaces resolving each payload and checking containment. That was two
-    independent pathname resolutions, and a run that toggled a link between them
-    could pass the check while the digest came from outside; removing the object
-    being raced is simpler and strictly stronger, and it matches an invariant the
-    publisher already enforces by hard-linking and by rejecting symlinks in its
-    own verifier.
-    """
-
-    with pytest.raises(LaunchEvidenceError, match="contains symlinks"):
-        refuse_package_symlinks(
-            f"/pkg/attempt-002/payloads/frame002.ims\n{SYMLINK_SCAN_OK}\n", package_path="/pkg/attempt-002"
-        )
-
-
-def test_a_package_with_no_symlinks_is_accepted() -> None:
-    refuse_package_symlinks(SYMLINK_SCAN_OK, package_path="/pkg/attempt-002")
-    refuse_package_symlinks(f"\n  \n{SYMLINK_SCAN_OK}\n", package_path="/pkg/attempt-002")
-
-
-def test_a_scan_that_did_not_complete_is_not_an_empty_package() -> None:
-    """`find` exits non-zero when it cannot enumerate, and says nothing either way.
-
-    A package that is searchable but not readable still lets its known files be
-    opened, so a publisher could chmod it to execute-only and hide a payload
-    symlink behind a scan that reported nothing because it could not look. The
-    scan therefore has to announce its own success.
-    """
-
-    with pytest.raises(LaunchEvidenceError, match="did not complete"):
-        refuse_package_symlinks("", package_path="/pkg/attempt-002")
-    with pytest.raises(LaunchEvidenceError, match="did not complete"):
-        refuse_package_symlinks("/pkg/attempt-002/link", package_path="/pkg/attempt-002")
-
-
-def test_the_refusal_names_the_offending_links_without_dumping_all_of_them() -> None:
-    listing = "\n".join([*(f"/pkg/attempt-002/link{index}" for index in range(9)), SYMLINK_SCAN_OK])
-    with pytest.raises(LaunchEvidenceError, match="and 4 more") as caught:
-        refuse_package_symlinks(listing, package_path="/pkg/attempt-002")
-    assert "/pkg/attempt-002/link0" in str(caught.value)
-    assert "/pkg/attempt-002/link8" not in str(caught.value)
-
-
 def test_the_resolved_package_is_recorded() -> None:
     record = _build()
     assert record["destination"]["resolved_package_path"] == "/pkg/attempt-002"
@@ -630,23 +594,23 @@ def test_an_aged_out_job_refuses_rather_than_falling_back_to_the_diagnostic() ->
 
 
 def test_ambiguous_accounting_refuses_to_mint() -> None:
-    two = "52085188|COMPLETED|tabin|short\n52085188|FAILED|tabin|short\n"
+    two = "52085188|COMPLETED|tabin|short|\n52085188|FAILED|tabin|short|\n"
     with pytest.raises(LaunchEvidenceError, match="returned 2 allocations"):
         parse_scheduler_record(two, job_id="52085188")
 
 
 def test_accounting_answering_about_another_job_refuses_to_mint() -> None:
     with pytest.raises(LaunchEvidenceError, match="answered for job"):
-        parse_scheduler_record("99999999|COMPLETED|tabin|short\n", job_id="52085188")
+        parse_scheduler_record("99999999|COMPLETED|tabin|short|\n", job_id="52085188")
 
 
 def test_a_malformed_accounting_row_refuses_to_mint() -> None:
-    with pytest.raises(LaunchEvidenceError, match="not the four fields"):
-        parse_scheduler_record("52085188|COMPLETED\n", job_id="52085188")
+    with pytest.raises(LaunchEvidenceError, match="not the five fields"):
+        parse_scheduler_record("52085188|COMPLETED|tabin\n", job_id="52085188")
 
 
 def test_a_well_formed_accounting_row_parses() -> None:
-    assert parse_scheduler_record("52085188|COMPLETED|tabin|short\n", job_id="52085188") == _scheduler_record()
+    assert parse_scheduler_record("52085188|COMPLETED|tabin|short|\n", job_id="52085188") == _scheduler_record()
 
 
 # --- the claimed job id must be a job id before it reaches a shell ------------
@@ -678,14 +642,14 @@ def test_a_terminally_failed_job_refuses_to_mint(state) -> None:
     """
 
     with pytest.raises(LaunchEvidenceError, match="did not finish"):
-        parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")
+        parse_scheduler_record(f"52085188|{state}|tabin|short|\n", job_id="52085188")
 
 
 @pytest.mark.parametrize("state", ["COMPLETED", "RUNNING", "COMPLETING"])
 def test_a_state_reachable_after_the_job_ran_still_mints(state) -> None:
     """The accounting race the record documents must stay allowed."""
 
-    assert parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")["state"] == state
+    assert parse_scheduler_record(f"52085188|{state}|tabin|short|\n", job_id="52085188")["state"] == state
 
 
 @pytest.mark.parametrize("state", ["PENDING", "REQUEUED", "REQUEUE_HOLD", "CONFIGURING", "SUSPENDED", "RESIZING"])
@@ -698,12 +662,12 @@ def test_a_job_that_has_not_run_refuses_to_mint(state) -> None:
     """
 
     with pytest.raises(LaunchEvidenceError, match="did not finish"):
-        parse_scheduler_record(f"52085188|{state}|tabin|short\n", job_id="52085188")
+        parse_scheduler_record(f"52085188|{state}|tabin|short|\n", job_id="52085188")
 
 
 def test_an_unrecognised_state_refuses_rather_than_being_assumed_benign() -> None:
     with pytest.raises(LaunchEvidenceError, match="did not finish"):
-        parse_scheduler_record("52085188|SOME_FUTURE_STATE|tabin|short\n", job_id="52085188")
+        parse_scheduler_record("52085188|SOME_FUTURE_STATE|tabin|short|\n", job_id="52085188")
 
 
 # --- the approval fields are verified against the ledger, not just the digest --
@@ -815,6 +779,7 @@ def test_run_reported_values_are_separated_from_the_bound_ones() -> None:
         "allocated_hostnames",
         "mount_source",
         "reopened_output_sha256",
+        "scheduler_comment",
         "continuation_authorized",
         "diagnostic_schema_version",
     }
@@ -849,11 +814,14 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         ("runtime_identities", "interpreter_replay_context_sha256"),
         ("destination", "package"),
         ("destination", "inode"),
+        ("destination", "package_inode"),
         ("destination", "mount_point"),
         # confirmed against Slurm accounting
         ("submission", "job_id"),
         ("submission", "account"),
         ("submission", "partition"),
+        # bound to the plan's stage_id
+        ("stage",),
         # required to hold a specific value
         ("verified_package", "verification_status"),
         ("run_diagnostic", "status"),
@@ -861,7 +829,6 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         ("verified_package", "n_payloads"),
         # computed or observed by the server itself
         ("schema",),
-        # Supplied by the approving operator, and said to be so in binding_check.
         ("stage",),
         ("approved_plan", "sha256"),
         ("destination", "read_back_package_path"),
@@ -869,7 +836,7 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         ("destination", "device_note"),
         ("binding_check", "all_links_agree"),
         ("binding_check", "checked"),
-        ("binding_check", "stage_is_operator_supplied"),
+        ("binding_check", "scheduler_comment_bound"),
     }
     record = _build()
     leaves = set()
@@ -965,16 +932,95 @@ def test_an_uppercase_digest_is_refused_so_comparisons_stay_exact() -> None:
         _build(plan=plan, diagnostic=diagnostic)
 
 
-def test_the_record_says_the_stage_is_not_bound_to_the_artifacts() -> None:
-    """The same artifacts mint under a different label if an operator approves it.
+def test_a_stage_the_plan_did_not_name_refuses_to_mint() -> None:
+    """The label arrives with the approval, so it has to match the plan.
 
-    The stage comes from the approval, not from the plan or diagnostic, and
-    nothing here ties the two -- so the record says so where a reader looks for
-    what was checked, rather than presenting it as derived.
+    Without this the same platform-canary artifacts would mint a record labelled
+    `acquisition` whenever an operator approved that label.
     """
 
-    canary = _build(stage="platform-canary")
-    acquisition = _build(stage="acquisition")
-    assert canary["stage"] != acquisition["stage"]
-    note = canary["binding_check"]["stage_is_operator_supplied"]
-    assert "not from the plan or the diagnostic" in note
+    with pytest.raises(LaunchEvidenceError, match="stage_id"):
+        _build(stage="acquisition")
+
+
+def test_a_plan_that_names_no_stage_refuses_to_mint() -> None:
+    plan = json.loads(json.dumps(_PLAN))
+    del plan["stage_id"]
+    with pytest.raises(LaunchEvidenceError, match="stage_id"):
+        _build(plan=plan, diagnostic=_diagnostic(plan))
+
+
+def test_the_stage_the_plan_names_mints() -> None:
+    assert _build(stage="platform-canary")["stage"] == "platform-canary"
+
+
+# --- the package directory's own identity, and the manifest's ------------------
+def test_a_directory_renamed_into_the_approved_path_refuses_to_mint() -> None:
+    """Resolving the pathname does not settle identity; the inode does.
+
+    `destination.inode` names the parent directory, which is why binding it
+    never caught this. `output.package_inode` names the package itself.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="package_inode"):
+        _build(observed_package_inode=1234567890)
+
+
+@pytest.mark.parametrize("recorded", [None, 0, "7483730113644355164", True])
+def test_a_run_recording_no_usable_package_inode_refuses(recorded) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["output"]["package_inode"] = recorded
+    with pytest.raises(LaunchEvidenceError, match="package_inode"):
+        _build(diagnostic=diagnostic)
+
+
+def test_an_equal_size_manifest_replacement_refuses_to_mint() -> None:
+    """The payload count was only ever a proxy; the manifest digest is the thing.
+
+    A publisher can swap SHA256SUMS and the payloads for the same number of
+    different, internally consistent entries -- which passes the cardinality
+    check and fails this one.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="sha256sums_sha256"):
+        _build(package_digests={**_digests(), "SHA256SUMS": "0" * 64})
+
+
+def test_a_swapped_conversion_manifest_refuses_to_mint() -> None:
+    with pytest.raises(LaunchEvidenceError, match="conversion_manifest_sha256"):
+        _build(package_digests={**_digests(), "conversion_manifest.json": "0" * 64})
+
+
+@pytest.mark.parametrize("field", ["sha256sums_sha256", "conversion_manifest_sha256"])
+def test_a_run_recording_no_digest_for_its_own_files_refuses(field) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    del diagnostic["output"][field]
+    with pytest.raises(LaunchEvidenceError, match=field):
+        _build(diagnostic=diagnostic)
+
+
+# --- the accounting comment: checked when present, recorded when absent --------
+def test_a_comment_naming_another_plan_refuses_to_mint() -> None:
+    """Once submissions carry the plan digest, a sibling job stops passing."""
+
+    with pytest.raises(LaunchEvidenceError, match="did not submit this plan"):
+        _build(scheduler_record=_scheduler_record(comment="0" * 64))
+
+
+def test_a_comment_naming_this_plan_mints_and_is_recorded_as_bound() -> None:
+    record = _build(scheduler_record=_scheduler_record(comment=plan_digest(_PLAN)))
+    assert record["binding_check"]["scheduler_comment_bound"] is True
+    assert record["unbound_run_reported"]["scheduler_comment"] == plan_digest(_PLAN)
+
+
+def test_an_absent_comment_mints_and_says_the_job_is_not_bound_to_the_plan() -> None:
+    """Jobs submitted before the plan builder sets it must stay attestable.
+
+    The asymmetry is deliberate: the check goes live the moment submissions
+    carry a comment, and until then the record says the binding was not made
+    rather than implying it was.
+    """
+
+    record = _build(scheduler_record=_scheduler_record(comment=""))
+    assert record["binding_check"]["scheduler_comment_bound"] is False
+    assert record["unbound_run_reported"]["scheduler_comment"] is None
