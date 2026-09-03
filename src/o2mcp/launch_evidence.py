@@ -248,6 +248,21 @@ def _same_posix_path(left: Any, right: Any) -> bool:
     return str(PurePosixPath(left)) == str(PurePosixPath(right))
 
 
+def _is_beneath(child: Any, parent: Any) -> bool:
+    """True when ``child`` is a strict descendant of ``parent``, componentwise.
+
+    Compared as path components rather than as a string prefix, so
+    ``/pkg/attempt-002-other`` is not treated as living inside
+    ``/pkg/attempt-002``.
+    """
+
+    if not isinstance(child, str) or not isinstance(parent, str) or not child.strip() or not parent.strip():
+        return False
+    child_parts = PurePosixPath(child).parts
+    parent_parts = PurePosixPath(parent).parts
+    return len(child_parts) > len(parent_parts) and child_parts[: len(parent_parts)] == parent_parts
+
+
 def build_launch_evidence(
     *,
     diagnostic: Mapping[str, Any],
@@ -259,6 +274,8 @@ def build_launch_evidence(
     approval: Mapping[str, Any],
     stage: str,
     read_back_package_path: str,
+    resolved_package_path: str,
+    resolved_payload_paths: Mapping[str, str],
 ) -> dict[str, Any]:
     """Verify every link and return the record, or raise naming what disagreed.
 
@@ -267,7 +284,10 @@ def build_launch_evidence(
     ``checksum_manifest`` is the package's own SHA256SUMS as parsed, and
     ``payload_digests`` is what those same payloads actually hash to now --
     hashed by the server, not by the run. ``read_back_package_path`` is the
-    directory the server actually read, which must be the one the plan approved.
+    directory the server actually read and ``resolved_package_path`` is what it
+    resolves to on the cluster; both must be the package the plan approved.
+    ``resolved_payload_paths`` maps each manifest entry to the file the cluster
+    actually opened for it, which must lie inside that resolved package.
     """
 
     expected_plan_sha256 = plan_digest(plan)
@@ -295,6 +315,16 @@ def build_launch_evidence(
     checks += 1
     if not _same_posix_path(read_back_package_path, approved_package):
         mismatches.append(f"package_read_back_path: read={read_back_package_path!r} plan={approved_package!r}")
+
+    # A lexical comparison is not enough on its own: `cat` and `sha256sum` follow
+    # links, so a pathname that spells the approved package can still open a
+    # substituted directory. Bind what the cluster actually resolved it to.
+    checks += 1
+    if not _same_posix_path(resolved_package_path, approved_package):
+        mismatches.append(
+            f"resolved_package_path: the cluster resolves the package to {resolved_package_path!r}, "
+            f"but the plan approved {approved_package!r}"
+        )
 
     # The owner marker is written first inside the claimed package, so it is the
     # one artifact proving the package on disk belongs to THIS approved plan.
@@ -361,6 +391,15 @@ def build_launch_evidence(
         # read. Requiring the two to agree closes the window between them.
         elif name in package_digests and package_digests[name] != observed_digest:
             mismatches.append(f"payload {name!r} changed between the two reads of the package")
+        # Refusing a lexically escaping name is not the same as refusing one that
+        # escapes through a link. Without this, a subverted run could publish a
+        # payload as a symlink to a file outside the package, put that target's
+        # digest in SHA256SUMS, and obtain a record calling it a package payload.
+        elif not _is_beneath(resolved_payload_paths.get(name), resolved_package_path):
+            mismatches.append(
+                f"payload {name!r} resolves to {resolved_payload_paths.get(name)!r}, "
+                f"which is not inside {resolved_package_path!r}"
+            )
 
     if mismatches:
         raise LaunchEvidenceError(
@@ -396,6 +435,7 @@ def build_launch_evidence(
         "destination": {
             "package": _dig(diagnostic, ("output", "package")),
             "read_back_package_path": read_back_package_path,
+            "resolved_package_path": resolved_package_path,
             "inode": binding.get("inode"),
             "mount_point": mountinfo.get("mount_point"),
             "mount_source": mountinfo.get("mount_source"),

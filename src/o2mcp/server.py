@@ -1236,12 +1236,17 @@ _MARKER_DIAGNOSTIC = "===DIAGNOSTIC==="
 _MARKER_PLAN = "===PLAN==="
 _MARKER_OWNER = "===OWNER==="
 _MARKER_MANIFEST = "===MANIFEST==="
+_MARKER_RESOLVED = "===RESOLVED==="
 _MARKER_DIGESTS = "===DIGESTS==="
+# Separates the two halves of one payload batch: what each operand resolves
+# to, then what it hashes to.
+_MARKER_PAYLOAD_DIGESTS = "===PAYLOADDIGESTS==="
 _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_DIAGNOSTIC,
     _MARKER_PLAN,
     _MARKER_OWNER,
     _MARKER_MANIFEST,
+    _MARKER_RESOLVED,
     _MARKER_DIGESTS,
 )
 
@@ -1285,6 +1290,8 @@ def _read_launch_artifacts(
             f"base64 {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST)}",
             f"base64 {shlex.quote(manifest_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_RESOLVED)}",
+            f"realpath -- {shlex.quote(package_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
             "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
@@ -1324,7 +1331,13 @@ def _read_launch_artifacts(
     manifest = parse_encoded_checksum_manifest(
         sections[_MARKER_MANIFEST], expected_sha256=package_digests.get("SHA256SUMS")
     )
+    # `cat` and `sha256sum` follow links, so the record has to say what the
+    # cluster actually opened, not what the caller spelled.
+    resolved = [line.strip() for line in sections[_MARKER_RESOLVED].splitlines() if line.strip()]
+    if len(resolved) != 1:
+        raise LaunchEvidenceError("the package directory did not resolve to exactly one path on the cluster")
     return {
+        "resolved_package_path": resolved[0],
         "diagnostic": parse_json_artifact(sections[_MARKER_DIAGNOSTIC], label="run diagnostic"),
         "plan": parse_json_artifact(sections[_MARKER_PLAN], label="execution plan"),
         # The owner marker is the artifact tying the package to this plan, so
@@ -1342,7 +1355,9 @@ def _read_launch_artifacts(
 # One `sha256sum` per payload would be correct but would take a hold on the
 # shared channel per file. Batching keeps that to the minimum number of commands
 # the broker's 64 KiB limit allows, with room for the prefix and the separators.
-_HASH_COMMAND_BUDGET = MAX_COMMAND_BYTES - 1024
+# Halved because each batch names every path twice: once to resolve it, once to
+# hash it.
+_HASH_COMMAND_BUDGET = (MAX_COMMAND_BYTES - 1024) // 2
 
 
 def _hash_batches(paths: list[str]) -> Iterator[list[str]]:
@@ -1369,34 +1384,56 @@ def _hash_batches(paths: list[str]) -> Iterator[list[str]]:
         yield batch
 
 
-def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeout: float) -> dict[str, str]:
-    """Hash every payload SHA256SUMS names, on the cluster, and return the digests.
+def _hash_package_payloads(
+    *, package_path: str, manifest: dict[str, str], timeout: float
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve and hash every payload SHA256SUMS names, returning both.
 
     This is a second hold on the channel because it has to be: the payload list
     only exists once the manifest has been read. Running ``sha256sum -c``
     remotely would avoid that at the cost of putting the comparison back inside
     a process whose verdict this record exists to check, so the digests come
     back raw and ``build_launch_evidence`` decides.
+
+    Each batch resolves its operands before hashing them, joined by ``&&`` so a
+    path that cannot be resolved fails the command rather than silently
+    shortening the listing. GNU ``realpath`` writes one line per operand in
+    order, which is what makes the two halves line up.
     """
 
     targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
     if len(targets) != len(manifest):
         raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
     payload_digests: dict[str, str] = {}
+    resolved_paths: dict[str, str] = {}
     for batch in _hash_batches(sorted(targets)):
-        command = "sha256sum -- {}".format(" ".join(batch))
+        operands = " ".join(batch)
+        marker = shlex.quote(_MARKER_PAYLOAD_DIGESTS)
+        command = f"realpath -- {operands} && printf '\\n%s\\n' {marker} && sha256sum -- {operands}"
         result = _connection().run(command, timeout=timeout)
         if not result.ok:
             raise LaunchEvidenceError(
-                "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
+                "could not resolve and hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
             )
         _refuse_truncated_read(result, label="the package payload digest read")
-        for operand, digest in parse_sha256_lines(result.stdout, label="the payload digest output").items():
+        head, separator, tail = result.stdout.partition(f"\n{_MARKER_PAYLOAD_DIGESTS}\n")
+        if not separator:
+            raise LaunchEvidenceError("the payload read returned no digest section")
+        resolved = [line.strip() for line in head.splitlines() if line.strip()]
+        if len(resolved) != len(batch):
+            raise LaunchEvidenceError(
+                f"the cluster resolved {len(resolved)} of {len(batch)} payload paths, so they cannot be matched up"
+            )
+        # `realpath` echoes no names, so the pairing is positional -- which holds
+        # only because the command failed outright if any operand was unresolved.
+        for quoted_operand, resolved_path in zip(batch, resolved):
+            resolved_paths[targets[shlex.split(quoted_operand)[0]]] = resolved_path
+        for operand, digest in parse_sha256_lines(tail, label="the payload digest output").items():
             name = targets.get(operand)
             if name is None:
                 raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")
             payload_digests[name] = digest
-    return payload_digests
+    return payload_digests, resolved_paths
 
 
 @mcp.tool(
@@ -1435,7 +1472,7 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             package_path=package_path,
             timeout=params.timeout_seconds,
         )
-        payload_digests = _hash_package_payloads(
+        payload_digests, resolved_payload_paths = _hash_package_payloads(
             package_path=package_path,
             manifest=artifacts["checksum_manifest"],
             timeout=params.timeout_seconds,
@@ -1452,6 +1489,8 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
                 approval=approval,
                 stage=params.stage,
                 read_back_package_path=package_path,
+                resolved_package_path=artifacts["resolved_package_path"],
+                resolved_payload_paths=resolved_payload_paths,
             )
 
         # Verify BEFORE recording an approval: a chain that does not agree must

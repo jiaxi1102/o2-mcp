@@ -1584,6 +1584,8 @@ def _launch_evidence_responder(
     manifest_sha256=None,
     owner_sha256=None,
     n_payloads=None,
+    resolved_package=None,
+    resolves=None,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
@@ -1602,6 +1604,7 @@ def _launch_evidence_responder(
     from o2mcp.launch_evidence import plan_digest
 
     listed = dict(_PAYLOADS if manifest_payloads is None else manifest_payloads)
+    resolves = dict(resolves or {})
     on_disk = dict(listed if payloads is None else payloads)
     named = package if approved_package is None else approved_package
     plan = {
@@ -1660,17 +1663,21 @@ def _launch_evidence_responder(
 
     def responder(argv, input_text):
         command = argv[-1]
-        if command.startswith("sha256sum"):
+        if command.startswith("realpath -- ") and "sha256sum" in command:
             # The later holds on the channel: the payloads the manifest named,
-            # in whatever batches the broker's command limit allowed. Answer only
-            # for the operands this batch actually asked about.
-            asked = [operand for operand in shlex.split(command)[2:]]
-            lines = []
-            for operand in asked:
-                name = operand[len(package) + 1 :]
-                if name in on_disk:
-                    lines.append(f"{on_disk[name]}  {operand}")
-            return "\n".join(lines), "", 0
+            # in whatever batches the broker's command limit allowed. Each batch
+            # resolves its operands, then hashes them. Answer only for the
+            # operands this batch actually asked about.
+            asked = [token for token in shlex.split(command.split("&&")[0])[2:]]
+            resolved = "\n".join(resolves.get(operand, operand) for operand in asked)
+            digested = "\n".join(
+                f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
+                for operand in asked
+                if operand[len(package) + 1 :] in on_disk
+            )
+            return f"{resolved}\n===PAYLOADDIGESTS===\n{digested}", "", 0
+        if command.startswith("realpath -- "):
+            return package if resolved_package is None else resolved_package, "", 0
         payload = "\n".join(
             [
                 "===DIAGNOSTIC===",
@@ -1681,6 +1688,8 @@ def _launch_evidence_responder(
                 _base64.b64encode(owner_bytes).decode(),
                 "===MANIFEST===",
                 _base64.b64encode(manifest_bytes).decode(),
+                "===RESOLVED===",
+                package if resolved_package is None else resolved_package,
                 "===DIGESTS===",
                 digests,
             ]
@@ -1969,6 +1978,46 @@ async def test_mint_refuses_a_run_whose_own_outcome_is_not_success(monkeypatch, 
 
 
 @pytest.mark.anyio
+async def test_mint_refuses_a_package_pathname_that_resolves_elsewhere(monkeypatch, tmp_path):
+    """The approved spelling reaching a substituted directory must not mint."""
+
+    responder = _launch_evidence_responder(resolved_package="/pkg/substituted")
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "resolved_package_path" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_payload_symlinked_out_of_the_package(monkeypatch, tmp_path):
+    """A lexically internal name whose link leaves the package must not mint."""
+
+    responder = _launch_evidence_responder(
+        resolves={f"{_PACKAGE}/payloads/frame002.ims": "/n/groups/elsewhere/secret.ims"}
+    )
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "which is not inside" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_records_what_the_cluster_resolved(monkeypatch, tmp_path):
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["destination"]["resolved_package_path"] == _PACKAGE
+
+
+@pytest.mark.anyio
 async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeypatch, tmp_path):
     """A package with many payloads must still mint.
 
@@ -1986,7 +2035,11 @@ async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeyp
     assert minted["ok"] is True
     assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 800
 
-    hash_commands = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sha256sum")]
+    hash_commands = [
+        call["argv"][-1]
+        for call in runner.calls
+        if call["argv"][-1].startswith("realpath -- ") and "sha256sum" in call["argv"][-1]
+    ]
     assert len(hash_commands) > 1, "the payload list should have needed more than one command"
     assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in hash_commands)
 

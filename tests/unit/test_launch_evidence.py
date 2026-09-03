@@ -105,6 +105,10 @@ def _build(**overrides):
         approval=overrides.pop("approval", {"approval_reference": "operator approved"}),
         stage=overrides.pop("stage", "platform-canary"),
         read_back_package_path=overrides.pop("read_back_package_path", "/pkg/attempt-002"),
+        resolved_package_path=overrides.pop("resolved_package_path", "/pkg/attempt-002"),
+        resolved_payload_paths=overrides.pop(
+            "resolved_payload_paths", {name: f"/pkg/attempt-002/{name}" for name in manifest}
+        ),
     )
 
 
@@ -475,3 +479,58 @@ def test_an_unauthorized_continuation_is_not_a_failure() -> None:
     record = _build(diagnostic=diagnostic)
     assert record["run_diagnostic"]["continuation_authorized"] is False
     assert record["run_diagnostic"]["status"] == EXPECTED_DIAGNOSTIC_STATUS
+
+
+# --- links must not carry the read outside the approved package ---------------
+def test_a_package_pathname_that_resolves_elsewhere_refuses_to_mint() -> None:
+    """Spelling the approved package is not the same as being it.
+
+    `cat` and `sha256sum` follow links, so a pathname that passes the lexical
+    comparison can still open a substituted directory holding a copied owner
+    marker.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="resolved_package_path"):
+        _build(resolved_package_path="/pkg/somewhere-else")
+
+
+def test_a_payload_symlinked_out_of_the_package_refuses_to_mint() -> None:
+    """A manifest entry may be lexically internal and still escape through a link.
+
+    Without this a subverted run could publish `payloads/x` as a symlink to a
+    file outside the package, put that file's digest in SHA256SUMS, and obtain a
+    record calling an external file a verified package payload.
+    """
+
+    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
+    escaping["payloads/frame002.ims"] = "/n/groups/elsewhere/secret.ims"
+    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
+        _build(resolved_payload_paths=escaping)
+
+
+def test_a_payload_resolving_to_the_package_itself_refuses_to_mint() -> None:
+    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
+    escaping["payloads/frame002.ims"] = "/pkg/attempt-002"
+    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
+        _build(resolved_payload_paths=escaping)
+
+
+def test_a_sibling_directory_sharing_a_name_prefix_is_not_inside() -> None:
+    """Containment is componentwise, so a prefix match is not enough."""
+
+    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
+    escaping["payloads/frame002.ims"] = "/pkg/attempt-002-other/frame002.ims"
+    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
+        _build(resolved_payload_paths=escaping)
+
+
+def test_an_unresolved_payload_refuses_to_mint() -> None:
+    partial = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
+    partial.pop("payloads/frame002.ims")
+    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
+        _build(resolved_payload_paths=partial)
+
+
+def test_the_resolved_package_is_recorded() -> None:
+    record = _build()
+    assert record["destination"]["resolved_package_path"] == "/pkg/attempt-002"
