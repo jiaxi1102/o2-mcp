@@ -1582,6 +1582,7 @@ def _launch_evidence_responder(
     manifest_payloads=None,
     approved_package=None,
     manifest_sha256=None,
+    owner_sha256=None,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
@@ -1644,8 +1645,9 @@ def _launch_evidence_responder(
     manifest_bytes = ("\n".join(f"{digest}  {name}" for name, digest in sorted(listed.items())) + "\n").encode()
     # The server proves the manifest it parsed is the file it recorded a digest
     # for, so the fixture's SHA256SUMS digest has to be the real one.
+    owner_bytes = _json.dumps(owner).encode()
     file_digests = {
-        "PUBLICATION_OWNER.json": "d" * 64,
+        "PUBLICATION_OWNER.json": (_hashlib.sha256(owner_bytes).hexdigest() if owner_sha256 is None else owner_sha256),
         "SUCCESS.json": "d" * 64,
         "conversion_manifest.json": "d" * 64,
         "SHA256SUMS": _hashlib.sha256(manifest_bytes).hexdigest() if manifest_sha256 is None else manifest_sha256,
@@ -1672,7 +1674,7 @@ def _launch_evidence_responder(
                 "===PLAN===",
                 _json.dumps(plan),
                 "===OWNER===",
-                _json.dumps(owner),
+                _base64.b64encode(owner_bytes).decode(),
                 "===MANIFEST===",
                 _base64.b64encode(manifest_bytes).decode(),
                 "===DIGESTS===",
@@ -1885,6 +1887,45 @@ async def test_mint_refuses_a_manifest_that_changed_while_it_was_read(monkeypatc
     assert refused["error"] == "launch_evidence_refused"
     assert "changed while it was being read" in refused["message"]
     after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_an_owner_marker_that_changed_while_it_was_read(monkeypatch, tmp_path):
+    """The owner marker ties the package to this plan, so its bytes must be its file.
+
+    Replaced between the read and the hash, an old marker could satisfy the
+    plan and attempt checks while `file_digests` recorded the replacement's
+    hash -- the record would then authenticate a package whose current owner
+    identifies a different launch.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(owner_sha256="0" * 64))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "publication owner changed while it was being read" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_diagnostic_with_no_job_id(monkeypatch, tmp_path):
+    """A record that binds no submitted job is not the thing this tool issues."""
+
+    def without_job(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        return payload.replace('"job_id": "52085188"', '"job_id": null'), err, rc
+
+    _patch_connection(monkeypatch, tmp_path, responder=without_job)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "job_id" in refused["message"]
+    after = await _call("o2_local_status", {})
+    # In particular, the ledger must not have recorded the string "None" as a job.
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 
 

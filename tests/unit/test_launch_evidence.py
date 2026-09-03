@@ -21,6 +21,7 @@ from o2mcp.launch_evidence import (
     launch_evidence_digest,
     parse_checksum_manifest,
     parse_encoded_checksum_manifest,
+    parse_encoded_json_artifact,
     parse_json_artifact,
     parse_sha256_lines,
     plan_digest,
@@ -378,3 +379,29 @@ def test_a_manifest_with_no_recorded_digest_refuses_to_mint() -> None:
 def test_a_manifest_that_is_not_base64_is_named_as_such() -> None:
     with pytest.raises(LaunchEvidenceError, match="valid base64"):
         parse_encoded_checksum_manifest("not base64 !!", expected_sha256="0" * 64)
+
+
+def test_encoded_json_artifact_must_hash_to_the_digest_recorded_for_it() -> None:
+    raw = b'{"plan_sha256": "abc"}'
+    encoded = base64.b64encode(raw).decode()
+    digest = hashlib.sha256(raw).hexdigest()
+    assert parse_encoded_json_artifact(encoded, expected_sha256=digest, label="publication owner") == {
+        "plan_sha256": "abc"
+    }
+    with pytest.raises(LaunchEvidenceError, match="publication owner changed while it was being read"):
+        parse_encoded_json_artifact(encoded, expected_sha256="0" * 64, label="publication owner")
+
+
+# --- the record must name the job it attests ----------------------------------
+@pytest.mark.parametrize("job_id", [None, "", "   ", [], {}, True])
+def test_a_record_that_binds_no_submitted_job_refuses_to_mint(job_id) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["slurm"]["scheduler"]["job_id"] = job_id
+    with pytest.raises(LaunchEvidenceError, match="would bind no submitted job"):
+        _build(diagnostic=diagnostic)
+
+
+def test_an_integer_job_id_is_accepted() -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["slurm"]["scheduler"]["job_id"] = 52085188
+    assert _build(diagnostic=diagnostic)["submission"]["job_id"] == 52085188

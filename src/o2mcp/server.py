@@ -74,6 +74,7 @@ from o2mcp.launch_evidence import (
     evidence_content_digest,
     launch_evidence_digest,
     parse_encoded_checksum_manifest,
+    parse_encoded_json_artifact,
     parse_json_artifact,
     parse_sha256_lines,
     required_package_files,
@@ -1281,7 +1282,7 @@ def _read_launch_artifacts(
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN)}",
             f"cat {shlex.quote(plan_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
-            f"cat {shlex.quote(owner_path)}",
+            f"base64 {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST)}",
             f"base64 {shlex.quote(manifest_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
@@ -1326,7 +1327,13 @@ def _read_launch_artifacts(
     return {
         "diagnostic": parse_json_artifact(sections[_MARKER_DIAGNOSTIC], label="run diagnostic"),
         "plan": parse_json_artifact(sections[_MARKER_PLAN], label="execution plan"),
-        "owner": parse_json_artifact(sections[_MARKER_OWNER], label="publication owner"),
+        # The owner marker is the artifact tying the package to this plan, so
+        # like SHA256SUMS the bytes parsed must be the file that was hashed.
+        "owner": parse_encoded_json_artifact(
+            sections[_MARKER_OWNER],
+            expected_sha256=package_digests.get("PUBLICATION_OWNER.json"),
+            label="publication owner",
+        ),
         "checksum_manifest": manifest,
         "package_digests": package_digests,
     }

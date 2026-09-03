@@ -123,37 +123,53 @@ def parse_checksum_manifest(text: str, *, label: str = "SHA256SUMS") -> dict[str
     return manifest
 
 
-def parse_encoded_checksum_manifest(
-    encoded: str, *, expected_sha256: str | None, label: str = "SHA256SUMS"
-) -> dict[str, str]:
-    """Decode the manifest, prove it is the file whose digest was recorded, parse it.
+def decode_verified_artifact(encoded: str, *, expected_sha256: str | None, label: str) -> str:
+    """Decode one package file and prove it is the file whose digest was recorded.
 
-    The manifest is read and hashed by two different commands, so on their own
-    the bytes that chose the payloads and the digest the record reports as the
-    manifest's are not the same evidence: a replacement between them would let a
-    record claim a manifest it never used. Hashing the decoded bytes here and
-    requiring them to match closes that. The transport is base64 so the bytes
-    survive line-splitting exactly -- a digest over reconstructed text would
-    prove only that the reconstruction was self-consistent.
+    A file inside the package is read by one command and hashed by another, so
+    on their own the bytes that were parsed and the digest the record reports
+    for that filename are not the same evidence: a replacement in between would
+    let a record quote content it never used alongside a digest of something
+    else. Hashing the decoded bytes here and requiring them to match closes
+    that. The transport is base64 so the bytes survive line-splitting exactly --
+    a digest over reconstructed text would prove only that the reconstruction
+    was self-consistent.
     """
 
     try:
         raw = base64.b64decode("".join(encoded.split()), validate=True)
     except (binascii.Error, ValueError) as error:
         raise LaunchEvidenceError(f"{label} did not come back as valid base64: {error}") from error
-    observed = hashlib.sha256(raw).hexdigest()
     if not expected_sha256:
         raise LaunchEvidenceError(f"the package digest output carried no digest for {label}")
+    observed = hashlib.sha256(raw).hexdigest()
     if observed != expected_sha256:
         raise LaunchEvidenceError(
             f"{label} changed while it was being read: the bytes parsed hash to {observed}, "
             f"but the file digest recorded is {expected_sha256}"
         )
     try:
-        text = raw.decode("utf-8")
+        return raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise LaunchEvidenceError(f"{label} is not valid UTF-8: {error}") from error
-    return parse_checksum_manifest(text, label=label)
+
+
+def parse_encoded_checksum_manifest(
+    encoded: str, *, expected_sha256: str | None, label: str = "SHA256SUMS"
+) -> dict[str, str]:
+    """Decode the manifest, prove it is the file whose digest was recorded, parse it."""
+
+    return parse_checksum_manifest(
+        decode_verified_artifact(encoded, expected_sha256=expected_sha256, label=label), label=label
+    )
+
+
+def parse_encoded_json_artifact(encoded: str, *, expected_sha256: str | None, label: str) -> dict[str, Any]:
+    """Decode a JSON package file, prove it is the file that was hashed, parse it."""
+
+    return parse_json_artifact(
+        decode_verified_artifact(encoded, expected_sha256=expected_sha256, label=label), label=label
+    )
 
 
 def _dig(payload: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -284,6 +300,14 @@ def build_launch_evidence(
     missing_files = [name for name in REQUIRED_PACKAGE_FILES if name not in package_digests]
     if missing_files:
         mismatches.append("package files absent: {}".format(", ".join(sorted(missing_files))))
+
+    # A record whose whole purpose is to bind an approved plan to a submitted job
+    # must name the job. Without this the field is simply null, and the audit
+    # ledger records the literal string "None" as the job it approved.
+    checks += 1
+    job_id = _dig(diagnostic, ("slurm", "scheduler", "job_id"))
+    if isinstance(job_id, bool) or not isinstance(job_id, (str, int)) or not str(job_id).strip():
+        mismatches.append(f"submission job_id is {job_id!r}, so the record would bind no submitted job")
 
     checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
@@ -436,10 +460,12 @@ __all__ = [
     "LaunchEvidenceError",
     "build_launch_evidence",
     "canonical_json",
+    "decode_verified_artifact",
     "evidence_content_digest",
     "launch_evidence_digest",
     "parse_checksum_manifest",
     "parse_encoded_checksum_manifest",
+    "parse_encoded_json_artifact",
     "parse_json_artifact",
     "parse_sha256_lines",
     "plan_digest",
