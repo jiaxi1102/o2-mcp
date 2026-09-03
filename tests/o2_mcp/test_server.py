@@ -1140,6 +1140,7 @@ _ALLOCATION_OPTIONS = (
     "--cores-per-socket",
     "--threads-per-core",
     "--mincpus",
+    "--hint",
     "--tres-per-task",
     "--core-spec",
     "--thread-spec",

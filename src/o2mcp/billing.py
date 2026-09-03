@@ -472,6 +472,11 @@ UNPRICEABLE_OPTIONS = {
     "--cores-per-socket": "constrains node selection by hardware layout",
     "--threads-per-core": "changes how many CPUs a core contributes",
     "--extra-node-info": "specifies sockets/cores/threads of the chosen nodes",
+    # sbatch(1) refuses --hint alongside --ntasks-per-core, --cores-per-socket,
+    # --sockets-per-node, --threads-per-core or -B, because it implies values
+    # for them -- and "one core in each socket" is a CPU count only the chosen
+    # hardware can supply.
+    "--hint": "implies a socket/core/thread layout, so the CPUs allocated depend on the hardware",
     "--overcommit": "decouples the CPU allocation from the task count",
     "--mem=0": "means all memory on every allocated node, which needs node sizes",
     # TRES this module has no input for at all. Each can carry its own
