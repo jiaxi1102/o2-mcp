@@ -777,3 +777,46 @@ def test_a_malformed_mint_ledger_is_refused(tmp_path):
     snapshot = O2PolicyStore(policy, client_id="client-a").snapshot()
     assert snapshot.valid is False
     assert "launch_evidence_mints" in (snapshot.error or "")
+
+
+def test_a_schema_1_file_survives_the_repair_path_rather_than_being_replaced(tmp_path):
+    """The migration must hold on `disable`'s repair path, not just on read.
+
+    `_read_for_repair_or_initialize` catches O2PolicyInvalidError and replaces
+    the file with a conservative skeleton. So a schema bump without a read-side
+    migration would not merely refuse an existing policy file -- the next
+    `disable` would silently discard the state it was meant to protect, minting a
+    fresh generation and losing the mint ledger. This pins that interaction.
+    """
+
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-00000000abcd",
+                "revision": 11,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [{"at": 1.0, "event": "policy_reuse_enabled"}],
+            }
+        )
+    )
+    policy.chmod(0o600)
+    store = O2PolicyStore(policy, client_id="client-a", clock=lambda: 1000.0)
+
+    disabled = store.disable(reason="operator disabling an existing v1 policy")
+
+    # Preserved, not repaired: a repair mints a fresh generation and restarts the
+    # revision, and it stamps a conservative cooldown receipt.
+    assert disabled["generation"] == "00000000-0000-4000-8000-00000000abcd"
+    assert disabled["revision"] == 12
+    assert disabled["mode"] == "disabled"
+    assert disabled["login_attempt"] is None
+    events = [event.get("event") for event in disabled["events"]]
+    assert "policy_repaired_with_conservative_cooldown" not in events
+    assert events[0] == "policy_reuse_enabled"
+    persisted = json.loads(policy.read_text())
+    assert persisted["schema_version"] == SCHEMA_VERSION
+    assert persisted["launch_evidence_mints"] == []
