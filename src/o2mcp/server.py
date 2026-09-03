@@ -1090,20 +1090,68 @@ def _resource_flags_seen(params: SubmitInput, remote_directives: list[str] | Non
     return sorted(flag for flag in _RESOURCE_FLAGS if _flag_is_set(flag, tokens))
 
 
-def _stated_partition(params: SubmitInput, remote_directives: list[str] | None = None) -> str | None:
-    """The partition this submission names, or None if it names none.
+# Distinguishes "the environment sets no partition" from "the environment could
+# not be read". The second must not be treated as the first: a check that
+# asserts a conflict on an unknown is the failure this whole record avoids.
+UNKNOWN_ENV = object()
 
-    sbatch takes the command line over the script's directives, so an argument
-    wins over a #SBATCH line naming a different one. This is the only place
-    that precedence is resolved, because it is the only place the answer
-    changes an outcome.
+
+def _last_partition_in(tokens: list[str]) -> str | None:
+    """The partition a token list settles on, scanning in order.
+
+    sbatch parses options sequentially, so a repeated option is decided by the
+    LAST occurrence and by position rather than by spelling. Searching
+    "--partition" before "-p" answered `short` for
+    ["--partition=short", "-plong"], which sbatch reads as long.
     """
-    for tokens in (list(params.sbatch_args or []), _directive_tokens(params, remote_directives)):
+    found: str | None = None
+    for index in range(len(tokens)):
         for flag in ("--partition", "-p"):
-            value = _value_after(flag, tokens)
+            value = _value_after(flag, tokens[index : index + 2])
             if value:
-                return value.strip()
-    return None
+                found = value.strip()
+                break
+    return found
+
+
+def _remote_sbatch_partition(connection: Any) -> Any:
+    """SBATCH_PARTITION as sbatch will see it, or UNKNOWN_ENV if unreadable.
+
+    The broker copies os.environ into every command it runs, so a partition set
+    in the login environment reaches sbatch and outranks the script's
+    directives. Reading it is the same principle the rest of this record is
+    built on: look, rather than assume.
+    """
+    try:
+        result = connection.run('printf %s "${SBATCH_PARTITION-}"', timeout=15.0)
+    except Exception:
+        return UNKNOWN_ENV
+    if result.returncode != 0:
+        return UNKNOWN_ENV
+    return (result.stdout or "").strip() or None
+
+
+def _stated_partition(
+    params: SubmitInput,
+    remote_directives: list[str] | None = None,
+    env_partition: Any = UNKNOWN_ENV,
+) -> Any:
+    """The partition this submission settles on, or UNKNOWN_ENV if undecidable.
+
+    sbatch resolves the command line over the environment over the script's
+    directives. The command line is therefore authoritative on its own; below
+    it, a directive only decides the outcome once the environment is known not
+    to override it, and an unreadable environment leaves the answer unknown
+    rather than assumed.
+    """
+    from_arguments = _last_partition_in(list(params.sbatch_args or []))
+    if from_arguments:
+        return from_arguments
+    if env_partition is UNKNOWN_ENV:
+        return UNKNOWN_ENV
+    if env_partition:
+        return env_partition
+    return _last_partition_in(_directive_tokens(params, remote_directives))
 
 
 def _receipt_partition_conflict(receipt: dict[str, Any], stated: str | None) -> str | None:
@@ -1115,7 +1163,10 @@ def _receipt_partition_conflict(receipt: dict[str, Any], stated: str | None) -> 
     part of binding a receipt to a script that needs no script parser -- just
     two strings.
     """
-    if not stated:
+    # UNKNOWN_ENV means the environment that outranks the script could not be
+    # read, so which partition wins is undecided. Asserting a conflict here
+    # would be the record claiming something it cannot establish.
+    if stated is UNKNOWN_ENV or not stated:
         return None
     priced_for = str(receipt.get("partition") or "")
     # sbatch accepts a comma-separated list and picks one, so the receipt is
@@ -1133,7 +1184,11 @@ def _receipt_partition_conflict(receipt: dict[str, Any], stated: str | None) -> 
     )
 
 
-def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = None) -> dict[str, Any]:
+def _pricing_record(
+    params: SubmitInput,
+    remote_directives: list[str] | None = None,
+    env_partition: Any = UNKNOWN_ENV,
+) -> dict[str, Any]:
     """What this submission can say about having been priced.
 
     Advisory only -- it never blocks. A receipt proves a price was obtained and
@@ -1151,7 +1206,7 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
         # The receipt is still reported -- it is evidence about some shape, and
         # discarding it would lose that -- but a client gating on the boolean
         # must not read it as this job having a price.
-        conflict = _receipt_partition_conflict(receipt, _stated_partition(params, remote_directives))
+        conflict = _receipt_partition_conflict(receipt, _stated_partition(params, remote_directives, env_partition))
         record: dict[str, Any] = {"priced": not unpriceable and not conflict, "receipt": receipt}
         if conflict:
             # Named ahead of the unpriceable note: this one says the receipt is
@@ -1263,6 +1318,13 @@ async def o2_submit_job(params: SubmitInput) -> str:
             # skipping the read here would have left that warning reachable for
             # an inline script and silent for a remote one.
             directives = _remote_directives(submitted_path)
+        # Read the partition the login environment sets, since it outranks the
+        # script's directives and only sbatch would otherwise know. Read for
+        # every submission carrying a receipt, inline or remote, because the
+        # environment applies to both.
+        env_partition = UNKNOWN_ENV
+        if billing.parse_price_receipt(params.priced or ""):
+            env_partition = _remote_sbatch_partition(_connection())
         if params.script_text is not None:
             if not params.remote_path:
                 return {"ok": False, "error": "bad_input", "message": "remote_path is required with script_text."}
@@ -1279,7 +1341,7 @@ async def o2_submit_job(params: SubmitInput) -> str:
             "ok": res.submitted,
             "submitted": res.submitted,
             "job_id": res.job_id,
-            "pricing": _pricing_record(params, directives),
+            "pricing": _pricing_record(params, directives, env_partition),
             **_command_payload(res.command),
         }
 

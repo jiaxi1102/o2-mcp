@@ -1372,7 +1372,8 @@ def test_a_receipt_for_another_partition_is_not_this_job_s_price():
             script_text="#!/bin/bash\n#SBATCH --partition=long\n",
             remote_path="/n/x.sh",
             priced=_short_receipt(),
-        )
+        ),
+        env_partition=None,
     )
     assert record["priced"] is False
     assert "priced for partition 'short'" in record["note"]
@@ -1424,7 +1425,8 @@ def test_a_partition_list_conflicts_only_when_the_receipt_is_not_in_it():
                 script_text=f"#!/bin/bash\n#SBATCH --partition={value}\n",
                 remote_path="/n/x.sh",
                 priced=_short_receipt(),
-            )
+            ),
+            env_partition=None,
         )
 
     assert rec("long,short")["priced"] is True
@@ -1438,6 +1440,59 @@ def test_a_submission_naming_no_partition_is_not_a_conflict():
         )
     )
     assert record["priced"] is True
+
+
+def test_the_last_partition_option_wins_whatever_its_spelling():
+    """sbatch parses sequentially, so position decides, not spelling.
+
+    Searching "--partition" before "-p" answered `short` for
+    ["--partition=short", "-plong"], which sbatch reads as long.
+    """
+
+    def mk(args):
+        return o2server.SubmitInput(script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=args)
+
+    assert o2server._stated_partition(mk(["--partition=short", "-plong"]), env_partition=None) == "long"
+    assert o2server._stated_partition(mk(["-pshort", "--partition=long"]), env_partition=None) == "long"
+    assert o2server._stated_partition(mk(["-plong"]), env_partition=None) == "long"
+
+
+def test_the_environment_outranks_a_directive():
+    # The broker copies os.environ into every command, so SBATCH_PARTITION
+    # reaches sbatch and beats the script -- but not the command line.
+    scripted = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --partition=long\n", remote_path="/n/x.sh")
+    assert o2server._stated_partition(scripted, env_partition="short") == "short"
+    assert o2server._stated_partition(scripted, env_partition=None) == "long"
+    with_argument = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --partition=long\n",
+        remote_path="/n/x.sh",
+        sbatch_args=["-pgpu"],
+    )
+    assert o2server._stated_partition(with_argument, env_partition="short") == "gpu"
+
+
+def test_an_unreadable_environment_claims_no_conflict():
+    """Undecidable is not a conflict.
+
+    The environment outranks the script, so when it cannot be read the winning
+    partition is unknown -- and a record that asserts a conflict there is
+    claiming something it cannot establish.
+    """
+    params = o2server.SubmitInput(
+        script_text="#!/bin/bash\n#SBATCH --partition=long\n",
+        remote_path="/n/x.sh",
+        priced=_short_receipt(),
+    )
+    assert o2server._stated_partition(params) is o2server.UNKNOWN_ENV
+    record = o2server._pricing_record(params)
+    assert record["priced"] is True
+    assert "note" not in record
+    # ...but a command-line partition outranks the environment either way, so
+    # that conflict IS decidable without reading it.
+    from_argument = o2server.SubmitInput(
+        script_text="#!/bin/bash\n", remote_path="/n/x.sh", sbatch_args=["-plong"], priced=_short_receipt()
+    )
+    assert o2server._pricing_record(from_argument)["priced"] is False
 
 
 def test_a_receipt_cannot_silence_an_unpriceable_option():
