@@ -1583,6 +1583,7 @@ def _launch_evidence_responder(
     approved_package=None,
     manifest_sha256=None,
     owner_sha256=None,
+    n_payloads=None,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
@@ -1638,7 +1639,10 @@ def _launch_evidence_responder(
         "output": {
             "package": named,
             "reopened_output_sha256": "r" * 64,
-            "verification": {"status": "success", "n_payloads": 9},
+            "verification": {
+                "status": "success",
+                "n_payloads": len(listed) if n_payloads is None else n_payloads,
+            },
         },
     }
     owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
@@ -1926,6 +1930,41 @@ async def test_mint_refuses_a_diagnostic_with_no_job_id(monkeypatch, tmp_path):
     assert "job_id" in refused["message"]
     after = await _call("o2_local_status", {})
     # In particular, the ledger must not have recorded the string "None" as a job.
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_manifest_shortened_after_the_run(monkeypatch, tmp_path):
+    """Payloads deleted from disk and from SHA256SUMS together are still caught.
+
+    Every remaining entry rehashes correctly, so only the count the run recorded
+    reveals the deletion.
+    """
+
+    shortened = {"payloads/frame002.ims": "2" * 64}
+    responder = _launch_evidence_responder(manifest_payloads=shortened, n_payloads=len(_PAYLOADS))
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "but the run verified" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_run_whose_own_outcome_is_not_success(monkeypatch, tmp_path):
+    def failed(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        return payload.replace('"diagnostic_success"', '"diagnostic_failed"'), err, rc
+
+    _patch_connection(monkeypatch, tmp_path, responder=failed)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "does not say it finished" in refused["message"]
+    after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 
 

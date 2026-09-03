@@ -47,6 +47,11 @@ from pathlib import PurePosixPath
 from typing import Any
 
 LAUNCH_EVIDENCE_SCHEMA = "o2-launch-evidence-v1"
+# The canary emits exactly two status strings -- "success" for package
+# verification and this one for the run object -- and signals every failure by
+# raising, so a diagnostic file exists only for a run that reached the end.
+# Requiring it therefore cannot refuse a correct run.
+EXPECTED_DIAGNOSTIC_STATUS = "diagnostic_success"
 REQUIRED_PACKAGE_FILES: tuple[str, ...] = (
     "PUBLICATION_OWNER.json",
     "SUCCESS.json",
@@ -314,6 +319,18 @@ def build_launch_evidence(
     if verification_status != "success":
         mismatches.append(f"package verification status is {verification_status!r}, not 'success'")
 
+    # The run's own top-level outcome. Note that `continuation_authorized: false`
+    # is NOT a failure and is deliberately not checked: it is the run asserting
+    # it cannot authenticate its own launch, which is the reason this record
+    # exists at all.
+    checks += 1
+    diagnostic_status = diagnostic.get("status")
+    if diagnostic_status != EXPECTED_DIAGNOSTIC_STATUS:
+        mismatches.append(
+            f"run diagnostic status is {diagnostic_status!r}, not {EXPECTED_DIAGNOSTIC_STATUS!r}; "
+            "the run's own outcome does not say it finished"
+        )
+
     # That status is the executed process vouching for itself, and this record
     # exists precisely because such a process cannot authenticate its own
     # output: a payload deleted or altered after the run reported success, or a
@@ -322,6 +339,17 @@ def build_launch_evidence(
     if not checksum_manifest:
         checks += 1
         mismatches.append("SHA256SUMS lists no payloads, so nothing could be reverified")
+
+    # SHA256SUMS covers exactly the payloads the run counted: it cannot list
+    # itself, and SUCCESS.json is written after it. So a manifest replaced after
+    # the run with a valid but shorter one -- payloads deleted from disk and
+    # from the manifest together -- is caught here and nowhere else.
+    checks += 1
+    n_payloads = _dig(diagnostic, ("output", "verification", "n_payloads"))
+    if not isinstance(n_payloads, int) or isinstance(n_payloads, bool):
+        mismatches.append(f"the run diagnostic's n_payloads is {n_payloads!r}, so nothing pins the manifest length")
+    elif n_payloads != len(checksum_manifest):
+        mismatches.append(f"SHA256SUMS lists {len(checksum_manifest)} payloads but the run verified {n_payloads}")
     for name, expected_digest in sorted(checksum_manifest.items()):
         checks += 1
         observed_digest = payload_digests.get(name)
@@ -456,6 +484,7 @@ def required_package_files() -> tuple[str, ...]:
 
 
 __all__ = [
+    "EXPECTED_DIAGNOSTIC_STATUS",
     "LAUNCH_EVIDENCE_SCHEMA",
     "LaunchEvidenceError",
     "build_launch_evidence",

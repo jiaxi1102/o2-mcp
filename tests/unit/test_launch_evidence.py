@@ -13,6 +13,7 @@ import hashlib
 import pytest
 
 from o2mcp.launch_evidence import (
+    EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
     LaunchEvidenceError,
     build_launch_evidence,
@@ -35,6 +36,9 @@ _PLAN = {
     "interpreter": {"sha256": "i" * 64, "closure_sha256": "c" * 64, "context_sha256": "x" * 64},
     "destination": {"inode": 6411787343743799620, "mount": "/n/scratch", "expected_package": "/pkg/attempt-002"},
 }
+
+
+_MANIFEST = {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
 
 
 def _diagnostic(plan: dict) -> dict:
@@ -68,7 +72,7 @@ def _diagnostic(plan: dict) -> dict:
         "output": {
             "package": "/pkg/attempt-002",
             "reopened_output_sha256": "r" * 64,
-            "verification": {"status": "success", "n_payloads": 9},
+            "verification": {"status": "success", "n_payloads": len(_MANIFEST)},
         },
     }
 
@@ -80,7 +84,7 @@ def _digests() -> dict[str, str]:
 def _manifest() -> dict[str, str]:
     """What the package's own SHA256SUMS claims its payloads hash to."""
 
-    return {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
+    return dict(_MANIFEST)
 
 
 def _owner(plan: dict) -> dict:
@@ -405,3 +409,69 @@ def test_an_integer_job_id_is_accepted() -> None:
     diagnostic = _diagnostic(_PLAN)
     diagnostic["slurm"]["scheduler"]["job_id"] = 52085188
     assert _build(diagnostic=diagnostic)["submission"]["job_id"] == 52085188
+
+
+# --- the manifest must cover every payload the run counted --------------------
+def test_a_manifest_shortened_after_the_run_refuses_to_mint() -> None:
+    """Deleting payloads from disk and from SHA256SUMS together is caught here.
+
+    Every remaining entry rehashes correctly, so nothing else in the chain
+    notices; only the count the run recorded does. On the real canary package
+    SHA256SUMS holds exactly the 9 payloads the diagnostic counts -- it cannot
+    list itself, and SUCCESS.json is written after it.
+    """
+
+    shortened = {"payloads/frame002.ims": "2" * 64}
+    with pytest.raises(LaunchEvidenceError, match="lists 1 payloads but the run verified 2"):
+        _build(checksum_manifest=shortened, payload_digests=dict(shortened))
+
+
+def test_a_manifest_with_extra_entries_refuses_to_mint() -> None:
+    padded = {**_manifest(), "payloads/frame003.ims": "3" * 64}
+    with pytest.raises(LaunchEvidenceError, match="lists 3 payloads but the run verified 2"):
+        _build(checksum_manifest=padded, payload_digests=dict(padded))
+
+
+@pytest.mark.parametrize("count", [None, "2", 2.0, True])
+def test_a_diagnostic_without_a_usable_payload_count_refuses_to_mint(count) -> None:
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["output"]["verification"]["n_payloads"] = count
+    with pytest.raises(LaunchEvidenceError, match="nothing pins the manifest length"):
+        _build(diagnostic=diagnostic)
+
+
+# --- the run's own outcome must say it finished -------------------------------
+def test_a_diagnostic_that_did_not_succeed_refuses_to_mint() -> None:
+    """A failed run must not yield a continuation credential.
+
+    The canary signals failure by raising, so a diagnostic only exists for a run
+    that reached the end -- but a status that is not the expected one still must
+    not be copied into an otherwise successful record.
+    """
+
+    diagnostic = _diagnostic(_PLAN)
+    diagnostic["status"] = "diagnostic_failed"
+    with pytest.raises(LaunchEvidenceError, match="does not say it finished"):
+        _build(diagnostic=diagnostic)
+
+
+def test_an_absent_diagnostic_status_refuses_to_mint() -> None:
+    diagnostic = _diagnostic(_PLAN)
+    del diagnostic["status"]
+    with pytest.raises(LaunchEvidenceError, match="does not say it finished"):
+        _build(diagnostic=diagnostic)
+
+
+def test_an_unauthorized_continuation_is_not_a_failure() -> None:
+    """`continuation_authorized: false` is the expected value and must still mint.
+
+    It is the run asserting it cannot authenticate its own launch, which is the
+    reason this record exists. Treating it as failure would make the record
+    impossible to mint for exactly the runs that need it.
+    """
+
+    diagnostic = _diagnostic(_PLAN)
+    assert diagnostic["continuation_authorized"] is False
+    record = _build(diagnostic=diagnostic)
+    assert record["run_diagnostic"]["continuation_authorized"] is False
+    assert record["run_diagnostic"]["status"] == EXPECTED_DIAGNOSTIC_STATUS
