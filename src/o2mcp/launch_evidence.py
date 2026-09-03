@@ -193,43 +193,70 @@ def _dig(payload: Mapping[str, Any], path: Sequence[str]) -> Any:
     return current
 
 
-# Each entry is (label, path within the run diagnostic, path within the plan).
-# Declarative so a reviewer can see the whole binding surface at once, and so a
-# new field cannot be added to one side without appearing here.
-_BINDINGS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
-    ("attempt_id", ("attempt_id",), ("attempt_id",)),
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _well_formed(kind: str, value: Any) -> bool:
+    """Is this value even the kind of thing the field is supposed to hold?
+
+    Equality alone is not a binding. A falsified plan and a matching diagnostic
+    can agree on ``{}`` or ``""`` for an interpreter digest, and every check
+    would pass while the record carried an identity that identifies nothing.
+    """
+
+    if kind == "sha256":
+        return isinstance(value, str) and bool(_SHA256.match(value))
+    if kind == "inode":
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    if kind == "path":
+        return isinstance(value, str) and value.startswith("/") and bool(value.strip())
+    return isinstance(value, str) and bool(value.strip())
+
+
+# Each entry is (label, path within the run diagnostic, path within the plan,
+# the shape the value must have). Declarative so a reviewer can see the whole
+# binding surface at once, and so a new field cannot be added to one side
+# without appearing here.
+_BINDINGS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
+    ("attempt_id", ("attempt_id",), ("attempt_id",), "text"),
     (
         "source_bundle_sha256",
         ("runtime", "source_bundle", "bundle_sha256"),
         ("software", "bundle", "bundle_sha256"),
+        "sha256",
     ),
     (
         "runtime_wrapper_sha256",
         ("runtime", "runtime_wrapper_sha256"),
         ("runtime_wrapper", "sha256"),
+        "sha256",
     ),
     (
         "interpreter_sha256",
         ("runtime", "approved_interpreter", "sha256"),
         ("interpreter", "sha256"),
+        "sha256",
     ),
     (
         "interpreter_closure_sha256",
         ("runtime", "approved_interpreter", "dynamic_closure", "closure_sha256"),
         ("interpreter", "closure_sha256"),
+        "sha256",
     ),
     (
         "interpreter_replay_context_sha256",
         ("runtime", "approved_interpreter", "runtime_context_sha256"),
         ("interpreter", "context_sha256"),
+        "sha256",
     ),
-    ("destination_inode", ("destination_binding", "inode"), ("destination", "inode")),
+    ("destination_inode", ("destination_binding", "inode"), ("destination", "inode"), "inode"),
     (
         "destination_mount_point",
         ("destination_binding", "linux_mountinfo", "mount_point"),
         ("destination", "mount"),
+        "path",
     ),
-    ("package_path", ("output", "package"), ("destination", "expected_package")),
+    ("package_path", ("output", "package"), ("destination", "expected_package"), "path"),
 )
 
 
@@ -413,17 +440,23 @@ def build_launch_evidence(
     mismatches: list[str] = []
     checks = 0
 
-    def bind(label: str, observed: Any, expected: Any) -> None:
+    def bind(label: str, observed: Any, expected: Any, kind: str = "text") -> None:
         nonlocal checks
         checks += 1
         if observed is None:
             mismatches.append(f"{label}: absent from the run diagnostic")
         elif observed != expected:
             mismatches.append(f"{label}: run={observed!r} plan={expected!r}")
+        # Agreeing on a value that is not the kind of thing the field holds is
+        # not a binding: a falsified plan and a matching diagnostic could settle
+        # on an empty string or an object for an interpreter digest and pass
+        # every check while identifying nothing.
+        elif not _well_formed(kind, observed):
+            mismatches.append(f"{label}: {observed!r} is not a well-formed {kind}")
 
-    bind("plan_sha256", diagnostic.get("plan_sha256"), expected_plan_sha256)
-    for label, run_path, plan_path in _BINDINGS:
-        bind(label, _dig(diagnostic, run_path), _dig(plan, plan_path))
+    bind("plan_sha256", diagnostic.get("plan_sha256"), expected_plan_sha256, "sha256")
+    for label, run_path, plan_path, kind in _BINDINGS:
+        bind(label, _dig(diagnostic, run_path), _dig(plan, plan_path), kind)
 
     # The caller chooses which directory is read back, so without this the owner
     # marker and the digests below could describe package B while the record
@@ -446,8 +479,8 @@ def build_launch_evidence(
 
     # The owner marker is written first inside the claimed package, so it is the
     # one artifact proving the package on disk belongs to THIS approved plan.
-    bind("owner_plan_sha256", owner.get("plan_sha256"), expected_plan_sha256)
-    bind("owner_attempt_id", owner.get("attempt_id"), _dig(plan, ("attempt_id",)))
+    bind("owner_plan_sha256", owner.get("plan_sha256"), expected_plan_sha256, "sha256")
+    bind("owner_attempt_id", owner.get("attempt_id"), _dig(plan, ("attempt_id",)), "text")
 
     checks += 1
     missing_files = [name for name in REQUIRED_PACKAGE_FILES if name not in package_digests]

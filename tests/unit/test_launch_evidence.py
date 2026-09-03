@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 
 import pytest
 
@@ -38,8 +39,8 @@ from o2mcp.launch_evidence import (
 _PLAN = {
     "attempt_id": "002",
     "software": {"bundle": {"bundle_sha256": "b" * 64}},
-    "runtime_wrapper": {"sha256": "w" * 64},
-    "interpreter": {"sha256": "i" * 64, "closure_sha256": "c" * 64, "context_sha256": "x" * 64},
+    "runtime_wrapper": {"sha256": "a1" * 32},
+    "interpreter": {"sha256": "b2" * 32, "closure_sha256": "c" * 64, "context_sha256": "c3" * 32},
     "destination": {"inode": 6411787343743799620, "mount": "/n/scratch", "expected_package": "/pkg/attempt-002"},
 }
 
@@ -58,11 +59,11 @@ def _diagnostic(plan: dict) -> dict:
         "attempt_id": "002",
         "runtime": {
             "source_bundle": {"bundle_sha256": "b" * 64},
-            "runtime_wrapper_sha256": "w" * 64,
+            "runtime_wrapper_sha256": "a1" * 32,
             "approved_interpreter": {
                 "approved_path": "/usr/bin/python3",
-                "sha256": "i" * 64,
-                "runtime_context_sha256": "x" * 64,
+                "sha256": "b2" * 32,
+                "runtime_context_sha256": "c3" * 32,
                 "dynamic_closure": {"closure_sha256": "c" * 64},
             },
         },
@@ -74,10 +75,10 @@ def _diagnostic(plan: dict) -> dict:
             "scheduler": {"job_id": "52085188", "allocated_hostnames": ["compute-b-16-192"]},
             "environment": {"SLURM_JOB_ACCOUNT": "tabin", "SLURM_JOB_PARTITION": "short"},
         },
-        "launch": {"loaded_library_closure": {"loaded_closure_sha256": "l" * 64}},
+        "launch": {"loaded_library_closure": {"loaded_closure_sha256": "d4" * 32}},
         "output": {
             "package": "/pkg/attempt-002",
-            "reopened_output_sha256": "r" * 64,
+            "reopened_output_sha256": "e5" * 32,
             "verification": {"status": "success", "n_payloads": len(_MANIFEST)},
         },
     }
@@ -131,7 +132,7 @@ def test_intact_chain_mints_a_record() -> None:
     # The count is what was actually checked, payload by payload, not a constant.
     assert record["binding_check"]["checked"] > len(_manifest())
     assert record["submission"]["job_id"] == "52085188"
-    assert record["unbound_run_reported"]["loaded_closure_sha256"] == "l" * 64
+    assert record["unbound_run_reported"]["loaded_closure_sha256"] == "d4" * 32
     assert record["operator_approval"]["approval_reference"] == "operator approved"
 
 
@@ -803,9 +804,9 @@ def test_run_reported_values_are_separated_from_the_bound_ones() -> None:
         "diagnostic_schema_version",
     }
     assert "not part of this record's authenticated claims" in unbound["note"]
-    assert unbound["loaded_closure_sha256"] == "l" * 64
+    assert unbound["loaded_closure_sha256"] == "d4" * 32
     assert unbound["mount_source"] == "server:/scratch"
-    assert unbound["reopened_output_sha256"] == "r" * 64
+    assert unbound["reopened_output_sha256"] == "e5" * 32
     assert unbound["allocated_hostnames"] == ["compute-b-16-192"]
     # And none of them is left behind in a section that reads as authenticated.
     assert "mount_source" not in record["destination"]
@@ -891,3 +892,57 @@ def test_a_missing_approval_field_fails_verification() -> None:
     del record["operator_approval"]["client_id"]
     with pytest.raises(LaunchEvidenceError, match="client_id"):
         verify_launch_evidence(record, entry)
+
+
+# --- agreeing on nonsense is not a binding ------------------------------------
+@pytest.mark.parametrize(
+    ("path", "plan_path", "value"),
+    [
+        (("runtime", "source_bundle", "bundle_sha256"), ("software", "bundle", "bundle_sha256"), ""),
+        (("runtime", "runtime_wrapper_sha256"), ("runtime_wrapper", "sha256"), {}),
+        (("runtime", "approved_interpreter", "sha256"), ("interpreter", "sha256"), "not a digest"),
+        (("runtime", "approved_interpreter", "sha256"), ("interpreter", "sha256"), "Z" * 64),
+        (("destination_binding", "inode"), ("destination", "inode"), 0),
+        (("destination_binding", "inode"), ("destination", "inode"), "42"),
+        (("destination_binding", "inode"), ("destination", "inode"), True),
+    ],
+)
+def test_a_bound_field_agreeing_on_a_malformed_value_refuses(path, plan_path, value) -> None:
+    """Both sides matching is not enough if neither is the kind of thing meant.
+
+    A falsified plan and a matching diagnostic could otherwise settle on an
+    empty string or an object for an interpreter digest, pass every check, and
+    produce a record whose identities identify nothing.
+    """
+
+    plan = json.loads(json.dumps(_PLAN))
+    target = plan
+    for key in plan_path[:-1]:
+        target = target[key]
+    target[plan_path[-1]] = value
+    diagnostic = _diagnostic(plan)
+    target = diagnostic
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    with pytest.raises(LaunchEvidenceError, match="is not a well-formed"):
+        _build(plan=plan, diagnostic=diagnostic)
+
+
+def test_a_mount_point_that_is_not_a_path_refuses() -> None:
+    plan = json.loads(json.dumps(_PLAN))
+    plan["destination"]["mount"] = "scratch"
+    diagnostic = _diagnostic(plan)
+    diagnostic["destination_binding"]["linux_mountinfo"]["mount_point"] = "scratch"
+    with pytest.raises(LaunchEvidenceError, match="is not a well-formed path"):
+        _build(plan=plan, diagnostic=diagnostic)
+
+
+def test_an_uppercase_digest_is_refused_so_comparisons_stay_exact() -> None:
+    plan = json.loads(json.dumps(_PLAN))
+    plan["interpreter"]["sha256"] = "B2" * 32
+    diagnostic = _diagnostic(plan)
+    diagnostic["runtime"]["approved_interpreter"]["sha256"] = "B2" * 32
+    with pytest.raises(LaunchEvidenceError, match="is not a well-formed sha256"):
+        _build(plan=plan, diagnostic=diagnostic)

@@ -1616,8 +1616,8 @@ def _launch_evidence_responder(
     plan = {
         "attempt_id": "002",
         "software": {"bundle": {"bundle_sha256": "b" * 64}},
-        "runtime_wrapper": {"sha256": "w" * 64},
-        "interpreter": {"sha256": "i" * 64, "closure_sha256": "c" * 64, "context_sha256": "x" * 64},
+        "runtime_wrapper": {"sha256": "a1" * 32},
+        "interpreter": {"sha256": "b2" * 32, "closure_sha256": "c" * 64, "context_sha256": "c3" * 32},
         "destination": {"inode": 42, "mount": "/n/scratch", "expected_package": named},
     }
     diagnostic = {
@@ -1628,11 +1628,11 @@ def _launch_evidence_responder(
         "attempt_id": "002",
         "runtime": {
             "source_bundle": {"bundle_sha256": "b" * 64},
-            "runtime_wrapper_sha256": "w" * 64,
+            "runtime_wrapper_sha256": "a1" * 32,
             "approved_interpreter": {
                 "approved_path": "/usr/bin/python3",
-                "sha256": "i" * 64,
-                "runtime_context_sha256": "x" * 64,
+                "sha256": "b2" * 32,
+                "runtime_context_sha256": "c3" * 32,
                 "dynamic_closure": {"closure_sha256": "c" * 64},
             },
         },
@@ -1644,10 +1644,10 @@ def _launch_evidence_responder(
             "scheduler": {"job_id": job_id, "allocated_hostnames": ["compute-b-16-192"]},
             "environment": {"SLURM_JOB_ACCOUNT": "tabin", "SLURM_JOB_PARTITION": "short"},
         },
-        "launch": {"loaded_library_closure": {"loaded_closure_sha256": "l" * 64}},
+        "launch": {"loaded_library_closure": {"loaded_closure_sha256": "d4" * 32}},
         "output": {
             "package": named,
-            "reopened_output_sha256": "r" * 64,
+            "reopened_output_sha256": "e5" * 32,
             "verification": {
                 "status": "success",
                 "n_payloads": len(listed) if n_payloads is None else n_payloads,
