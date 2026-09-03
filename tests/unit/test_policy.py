@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from o2mcp.policy import (
+    SUPPORTED_SCHEMA_VERSIONS,
     DEFAULT_GRANT_TTL_SECONDS,
     MAX_LAUNCH_EVIDENCE_MINTS,
     SCHEMA_VERSION,
@@ -745,6 +746,66 @@ def test_schema_1_state_is_migrated_rather_than_invalidated(tmp_path):
     persisted = json.loads(policy.read_text())
     assert persisted["schema_version"] == SCHEMA_VERSION
     assert [mint["evidence_sha256"] for mint in persisted["launch_evidence_mints"]] == ["a" * 64]
+
+
+def test_the_written_schema_is_the_oldest_one_still_accepted():
+    """Writing a version an already-running reader refuses is an outage.
+
+    A reader one vintage behind does not ignore an unknown schema the way it
+    ignores an unknown key -- it refuses the whole file. Bumping the written
+    version before every deployed reader accepted it took out each live
+    process: a broker start rewrote the file, and the long-lived server then
+    failed every command against it. Accept first, write later.
+    """
+
+    assert SCHEMA_VERSION == min(SUPPORTED_SCHEMA_VERSIONS)
+
+
+def test_a_schema_2_file_keeps_its_ledger_when_normalised(tmp_path):
+    """Files from the brief schema-2 build exist; reading one must not drop it."""
+
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "generation": "00000000-0000-4000-8000-000000000002",
+                "revision": 11,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+                "launch_evidence_mints": [
+                    {
+                        "approval_reference": "operator approved",
+                        "stage": "platform-canary",
+                        "job_id": "52127102",
+                        "package": "/pkg/attempt-001",
+                        "client_id": "client-z",
+                        "policy_generation": "00000000-0000-4000-8000-000000000002",
+                        "policy_revision": 10,
+                        "evidence_sha256": "b" * 64,
+                        "plan_sha256": "c" * 64,
+                        "at": 5.0,
+                    }
+                ],
+            }
+        )
+    )
+    policy.chmod(0o600)
+    store = O2PolicyStore(policy, client_id="client-a", clock=lambda: 1000.0)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is True
+    # The attestation survives being read by the version that writes 1.
+    assert [m["evidence_sha256"] for m in snapshot.state["launch_evidence_mints"]] == ["b" * 64]
+    assert snapshot.state["schema_version"] == SCHEMA_VERSION
+
+    _mint(store, snapshot.state)
+    persisted = json.loads(policy.read_text())
+    # Normalised down to what every live reader accepts, ledger intact and appended to.
+    assert persisted["schema_version"] == SCHEMA_VERSION
+    assert [m["evidence_sha256"] for m in persisted["launch_evidence_mints"]] == ["b" * 64, "a" * 64]
 
 
 def test_an_unknown_schema_is_still_refused(tmp_path):

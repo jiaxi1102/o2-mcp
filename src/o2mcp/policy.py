@@ -43,10 +43,20 @@ PolicyMode = Literal["disabled", "reuse_only"]
 LoginTarget = Literal["login", "transfer"]
 LoginAuthorizationMethod = Literal["explicit_user_approval", "standing_on_vpn"]
 
-SCHEMA_VERSION = 2
-# Schema 1 predates the durable launch-evidence ledger and is still readable: it
-# is migrated in memory on read and persisted as 2 by the next policy write, so
-# an existing policy file is never invalidated merely by upgrading this code.
+# The version we WRITE. The mint ledger is a purely additive key, and every
+# released reader ignores keys it does not know -- so the file does not need a
+# bump to carry it. Writing 2 while an older reader was still live did not make
+# that reader ignore one key: it made the reader refuse the whole file, which
+# took out every already-running process that had loaded the older module. A
+# broker start rewrote the file to 2 and the long-lived server, one vintage
+# behind, then failed every command against it.
+#
+# So this stays at 1 until every deployed reader is known to accept 2. Accept
+# first, write later -- the reverse order is an outage, not a migration.
+SCHEMA_VERSION = 1
+# The versions we ACCEPT. 2 is accepted because it was briefly written and
+# those files exist; reading one normalises it back down to 1 without losing
+# the ledger. Raise SCHEMA_VERSION to 2 only once no reader below it survives.
 SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 DEFAULT_GRANT_TTL_SECONDS = 300.0
 DEFAULT_LOGIN_COOLDOWN_SECONDS = 300.0
@@ -807,12 +817,16 @@ class O2PolicyStore:
         # Detach before migrating so no caller's structure -- or a JSON decoder
         # cache -- is mutated by reading.
         payload = json.loads(json.dumps(payload))
+        # Ensure the ledger key regardless of version. Tying this to a version
+        # mismatch meant that once the written version matched the file's, the
+        # key stopped being seeded and the next write dropped it -- the ledger
+        # has to exist for every accepted version, not only for migrated ones.
+        # setdefault only fills an absent key, so a file that already carries a
+        # ledger keeps it verbatim.
+        payload.setdefault("launch_evidence_mints", [])
         if version != SCHEMA_VERSION:
-            # Schema 1 is otherwise entirely valid; it simply has no durable mint
-            # ledger yet. Adding the empty list upgrades it in memory, and the
-            # next policy write persists the new version. Nothing is rewritten
-            # merely to read, and no existing state is invalidated.
-            payload.setdefault("launch_evidence_mints", [])
+            # Normalise an accepted version to the one we write, in memory only.
+            # Nothing is rewritten merely to read and no state is invalidated.
             payload["schema_version"] = SCHEMA_VERSION
         revision = payload.get("revision")
         if type(revision) is not int or revision < 0:
