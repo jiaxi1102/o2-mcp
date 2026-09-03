@@ -1246,13 +1246,13 @@ def _absolute_remote_path(value: str, *, label: str) -> str:
 
 _MARKER_DIAGNOSTIC_SIZE = "===DIAGNOSTICSIZE==="
 _MARKER_PLAN_SIZE = "===PLANSIZE==="
-_MARKER_OWNER = "===OWNER==="
+_MARKER_OWNER_SIZE = "===OWNERSIZE==="
 _MARKER_MANIFEST_SIZE = "===MANIFESTSIZE==="
 _MARKER_RESOLVED = "===RESOLVED==="
 _LAUNCH_EVIDENCE_MARKERS = (
     _MARKER_DIAGNOSTIC_SIZE,
     _MARKER_PLAN_SIZE,
-    _MARKER_OWNER,
+    _MARKER_OWNER_SIZE,
     _MARKER_MANIFEST_SIZE,
     _MARKER_RESOLVED,
 )
@@ -1382,6 +1382,7 @@ def _read_launch_artifacts(
     """
 
     manifest_path = str(PurePosixPath(package_path) / "SHA256SUMS")
+    owner_path = str(PurePosixPath(package_path) / "PUBLICATION_OWNER.json")
     command = "; ".join(
         [
             f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC_SIZE)}",
@@ -1390,6 +1391,8 @@ def _read_launch_artifacts(
             f"stat -c %s -- {shlex.quote(plan_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST_SIZE)}",
             f"stat -c %s -- {shlex.quote(manifest_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER_SIZE)}",
+            f"stat -c %s -- {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_RESOLVED)}",
             f"realpath -- {shlex.quote(package_path)}",
         ]
@@ -1465,7 +1468,13 @@ def _read_launch_artifacts(
         # The owner marker is the artifact tying the package to this plan, so
         # like SHA256SUMS the bytes parsed must be the file that was hashed.
         "owner": parse_encoded_json_artifact(
-            sections[_MARKER_OWNER],
+            _read_artifact_base64(
+                path=owner_path,
+                size_section=sections[_MARKER_OWNER_SIZE],
+                timeout=timeout,
+                label="publication owner",
+                ceiling=_MAX_JSON_ARTIFACT_BYTES,
+            ),
             expected_sha256=package_digests.get("PUBLICATION_OWNER.json"),
             label="publication owner",
         ),
@@ -1547,6 +1556,20 @@ def _read_artifact_base64(*, path: str, size_section: str, timeout: float, label
             )
         _refuse_truncated_read(result, label=f"the {label} read")
         encoded.append("".join(result.stdout.split()))
+    # The size was taken once, before the digest was computed and before these
+    # reads. A file that grew afterwards would still hand back a prefix that
+    # hashes to the recorded digest, so the manifest could be extended with
+    # entries this never sees. Probing one byte past the end refuses that.
+    probe = f"tail -c +{size + 1} -- {shlex.quote(path)} | head -c 1 | wc -c"
+    result = _connection().run(probe, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not confirm the end of {} on O2: {}".format(label, (result.stderr or "").strip()[:400])
+        )
+    if result.stdout.strip() != "0":
+        raise LaunchEvidenceError(
+            f"{label} grew while it was being read, so the bytes hashed are only a prefix of the file now " "on disk"
+        )
     return "".join(encoded)
 
 

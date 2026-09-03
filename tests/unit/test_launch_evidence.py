@@ -33,6 +33,7 @@ from o2mcp.launch_evidence import (
     required_package_files,
     verify_launch_evidence,
 )
+from o2mcp.runorg.execution_models import SubmissionIdentity
 
 _PLAN = {
     "attempt_id": "002",
@@ -1000,17 +1001,45 @@ def test_a_run_recording_no_digest_for_its_own_files_refuses(field) -> None:
 
 
 # --- the accounting comment: checked when present, recorded when absent --------
+def _engine_comment(plan_sha256=None, stage_id="platform-canary", attempt=2) -> str:
+    """The identity the execution engine writes into Slurm's --comment."""
+
+    return SubmissionIdentity(plan_sha256 or plan_digest(_PLAN), stage_id, attempt).comment
+
+
 def test_a_comment_naming_another_plan_refuses_to_mint() -> None:
-    """Once submissions carry the plan digest, a sibling job stops passing."""
+    """Once submissions carry the identity, a sibling job stops passing."""
 
-    with pytest.raises(LaunchEvidenceError, match="did not submit this plan"):
-        _build(scheduler_record=_scheduler_record(comment="0" * 64))
+    with pytest.raises(LaunchEvidenceError, match="names plan"):
+        _build(scheduler_record=_scheduler_record(comment=_engine_comment(plan_sha256="0" * 64)))
 
 
-def test_a_comment_naming_this_plan_mints_and_is_recorded_as_bound() -> None:
-    record = _build(scheduler_record=_scheduler_record(comment=plan_digest(_PLAN)))
+def test_a_comment_naming_another_stage_refuses_to_mint() -> None:
+    """The engine's identity carries the stage too, so bind that as well."""
+
+    with pytest.raises(LaunchEvidenceError, match="names stage"):
+        _build(scheduler_record=_scheduler_record(comment=_engine_comment(stage_id="acquisition")))
+
+
+def test_a_comment_that_is_not_an_engine_identity_refuses_to_mint() -> None:
+    """A non-empty comment this cannot verify is not evidence of anything."""
+
+    with pytest.raises(LaunchEvidenceError, match="not an o2-mcp submission identity"):
+        _build(scheduler_record=_scheduler_record(comment="set by hand"))
+
+
+def test_a_bare_digest_comment_is_not_accepted() -> None:
+    """The engine's format is the format; a bare digest is not one of its jobs."""
+
+    with pytest.raises(LaunchEvidenceError, match="not an o2-mcp submission identity"):
+        _build(scheduler_record=_scheduler_record(comment=plan_digest(_PLAN)))
+
+
+def test_a_comment_naming_this_plan_and_stage_mints_and_is_recorded_as_bound() -> None:
+    comment = _engine_comment()
+    record = _build(scheduler_record=_scheduler_record(comment=comment))
     assert record["binding_check"]["scheduler_comment_bound"] is True
-    assert record["unbound_run_reported"]["scheduler_comment"] == plan_digest(_PLAN)
+    assert record["unbound_run_reported"]["scheduler_comment"] == comment
 
 
 def test_an_absent_comment_mints_and_says_the_job_is_not_bound_to_the_plan() -> None:

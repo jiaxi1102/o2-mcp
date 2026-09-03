@@ -1594,6 +1594,7 @@ def _launch_evidence_responder(
     observed_inode=None,
     diagnostic_edit=None,
     stage_id="platform-canary",
+    grown_by=None,
     accounting=_UNSET,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
@@ -1673,6 +1674,15 @@ def _launch_evidence_responder(
     # for, so the fixture's SHA256SUMS digest has to be the real one.
     owner_bytes = _json.dumps(owner).encode()
 
+    def _body_for(operand):
+        if operand.endswith("diag.json"):
+            return _json.dumps(diagnostic).encode()
+        if operand.endswith("plan.json"):
+            return _json.dumps(plan).encode()
+        if operand.endswith("PUBLICATION_OWNER.json"):
+            return owner_bytes
+        return manifest_bytes if grown_by is None else manifest_bytes + b"x" * grown_by
+
     def responder(argv, input_text):
         command = argv[-1]
         if command.startswith("/usr/bin/python3 -c "):
@@ -1697,19 +1707,19 @@ def _launch_evidence_responder(
                 else:
                     reply["errors"][name] = "ENOENT"
             return _json.dumps(reply), "", 0
+        if command.startswith("tail -c +") and command.endswith("| wc -c"):
+            # The end-of-file probe: one byte past the size that was stat'd.
+            operand = shlex.split(command.split(" -- ")[1].split(" |")[0])[0]
+            start = int(command.split("tail -c +")[1].split(" ")[0]) - 1
+            body = _body_for(operand)
+            return ("1" if len(body) > start else "0") + "\n", "", 0
         if command.startswith("tail -c +"):
             # Every large artifact is read in bounded pieces so it still fits the
             # broker's output cap; serve exactly the slice that was asked for.
             start = int(command.split("tail -c +")[1].split(" ")[0]) - 1
             count = int(command.split("head -c ")[1].split(" ")[0])
-            operand = shlex.split(command.split("tail -c +")[1].split(" -- ")[1].split(" |")[0])[0]
-            if operand.endswith("diag.json"):
-                body = _json.dumps(diagnostic).encode()
-            elif operand.endswith("plan.json"):
-                body = _json.dumps(plan).encode()
-            else:
-                body = manifest_bytes
-            return _base64.b64encode(body[start : start + count]).decode(), "", 0
+            operand = shlex.split(command.split(" -- ")[1].split(" |")[0])[0]
+            return _base64.b64encode(_body_for(operand)[start : start + count]).decode(), "", 0
         if command.startswith("sacct "):
             # Slurm accounting, read through the broker rather than taken from
             # the diagnostic. One allocation row, `|`-separated, no header.
@@ -1720,8 +1730,8 @@ def _launch_evidence_responder(
                 str(len(_json.dumps(diagnostic).encode())),
                 "===PLANSIZE===",
                 str(len(_json.dumps(plan).encode())),
-                "===OWNER===",
-                _base64.b64encode(owner_bytes).decode(),
+                "===OWNERSIZE===",
+                str(len(owner_bytes)),
                 "===MANIFESTSIZE===",
                 str(len(manifest_bytes)),
                 "===RESOLVED===",
@@ -2396,12 +2406,54 @@ async def test_mint_binds_a_comment_naming_the_plan(monkeypatch, tmp_path):
     assert minted["ok"] is True
     assert minted["launch_evidence"]["binding_check"]["scheduler_comment_bound"] is False
 
-    wrong = _launch_evidence_responder(accounting="52085188|COMPLETED|tabin|short|" + "0" * 64)
+    wrong = _launch_evidence_responder(
+        accounting="52085188|COMPLETED|tabin|short|o2plan:v1:" + "0" * 64 + ":platform-canary:a002"
+    )
     _patch_connection(monkeypatch, tmp_path, responder=wrong)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
-    assert "did not submit this plan" in refused["message"]
+    assert "names plan" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_the_artifact_command_asks_for_every_section_it_requires(monkeypatch, tmp_path):
+    """The reader must not require a section the command never asks for.
+
+    A responder that answers generously hides this: the command stopped emitting
+    the owner artifact while the reader still required it, so every real broker
+    response would have refused the mint on a missing section.
+    """
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+
+    artifact = [call["argv"][-1] for call in runner.calls if "===DIAGNOSTICSIZE===" in call["argv"][-1]][0]
+    for marker in o2server._LAUNCH_EVIDENCE_MARKERS:
+        assert marker in artifact, f"{marker} is required by the reader but never asked for"
+    # And the owner is actually read, not merely sized.
+    assert any("PUBLICATION_OWNER.json" in call["argv"][-1] for call in runner.calls)
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_manifest_that_grew_after_it_was_sized(monkeypatch, tmp_path):
+    """A prefix that hashes correctly is not the file that is on disk now.
+
+    The size is taken once, before the digest and before the chunk reads, so a
+    manifest extended afterwards would hand back a prefix matching the recorded
+    digest while carrying entries this never sees.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(grown_by=4096))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "grew while it was being read" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
 
 
 @pytest.mark.anyio

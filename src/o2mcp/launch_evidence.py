@@ -48,7 +48,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 from typing import Any
 
-from o2mcp.runorg.execution_models import SUCCESS_SLURM_STATES
+from o2mcp.runorg.execution_models import SUCCESS_SLURM_STATES, SubmissionIdentity
 from o2mcp.runorg.strict_json import strict_json_object
 
 LAUNCH_EVIDENCE_SCHEMA = "o2-launch-evidence-v1"
@@ -501,20 +501,40 @@ def build_launch_evidence(
                 mismatches.append(
                     f"scheduler {label}: diagnostic={claimed!r} accounting={scheduler_record.get(reported)!r}"
                 )
-        # The plan builder sets the job's Slurm comment to the plan digest, which
-        # is the only field that ties the accounting row to *this* plan rather
-        # than to any job of the same account and partition. It is checked when
-        # present and recorded as unbound when absent, so the binding is live the
-        # moment submissions carry it without making every job submitted before
-        # then unattestable. That asymmetry is deliberate.
+        # The Slurm comment is the only field that ties the accounting row to
+        # *this* plan rather than to any job of the same account and partition.
+        # The execution engine already writes a structured identity there --
+        # o2plan:v1:<plan sha>:<stage>:aNNN -- so this parses it with the
+        # engine's own reader rather than inventing a second format, and binds
+        # both the plan digest and the stage it carries.
+        #
+        # It is checked when present and recorded as unbound when absent, so the
+        # binding is live for engine-submitted jobs without making jobs
+        # submitted before it unattestable. That asymmetry is deliberate. A
+        # comment that is present but not an engine identity is refused: a
+        # non-empty comment this cannot verify is not evidence of anything.
         comment = (scheduler_record.get("comment") or "").strip()
         if comment:
             checks += 1
-            if comment != expected_plan_sha256:
+            try:
+                identity = SubmissionIdentity.from_comment(comment)
+            except ValueError:
                 mismatches.append(
-                    f"scheduler comment: accounting={comment!r} plan={expected_plan_sha256}; that job did "
-                    "not submit this plan"
+                    f"scheduler comment: accounting={comment!r} is not an o2-mcp submission identity, so "
+                    "it cannot confirm which plan that job ran"
                 )
+            else:
+                if identity.plan_sha256 != expected_plan_sha256:
+                    mismatches.append(
+                        f"scheduler comment: the job names plan {identity.plan_sha256} but this record "
+                        f"attests {expected_plan_sha256}"
+                    )
+                checks += 1
+                if identity.stage_id != stage:
+                    mismatches.append(
+                        f"scheduler comment: the job names stage {identity.stage_id!r} but this record "
+                        f"attests {stage!r}"
+                    )
 
     checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
@@ -680,8 +700,10 @@ def build_launch_evidence(
             "allocated_hostnames": scheduler.get("allocated_hostnames"),
             # The mount point is bound; the source backing it is not observed.
             "mount_source": mountinfo.get("mount_source"),
-            # Empty until the plan builder sets the job's Slurm comment to the
-            # plan digest; non-empty it is bound, and this says which happened.
+            # Empty for jobs submitted before the engine set a structured
+            # identity here; non-empty it is parsed and bound, and the attempt
+            # index it also carries is recorded but not compared, because the
+            # plan's attempt_id format is not this module's to assume.
             "scheduler_comment": (scheduler_record.get("comment") or "").strip() or None,
             # Never recomputed here -- the payloads are rehashed against
             # SHA256SUMS instead, which is what the package's integrity rests on.
