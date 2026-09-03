@@ -987,3 +987,39 @@ def test_the_ledger_files_a_stage_exactly_as_given(tmp_path):
     assert entry["stage"] == "platform  canary"
     # Only the free-text approval note is still collapsed.
     assert entry["approval_reference"] == "operator approved"
+
+
+def test_repair_keeps_the_mints_that_are_still_valid(tmp_path):
+    """One malformed entry must not cost every other attestation.
+
+    Repair replaces the whole file, and these entries are the only durable
+    authenticators their evidence records have -- so a localized corruption that
+    emptied the ledger would silently invalidate every record ever minted.
+    """
+
+    good = [_valid_mint(evidence_sha256=f"{index:064x}") for index in range(3)]
+    store = _policy_with_mints(tmp_path, [good[0], {"at": 1.0}, good[1], _valid_mint(policy_revision=-1), good[2]])
+    assert store.snapshot().valid is False
+
+    repaired = store.disable(reason="repair after localized ledger damage")
+    kept = [entry["evidence_sha256"] for entry in repaired["launch_evidence_mints"]]
+    assert kept == [f"{index:064x}" for index in range(3)]
+    assert repaired["mode"] == "disabled"
+
+    # The repair says how much survived, so an emptied ledger is distinguishable
+    # from one that had nothing to keep.
+    event = [e for e in repaired["events"] if e.get("event") == "policy_repaired_with_conservative_cooldown"][-1]
+    assert event["launch_evidence_mints_kept"] == 3
+    assert store.snapshot().valid is True
+
+
+def test_repair_of_unparseable_json_keeps_nothing_and_says_so(tmp_path):
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text("{truncated")
+    policy.chmod(0o600)
+    store = O2PolicyStore(policy, client_id="client-a")
+
+    repaired = store.disable(reason="repair unparseable policy")
+    assert repaired["launch_evidence_mints"] == []
+    event = [e for e in repaired["events"] if e.get("event") == "policy_repaired_with_conservative_cooldown"][-1]
+    assert event["launch_evidence_mints_kept"] == 0

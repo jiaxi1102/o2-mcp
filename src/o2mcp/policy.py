@@ -712,11 +712,45 @@ class O2PolicyStore:
             raise O2PolicyInvalidError(f"Cannot inspect O2 policy at {self.path}: {exc}") from exc
         self._validate_file_metadata(self.path, metadata)
         try:
-            return self._validate_state(json.loads(self.path.read_text()))
-        except (OSError, ValueError, O2PolicyInvalidError):
-            return self._conservative_repair_state(metadata)
+            payload = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            # Nothing parsed, so there is nothing to salvage.
+            return self._conservative_repair_state(metadata, salvaged_mints=[])
+        try:
+            return self._validate_state(payload)
+        except O2PolicyInvalidError:
+            # The JSON parsed but something in it is invalid. One malformed mint
+            # must not cost every other attestation, so keep the entries that
+            # stand on their own.
+            return self._conservative_repair_state(metadata, salvaged_mints=self._salvage_mints(payload))
 
-    def _conservative_repair_state(self, metadata: os.stat_result) -> dict[str, Any]:
+    def _salvage_mints(self, payload: Any) -> list[dict[str, Any]]:
+        """Keep the mint entries that are individually valid, drop the rest.
+
+        Repair replaces the whole file, so without this a single malformed entry
+        would erase every other attestation in the ledger -- and those entries
+        are the only durable authenticators their evidence records have. An
+        entry that does not validate on its own authenticates nothing and is
+        dropped; one that does is worth keeping regardless of what damaged its
+        neighbour.
+        """
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("launch_evidence_mints"), list):
+            return []
+        salvaged: list[dict[str, Any]] = []
+        for entry in payload["launch_evidence_mints"]:
+            if len(salvaged) >= MAX_LAUNCH_EVIDENCE_MINTS:
+                break
+            try:
+                self._validate_launch_evidence_mints([entry])
+            except O2PolicyInvalidError:
+                continue
+            salvaged.append(json.loads(json.dumps(entry)))
+        return salvaged
+
+    def _conservative_repair_state(
+        self, metadata: os.stat_result, *, salvaged_mints: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """Replace malformed JSON while retaining a file-age retry cooldown.
 
         Truncation destroys the exact login-attempt receipt, so repair cannot
@@ -733,6 +767,7 @@ class O2PolicyStore:
             modification_time = now
         started_at = max(0.0, min(modification_time, now))
         state = self._initial_state()
+        state["launch_evidence_mints"] = salvaged_mints
         repair_id = f"repair-{uuid.uuid4()}"
         state["login_attempt"] = {
             "grant_id": repair_id,
@@ -752,6 +787,10 @@ class O2PolicyStore:
             "policy_repaired_with_conservative_cooldown",
             repair_id=repair_id,
             source_modified_at=modification_time,
+            # Say how much of the attestation ledger survived, so a repair that
+            # silently emptied it is distinguishable from one that had nothing
+            # to keep.
+            launch_evidence_mints_kept=len(salvaged_mints),
         )
         return state
 
