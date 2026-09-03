@@ -1574,19 +1574,33 @@ _PACKAGE = "/pkg/attempt-002"
 _PAYLOADS = {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
 
 
-def _launch_evidence_responder(job_id="52085188", *, package=_PACKAGE, payloads=None, approved_package=None):
+def _launch_evidence_responder(
+    job_id="52085188",
+    *,
+    package=_PACKAGE,
+    payloads=None,
+    manifest_payloads=None,
+    approved_package=None,
+    manifest_sha256=None,
+):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
     ``package`` is where the artifacts actually live, ``approved_package`` is what
     the plan and the diagnostic name; they differ only when a test is checking
-    that a substituted directory is refused.
+    that a substituted directory is refused. ``manifest_payloads`` is what
+    SHA256SUMS lists and ``payloads`` is what those files actually hash to, so a
+    test can make the package drift out from under its own manifest.
     """
 
+    import base64 as _base64
+    import hashlib as _hashlib
     import json as _json
+    import shlex
 
     from o2mcp.launch_evidence import plan_digest
 
-    on_disk = dict(_PAYLOADS if payloads is None else payloads)
+    listed = dict(_PAYLOADS if manifest_payloads is None else manifest_payloads)
+    on_disk = dict(listed if payloads is None else payloads)
     named = package if approved_package is None else approved_package
     plan = {
         "attempt_id": "002",
@@ -1627,17 +1641,30 @@ def _launch_evidence_responder(job_id="52085188", *, package=_PACKAGE, payloads=
         },
     }
     owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
-    manifest = "\n".join(f"{digest}  {name}" for name, digest in sorted(_PAYLOADS.items()))
-    digests = "\n".join(
-        f"{'d' * 64}  {package}/{name}"
-        for name in sorted(("PUBLICATION_OWNER.json", "SUCCESS.json", "SHA256SUMS", "conversion_manifest.json"))
-    )
+    manifest_bytes = ("\n".join(f"{digest}  {name}" for name, digest in sorted(listed.items())) + "\n").encode()
+    # The server proves the manifest it parsed is the file it recorded a digest
+    # for, so the fixture's SHA256SUMS digest has to be the real one.
+    file_digests = {
+        "PUBLICATION_OWNER.json": "d" * 64,
+        "SUCCESS.json": "d" * 64,
+        "conversion_manifest.json": "d" * 64,
+        "SHA256SUMS": _hashlib.sha256(manifest_bytes).hexdigest() if manifest_sha256 is None else manifest_sha256,
+    }
+    digests = "\n".join(f"{digest}  {package}/{name}" for name, digest in sorted(file_digests.items()))
 
     def responder(argv, input_text):
         command = argv[-1]
         if command.startswith("sha256sum"):
-            # The second hold on the channel: the payloads the manifest named.
-            return "\n".join(f"{digest}  {package}/{name}" for name, digest in sorted(on_disk.items())), "", 0
+            # The later holds on the channel: the payloads the manifest named,
+            # in whatever batches the broker's command limit allowed. Answer only
+            # for the operands this batch actually asked about.
+            asked = [operand for operand in shlex.split(command)[2:]]
+            lines = []
+            for operand in asked:
+                name = operand[len(package) + 1 :]
+                if name in on_disk:
+                    lines.append(f"{on_disk[name]}  {operand}")
+            return "\n".join(lines), "", 0
         payload = "\n".join(
             [
                 "===DIAGNOSTIC===",
@@ -1647,7 +1674,7 @@ def _launch_evidence_responder(job_id="52085188", *, package=_PACKAGE, payloads=
                 "===OWNER===",
                 _json.dumps(owner),
                 "===MANIFEST===",
-                manifest,
+                _base64.b64encode(manifest_bytes).decode(),
                 "===DIGESTS===",
                 digests,
             ]
@@ -1840,6 +1867,57 @@ async def test_mint_records_the_record_digest_in_the_audit_ledger(monkeypatch, t
     tampered = json.loads(json.dumps(record))
     tampered["runtime_identities"]["interpreter_sha256"] = "0" * 64
     assert evidence_content_digest(tampered) != events[0]["evidence_sha256"]
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_manifest_that_changed_while_it_was_read(monkeypatch, tmp_path):
+    """The bytes that chose the payloads must be the file whose digest is recorded.
+
+    The manifest is read and hashed by two commands in the same line. If it is
+    replaced in between, the record would report the digest of a manifest it
+    never used to decide anything.
+    """
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_sha256="0" * 64))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "changed while it was being read" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeypatch, tmp_path):
+    """A package with many payloads must still mint.
+
+    One `sha256sum` naming every payload overruns the broker's command limit,
+    and BrokerClient.execute rejects it before it runs -- so an entirely
+    legitimate package could never be attested.
+    """
+
+    from o2mcp.broker_protocol import MAX_COMMAND_BYTES
+
+    payloads = {f"payloads/{'segment-' * 16}{index:04d}.ims": f"{index:064d}" for index in range(800)}
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_payloads=payloads))
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 800
+
+    hash_commands = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sha256sum")]
+    assert len(hash_commands) > 1, "the payload list should have needed more than one command"
+    assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in hash_commands)
+
+
+def test_hash_batches_refuses_a_single_path_it_can_never_send():
+    with pytest.raises(o2server.LaunchEvidenceError, match="too long for one broker command"):
+        list(o2server._hash_batches(["/n/scratch/" + "x" * 70000]))
+
+
+def test_hash_batches_keeps_one_command_when_it_fits():
+    assert list(o2server._hash_batches(["/a", "/b", "/c"])) == [["/a", "/b", "/c"]]
 
 
 @pytest.mark.anyio

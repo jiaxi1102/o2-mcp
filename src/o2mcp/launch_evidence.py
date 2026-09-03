@@ -37,6 +37,8 @@ without the MCP SDK.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -119,6 +121,39 @@ def parse_checksum_manifest(text: str, *, label: str = "SHA256SUMS") -> dict[str
     if not manifest:
         raise LaunchEvidenceError(f"{label} lists no payloads, so there is nothing to reverify")
     return manifest
+
+
+def parse_encoded_checksum_manifest(
+    encoded: str, *, expected_sha256: str | None, label: str = "SHA256SUMS"
+) -> dict[str, str]:
+    """Decode the manifest, prove it is the file whose digest was recorded, parse it.
+
+    The manifest is read and hashed by two different commands, so on their own
+    the bytes that chose the payloads and the digest the record reports as the
+    manifest's are not the same evidence: a replacement between them would let a
+    record claim a manifest it never used. Hashing the decoded bytes here and
+    requiring them to match closes that. The transport is base64 so the bytes
+    survive line-splitting exactly -- a digest over reconstructed text would
+    prove only that the reconstruction was self-consistent.
+    """
+
+    try:
+        raw = base64.b64decode("".join(encoded.split()), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise LaunchEvidenceError(f"{label} did not come back as valid base64: {error}") from error
+    observed = hashlib.sha256(raw).hexdigest()
+    if not expected_sha256:
+        raise LaunchEvidenceError(f"the package digest output carried no digest for {label}")
+    if observed != expected_sha256:
+        raise LaunchEvidenceError(
+            f"{label} changed while it was being read: the bytes parsed hash to {observed}, "
+            f"but the file digest recorded is {expected_sha256}"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise LaunchEvidenceError(f"{label} is not valid UTF-8: {error}") from error
+    return parse_checksum_manifest(text, label=label)
 
 
 def _dig(payload: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -404,6 +439,7 @@ __all__ = [
     "evidence_content_digest",
     "launch_evidence_digest",
     "parse_checksum_manifest",
+    "parse_encoded_checksum_manifest",
     "parse_json_artifact",
     "parse_sha256_lines",
     "plan_digest",

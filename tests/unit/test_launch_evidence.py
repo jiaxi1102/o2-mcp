@@ -7,6 +7,9 @@ so most of these assert a refusal.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+
 import pytest
 
 from o2mcp.launch_evidence import (
@@ -17,6 +20,7 @@ from o2mcp.launch_evidence import (
     evidence_content_digest,
     launch_evidence_digest,
     parse_checksum_manifest,
+    parse_encoded_checksum_manifest,
     parse_json_artifact,
     parse_sha256_lines,
     plan_digest,
@@ -344,3 +348,33 @@ def test_an_approval_carrying_the_right_digest_mints() -> None:
     digest = evidence_content_digest(_build(approval={}))
     record = _build(approval={"approval_reference": "operator approved", "evidence_sha256": digest})
     assert record["operator_approval"]["evidence_sha256"] == digest
+
+
+# --- the manifest parsed must be the manifest whose digest was recorded --------
+def _encoded_manifest() -> tuple[str, str]:
+    raw = "{}  a payload.ims\n".format("1" * 64).encode()
+    return base64.b64encode(raw).decode(), hashlib.sha256(raw).hexdigest()
+
+
+def test_encoded_manifest_parses_when_its_digest_matches() -> None:
+    encoded, digest = _encoded_manifest()
+    assert parse_encoded_checksum_manifest(encoded, expected_sha256=digest) == {"a payload.ims": "1" * 64}
+
+
+def test_a_manifest_replaced_between_the_two_reads_refuses_to_mint() -> None:
+    """The bytes that chose the payloads and the digest recorded must be one file."""
+
+    encoded, _ = _encoded_manifest()
+    with pytest.raises(LaunchEvidenceError, match="changed while it was being read"):
+        parse_encoded_checksum_manifest(encoded, expected_sha256="0" * 64)
+
+
+def test_a_manifest_with_no_recorded_digest_refuses_to_mint() -> None:
+    encoded, _ = _encoded_manifest()
+    with pytest.raises(LaunchEvidenceError, match="carried no digest"):
+        parse_encoded_checksum_manifest(encoded, expected_sha256=None)
+
+
+def test_a_manifest_that_is_not_base64_is_named_as_such() -> None:
+    with pytest.raises(LaunchEvidenceError, match="valid base64"):
+        parse_encoded_checksum_manifest("not base64 !!", expected_sha256="0" * 64)

@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
@@ -65,13 +66,14 @@ from o2mcp import (
     billing,
     transfer_tools,
 )
+from o2mcp.broker_protocol import MAX_COMMAND_BYTES
 from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
     LaunchEvidenceError,
     build_launch_evidence,
     evidence_content_digest,
     launch_evidence_digest,
-    parse_checksum_manifest,
+    parse_encoded_checksum_manifest,
     parse_json_artifact,
     parse_sha256_lines,
     required_package_files,
@@ -1281,7 +1283,7 @@ def _read_launch_artifacts(
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
             f"cat {shlex.quote(owner_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST)}",
-            f"cat {shlex.quote(manifest_path)}",
+            f"base64 {shlex.quote(manifest_path)}",
             f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
             "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
@@ -1316,13 +1318,48 @@ def _read_launch_artifacts(
         if name is None:
             raise LaunchEvidenceError(f"the package digest output named {operand!r}, which was not requested")
         package_digests[name] = digest
+    # The manifest is read and hashed by two commands, so the bytes that choose
+    # the payloads must be proven to be the file whose digest the record reports.
+    manifest = parse_encoded_checksum_manifest(
+        sections[_MARKER_MANIFEST], expected_sha256=package_digests.get("SHA256SUMS")
+    )
     return {
         "diagnostic": parse_json_artifact(sections[_MARKER_DIAGNOSTIC], label="run diagnostic"),
         "plan": parse_json_artifact(sections[_MARKER_PLAN], label="execution plan"),
         "owner": parse_json_artifact(sections[_MARKER_OWNER], label="publication owner"),
-        "checksum_manifest": parse_checksum_manifest(sections[_MARKER_MANIFEST]),
+        "checksum_manifest": manifest,
         "package_digests": package_digests,
     }
+
+
+# One `sha256sum` per payload would be correct but would take a hold on the
+# shared channel per file. Batching keeps that to the minimum number of commands
+# the broker's 64 KiB limit allows, with room for the prefix and the separators.
+_HASH_COMMAND_BUDGET = MAX_COMMAND_BYTES - 1024
+
+
+def _hash_batches(paths: list[str]) -> Iterator[list[str]]:
+    """Group quoted payload paths into commands the broker will accept.
+
+    A package with a few hundred image files overruns the broker's command limit
+    in one command, and `BrokerClient.execute` rejects it before it runs -- so an
+    entirely legitimate package could never mint.
+    """
+
+    batch: list[str] = []
+    used = 0
+    for path in paths:
+        quoted = shlex.quote(path)
+        cost = len(quoted.encode("utf-8")) + 1
+        if cost > _HASH_COMMAND_BUDGET:
+            raise LaunchEvidenceError(f"payload path is too long for one broker command: {path!r}")
+        if batch and used + cost > _HASH_COMMAND_BUDGET:
+            yield batch
+            batch, used = [], 0
+        batch.append(quoted)
+        used += cost
+    if batch:
+        yield batch
 
 
 def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeout: float) -> dict[str, str]:
@@ -1338,19 +1375,20 @@ def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeo
     targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
     if len(targets) != len(manifest):
         raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
-    command = "sha256sum -- {}".format(" ".join(shlex.quote(path) for path in sorted(targets)))
-    result = _connection().run(command, timeout=timeout)
-    if not result.ok:
-        raise LaunchEvidenceError(
-            "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
-        )
-    _refuse_truncated_read(result, label="the package payload digest read")
     payload_digests: dict[str, str] = {}
-    for operand, digest in parse_sha256_lines(result.stdout, label="the payload digest output").items():
-        name = targets.get(operand)
-        if name is None:
-            raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")
-        payload_digests[name] = digest
+    for batch in _hash_batches(sorted(targets)):
+        command = "sha256sum -- {}".format(" ".join(batch))
+        result = _connection().run(command, timeout=timeout)
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
+            )
+        _refuse_truncated_read(result, label="the package payload digest read")
+        for operand, digest in parse_sha256_lines(result.stdout, label="the payload digest output").items():
+            name = targets.get(operand)
+            if name is None:
+                raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")
+            payload_digests[name] = digest
     return payload_digests
 
 
