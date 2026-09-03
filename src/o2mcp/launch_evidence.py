@@ -558,13 +558,31 @@ def build_launch_evidence(
             "scheduler_accounting": dict(scheduler_record),
         },
         "runtime_identities": {
+            # Every digest at this level is bound to the approved plan by
+            # _BINDINGS, so a run that differs from what was approved cannot
+            # produce a record carrying them.
             "source_bundle_sha256": _dig(diagnostic, ("runtime", "source_bundle", "bundle_sha256")),
             "runtime_wrapper_sha256": _dig(diagnostic, ("runtime", "runtime_wrapper_sha256")),
-            "interpreter_path": interpreter.get("approved_path"),
             "interpreter_sha256": interpreter.get("sha256"),
             "interpreter_closure_sha256": closure.get("closure_sha256"),
             "interpreter_replay_context_sha256": interpreter.get("runtime_context_sha256"),
-            "loaded_closure_sha256": _dig(diagnostic, ("launch", "loaded_library_closure", "loaded_closure_sha256")),
+            "unbound_run_reported": {
+                # These are NOT authenticated claims. The plan approves no
+                # counterpart for either, and the server observes neither, so a
+                # compromised run could put any value here -- the loaded closure
+                # in particular could name a set of libraries that were never
+                # loaded. They are kept because they are useful context, and
+                # separated because everything above them is bound and they are
+                # not; a reader must not mistake one for the other.
+                "note": (
+                    "reported by the executed process, bound to nothing the plan approved or the "
+                    "server observed; not part of this record's authenticated claims"
+                ),
+                "interpreter_path": interpreter.get("approved_path"),
+                "loaded_closure_sha256": _dig(
+                    diagnostic, ("launch", "loaded_library_closure", "loaded_closure_sha256")
+                ),
+            },
         },
         "destination": {
             "package": _dig(diagnostic, ("output", "package")),

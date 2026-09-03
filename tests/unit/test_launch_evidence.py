@@ -13,6 +13,7 @@ import hashlib
 import pytest
 
 from o2mcp.launch_evidence import (
+    _BINDINGS,
     EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
     SACCT_RETENTION_DAYS,
@@ -131,7 +132,7 @@ def test_intact_chain_mints_a_record() -> None:
     # The count is what was actually checked, payload by payload, not a constant.
     assert record["binding_check"]["checked"] > len(_manifest())
     assert record["submission"]["job_id"] == "52085188"
-    assert record["runtime_identities"]["loaded_closure_sha256"] == "l" * 64
+    assert record["runtime_identities"]["unbound_run_reported"]["loaded_closure_sha256"] == "l" * 64
     assert record["operator_approval"]["approval_reference"] == "operator approved"
 
 
@@ -758,3 +759,32 @@ def test_a_record_without_an_approval_cannot_be_verified() -> None:
     record = _build(approval={})
     with pytest.raises(LaunchEvidenceError, match="no operator approval"):
         verify_launch_evidence(record, _ledger_entry(_approved_record()))
+
+
+# --- unbound values must not sit among the authenticated ones -----------------
+def test_run_reported_values_are_separated_from_the_bound_ones() -> None:
+    """The plan approves no counterpart for either, so neither is a claim.
+
+    A compromised run can put any digest in `loaded_closure_sha256`; leaving it
+    alongside the bound identities made the record look like it attested a set
+    of libraries it had never checked.
+    """
+
+    identities = _build()["runtime_identities"]
+    assert "loaded_closure_sha256" not in identities
+    assert "interpreter_path" not in identities
+    unbound = identities["unbound_run_reported"]
+    assert unbound["loaded_closure_sha256"] == "l" * 64
+    assert unbound["interpreter_path"] == "/usr/bin/python3"
+    assert "not part of this record's authenticated claims" in unbound["note"]
+
+
+def test_every_digest_left_at_the_top_of_runtime_identities_is_bound() -> None:
+    """If a field is added there without a binding, this fails."""
+
+    bound_labels = {label for label, _, _ in _BINDINGS}
+    identities = _build()["runtime_identities"]
+    for field in identities:
+        if field == "unbound_run_reported":
+            continue
+        assert field in bound_labels, f"{field} sits among the bound identities but nothing binds it"
