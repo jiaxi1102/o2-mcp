@@ -1156,6 +1156,11 @@ _ALLOCATION_OPTIONS = (
     # Not a resource: a QoS UsageFactor multiplies the charge itself.
     "--qos",
     "-q",
+    # An explicit node list sets the node count when nothing else does.
+    "--nodelist",
+    "-w",
+    "--nodefile",
+    "-F",
 )
 
 
@@ -1223,6 +1228,17 @@ def test_a_colon_separated_hetjob_is_recognised():
     plain = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --gres=gpu:1\n", remote_path="/n/x.sh")
     assert o2server._unpriceable_options_seen(plain) == []
     assert o2server._resource_flags_seen(plain) == ["--gres"]
+
+
+def test_an_explicit_node_list_sizes_the_allocation():
+    def mk(directive):
+        return o2server.SubmitInput(script_text=f"#!/bin/bash\n#SBATCH {directive}\n", remote_path="/n/x.sh")
+
+    assert o2server._resource_flags_seen(mk("--nodelist=node[01-04]")) == ["--nodelist"]
+    assert o2server._resource_flags_seen(mk("-w node01")) == ["-w"]
+    assert o2server._resource_flags_seen(mk("--nodefile=f.txt")) == ["--nodefile"]
+    # --exclude removes candidates without changing how much is allocated.
+    assert o2server._resource_flags_seen(mk("--exclude=node09")) == []
 
 
 def test_oversubscribe_is_not_a_resource_request():

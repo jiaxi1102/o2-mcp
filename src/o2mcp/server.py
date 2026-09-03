@@ -874,6 +874,13 @@ _RESOURCE_FLAGS = (
     "--core-spec",
     "-S",
     "--thread-spec",
+    # An explicit node list sets the node count when nothing else does --
+    # --nodelist=node[01-04] is four nodes -- so it sizes the allocation. -x /
+    # --exclude is not here: it removes candidates without changing the size.
+    "--nodelist",
+    "-w",
+    "--nodefile",
+    "-F",
     "--partition",
     "-p",
 )
