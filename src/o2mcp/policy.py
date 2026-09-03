@@ -48,6 +48,9 @@ DEFAULT_GRANT_TTL_SECONDS = 300.0
 DEFAULT_LOGIN_COOLDOWN_SECONDS = 300.0
 MAX_EVENTS = 64
 
+# Digests recorded in the audit ledger must be literal hex, never a label.
+_HEX_DIGITS = "0123456789abcdef"
+
 # All connections created by one MCP server process share an identity.  Binding a
 # grant to this value prevents another concurrently running task from consuming a
 # user's authorization merely because both tasks can read the global policy file.
@@ -320,6 +323,8 @@ class O2PolicyStore:
         stage: str,
         job_id: str,
         package: str,
+        evidence_sha256: str,
+        plan_sha256: str,
     ) -> dict[str, Any]:
         """Record one operator-approved launch-evidence mint in the audit ledger.
 
@@ -329,6 +334,14 @@ class O2PolicyStore:
         together with a human approval reference. Minting is otherwise an
         ordinary read of cluster artifacts and would attest nothing.
 
+        ``evidence_sha256`` is the digest of the *complete* evidence record this
+        approval covers, and storing it here is what ties the approval to that
+        exact content. Recording only the stage, job, and package would leave a
+        holder of a legitimate record free to alter its runtime identities or
+        package digests, recompute the record's own unkeyed digest, and keep an
+        approval object that still agreed with the ledger. With the digest
+        stored, that edit no longer matches the entry that approved it.
+
         It deliberately does NOT consume a login grant or change mode: attesting
         a finished run is not authority to start another one.
         """
@@ -337,6 +350,8 @@ class O2PolicyStore:
         clean_stage = self._clean_reference(stage, field="stage")
         clean_job = self._clean_reference(job_id, field="job_id")
         clean_package = self._clean_reference(package, field="package")
+        evidence_digest = self._clean_digest(evidence_sha256, field="evidence_sha256")
+        approved_plan_digest = self._clean_digest(plan_sha256, field="plan_sha256")
         with self._locked():
             state = self._read_valid_state()
             self._require_revision(state, expected_revision, expected_generation)
@@ -347,10 +362,14 @@ class O2PolicyStore:
                 stage=clean_stage,
                 job_id=clean_job,
                 package=clean_package,
+                evidence_sha256=evidence_digest,
+                plan_sha256=approved_plan_digest,
             )
             snapshot = self._write_next_revision(state)
         return {
             "approval_reference": reference,
+            "evidence_sha256": evidence_digest,
+            "plan_sha256": approved_plan_digest,
             "policy_revision": snapshot["revision"] if isinstance(snapshot, dict) else None,
             "policy_generation": snapshot["generation"] if isinstance(snapshot, dict) else None,
             "client_id": self.client_id,
@@ -1077,4 +1096,13 @@ class O2PolicyStore:
         cleaned = " ".join(value.split())
         if len(cleaned) > 240:
             raise O2PolicyInvalidError(f"{field} must be at most 240 characters")
+        return cleaned
+
+    @staticmethod
+    def _clean_digest(value: str, *, field: str) -> str:
+        """Require a literal SHA-256 hex digest for a binding the ledger records."""
+
+        cleaned = value.strip().lower() if isinstance(value, str) else ""
+        if len(cleaned) != 64 or cleaned.strip(_HEX_DIGITS):
+            raise O2PolicyInvalidError(f"{field} must be a 64-character SHA-256 hex digest")
         return cleaned

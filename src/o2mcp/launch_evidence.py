@@ -21,8 +21,15 @@ Two properties are deliberate and should survive future edits:
 * **Minting requires a live operator approval.** The caller must quote the
   current policy generation and revision -- obtainable only from a fresh status
   snapshot -- together with a human approval reference, and the mint is recorded
-  in the policy audit ledger. That approval is the authenticating element, in
-  the sense of AGENTS.md's "one conditional approval of an exact frozen replay".
+  in the policy audit ledger *against this record's content digest*. That
+  approval is the authenticating element, in the sense of AGENTS.md's "one
+  conditional approval of an exact frozen replay", and storing the digest with
+  it is what stops an edited copy of a legitimate record from still matching
+  the ledger.
+* **The package is reverified here, not taken on the run's word.** The run
+  diagnostic's own "verification succeeded" is the executed process vouching
+  for itself, so every payload SHA256SUMS names is hashed again on the cluster
+  and compared in this module.
 
 This module is pure stdlib on purpose so the binding logic stays testable
 without the MCP SDK.
@@ -32,7 +39,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
+from pathlib import PurePosixPath
 from typing import Any
 
 LAUNCH_EVIDENCE_SCHEMA = "o2-launch-evidence-v1"
@@ -46,6 +55,70 @@ REQUIRED_PACKAGE_FILES: tuple[str, ...] = (
 
 class LaunchEvidenceError(RuntimeError):
     """One link in the launch chain is missing, malformed, or disagrees."""
+
+
+# GNU sha256sum writes "<64 hex><space><mode><name>", where <mode> is " " for a
+# text read and "*" for a binary one and <name> runs to the end of the line.
+# Splitting on whitespace would silently drop every entry whose filename
+# contains a space, which is a legal character in an O2 path. The mode is
+# optional here only so a manifest written with a single separator by something
+# other than coreutils still parses; it cannot mis-read GNU output, because a
+# name that itself starts with a space or "*" still keeps its leading character
+# once the fixed separator is consumed.
+_SHA256_LINE = re.compile(r"^([0-9a-fA-F]{64}) [ *]?(.+)$")
+
+
+def parse_sha256_lines(text: str, *, label: str) -> dict[str, str]:
+    """Parse ``sha256sum`` output -- and a SHA256SUMS manifest, same format.
+
+    Returns ``{name: digest}`` with the name exactly as the tool wrote it. A
+    line that is not an entry raises rather than being skipped: a partially
+    parsed listing looks indistinguishable from a package that is missing
+    files, and this record must never rest on that ambiguity.
+    """
+
+    digests: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line.strip():
+            continue
+        if line.startswith("\\"):
+            # GNU sha256sum escapes a name containing a newline or a backslash
+            # by prefixing its line with "\". The original name cannot be
+            # recovered unambiguously from that, and a record must not bind a
+            # filename it had to guess at.
+            raise LaunchEvidenceError(f"{label} contains an escaped filename, which cannot be bound unambiguously")
+        match = _SHA256_LINE.match(line)
+        if match is None:
+            raise LaunchEvidenceError(f"{label} has a line that is not a sha256 entry: {line[:120]!r}")
+        digest, name = match.group(1).lower(), match.group(2)
+        if digests.get(name, digest) != digest:
+            raise LaunchEvidenceError(f"{label} lists {name!r} twice with different digests")
+        digests[name] = digest
+    return digests
+
+
+def parse_checksum_manifest(text: str, *, label: str = "SHA256SUMS") -> dict[str, str]:
+    """Parse the package's own checksum manifest into ``{payload: digest}``.
+
+    Every name must be a path *inside* the package: the reverification hashes
+    what this manifest names, so an absolute or traversal-bearing entry would
+    let a package steer the read outside itself and have the result counted as
+    that package's payload.
+    """
+
+    manifest: dict[str, str] = {}
+    for name, digest in parse_sha256_lines(text, label=label).items():
+        candidate = PurePosixPath(name)
+        normalized = str(candidate)
+        if candidate.is_absolute() or ".." in candidate.parts or normalized in {".", ""} or not name.strip():
+            raise LaunchEvidenceError(f"{label} names {name!r}, which is not a payload path inside the package")
+        if manifest.get(normalized, digest) != digest:
+            raise LaunchEvidenceError(f"{label} lists {normalized!r} twice with different digests")
+        manifest[normalized] = digest
+    if not manifest:
+        raise LaunchEvidenceError(f"{label} lists no payloads, so there is nothing to reverify")
+    return manifest
 
 
 def _dig(payload: Mapping[str, Any], path: Sequence[str]) -> Any:
@@ -111,25 +184,44 @@ def plan_digest(plan: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(plan).encode("utf-8")).hexdigest()
 
 
+def _same_posix_path(left: Any, right: Any) -> bool:
+    """Compare two O2 paths ignoring only cosmetic separator differences."""
+
+    if not isinstance(left, str) or not isinstance(right, str) or not left.strip() or not right.strip():
+        return False
+    return str(PurePosixPath(left)) == str(PurePosixPath(right))
+
+
 def build_launch_evidence(
     *,
     diagnostic: Mapping[str, Any],
     plan: Mapping[str, Any],
     package_digests: Mapping[str, str],
+    checksum_manifest: Mapping[str, str],
+    payload_digests: Mapping[str, str],
     owner: Mapping[str, Any],
     approval: Mapping[str, Any],
     stage: str,
+    read_back_package_path: str,
 ) -> dict[str, Any]:
     """Verify every link and return the record, or raise naming what disagreed.
 
     ``package_digests`` maps each required package filename to the SHA-256 the
     server computed by reading that file back off the cluster.
+    ``checksum_manifest`` is the package's own SHA256SUMS as parsed, and
+    ``payload_digests`` is what those same payloads actually hash to now --
+    hashed by the server, not by the run. ``read_back_package_path`` is the
+    directory the server actually read, which must be the one the plan approved.
     """
 
     expected_plan_sha256 = plan_digest(plan)
+    approved_package = _dig(plan, ("destination", "expected_package"))
     mismatches: list[str] = []
+    checks = 0
 
     def bind(label: str, observed: Any, expected: Any) -> None:
+        nonlocal checks
+        checks += 1
         if observed is None:
             mismatches.append(f"{label}: absent from the run diagnostic")
         elif observed != expected:
@@ -139,18 +231,49 @@ def build_launch_evidence(
     for label, run_path, plan_path in _BINDINGS:
         bind(label, _dig(diagnostic, run_path), _dig(plan, plan_path))
 
+    # The caller chooses which directory is read back, so without this the owner
+    # marker and the digests below could describe package B while the record
+    # reports package A -- a copied marker is all it would take. Bind the
+    # directory that was actually read to the one the plan approved; the plan
+    # and the diagnostic are bound to each other just above.
+    checks += 1
+    if not _same_posix_path(read_back_package_path, approved_package):
+        mismatches.append(f"package_read_back_path: read={read_back_package_path!r} plan={approved_package!r}")
+
     # The owner marker is written first inside the claimed package, so it is the
     # one artifact proving the package on disk belongs to THIS approved plan.
     bind("owner_plan_sha256", owner.get("plan_sha256"), expected_plan_sha256)
     bind("owner_attempt_id", owner.get("attempt_id"), _dig(plan, ("attempt_id",)))
 
+    checks += 1
     missing_files = [name for name in REQUIRED_PACKAGE_FILES if name not in package_digests]
     if missing_files:
         mismatches.append("package files absent: {}".format(", ".join(sorted(missing_files))))
 
+    checks += 1
     verification_status = _dig(diagnostic, ("output", "verification", "status"))
     if verification_status != "success":
         mismatches.append(f"package verification status is {verification_status!r}, not 'success'")
+
+    # That status is the executed process vouching for itself, and this record
+    # exists precisely because such a process cannot authenticate its own
+    # output: a payload deleted or altered after the run reported success, or a
+    # run that reported success falsely, would both still read as verified. So
+    # recompute the package's own manifest here from digests taken outside it.
+    if not checksum_manifest:
+        checks += 1
+        mismatches.append("SHA256SUMS lists no payloads, so nothing could be reverified")
+    for name, expected_digest in sorted(checksum_manifest.items()):
+        checks += 1
+        observed_digest = payload_digests.get(name)
+        if observed_digest is None:
+            mismatches.append(f"payload {name!r} is listed in SHA256SUMS but was not hashed on the cluster")
+        elif observed_digest != expected_digest:
+            mismatches.append(f"payload {name!r}: SHA256SUMS={expected_digest} on_disk={observed_digest}")
+        # A metadata file the manifest also covers was hashed twice, once per
+        # read. Requiring the two to agree closes the window between them.
+        elif name in package_digests and package_digests[name] != observed_digest:
+            mismatches.append(f"payload {name!r} changed between the two reads of the package")
 
     if mismatches:
         raise LaunchEvidenceError(
@@ -185,6 +308,7 @@ def build_launch_evidence(
         },
         "destination": {
             "package": _dig(diagnostic, ("output", "package")),
+            "read_back_package_path": read_back_package_path,
             "inode": binding.get("inode"),
             "mount_point": mountinfo.get("mount_point"),
             "mount_source": mountinfo.get("mount_source"),
@@ -199,6 +323,15 @@ def build_launch_evidence(
             "n_payloads": _dig(diagnostic, ("output", "verification", "n_payloads")),
             "reopened_output_sha256": _dig(diagnostic, ("output", "reopened_output_sha256")),
             "file_digests": dict(package_digests),
+            "payload_reverification": {
+                "manifest": "SHA256SUMS",
+                "manifest_sha256": package_digests.get("SHA256SUMS"),
+                "n_payloads_reverified": len(checksum_manifest),
+                "method": (
+                    "every path SHA256SUMS names was hashed on the cluster and compared here, so this "
+                    "record does not rest on the run's own verification verdict"
+                ),
+            },
         },
         "run_diagnostic": {
             "status": diagnostic.get("status"),
@@ -206,8 +339,18 @@ def build_launch_evidence(
             "schema_version": diagnostic.get("schema_version"),
         },
         "operator_approval": dict(approval),
-        "binding_check": {"all_links_agree": True, "checked": len(_BINDINGS) + 4},
+        "binding_check": {"all_links_agree": True, "checked": checks},
     }
+
+    # The ledger records the approval against this content digest, so a record
+    # whose content no longer produces the approved digest is not the record the
+    # operator approved, whatever its approval object says.
+    recorded_digest = approval.get("evidence_sha256")
+    if recorded_digest is not None and recorded_digest != evidence_content_digest(record):
+        raise LaunchEvidenceError(
+            "refusing to mint launch evidence; the approval in the audit ledger was recorded against a "
+            "different record than the one built here"
+        )
     return record
 
 
@@ -215,6 +358,24 @@ def launch_evidence_digest(record: Mapping[str, Any]) -> str:
     """Digest a minted record so it can be quoted and re-verified later."""
 
     return hashlib.sha256(canonical_json(record).encode("utf-8")).hexdigest()
+
+
+def evidence_content_digest(record: Mapping[str, Any]) -> str:
+    """Digest everything the record asserts, excluding the operator approval.
+
+    This is the digest the policy ledger stores when the mint is approved, and
+    it is what makes that ledger entry authenticate the record rather than
+    merely note that a mint happened. The approval itself is excluded because
+    it does not exist yet when the digest is taken -- and because a holder of a
+    legitimate record could otherwise edit its runtime identities or package
+    digests, recompute the unkeyed whole-record digest, and keep an approval
+    object that still matched the ledger. Recomputing this from a record in hand
+    and comparing it with the ledger entry detects exactly that.
+    """
+
+    content = dict(record)
+    content["operator_approval"] = {}
+    return hashlib.sha256(canonical_json(content).encode("utf-8")).hexdigest()
 
 
 def parse_json_artifact(text: str, *, label: str) -> dict[str, Any]:
@@ -240,8 +401,11 @@ __all__ = [
     "LaunchEvidenceError",
     "build_launch_evidence",
     "canonical_json",
+    "evidence_content_digest",
     "launch_evidence_digest",
+    "parse_checksum_manifest",
     "parse_json_artifact",
+    "parse_sha256_lines",
     "plan_digest",
     "required_package_files",
 ]

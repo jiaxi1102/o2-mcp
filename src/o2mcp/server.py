@@ -65,11 +65,15 @@ from o2mcp import (
     billing,
     transfer_tools,
 )
+from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
     LaunchEvidenceError,
     build_launch_evidence,
+    evidence_content_digest,
     launch_evidence_digest,
+    parse_checksum_manifest,
     parse_json_artifact,
+    parse_sha256_lines,
     required_package_files,
 )
 from o2mcp.policy import LoginTarget
@@ -1225,7 +1229,31 @@ def _absolute_remote_path(value: str, *, label: str) -> str:
     return cleaned
 
 
-_LAUNCH_EVIDENCE_MARKERS = ("===DIAGNOSTIC===", "===PLAN===", "===OWNER===", "===DIGESTS===")
+_MARKER_DIAGNOSTIC = "===DIAGNOSTIC==="
+_MARKER_PLAN = "===PLAN==="
+_MARKER_OWNER = "===OWNER==="
+_MARKER_MANIFEST = "===MANIFEST==="
+_MARKER_DIGESTS = "===DIGESTS==="
+_LAUNCH_EVIDENCE_MARKERS = (
+    _MARKER_DIAGNOSTIC,
+    _MARKER_PLAN,
+    _MARKER_OWNER,
+    _MARKER_MANIFEST,
+    _MARKER_DIGESTS,
+)
+
+
+def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
+    """Refuse an artifact the broker cut short.
+
+    The broker caps captured output and reports the cut only as a note on
+    stderr, leaving the return code 0. A partial digest listing is
+    indistinguishable from a package missing files, so a truncated read must
+    end the mint rather than quietly shrink what the record covers.
+    """
+
+    if BROKER_TRUNCATION_NOTE in (result.stderr or ""):
+        raise LaunchEvidenceError(f"{label} was truncated by the broker's output cap, so it cannot be bound")
 
 
 def _read_launch_artifacts(
@@ -1234,22 +1262,28 @@ def _read_launch_artifacts(
     """Read every artifact back off the cluster through the authenticated broker.
 
     Reading them here rather than accepting caller-supplied content is the point:
-    the record must attest what is actually on O2. One command keeps a single
-    hold on the shared channel.
+    the record must attest what is actually on O2. One command keeps this to a
+    single hold on the shared channel; hashing the payloads the manifest names
+    needs a second one, because that list only exists once this has returned.
     """
 
     owner_path = str(PurePosixPath(package_path) / "PUBLICATION_OWNER.json")
-    digest_targets = [str(PurePosixPath(package_path) / name) for name in required_package_files()]
+    manifest_path = str(PurePosixPath(package_path) / "SHA256SUMS")
+    # Remember which required file each operand stands for: sha256sum echoes the
+    # operand back, and mapping by that is exact even when a path has spaces.
+    digest_targets = {str(PurePosixPath(package_path) / name): name for name in required_package_files()}
     command = "; ".join(
         [
-            f"printf '%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[0])}",
+            f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC)}",
             f"cat {shlex.quote(diagnostic_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[1])}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN)}",
             f"cat {shlex.quote(plan_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[2])}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER)}",
             f"cat {shlex.quote(owner_path)}",
-            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[3])}",
-            "sha256sum {}".format(" ".join(shlex.quote(item) for item in digest_targets)),
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST)}",
+            f"cat {shlex.quote(manifest_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_DIGESTS)}",
+            "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
     )
     result = _connection().run(command, timeout=timeout)
@@ -1257,6 +1291,7 @@ def _read_launch_artifacts(
         raise LaunchEvidenceError(
             "could not read the launch artifacts from O2: {}".format((result.stderr or "").strip()[:400])
         )
+    _refuse_truncated_read(result, label="the launch artifact read")
 
     sections: dict[str, str] = {}
     current: str | None = None
@@ -1276,16 +1311,47 @@ def _read_launch_artifacts(
         raise LaunchEvidenceError("artifact read returned no {} section".format(", ".join(missing)))
 
     package_digests: dict[str, str] = {}
-    for line in sections[_LAUNCH_EVIDENCE_MARKERS[3]].splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            package_digests[PurePosixPath(parts[1]).name] = parts[0]
+    for operand, digest in parse_sha256_lines(sections[_MARKER_DIGESTS], label="the package digest output").items():
+        name = digest_targets.get(operand)
+        if name is None:
+            raise LaunchEvidenceError(f"the package digest output named {operand!r}, which was not requested")
+        package_digests[name] = digest
     return {
-        "diagnostic": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[0]], label="run diagnostic"),
-        "plan": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[1]], label="execution plan"),
-        "owner": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[2]], label="publication owner"),
+        "diagnostic": parse_json_artifact(sections[_MARKER_DIAGNOSTIC], label="run diagnostic"),
+        "plan": parse_json_artifact(sections[_MARKER_PLAN], label="execution plan"),
+        "owner": parse_json_artifact(sections[_MARKER_OWNER], label="publication owner"),
+        "checksum_manifest": parse_checksum_manifest(sections[_MARKER_MANIFEST]),
         "package_digests": package_digests,
     }
+
+
+def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeout: float) -> dict[str, str]:
+    """Hash every payload SHA256SUMS names, on the cluster, and return the digests.
+
+    This is a second hold on the channel because it has to be: the payload list
+    only exists once the manifest has been read. Running ``sha256sum -c``
+    remotely would avoid that at the cost of putting the comparison back inside
+    a process whose verdict this record exists to check, so the digests come
+    back raw and ``build_launch_evidence`` decides.
+    """
+
+    targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
+    if len(targets) != len(manifest):
+        raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
+    command = "sha256sum -- {}".format(" ".join(shlex.quote(path) for path in sorted(targets)))
+    result = _connection().run(command, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not hash the package payloads on O2: {}".format((result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the package payload digest read")
+    payload_digests: dict[str, str] = {}
+    for operand, digest in parse_sha256_lines(result.stdout, label="the payload digest output").items():
+        name = targets.get(operand)
+        if name is None:
+            raise LaunchEvidenceError(f"the payload digest output named {operand!r}, which was not requested")
+        payload_digests[name] = digest
+    return payload_digests
 
 
 @mcp.tool(
@@ -1303,9 +1369,12 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
     A repository canary can verify its own scientific path but cannot
     authenticate its own launch, so the authority has to come from outside the
     executed process. This reads the run diagnostic, the frozen plan, the
-    publication owner marker, and the package digests back off the cluster
-    through the authenticated broker, checks that every link agrees, and records
-    the mint in the policy audit ledger against the operator's approval.
+    publication owner marker, the package's SHA256SUMS, and the package digests
+    back off the cluster through the authenticated broker, rehashes every
+    payload the manifest names rather than trusting the run's own "verified"
+    verdict, checks that every link agrees -- including that the directory read
+    is the package the plan approved -- and records the mint, with the digest of
+    the record it approves, in the policy audit ledger.
 
     Minting attests a finished run. It is deliberately NOT authority to start
     another one: it consumes no login grant and changes no policy mode.
@@ -1321,16 +1390,28 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             package_path=package_path,
             timeout=params.timeout_seconds,
         )
+        payload_digests = _hash_package_payloads(
+            package_path=package_path,
+            manifest=artifacts["checksum_manifest"],
+            timeout=params.timeout_seconds,
+        )
+
+        def mint(approval: dict[str, Any]) -> dict[str, Any]:
+            return build_launch_evidence(
+                diagnostic=artifacts["diagnostic"],
+                plan=artifacts["plan"],
+                package_digests=artifacts["package_digests"],
+                checksum_manifest=artifacts["checksum_manifest"],
+                payload_digests=payload_digests,
+                owner=artifacts["owner"],
+                approval=approval,
+                stage=params.stage,
+                read_back_package_path=package_path,
+            )
+
         # Verify BEFORE recording an approval: a chain that does not agree must
         # not leave an audit entry implying it did.
-        preliminary = build_launch_evidence(
-            diagnostic=artifacts["diagnostic"],
-            plan=artifacts["plan"],
-            package_digests=artifacts["package_digests"],
-            owner=artifacts["owner"],
-            approval={},
-            stage=params.stage,
-        )
+        preliminary = mint({})
         approval = _connection().policy.record_launch_evidence_mint(
             expected_revision=params.expected_revision,
             expected_generation=params.expected_generation,
@@ -1338,19 +1419,17 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             stage=params.stage,
             job_id=str(preliminary["submission"]["job_id"]),
             package=str(preliminary["destination"]["package"]),
+            # The ledger entry records the digest of the record it approves, so
+            # an edited copy no longer matches the approval it carries.
+            evidence_sha256=evidence_content_digest(preliminary),
+            plan_sha256=str(preliminary["approved_plan"]["sha256"]),
         )
-        record = build_launch_evidence(
-            diagnostic=artifacts["diagnostic"],
-            plan=artifacts["plan"],
-            package_digests=artifacts["package_digests"],
-            owner=artifacts["owner"],
-            approval=approval,
-            stage=params.stage,
-        )
+        record = mint(approval)
         return {
             "ok": True,
             "launch_evidence": record,
             "launch_evidence_sha256": launch_evidence_digest(record),
+            "evidence_content_sha256": evidence_content_digest(record),
         }
 
     return await _run_tool(work)

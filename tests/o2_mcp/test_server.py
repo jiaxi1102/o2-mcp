@@ -1570,19 +1570,30 @@ def test_long_flags_still_end_at_the_token():
 
 
 # --- governed launch attestation ---------------------------------------------
-def _launch_evidence_responder(job_id="52085188"):
-    """Serve the four artifacts the mint reads back off the cluster."""
+_PACKAGE = "/pkg/attempt-002"
+_PAYLOADS = {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
+
+
+def _launch_evidence_responder(job_id="52085188", *, package=_PACKAGE, payloads=None, approved_package=None):
+    """Serve the artifacts and the payload digests the mint reads off the cluster.
+
+    ``package`` is where the artifacts actually live, ``approved_package`` is what
+    the plan and the diagnostic name; they differ only when a test is checking
+    that a substituted directory is refused.
+    """
 
     import json as _json
 
     from o2mcp.launch_evidence import plan_digest
 
+    on_disk = dict(_PAYLOADS if payloads is None else payloads)
+    named = package if approved_package is None else approved_package
     plan = {
         "attempt_id": "002",
         "software": {"bundle": {"bundle_sha256": "b" * 64}},
         "runtime_wrapper": {"sha256": "w" * 64},
         "interpreter": {"sha256": "i" * 64, "closure_sha256": "c" * 64, "context_sha256": "x" * 64},
-        "destination": {"inode": 42, "mount": "/n/scratch", "expected_package": "/pkg/attempt-002"},
+        "destination": {"inode": 42, "mount": "/n/scratch", "expected_package": named},
     }
     diagnostic = {
         "status": "diagnostic_success",
@@ -1610,18 +1621,23 @@ def _launch_evidence_responder(job_id="52085188"):
         },
         "launch": {"loaded_library_closure": {"loaded_closure_sha256": "l" * 64}},
         "output": {
-            "package": "/pkg/attempt-002",
+            "package": named,
             "reopened_output_sha256": "r" * 64,
             "verification": {"status": "success", "n_payloads": 9},
         },
     }
     owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
+    manifest = "\n".join(f"{digest}  {name}" for name, digest in sorted(_PAYLOADS.items()))
     digests = "\n".join(
-        f"{'d' * 64}  /pkg/attempt-002/{name}"
-        for name in ("PUBLICATION_OWNER.json", "SUCCESS.json", "SHA256SUMS", "conversion_manifest.json")
+        f"{'d' * 64}  {package}/{name}"
+        for name in sorted(("PUBLICATION_OWNER.json", "SUCCESS.json", "SHA256SUMS", "conversion_manifest.json"))
     )
 
     def responder(argv, input_text):
+        command = argv[-1]
+        if command.startswith("sha256sum"):
+            # The second hold on the channel: the payloads the manifest named.
+            return "\n".join(f"{digest}  {package}/{name}" for name, digest in sorted(on_disk.items())), "", 0
         payload = "\n".join(
             [
                 "===DIAGNOSTIC===",
@@ -1630,6 +1646,8 @@ def _launch_evidence_responder(job_id="52085188"):
                 _json.dumps(plan),
                 "===OWNER===",
                 _json.dumps(owner),
+                "===MANIFEST===",
+                manifest,
                 "===DIGESTS===",
                 digests,
             ]
@@ -1637,6 +1655,19 @@ def _launch_evidence_responder(job_id="52085188"):
         return payload, "", 0
 
     return responder
+
+
+def _mint_params(policy, **overrides):
+    params = {
+        "diagnostic_path": "/home/u/diag.json",
+        "plan_path": "/home/u/plan.json",
+        "package_path": _PACKAGE,
+        "expected_revision": policy["revision"],
+        "expected_generation": policy["generation"],
+        "approval_reference": "operator approved canary 002",
+    }
+    params.update(overrides)
+    return {"params": params}
 
 
 @pytest.mark.anyio
@@ -1721,6 +1752,117 @@ async def test_mint_rejects_a_relative_path_before_it_reaches_a_shell(monkeypatc
     assert refused["ok"] is False
     assert refused["error"] == "launch_evidence_refused"
     assert "absolute normalized" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_package_the_plan_did_not_approve(monkeypatch, tmp_path):
+    """The caller picks the directory that is read; the plan picks which is valid.
+
+    Here the artifacts -- owner marker included, as a copy would be -- sit in a
+    directory the plan never approved. Without binding the read-back path, the
+    record would name the approved package while its digests described this one.
+    """
+
+    _patch_connection(
+        monkeypatch,
+        tmp_path,
+        responder=_launch_evidence_responder(package=_PACKAGE, approved_package="/pkg/attempt-002-real"),
+    )
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "package_read_back_path" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_rehashes_the_payloads_and_refuses_one_that_drifted(monkeypatch, tmp_path):
+    """A payload that no longer matches SHA256SUMS ends the mint.
+
+    The run diagnostic still reports its own verification as ``success``: that
+    verdict is the executed process vouching for itself, which is exactly what
+    this record exists not to rely on.
+    """
+
+    drifted = dict(_PAYLOADS)
+    drifted["payloads/frame002.ims"] = "0" * 64
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(payloads=drifted))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "frame002.ims" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_payload_the_package_no_longer_holds(monkeypatch, tmp_path):
+    missing = dict(_PAYLOADS)
+    missing.pop("payloads/frame002.ims")
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(payloads=missing))
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "was not hashed on the cluster" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_records_the_record_digest_in_the_audit_ledger(monkeypatch, tmp_path):
+    """The ledger entry must pin the content, not just note that a mint happened.
+
+    Storing only the stage, job, and package would let a holder of a legitimate
+    record edit its runtime identities, recompute the record's own unkeyed
+    digest, and keep an approval that still agreed with the ledger.
+    """
+
+    from o2mcp.launch_evidence import evidence_content_digest
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    record = minted["launch_evidence"]
+
+    after = await _call("o2_local_status", {})
+    events = [e for e in after["policy"]["recent_events"] if e.get("event") == "launch_evidence_minted"]
+    assert len(events) == 1
+    assert events[0]["evidence_sha256"] == minted["evidence_content_sha256"]
+    assert events[0]["evidence_sha256"] == evidence_content_digest(record)
+    assert events[0]["plan_sha256"] == record["approved_plan"]["sha256"]
+    # The approval the record carries names the same digest the ledger recorded.
+    assert record["operator_approval"]["evidence_sha256"] == events[0]["evidence_sha256"]
+
+    # An edited record no longer produces the digest its approval was recorded
+    # against, which is what makes the ledger entry authenticate it.
+    tampered = json.loads(json.dumps(record))
+    tampered["runtime_identities"]["interpreter_sha256"] = "0" * 64
+    assert evidence_content_digest(tampered) != events[0]["evidence_sha256"]
+
+
+@pytest.mark.anyio
+async def test_mint_binds_a_package_whose_path_contains_spaces(monkeypatch, tmp_path):
+    """``sha256sum`` writes the whole filename, so splitting on spaces loses it.
+
+    Dropping those digests made the mint refuse an otherwise valid package for
+    the sole reason that its path was legal.
+    """
+
+    package = "/n/scratch/attempt 002/published package"
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(package=package))
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"], package_path=package))
+    assert minted["ok"] is True
+    assert minted["launch_evidence"]["destination"]["package"] == package
+    assert set(minted["launch_evidence"]["verified_package"]["file_digests"]) == {
+        "PUBLICATION_OWNER.json",
+        "SUCCESS.json",
+        "SHA256SUMS",
+        "conversion_manifest.json",
+    }
+    assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 2
 
 
 @pytest.mark.anyio

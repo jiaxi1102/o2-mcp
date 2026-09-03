@@ -14,8 +14,11 @@ from o2mcp.launch_evidence import (
     LaunchEvidenceError,
     build_launch_evidence,
     canonical_json,
+    evidence_content_digest,
     launch_evidence_digest,
+    parse_checksum_manifest,
     parse_json_artifact,
+    parse_sha256_lines,
     plan_digest,
     required_package_files,
 )
@@ -69,6 +72,12 @@ def _digests() -> dict[str, str]:
     return {name: "d" * 64 for name in required_package_files()}
 
 
+def _manifest() -> dict[str, str]:
+    """What the package's own SHA256SUMS claims its payloads hash to."""
+
+    return {"payloads/frame 001.ims": "1" * 64, "payloads/frame002.ims": "2" * 64}
+
+
 def _owner(plan: dict) -> dict:
     return {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
 
@@ -76,13 +85,17 @@ def _owner(plan: dict) -> dict:
 def _build(**overrides):
     plan = overrides.pop("plan", _PLAN)
     diagnostic = overrides.pop("diagnostic", _diagnostic(plan))
+    manifest = overrides.pop("checksum_manifest", _manifest())
     return build_launch_evidence(
         diagnostic=diagnostic,
         plan=plan,
         package_digests=overrides.pop("package_digests", _digests()),
+        checksum_manifest=manifest,
+        payload_digests=overrides.pop("payload_digests", dict(manifest)),
         owner=overrides.pop("owner", _owner(plan)),
         approval=overrides.pop("approval", {"approval_reference": "operator approved"}),
         stage=overrides.pop("stage", "platform-canary"),
+        read_back_package_path=overrides.pop("read_back_package_path", "/pkg/attempt-002"),
     )
 
 
@@ -90,6 +103,8 @@ def test_intact_chain_mints_a_record() -> None:
     record = _build()
     assert record["schema"] == LAUNCH_EVIDENCE_SCHEMA
     assert record["binding_check"]["all_links_agree"] is True
+    # The count is what was actually checked, payload by payload, not a constant.
+    assert record["binding_check"]["checked"] > len(_manifest())
     assert record["submission"]["job_id"] == "52085188"
     assert record["runtime_identities"]["loaded_closure_sha256"] == "l" * 64
     assert record["operator_approval"]["approval_reference"] == "operator approved"
@@ -185,3 +200,147 @@ def test_parse_json_artifact_names_the_bad_artifact() -> None:
         parse_json_artifact("{not json", label="run diagnostic")
     with pytest.raises(LaunchEvidenceError, match="must be a JSON object"):
         parse_json_artifact("[1, 2]", label="execution plan")
+
+
+# --- the read-back directory must be the package the plan approved ------------
+def test_read_back_directory_must_be_the_approved_package() -> None:
+    """A copied owner marker must not let a caller substitute another directory.
+
+    The caller picks which directory is hashed. If that is not the package the
+    plan approved, the record would name package A under ``destination`` while
+    its file digests described package B.
+    """
+
+    with pytest.raises(LaunchEvidenceError, match="package_read_back_path"):
+        _build(read_back_package_path="/pkg/attempt-002-copy")
+
+
+def test_read_back_directory_tolerates_a_cosmetic_trailing_slash() -> None:
+    record = _build(read_back_package_path="/pkg/attempt-002/")
+    assert record["destination"]["read_back_package_path"] == "/pkg/attempt-002/"
+
+
+def test_read_back_directory_must_be_a_real_path() -> None:
+    with pytest.raises(LaunchEvidenceError, match="package_read_back_path"):
+        _build(read_back_package_path="   ")
+
+
+# --- the package is reverified, not taken on the run's word -------------------
+def test_reported_success_does_not_substitute_for_reverifying_payloads() -> None:
+    """The run says the package verified; a payload that no longer matches wins.
+
+    This is the whole point of minting outside the executed process: a payload
+    corrupted after the diagnostic was written, or a run that reported success
+    falsely, must not still produce a record.
+    """
+
+    drifted = dict(_manifest())
+    drifted["payloads/frame002.ims"] = "0" * 64
+    with pytest.raises(LaunchEvidenceError, match="SHA256SUMS=.* on_disk="):
+        _build(payload_digests=drifted)
+
+
+def test_payload_listed_but_never_hashed_refuses_to_mint() -> None:
+    partial = dict(_manifest())
+    partial.pop("payloads/frame002.ims")
+    with pytest.raises(LaunchEvidenceError, match="listed in SHA256SUMS but was not hashed"):
+        _build(payload_digests=partial)
+
+
+def test_empty_manifest_refuses_to_mint() -> None:
+    with pytest.raises(LaunchEvidenceError, match="nothing could be reverified"):
+        _build(checksum_manifest={}, payload_digests={})
+
+
+def test_metadata_file_must_hash_the_same_in_both_reads() -> None:
+    """A file covered by both reads changing between them ends the mint."""
+
+    manifest = dict(_manifest())
+    manifest["SUCCESS.json"] = "e" * 64
+    payloads = dict(manifest)
+    with pytest.raises(LaunchEvidenceError, match="changed between the two reads"):
+        _build(checksum_manifest=manifest, payload_digests=payloads)
+
+
+def test_reverification_is_recorded_in_the_minted_record() -> None:
+    record = _build()
+    reverification = record["verified_package"]["payload_reverification"]
+    assert reverification["n_payloads_reverified"] == len(_manifest())
+    assert reverification["manifest_sha256"] == "d" * 64
+
+
+# --- sha256sum parsing --------------------------------------------------------
+def test_filenames_with_spaces_survive_parsing() -> None:
+    """``line.split()`` would drop every one of these and refuse a valid package."""
+
+    text = "{}  /pkg/attempt 002/a payload.ims\n{} */pkg/attempt 002/b.ims\n".format("1" * 64, "2" * 64)
+    assert parse_sha256_lines(text, label="output") == {
+        "/pkg/attempt 002/a payload.ims": "1" * 64,
+        "/pkg/attempt 002/b.ims": "2" * 64,
+    }
+
+
+def test_a_single_separator_manifest_still_parses() -> None:
+    """A SHA256SUMS not written by coreutils must not be refused for its spacing."""
+
+    assert parse_checksum_manifest("{} a payload.ims\n".format("1" * 64)) == {"a payload.ims": "1" * 64}
+
+
+def test_a_gnu_name_that_starts_with_a_space_keeps_it() -> None:
+    assert parse_sha256_lines("{}   leading.ims".format("1" * 64), label="output") == {" leading.ims": "1" * 64}
+
+
+def test_escaped_filename_is_refused_rather_than_guessed_at() -> None:
+    with pytest.raises(LaunchEvidenceError, match="escaped filename"):
+        parse_sha256_lines("\\{}  /pkg/new\\nline.ims\n".format("1" * 64), label="output")
+
+
+def test_a_line_that_is_not_a_digest_entry_is_refused_not_skipped() -> None:
+    with pytest.raises(LaunchEvidenceError, match="not a sha256 entry"):
+        parse_sha256_lines("{}  ok.ims\nsha256sum: nope\n".format("1" * 64), label="output")
+
+
+def test_a_name_listed_twice_with_different_digests_is_refused() -> None:
+    text = "{}  a.ims\n{}  a.ims\n".format("1" * 64, "2" * 64)
+    with pytest.raises(LaunchEvidenceError, match="twice with different digests"):
+        parse_sha256_lines(text, label="output")
+
+
+@pytest.mark.parametrize("name", ["/etc/passwd", "../../outside.ims", "sub/../../outside.ims"])
+def test_manifest_cannot_steer_the_reverification_outside_the_package(name) -> None:
+    with pytest.raises(LaunchEvidenceError, match="not a payload path inside the package"):
+        parse_checksum_manifest("{}  {}\n".format("1" * 64, name))
+
+
+def test_manifest_normalizes_a_leading_dot_slash() -> None:
+    assert parse_checksum_manifest("{}  ./a payload.ims\n".format("1" * 64)) == {"a payload.ims": "1" * 64}
+
+
+# --- the approval is bound to the record it approved ---------------------------
+def test_content_digest_ignores_the_approval_that_was_recorded_against_it() -> None:
+    """The ledger stores this digest, so it cannot depend on the approval itself."""
+
+    unapproved = _build(approval={})
+    digest = evidence_content_digest(unapproved)
+    approved = _build(approval={"approval_reference": "operator approved", "evidence_sha256": digest})
+    assert evidence_content_digest(approved) == digest
+    assert launch_evidence_digest(approved) != launch_evidence_digest(unapproved)
+
+
+def test_content_digest_moves_when_any_bound_field_moves() -> None:
+    baseline = evidence_content_digest(_build())
+    assert evidence_content_digest(_build(stage="acquisition")) != baseline
+    assert evidence_content_digest(_build(package_digests={**_digests(), "SUCCESS.json": "0" * 64})) != baseline
+
+
+def test_an_approval_recorded_against_another_record_refuses_to_mint() -> None:
+    """The approval object is only worth what the ledger recorded it against."""
+
+    with pytest.raises(LaunchEvidenceError, match="recorded against a different record"):
+        _build(approval={"approval_reference": "operator approved", "evidence_sha256": "0" * 64})
+
+
+def test_an_approval_carrying_the_right_digest_mints() -> None:
+    digest = evidence_content_digest(_build(approval={}))
+    record = _build(approval={"approval_reference": "operator approved", "evidence_sha256": digest})
+    assert record["operator_approval"]["evidence_sha256"] == digest
