@@ -1416,6 +1416,14 @@ def _payload_batch_command(package_path: str, operands: str) -> str:
 # exactly this reason, so the manifest is chunked rather than being the one thing
 # that makes a large package unmintable.
 _MANIFEST_CHUNK_BYTES = 384 * 1024
+# The size that drives the loop below comes from `stat` on a file the package
+# controls, so it is untrusted input to a resource decision. A sparse manifest
+# claiming a terabyte would otherwise mean millions of sequential broker
+# commands and an attempt to accumulate that much base64 in memory -- one mint
+# monopolising the shared channel indefinitely. 8 MiB is about 30,000 manifest
+# entries at typical path lengths, far beyond any real package, and bounds the
+# read at ~22 commands.
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
 
 def _read_manifest_base64(*, manifest_path: str, size_section: str, timeout: float) -> str:
@@ -1432,6 +1440,12 @@ def _read_manifest_base64(*, manifest_path: str, size_section: str, timeout: flo
     size = int(reported[0])
     if size == 0:
         raise LaunchEvidenceError("SHA256SUMS is empty, so there is nothing to reverify")
+    if size > _MAX_MANIFEST_BYTES:
+        raise LaunchEvidenceError(
+            f"SHA256SUMS is {size} bytes, over the {_MAX_MANIFEST_BYTES}-byte ceiling this reads. A manifest "
+            "that large is not a package this tool can attest, and reading it would hold the shared channel "
+            "for thousands of commands"
+        )
     encoded: list[str] = []
     for start in range(0, size, _MANIFEST_CHUNK_BYTES):
         count = min(_MANIFEST_CHUNK_BYTES, size - start)

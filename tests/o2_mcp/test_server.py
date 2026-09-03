@@ -2260,6 +2260,34 @@ async def test_mint_reads_a_manifest_larger_than_the_broker_output_cap(monkeypat
 
 
 @pytest.mark.anyio
+async def test_mint_refuses_a_manifest_too_large_to_be_a_package(monkeypatch, tmp_path):
+    """The size driving the chunk loop is untrusted, so it must be bounded.
+
+    A sparse SHA256SUMS claiming a terabyte would otherwise mean millions of
+    sequential broker commands and an attempt to accumulate that much base64 --
+    one mint monopolising the shared channel indefinitely.
+    """
+
+    def enormous(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        if argv[-1].startswith("tail -c +"):
+            raise AssertionError("the size ceiling should have refused before any chunk was read")
+        marker = "===MANIFESTSIZE===\n"
+        head, _, tail = payload.partition(marker)
+        return f"{head}{marker}{1024 ** 4}\n{tail.split(chr(10), 1)[1]}", err, rc
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=enormous)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "byte ceiling" in refused["message"]
+    assert not [call for call in runner.calls if call["argv"][-1].startswith("tail -c +")]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
 async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeypatch, tmp_path):
     """A package with many payloads must still mint.
 
