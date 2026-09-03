@@ -26,6 +26,7 @@ from o2mcp.launch_evidence import (
     parse_json_artifact,
     parse_sha256_lines,
     plan_digest,
+    refuse_package_symlinks,
     required_package_files,
 )
 
@@ -106,9 +107,6 @@ def _build(**overrides):
         stage=overrides.pop("stage", "platform-canary"),
         read_back_package_path=overrides.pop("read_back_package_path", "/pkg/attempt-002"),
         resolved_package_path=overrides.pop("resolved_package_path", "/pkg/attempt-002"),
-        resolved_payload_paths=overrides.pop(
-            "resolved_payload_paths", {name: f"/pkg/attempt-002/{name}" for name in manifest}
-        ),
     )
 
 
@@ -494,41 +492,32 @@ def test_a_package_pathname_that_resolves_elsewhere_refuses_to_mint() -> None:
         _build(resolved_package_path="/pkg/somewhere-else")
 
 
-def test_a_payload_symlinked_out_of_the_package_refuses_to_mint() -> None:
-    """A manifest entry may be lexically internal and still escape through a link.
+def test_any_symlink_in_the_package_refuses_to_mint() -> None:
+    """A published package contains none, so one appearing is grounds to refuse.
 
-    Without this a subverted run could publish `payloads/x` as a symlink to a
-    file outside the package, put that file's digest in SHA256SUMS, and obtain a
-    record calling an external file a verified package payload.
+    This replaces resolving each payload and checking containment. That was two
+    independent pathname resolutions, and a run that toggled a link between them
+    could pass the check while the digest came from outside; removing the object
+    being raced is simpler and strictly stronger, and it matches an invariant the
+    publisher already enforces by hard-linking and by rejecting symlinks in its
+    own verifier.
     """
 
-    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
-    escaping["payloads/frame002.ims"] = "/n/groups/elsewhere/secret.ims"
-    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
-        _build(resolved_payload_paths=escaping)
+    with pytest.raises(LaunchEvidenceError, match="contains symlinks"):
+        refuse_package_symlinks("/pkg/attempt-002/payloads/frame002.ims\n", package_path="/pkg/attempt-002")
 
 
-def test_a_payload_resolving_to_the_package_itself_refuses_to_mint() -> None:
-    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
-    escaping["payloads/frame002.ims"] = "/pkg/attempt-002"
-    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
-        _build(resolved_payload_paths=escaping)
+def test_a_package_with_no_symlinks_is_accepted() -> None:
+    refuse_package_symlinks("", package_path="/pkg/attempt-002")
+    refuse_package_symlinks("\n  \n", package_path="/pkg/attempt-002")
 
 
-def test_a_sibling_directory_sharing_a_name_prefix_is_not_inside() -> None:
-    """Containment is componentwise, so a prefix match is not enough."""
-
-    escaping = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
-    escaping["payloads/frame002.ims"] = "/pkg/attempt-002-other/frame002.ims"
-    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
-        _build(resolved_payload_paths=escaping)
-
-
-def test_an_unresolved_payload_refuses_to_mint() -> None:
-    partial = {name: f"/pkg/attempt-002/{name}" for name in _manifest()}
-    partial.pop("payloads/frame002.ims")
-    with pytest.raises(LaunchEvidenceError, match="which is not inside"):
-        _build(resolved_payload_paths=partial)
+def test_the_refusal_names_the_offending_links_without_dumping_all_of_them() -> None:
+    listing = "\n".join(f"/pkg/attempt-002/link{index}" for index in range(9))
+    with pytest.raises(LaunchEvidenceError, match="and 4 more") as caught:
+        refuse_package_symlinks(listing, package_path="/pkg/attempt-002")
+    assert "/pkg/attempt-002/link0" in str(caught.value)
+    assert "/pkg/attempt-002/link8" not in str(caught.value)
 
 
 def test_the_resolved_package_is_recorded() -> None:

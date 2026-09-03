@@ -1585,7 +1585,7 @@ def _launch_evidence_responder(
     owner_sha256=None,
     n_payloads=None,
     resolved_package=None,
-    resolves=None,
+    symlinks=None,
 ):
     """Serve the artifacts and the payload digests the mint reads off the cluster.
 
@@ -1604,7 +1604,6 @@ def _launch_evidence_responder(
     from o2mcp.launch_evidence import plan_digest
 
     listed = dict(_PAYLOADS if manifest_payloads is None else manifest_payloads)
-    resolves = dict(resolves or {})
     on_disk = dict(listed if payloads is None else payloads)
     named = package if approved_package is None else approved_package
     plan = {
@@ -1663,21 +1662,20 @@ def _launch_evidence_responder(
 
     def responder(argv, input_text):
         command = argv[-1]
-        if command.startswith("realpath -- ") and "sha256sum" in command:
+        if command.startswith("sha256sum"):
             # The later holds on the channel: the payloads the manifest named,
-            # in whatever batches the broker's command limit allowed. Each batch
-            # resolves its operands, then hashes them. Answer only for the
-            # operands this batch actually asked about.
-            asked = [token for token in shlex.split(command.split("&&")[0])[2:]]
-            resolved = "\n".join(resolves.get(operand, operand) for operand in asked)
-            digested = "\n".join(
-                f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
-                for operand in asked
-                if operand[len(package) + 1 :] in on_disk
+            # in whatever batches the broker's command limit allowed. Answer only
+            # for the operands this batch actually asked about.
+            asked = shlex.split(command)[2:]
+            return (
+                "\n".join(
+                    f"{on_disk[operand[len(package) + 1 :]]}  {operand}"
+                    for operand in asked
+                    if operand[len(package) + 1 :] in on_disk
+                ),
+                "",
+                0,
             )
-            return f"{resolved}\n===PAYLOADDIGESTS===\n{digested}", "", 0
-        if command.startswith("realpath -- "):
-            return package if resolved_package is None else resolved_package, "", 0
         payload = "\n".join(
             [
                 "===DIAGNOSTIC===",
@@ -1690,6 +1688,8 @@ def _launch_evidence_responder(
                 _base64.b64encode(manifest_bytes).decode(),
                 "===RESOLVED===",
                 package if resolved_package is None else resolved_package,
+                "===SYMLINKS===",
+                "\n".join(symlinks or ()),
                 "===DIGESTS===",
                 digests,
             ]
@@ -2013,19 +2013,34 @@ async def test_mint_refuses_a_package_pathname_that_resolves_elsewhere(monkeypat
 
 
 @pytest.mark.anyio
-async def test_mint_refuses_a_payload_symlinked_out_of_the_package(monkeypatch, tmp_path):
-    """A lexically internal name whose link leaves the package must not mint."""
+async def test_mint_refuses_a_package_containing_any_symlink(monkeypatch, tmp_path):
+    """A published package holds none, so one appearing ends the mint.
 
-    responder = _launch_evidence_responder(
-        resolves={f"{_PACKAGE}/payloads/frame002.ims": "/n/groups/elsewhere/secret.ims"}
-    )
+    The link need not point anywhere interesting: it is refused for existing,
+    which is what removes the object a resolve-then-hash sequence would race.
+    """
+
+    responder = _launch_evidence_responder(symlinks=[f"{_PACKAGE}/payloads/frame002.ims"])
     _patch_connection(monkeypatch, tmp_path, responder=responder)
     snapshot = await _call("o2_local_status", {})
     refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
     assert refused["ok"] is False
-    assert "which is not inside" in refused["message"]
+    assert refused["error"] == "launch_evidence_refused"
+    assert "contains symlinks" in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_package_path_that_is_itself_a_symlink(monkeypatch, tmp_path):
+    """`find` reports a symlinked start point rather than descending into it."""
+
+    responder = _launch_evidence_responder(symlinks=[_PACKAGE])
+    _patch_connection(monkeypatch, tmp_path, responder=responder)
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "contains symlinks" in refused["message"]
 
 
 @pytest.mark.anyio
@@ -2055,11 +2070,7 @@ async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeyp
     assert minted["ok"] is True
     assert minted["launch_evidence"]["verified_package"]["payload_reverification"]["n_payloads_reverified"] == 800
 
-    hash_commands = [
-        call["argv"][-1]
-        for call in runner.calls
-        if call["argv"][-1].startswith("realpath -- ") and "sha256sum" in call["argv"][-1]
-    ]
+    hash_commands = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("sha256sum")]
     assert len(hash_commands) > 1, "the payload list should have needed more than one command"
     assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in hash_commands)
 

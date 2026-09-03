@@ -248,19 +248,31 @@ def _same_posix_path(left: Any, right: Any) -> bool:
     return str(PurePosixPath(left)) == str(PurePosixPath(right))
 
 
-def _is_beneath(child: Any, parent: Any) -> bool:
-    """True when ``child`` is a strict descendant of ``parent``, componentwise.
+def refuse_package_symlinks(listing: str, *, package_path: str) -> None:
+    """Refuse a package containing any symlink at all.
 
-    Compared as path components rather than as a string prefix, so
-    ``/pkg/attempt-002-other`` is not treated as living inside
-    ``/pkg/attempt-002``.
+    Resolving each payload and requiring it to land inside the package was two
+    independent pathname resolutions, and a run that toggled a link between them
+    could pass the containment check while the digest came from elsewhere.
+    There is no way to make two shell commands share a descriptor, so this
+    removes the thing being raced instead: a published package contains no
+    symlinks, so any link found is grounds to refuse rather than to reason
+    about.
+
+    That is not a conservative approximation. The publisher hard-links and
+    passes ``follow_symlinks=False`` at every site, and the package verifier
+    rejects symlinks outright, so a package containing one is already invalid by
+    its own rules.
     """
 
-    if not isinstance(child, str) or not isinstance(parent, str) or not child.strip() or not parent.strip():
-        return False
-    child_parts = PurePosixPath(child).parts
-    parent_parts = PurePosixPath(parent).parts
-    return len(child_parts) > len(parent_parts) and child_parts[: len(parent_parts)] == parent_parts
+    offenders = [line.strip() for line in listing.splitlines() if line.strip()]
+    if offenders:
+        shown = ", ".join(repr(name) for name in offenders[:5])
+        more = f" (and {len(offenders) - 5} more)" if len(offenders) > 5 else ""
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; {package_path!r} contains symlinks, which a published "
+            f"package never does and its own verifier rejects: {shown}{more}"
+        )
 
 
 def build_launch_evidence(
@@ -275,7 +287,6 @@ def build_launch_evidence(
     stage: str,
     read_back_package_path: str,
     resolved_package_path: str,
-    resolved_payload_paths: Mapping[str, str],
 ) -> dict[str, Any]:
     """Verify every link and return the record, or raise naming what disagreed.
 
@@ -285,9 +296,10 @@ def build_launch_evidence(
     ``payload_digests`` is what those same payloads actually hash to now --
     hashed by the server, not by the run. ``read_back_package_path`` is the
     directory the server actually read and ``resolved_package_path`` is what it
-    resolves to on the cluster; both must be the package the plan approved.
-    ``resolved_payload_paths`` maps each manifest entry to the file the cluster
-    actually opened for it, which must lie inside that resolved package.
+    resolves to on the cluster; both must be the package the plan approved. A
+    manifest entry cannot escape the package because the names are refused if
+    they are absolute or traversing and the package is refused if it holds any
+    symlink at all; see ``refuse_package_symlinks``.
     """
 
     expected_plan_sha256 = plan_digest(plan)
@@ -391,15 +403,6 @@ def build_launch_evidence(
         # read. Requiring the two to agree closes the window between them.
         elif name in package_digests and package_digests[name] != observed_digest:
             mismatches.append(f"payload {name!r} changed between the two reads of the package")
-        # Refusing a lexically escaping name is not the same as refusing one that
-        # escapes through a link. Without this, a subverted run could publish a
-        # payload as a symlink to a file outside the package, put that target's
-        # digest in SHA256SUMS, and obtain a record calling it a package payload.
-        elif not _is_beneath(resolved_payload_paths.get(name), resolved_package_path):
-            mismatches.append(
-                f"payload {name!r} resolves to {resolved_payload_paths.get(name)!r}, "
-                f"which is not inside {resolved_package_path!r}"
-            )
 
     if mismatches:
         raise LaunchEvidenceError(
@@ -537,6 +540,7 @@ __all__ = [
     "parse_encoded_json_artifact",
     "parse_json_artifact",
     "parse_sha256_lines",
+    "refuse_package_symlinks",
     "plan_digest",
     "required_package_files",
 ]
