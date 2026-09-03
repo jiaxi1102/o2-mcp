@@ -2255,11 +2255,39 @@ async def test_mint_hashes_a_large_package_in_batches_the_broker_accepts(monkeyp
 
 def test_hash_batches_refuses_a_single_path_it_can_never_send():
     with pytest.raises(o2server.LaunchEvidenceError, match="too long for one broker command"):
-        list(o2server._hash_batches(["/n/scratch/" + "x" * 70000]))
+        list(o2server._hash_batches(["/n/scratch/" + "x" * 70000], package_path="/pkg"))
 
 
 def test_hash_batches_keeps_one_command_when_it_fits():
-    assert list(o2server._hash_batches(["/a", "/b", "/c"])) == [["/a", "/b", "/c"]]
+    assert list(o2server._hash_batches(["/a", "/b", "/c"], package_path="/pkg")) == [["/a", "/b", "/c"]]
+
+
+def test_hash_batches_counts_the_package_path_the_scans_embed():
+    """The budget must come from the command composed, not a fixed reserve.
+
+    Each batch names the package twice, once per symlink scan, so a deeply
+    nested package makes a constant reserve wrong by kilobytes -- and the broker
+    then rejects a batch that batching existed to make acceptable.
+    """
+
+    from o2mcp.broker_protocol import MAX_COMMAND_BYTES
+
+    package = "/n/scratch/users/" + "/".join("d" * 40 for _ in range(66))
+    paths = [f"{package}/payload-{index:04d}.ome.tif" for index in range(22)]
+
+    commands = [
+        o2server._payload_batch_command(package, " ".join(batch))
+        for batch in o2server._hash_batches(paths, package_path=package)
+    ]
+    assert len(commands) > 1, "the scan paths should have forced a split"
+    assert all(len(command.encode("utf-8")) <= MAX_COMMAND_BYTES for command in commands)
+    # One command for all of them is what the old fixed reserve would have sent.
+    assert len(o2server._payload_batch_command(package, " ".join(paths)).encode("utf-8")) > MAX_COMMAND_BYTES
+
+
+def test_a_package_path_too_long_to_scan_at_all_is_named():
+    with pytest.raises(o2server.LaunchEvidenceError, match="too long to hash through the broker"):
+        list(o2server._hash_batches(["/a"], package_path="/n/scratch/" + "x" * 70000))
 
 
 @pytest.mark.anyio

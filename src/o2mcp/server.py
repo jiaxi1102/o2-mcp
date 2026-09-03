@@ -1327,6 +1327,10 @@ def _read_launch_artifacts(
             "sha256sum -- {}".format(" ".join(shlex.quote(item) for item in sorted(digest_targets))),
         ]
     )
+    # This one is not batched, so a package path long enough to overrun the
+    # broker's limit would be rejected as an opaque ValueError. Name it instead.
+    if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
+        raise LaunchEvidenceError(f"the artifact read for {package_path!r} does not fit in one broker command")
     result = _connection().run(command, timeout=timeout)
     if not result.ok:
         raise LaunchEvidenceError(
@@ -1387,28 +1391,44 @@ def _read_launch_artifacts(
     }
 
 
-# One `sha256sum` per payload would be correct but would take a hold on the
-# shared channel per file. Batching keeps that to the minimum number of commands
-# the broker's 64 KiB limit allows, with room for the prefix and the separators.
-_HASH_COMMAND_BUDGET = MAX_COMMAND_BYTES - 1024
+def _payload_batch_command(package_path: str, operands: str) -> str:
+    """Compose one payload batch: scan, hash, scan again, chained with &&."""
+
+    scan = _symlink_scan(package_path)
+    marker = shlex.quote(_MARKER_PAYLOAD_DIGESTS)
+    rescan = shlex.quote(_MARKER_PAYLOAD_RESCAN)
+    return (
+        f"{scan} && printf '\\n%s\\n' {marker}"
+        f" && sha256sum -- {operands}"
+        f" && printf '\\n%s\\n' {rescan} && {scan}"
+    )
 
 
-def _hash_batches(paths: list[str]) -> Iterator[list[str]]:
+def _hash_batches(paths: list[str], *, package_path: str) -> Iterator[list[str]]:
     """Group quoted payload paths into commands the broker will accept.
 
     A package with a few hundred image files overruns the broker's command limit
     in one command, and `BrokerClient.execute` rejects it before it runs -- so an
     entirely legitimate package could never mint.
+
+    The allowance is measured from the command actually composed rather than
+    reserved as a constant: the scaffolding embeds the package path twice, once
+    per symlink scan, so a deeply nested package makes a fixed reserve wrong by
+    kilobytes and reintroduces exactly the rejection this batching exists to
+    avoid.
     """
 
+    budget = MAX_COMMAND_BYTES - len(_payload_batch_command(package_path, "").encode("utf-8"))
+    if budget <= 0:
+        raise LaunchEvidenceError(f"the package path is too long to hash through the broker at all: {package_path!r}")
     batch: list[str] = []
     used = 0
     for path in paths:
         quoted = shlex.quote(path)
         cost = len(quoted.encode("utf-8")) + 1
-        if cost > _HASH_COMMAND_BUDGET:
+        if cost > budget:
             raise LaunchEvidenceError(f"payload path is too long for one broker command: {path!r}")
-        if batch and used + cost > _HASH_COMMAND_BUDGET:
+        if batch and used + cost > budget:
             yield batch
             batch, used = [], 0
         batch.append(quoted)
@@ -1435,22 +1455,15 @@ def _hash_package_payloads(*, package_path: str, manifest: dict[str, str], timeo
     targets = {str(PurePosixPath(package_path) / name): name for name in manifest}
     if len(targets) != len(manifest):
         raise LaunchEvidenceError("SHA256SUMS names two payloads that resolve to the same path")
-    scan = _symlink_scan(package_path)
     payload_digests: dict[str, str] = {}
-    for batch in _hash_batches(sorted(targets)):
+    for batch in _hash_batches(sorted(targets), package_path=package_path):
         # Scan, hash, scan -- all in one command and all chained with &&. The
         # scan in the artifact read happens a round trip earlier, so on its own
         # it proves nothing about the instant these paths are opened. Bracketing
         # the hashing does not make the two atomic, but it does mean a link has
         # to be created and removed inside a single command rather than in the
         # gap between broker requests.
-        marker = shlex.quote(_MARKER_PAYLOAD_DIGESTS)
-        after = shlex.quote(_MARKER_PAYLOAD_RESCAN)
-        command = (
-            f"{scan} && printf '\\n%s\\n' {marker}"
-            f" && sha256sum -- {' '.join(batch)}"
-            f" && printf '\\n%s\\n' {after} && {scan}"
-        )
+        command = _payload_batch_command(package_path, " ".join(batch))
         result = _connection().run(command, timeout=timeout)
         if not result.ok:
             raise LaunchEvidenceError(
