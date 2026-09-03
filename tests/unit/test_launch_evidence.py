@@ -443,10 +443,17 @@ def test_a_record_that_binds_no_submitted_job_refuses_to_mint(job_id) -> None:
         _build(diagnostic=diagnostic)
 
 
-def test_an_integer_job_id_is_accepted() -> None:
+@pytest.mark.parametrize("job_id", [52085188, "52085188", " 52085188 "])
+def test_the_job_id_is_recorded_in_the_form_the_ledger_stores(job_id) -> None:
+    """The ledger stores the stripped text, and verification compares exactly.
+
+    Keeping the raw value let a diagnostic reporting a padded or numeric id mint
+    a record that then failed the verification it was just issued under.
+    """
+
     diagnostic = _diagnostic(_PLAN)
-    diagnostic["slurm"]["scheduler"]["job_id"] = 52085188
-    assert _build(diagnostic=diagnostic)["submission"]["job_id"] == 52085188
+    diagnostic["slurm"]["scheduler"]["job_id"] = job_id
+    assert _build(diagnostic=diagnostic)["submission"]["job_id"] == "52085188"
 
 
 # --- the manifest must cover every payload the run counted --------------------

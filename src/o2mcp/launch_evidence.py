@@ -582,8 +582,12 @@ def build_launch_evidence(
         "approved_plan": {"sha256": expected_plan_sha256, "attempt_id": plan.get("attempt_id")},
         "submission": {
             # job_id, account and partition are all bound to what Slurm
-            # accounting reports for the job, read through the broker.
-            "job_id": scheduler.get("job_id"),
+            # accounting reports for the job, read through the broker. The id is
+            # stored in the canonical text form the ledger and sacct both use:
+            # keeping the raw value would let a diagnostic reporting " 52085188 "
+            # mint a record that then failed its own ledger comparison, since
+            # the ledger stores the stripped id.
+            "job_id": str(scheduler.get("job_id")).strip(),
             "account": environment.get("SLURM_JOB_ACCOUNT"),
             "partition": environment.get("SLURM_JOB_PARTITION"),
             # What accounting itself said. The state is recorded but not gated
