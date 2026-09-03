@@ -175,6 +175,8 @@ async def test_tool_registry_and_annotations():
         # pre-submission pricing
         "o2_price_job",
         "o2_refresh_billing_weights",
+        # governed launch attestation
+        "o2_mint_launch_evidence",
     }
     assert tools["o2_status"].annotations.readOnlyHint is True
     assert tools["o2_status"].annotations.openWorldHint is False
@@ -198,6 +200,12 @@ async def test_tool_registry_and_annotations():
     # a tool that can write must not claim to be read-only at the point a
     # client decides whether to auto-approve it.
     assert tools["o2_price_job"].annotations.openWorldHint is False
+    # Minting reads cluster artifacts and appends one audit event, so it is not
+    # read-only; but it publishes nothing and removes nothing, so a client must
+    # not be told it is destructive either.
+    assert tools["o2_mint_launch_evidence"].annotations.readOnlyHint is False
+    assert tools["o2_mint_launch_evidence"].annotations.destructiveHint is False
+    assert tools["o2_mint_launch_evidence"].annotations.openWorldHint is False
     assert tools["o2_refresh_billing_weights"].annotations.readOnlyHint is False
     assert tools["o2_refresh_billing_weights"].annotations.openWorldHint is True
 
@@ -1559,3 +1567,187 @@ def test_long_flags_still_end_at_the_token():
     # The attached-value allowance must not let "--mem" match "--mem-per-cpu".
     params = o2server.SubmitInput(script_text="#!/bin/bash\n#SBATCH --mem-per-cpu=4G\n", remote_path="/n/x.sh")
     assert o2server._pricing_record(params)["resource_flags_seen"] == ["--mem-per-cpu"]
+
+
+# --- governed launch attestation ---------------------------------------------
+def _launch_evidence_responder(job_id="52085188"):
+    """Serve the four artifacts the mint reads back off the cluster."""
+
+    import json as _json
+
+    from o2mcp.launch_evidence import plan_digest
+
+    plan = {
+        "attempt_id": "002",
+        "software": {"bundle": {"bundle_sha256": "b" * 64}},
+        "runtime_wrapper": {"sha256": "w" * 64},
+        "interpreter": {"sha256": "i" * 64, "closure_sha256": "c" * 64, "context_sha256": "x" * 64},
+        "destination": {"inode": 42, "mount": "/n/scratch", "expected_package": "/pkg/attempt-002"},
+    }
+    diagnostic = {
+        "status": "diagnostic_success",
+        "continuation_authorized": False,
+        "schema_version": 2,
+        "plan_sha256": plan_digest(plan),
+        "attempt_id": "002",
+        "runtime": {
+            "source_bundle": {"bundle_sha256": "b" * 64},
+            "runtime_wrapper_sha256": "w" * 64,
+            "approved_interpreter": {
+                "approved_path": "/usr/bin/python3",
+                "sha256": "i" * 64,
+                "runtime_context_sha256": "x" * 64,
+                "dynamic_closure": {"closure_sha256": "c" * 64},
+            },
+        },
+        "destination_binding": {
+            "inode": 42,
+            "linux_mountinfo": {"mount_point": "/n/scratch", "mount_source": "server:/scratch"},
+        },
+        "slurm": {
+            "scheduler": {"job_id": job_id, "allocated_hostnames": ["compute-b-16-192"]},
+            "environment": {"SLURM_JOB_ACCOUNT": "tabin", "SLURM_JOB_PARTITION": "short"},
+        },
+        "launch": {"loaded_library_closure": {"loaded_closure_sha256": "l" * 64}},
+        "output": {
+            "package": "/pkg/attempt-002",
+            "reopened_output_sha256": "r" * 64,
+            "verification": {"status": "success", "n_payloads": 9},
+        },
+    }
+    owner = {"plan_sha256": plan_digest(plan), "attempt_id": "002"}
+    digests = "\n".join(
+        f"{'d' * 64}  /pkg/attempt-002/{name}"
+        for name in ("PUBLICATION_OWNER.json", "SUCCESS.json", "SHA256SUMS", "conversion_manifest.json")
+    )
+
+    def responder(argv, input_text):
+        payload = "\n".join(
+            [
+                "===DIAGNOSTIC===",
+                _json.dumps(diagnostic),
+                "===PLAN===",
+                _json.dumps(plan),
+                "===OWNER===",
+                _json.dumps(owner),
+                "===DIGESTS===",
+                digests,
+            ]
+        )
+        return payload, "", 0
+
+    return responder
+
+
+@pytest.mark.anyio
+async def test_mint_launch_evidence_binds_the_chain_and_records_the_approval(monkeypatch, tmp_path):
+    """The record exists only when every link agrees, and the mint is audited."""
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    policy = snapshot["policy"]
+
+    minted = await _call(
+        "o2_mint_launch_evidence",
+        {
+            "params": {
+                "diagnostic_path": "/home/u/diag.json",
+                "plan_path": "/home/u/plan.json",
+                "package_path": "/pkg/attempt-002",
+                "stage": "platform-canary",
+                "expected_revision": policy["revision"],
+                "expected_generation": policy["generation"],
+                "approval_reference": "operator approved canary 002",
+            }
+        },
+    )
+    assert minted["ok"] is True
+    record = minted["launch_evidence"]
+    assert record["binding_check"]["all_links_agree"] is True
+    assert record["submission"]["job_id"] == "52085188"
+    assert record["operator_approval"]["approval_reference"] == "operator approved canary 002"
+    assert len(minted["launch_evidence_sha256"]) == 64
+    # st_dev is host-local for NFS, so it must not be part of the binding.
+    assert "device" not in record["destination"]
+
+    after = await _call("o2_local_status", {})
+    assert any(event.get("event") == "launch_evidence_minted" for event in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_stale_approval(monkeypatch, tmp_path):
+    """An approval that predates a policy write must not still mint."""
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    policy = snapshot["policy"]
+    refused = await _call(
+        "o2_mint_launch_evidence",
+        {
+            "params": {
+                "diagnostic_path": "/home/u/diag.json",
+                "plan_path": "/home/u/plan.json",
+                "package_path": "/pkg/attempt-002",
+                "expected_revision": policy["revision"] + 5,
+                "expected_generation": policy["generation"],
+                "approval_reference": "stale approval",
+            }
+        },
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "policy_conflict"
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_rejects_a_relative_path_before_it_reaches_a_shell(monkeypatch, tmp_path):
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    policy = snapshot["policy"]
+    refused = await _call(
+        "o2_mint_launch_evidence",
+        {
+            "params": {
+                "diagnostic_path": "../escape/diag.json",
+                "plan_path": "/home/u/plan.json",
+                "package_path": "/pkg/attempt-002",
+                "expected_revision": policy["revision"],
+                "expected_generation": policy["generation"],
+                "approval_reference": "relative path",
+            }
+        },
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "absolute normalized" in refused["message"]
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_drifted_chain_without_recording_an_approval(monkeypatch, tmp_path):
+    """A refused mint must leave no audit entry implying the chain agreed."""
+
+    def drifted(argv, input_text):
+        payload, err, rc = _launch_evidence_responder()(argv, input_text)
+        return payload.replace('"' + "b" * 64 + '"', '"' + "0" * 64 + '"', 1), err, rc
+
+    _patch_connection(monkeypatch, tmp_path, responder=drifted)
+    snapshot = await _call("o2_local_status", {})
+    policy = snapshot["policy"]
+    refused = await _call(
+        "o2_mint_launch_evidence",
+        {
+            "params": {
+                "diagnostic_path": "/home/u/diag.json",
+                "plan_path": "/home/u/plan.json",
+                "package_path": "/pkg/attempt-002",
+                "expected_revision": policy["revision"],
+                "expected_generation": policy["generation"],
+                "approval_reference": "should not be recorded",
+            }
+        },
+    )
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])

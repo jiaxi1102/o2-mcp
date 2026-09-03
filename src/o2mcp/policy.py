@@ -311,6 +311,52 @@ class O2PolicyStore:
             self._append_event(state, "policy_reuse_enabled", approval_reference=reference)
             return self._write_next_revision(state)
 
+    def record_launch_evidence_mint(
+        self,
+        *,
+        expected_revision: int,
+        expected_generation: str,
+        approval_reference: str,
+        stage: str,
+        job_id: str,
+        package: str,
+    ) -> dict[str, Any]:
+        """Record one operator-approved launch-evidence mint in the audit ledger.
+
+        This is what authenticates the record. The caller must quote the current
+        generation and revision -- obtainable only from a fresh status snapshot,
+        so an approval cannot be replayed across an intervening policy write --
+        together with a human approval reference. Minting is otherwise an
+        ordinary read of cluster artifacts and would attest nothing.
+
+        It deliberately does NOT consume a login grant or change mode: attesting
+        a finished run is not authority to start another one.
+        """
+
+        reference = self._clean_reference(approval_reference, field="approval_reference")
+        clean_stage = self._clean_reference(stage, field="stage")
+        clean_job = self._clean_reference(job_id, field="job_id")
+        clean_package = self._clean_reference(package, field="package")
+        with self._locked():
+            state = self._read_valid_state()
+            self._require_revision(state, expected_revision, expected_generation)
+            self._append_event(
+                state,
+                "launch_evidence_minted",
+                approval_reference=reference,
+                stage=clean_stage,
+                job_id=clean_job,
+                package=clean_package,
+            )
+            snapshot = self._write_next_revision(state)
+        return {
+            "approval_reference": reference,
+            "policy_revision": snapshot["revision"] if isinstance(snapshot, dict) else None,
+            "policy_generation": snapshot["generation"] if isinstance(snapshot, dict) else None,
+            "client_id": self.client_id,
+            "approved_at": self._clock(),
+        }
+
     def authorize_login(
         self,
         *,

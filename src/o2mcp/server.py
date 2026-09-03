@@ -37,7 +37,7 @@ import stat
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
 import anyio
@@ -64,6 +64,13 @@ from o2mcp import (
     O2Workspace,
     billing,
     transfer_tools,
+)
+from o2mcp.launch_evidence import (
+    LaunchEvidenceError,
+    build_launch_evidence,
+    launch_evidence_digest,
+    parse_json_artifact,
+    required_package_files,
 )
 from o2mcp.policy import LoginTarget
 from o2mcp.slurm import _quote_remote_path
@@ -122,6 +129,10 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "broker_start_failed", "message": str(exc)}
     except O2BrokerError as exc:
         payload = {"ok": False, "error": "broker_error", "message": str(exc)}
+    except LaunchEvidenceError as exc:
+        # Refusing to mint is this tool working as intended, so it gets a named
+        # code rather than falling into the defensive catch-all below.
+        payload = {"ok": False, "error": "launch_evidence_refused", "message": str(exc)}
     except subprocess.TimeoutExpired as exc:
         payload = {"ok": False, "error": "operation_timeout", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
@@ -256,6 +267,41 @@ class AuthorizeLoginInput(BaseModel):
         description="Whether this exact one-shot login may proceed without a proven HMS VPN route.",
     )
     approval_reference: str = Field(..., min_length=1, max_length=240)
+
+
+class MintLaunchEvidenceInput(BaseModel):
+    """Bind one finished governed stage into an operator-approved record."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    diagnostic_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the stage's run diagnostic JSON (the job's stdout).",
+    )
+    plan_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the frozen execution plan JSON that was approved.",
+    )
+    package_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the published package directory the stage verified.",
+    )
+    stage: str = Field(default="platform-canary", min_length=1, max_length=120)
+    expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
+    approval_reference: str = Field(
+        ...,
+        min_length=1,
+        max_length=240,
+        description="The operator's explicit approval of this exact record; it is what authenticates it.",
+    )
+    timeout_seconds: float = Field(default=60.0, gt=0, le=60.0)
 
 
 class ProbeInput(BaseModel):
@@ -1168,6 +1214,146 @@ def _pricing_record(params: SubmitInput, remote_directives: list[str] | None = N
             "accompanied it. Price the shape with o2_price_job if it does."
         )
     return record
+
+
+def _absolute_remote_path(value: str, *, label: str) -> str:
+    """Require an absolute, traversal-free remote path before it reaches a shell."""
+
+    cleaned = value.strip()
+    if not cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+        raise LaunchEvidenceError(f"{label} must be an absolute normalized O2 path")
+    return cleaned
+
+
+_LAUNCH_EVIDENCE_MARKERS = ("===DIAGNOSTIC===", "===PLAN===", "===OWNER===", "===DIGESTS===")
+
+
+def _read_launch_artifacts(
+    *, diagnostic_path: str, plan_path: str, package_path: str, timeout: float
+) -> dict[str, Any]:
+    """Read every artifact back off the cluster through the authenticated broker.
+
+    Reading them here rather than accepting caller-supplied content is the point:
+    the record must attest what is actually on O2. One command keeps a single
+    hold on the shared channel.
+    """
+
+    owner_path = str(PurePosixPath(package_path) / "PUBLICATION_OWNER.json")
+    digest_targets = [str(PurePosixPath(package_path) / name) for name in required_package_files()]
+    command = "; ".join(
+        [
+            f"printf '%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[0])}",
+            f"cat {shlex.quote(diagnostic_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[1])}",
+            f"cat {shlex.quote(plan_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[2])}",
+            f"cat {shlex.quote(owner_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_LAUNCH_EVIDENCE_MARKERS[3])}",
+            "sha256sum {}".format(" ".join(shlex.quote(item) for item in digest_targets)),
+        ]
+    )
+    result = _connection().run(command, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not read the launch artifacts from O2: {}".format((result.stderr or "").strip()[:400])
+        )
+
+    sections: dict[str, str] = {}
+    current: str | None = None
+    collected: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.strip() in _LAUNCH_EVIDENCE_MARKERS:
+            if current is not None:
+                sections[current] = "\n".join(collected)
+            current = line.strip()
+            collected = []
+            continue
+        collected.append(line)
+    if current is not None:
+        sections[current] = "\n".join(collected)
+    missing = [marker for marker in _LAUNCH_EVIDENCE_MARKERS if marker not in sections]
+    if missing:
+        raise LaunchEvidenceError("artifact read returned no {} section".format(", ".join(missing)))
+
+    package_digests: dict[str, str] = {}
+    for line in sections[_LAUNCH_EVIDENCE_MARKERS[3]].splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            package_digests[PurePosixPath(parts[1]).name] = parts[0]
+    return {
+        "diagnostic": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[0]], label="run diagnostic"),
+        "plan": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[1]], label="execution plan"),
+        "owner": parse_json_artifact(sections[_LAUNCH_EVIDENCE_MARKERS[2]], label="publication owner"),
+        "package_digests": package_digests,
+    }
+
+
+@mcp.tool(
+    name="o2_mint_launch_evidence",
+    annotations={
+        "title": "Mint authenticated O2 launch evidence",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
+)
+async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
+    """Bind a finished governed stage into one operator-approved evidence record.
+
+    A repository canary can verify its own scientific path but cannot
+    authenticate its own launch, so the authority has to come from outside the
+    executed process. This reads the run diagnostic, the frozen plan, the
+    publication owner marker, and the package digests back off the cluster
+    through the authenticated broker, checks that every link agrees, and records
+    the mint in the policy audit ledger against the operator's approval.
+
+    Minting attests a finished run. It is deliberately NOT authority to start
+    another one: it consumes no login grant and changes no policy mode.
+    """
+
+    def work() -> dict[str, Any]:
+        diagnostic_path = _absolute_remote_path(params.diagnostic_path, label="diagnostic_path")
+        plan_path = _absolute_remote_path(params.plan_path, label="plan_path")
+        package_path = _absolute_remote_path(params.package_path, label="package_path")
+        artifacts = _read_launch_artifacts(
+            diagnostic_path=diagnostic_path,
+            plan_path=plan_path,
+            package_path=package_path,
+            timeout=params.timeout_seconds,
+        )
+        # Verify BEFORE recording an approval: a chain that does not agree must
+        # not leave an audit entry implying it did.
+        preliminary = build_launch_evidence(
+            diagnostic=artifacts["diagnostic"],
+            plan=artifacts["plan"],
+            package_digests=artifacts["package_digests"],
+            owner=artifacts["owner"],
+            approval={},
+            stage=params.stage,
+        )
+        approval = _connection().policy.record_launch_evidence_mint(
+            expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
+            approval_reference=params.approval_reference,
+            stage=params.stage,
+            job_id=str(preliminary["submission"]["job_id"]),
+            package=str(preliminary["destination"]["package"]),
+        )
+        record = build_launch_evidence(
+            diagnostic=artifacts["diagnostic"],
+            plan=artifacts["plan"],
+            package_digests=artifacts["package_digests"],
+            owner=artifacts["owner"],
+            approval=approval,
+            stage=params.stage,
+        )
+        return {
+            "ok": True,
+            "launch_evidence": record,
+            "launch_evidence_sha256": launch_evidence_digest(record),
+        }
+
+    return await _run_tool(work)
 
 
 @mcp.tool(
