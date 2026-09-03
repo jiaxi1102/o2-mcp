@@ -15,6 +15,8 @@ import pytest
 
 from o2mcp.policy import (
     DEFAULT_GRANT_TTL_SECONDS,
+    MAX_LAUNCH_EVIDENCE_MINTS,
+    SCHEMA_VERSION,
     O2LoginGrantError,
     O2PolicyConflictError,
     O2PolicyDeniedError,
@@ -617,7 +619,7 @@ def test_disable_repairs_owned_malformed_json_but_not_symlink(tmp_path):
 
     repaired = store.disable(reason="repair to safest state")
     assert repaired["mode"] == "disabled"
-    assert json.loads(policy.read_text())["schema_version"] == 1
+    assert json.loads(policy.read_text())["schema_version"] == SCHEMA_VERSION
 
 
 def test_malformed_policy_repair_preserves_recent_retry_cooldown(tmp_path):
@@ -649,3 +651,129 @@ def test_malformed_policy_repair_preserves_recent_retry_cooldown(tmp_path):
             allow_offvpn=False,
             approval_reference="must remain blocked",
         )
+
+
+# --- the durable launch-evidence ledger ---------------------------------------
+def _mint(store, snapshot, *, evidence="a" * 64, reference="operator approved"):
+    return store.record_launch_evidence_mint(
+        expected_revision=snapshot["revision"],
+        expected_generation=snapshot["generation"],
+        approval_reference=reference,
+        stage="platform-canary",
+        job_id="52085188",
+        package="/pkg/attempt-002",
+        evidence_sha256=evidence,
+        plan_sha256="b" * 64,
+    )
+
+
+def test_a_mint_survives_the_event_buffer_rolling_over(tmp_path):
+    """The digest that authenticates a record must not age out of the ledger.
+
+    `events` is a rolling buffer bounded to MAX_EVENTS and this file sees many
+    events per session, so an approval recorded only there stops being
+    verifiable after ordinary unrelated policy traffic -- tamper-evidence with a
+    shelf life.
+    """
+
+    store = _reuse_store(tmp_path)
+    _mint(store, store.snapshot().state)
+    for index in range(200):
+        state = store.snapshot().state
+        store.disable(reason=f"churn {index}")
+        store.enable_reuse(
+            expected_revision=store.snapshot().state["revision"],
+            expected_generation=state["generation"],
+            approval_reference=f"churn {index}",
+        )
+
+    final = store.snapshot().state
+    assert not any(event.get("event") == "launch_evidence_minted" for event in final["events"])
+    assert [mint["evidence_sha256"] for mint in final["launch_evidence_mints"]] == ["a" * 64]
+    assert final["launch_evidence_mints"][0]["plan_sha256"] == "b" * 64
+    assert final["launch_evidence_mints"][0]["package"] == "/pkg/attempt-002"
+
+
+def test_a_full_ledger_refuses_rather_than_evicting_an_attestation(tmp_path):
+    """Dropping the oldest attestation to make room is the defect being fixed."""
+
+    store = _reuse_store(tmp_path)
+    for index in range(MAX_LAUNCH_EVIDENCE_MINTS):
+        _mint(store, store.snapshot().state, evidence=f"{index:064x}")
+    before = store.snapshot().state
+    assert len(before["launch_evidence_mints"]) == MAX_LAUNCH_EVIDENCE_MINTS
+
+    with pytest.raises(O2PolicyInvalidError, match="maximum of"):
+        _mint(store, before, evidence="f" * 64)
+
+    after = store.snapshot().state
+    # Refused before anything was written: no revision bump, no partial event.
+    assert after["revision"] == before["revision"]
+    assert after["launch_evidence_mints"][0]["evidence_sha256"] == f"{0:064x}"
+    assert not any(mint["evidence_sha256"] == "f" * 64 for mint in after["launch_evidence_mints"])
+
+
+def test_schema_1_state_is_migrated_rather_than_invalidated(tmp_path):
+    """Upgrading this code must not brick an existing policy file."""
+
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generation": "00000000-0000-4000-8000-000000000001",
+                "revision": 7,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [{"at": 1.0, "event": "policy_reuse_enabled"}],
+            }
+        )
+    )
+    policy.chmod(0o600)
+    store = O2PolicyStore(policy, client_id="client-a", clock=lambda: 1000.0)
+
+    snapshot = store.snapshot()
+    assert snapshot.valid is True
+    assert snapshot.effective_mode == "reuse_only"
+    assert snapshot.state["launch_evidence_mints"] == []
+    assert snapshot.state["revision"] == 7
+    # Reading migrates in memory only; the file is untouched until a write.
+    assert json.loads(policy.read_text())["schema_version"] == 1
+
+    _mint(store, snapshot.state)
+    persisted = json.loads(policy.read_text())
+    assert persisted["schema_version"] == SCHEMA_VERSION
+    assert [mint["evidence_sha256"] for mint in persisted["launch_evidence_mints"]] == ["a" * 64]
+
+
+def test_an_unknown_schema_is_still_refused(tmp_path):
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(json.dumps({"schema_version": 99, "generation": "x", "revision": 0, "mode": "disabled"}))
+    policy.chmod(0o600)
+    store = O2PolicyStore(policy, client_id="client-a")
+    snapshot = store.snapshot()
+    assert snapshot.valid is False
+    assert "Unsupported O2 policy schema" in (snapshot.error or "")
+
+
+def test_a_malformed_mint_ledger_is_refused(tmp_path):
+    policy = tmp_path / "O2_POLICY.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "generation": "00000000-0000-4000-8000-000000000001",
+                "revision": 1,
+                "mode": "reuse_only",
+                "login_grant": None,
+                "login_attempt": None,
+                "events": [],
+                "launch_evidence_mints": ["not an object"],
+            }
+        )
+    )
+    policy.chmod(0o600)
+    snapshot = O2PolicyStore(policy, client_id="client-a").snapshot()
+    assert snapshot.valid is False
+    assert "launch_evidence_mints" in (snapshot.error or "")

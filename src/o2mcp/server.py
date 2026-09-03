@@ -618,6 +618,15 @@ def _local_status_payload() -> dict[str, Any]:
             "login_grant": grant,
             "login_attempt": state.get("login_attempt") if isinstance(state, dict) else None,
             "recent_events": state.get("events", [])[-10:] if isinstance(state, dict) else [],
+            # The durable attestation ledger. Unlike recent_events this is never
+            # evicted, so a record minted long ago is still verifiable against
+            # it; only the newest few are surfaced here, the rest live in the file.
+            "launch_evidence_mint_count": (
+                len(state.get("launch_evidence_mints", [])) if isinstance(state, dict) else 0
+            ),
+            "recent_launch_evidence_mints": (
+                state.get("launch_evidence_mints", [])[-10:] if isinstance(state, dict) else []
+            ),
         },
         "control_sockets": _local_socket_inventory(),
         # Keep the singular login-broker key for clients written against the

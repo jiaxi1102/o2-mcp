@@ -1885,6 +1885,26 @@ async def test_mint_records_the_record_digest_in_the_audit_ledger(monkeypatch, t
 
 
 @pytest.mark.anyio
+async def test_mint_is_recorded_in_the_durable_ledger_not_only_the_event_log(monkeypatch, tmp_path):
+    """A record stays verifiable after the rolling event buffer has moved on."""
+
+    from o2mcp.launch_evidence import evidence_content_digest
+
+    _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True
+    digest = evidence_content_digest(minted["launch_evidence"])
+
+    after = await _call("o2_local_status", {})
+    assert after["policy"]["launch_evidence_mint_count"] == 1
+    ledger = after["policy"]["recent_launch_evidence_mints"]
+    assert [entry["evidence_sha256"] for entry in ledger] == [digest]
+    assert ledger[0]["stage"] == "platform-canary"
+    assert ledger[0]["job_id"] == "52085188"
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_manifest_that_changed_while_it_was_read(monkeypatch, tmp_path):
     """The bytes that chose the payloads must be the file whose digest is recorded.
 

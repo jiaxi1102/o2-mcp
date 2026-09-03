@@ -43,10 +43,17 @@ PolicyMode = Literal["disabled", "reuse_only"]
 LoginTarget = Literal["login", "transfer"]
 LoginAuthorizationMethod = Literal["explicit_user_approval", "standing_on_vpn"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Schema 1 predates the durable launch-evidence ledger and is still readable: it
+# is migrated in memory on read and persisted as 2 by the next policy write, so
+# an existing policy file is never invalidated merely by upgrading this code.
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 DEFAULT_GRANT_TTL_SECONDS = 300.0
 DEFAULT_LOGIN_COOLDOWN_SECONDS = 300.0
 MAX_EVENTS = 64
+# The durable mint ledger is bounded too, but by refusing rather than evicting;
+# see _append_launch_evidence_mint for why silently dropping one is the defect.
+MAX_LAUNCH_EVIDENCE_MINTS = 256
 
 # Digests recorded in the audit ledger must be literal hex, never a label.
 _HEX_DIGITS = "0123456789abcdef"
@@ -342,6 +349,11 @@ class O2PolicyStore:
         approval object that still agreed with the ledger. With the digest
         stored, that edit no longer matches the entry that approved it.
 
+        The digest goes into ``launch_evidence_mints``, which event eviction
+        never touches, as well as into the rolling event log. An attestation
+        recorded only in a buffer bounded to MAX_EVENTS would stop being
+        verifiable after enough unrelated policy traffic.
+
         It deliberately does NOT consume a login grant or change mode: attesting
         a finished run is not authority to start another one.
         """
@@ -355,16 +367,20 @@ class O2PolicyStore:
         with self._locked():
             state = self._read_valid_state()
             self._require_revision(state, expected_revision, expected_generation)
-            self._append_event(
-                state,
-                "launch_evidence_minted",
-                approval_reference=reference,
-                stage=clean_stage,
-                job_id=clean_job,
-                package=clean_package,
-                evidence_sha256=evidence_digest,
-                plan_sha256=approved_plan_digest,
-            )
+            details = {
+                "approval_reference": reference,
+                "stage": clean_stage,
+                "job_id": clean_job,
+                "package": clean_package,
+                "evidence_sha256": evidence_digest,
+                "plan_sha256": approved_plan_digest,
+            }
+            # The durable ledger first: if it is full this raises before anything
+            # is written, so a refused mint leaves no event claiming otherwise.
+            self._append_launch_evidence_mint(state, **details)
+            # The rolling event stays as the operational log; the ledger above is
+            # what a record is verified against.
+            self._append_event(state, "launch_evidence_minted", **details)
             snapshot = self._write_next_revision(state)
         return {
             "approval_reference": reference,
@@ -725,10 +741,21 @@ class O2PolicyStore:
 
         if not isinstance(payload, dict):
             raise O2PolicyInvalidError("O2 policy root must be a JSON object")
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        version = payload.get("schema_version")
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
             raise O2PolicyInvalidError(
-                f"Unsupported O2 policy schema {payload.get('schema_version')!r}; expected {SCHEMA_VERSION}."
+                f"Unsupported O2 policy schema {version!r}; expected one of {SUPPORTED_SCHEMA_VERSIONS}."
             )
+        # Detach before migrating so no caller's structure -- or a JSON decoder
+        # cache -- is mutated by reading.
+        payload = json.loads(json.dumps(payload))
+        if version != SCHEMA_VERSION:
+            # Schema 1 is otherwise entirely valid; it simply has no durable mint
+            # ledger yet. Adding the empty list upgrades it in memory, and the
+            # next policy write persists the new version. Nothing is rewritten
+            # merely to read, and no existing state is invalidated.
+            payload.setdefault("launch_evidence_mints", [])
+            payload["schema_version"] = SCHEMA_VERSION
         revision = payload.get("revision")
         if type(revision) is not int or revision < 0:
             raise O2PolicyInvalidError("O2 policy revision must be a non-negative integer")
@@ -751,9 +778,10 @@ class O2PolicyStore:
             self._validate_login_attempt(payload["login_attempt"])
         if not isinstance(payload.get("events", []), list):
             raise O2PolicyInvalidError("events must be an array")
-        # Return a detached mutable copy so callers cannot accidentally mutate a
-        # structure shared with an input fixture or JSON decoder cache.
-        return json.loads(json.dumps(payload))
+        mints = payload.get("launch_evidence_mints", [])
+        if not isinstance(mints, list) or any(not isinstance(entry, dict) for entry in mints):
+            raise O2PolicyInvalidError("launch_evidence_mints must be an array of objects")
+        return payload
 
     @staticmethod
     def _validate_login_attempt(attempt: dict[str, Any]) -> None:
@@ -1005,6 +1033,7 @@ class O2PolicyStore:
             "login_grant": None,
             "login_attempt": None,
             "events": [],
+            "launch_evidence_mints": [],
         }
 
     def _require_revision(
@@ -1086,6 +1115,29 @@ class O2PolicyStore:
         events = state.setdefault("events", [])
         events.append({"at": self._clock(), "event": event, "client_id": self.client_id, **details})
         del events[:-MAX_EVENTS]
+
+    def _append_launch_evidence_mint(self, state: dict[str, Any], **details: Any) -> None:
+        """Append one mint to the ledger that ordinary event eviction never touches.
+
+        Deliberately not `_append_event`. That list is a rolling buffer capped at
+        MAX_EVENTS, and this ledger sees many events per session, so an approval
+        recorded only there stops being verifiable once unrelated policy traffic
+        pushes it out -- tamper-evidence with a shelf life, which is worse than
+        not claiming any.
+
+        This list is bounded too, but by refusing rather than evicting. Dropping
+        the oldest attestation to make room is exactly the defect being fixed, so
+        a full ledger is a loud and recoverable failure instead of a silent one.
+        """
+
+        mints = state.setdefault("launch_evidence_mints", [])
+        if len(mints) >= MAX_LAUNCH_EVIDENCE_MINTS:
+            raise O2PolicyInvalidError(
+                f"the launch-evidence ledger already holds its maximum of {MAX_LAUNCH_EVIDENCE_MINTS} mints. "
+                f"Archive and prune {self.path} before minting again: evicting an older attestation to make "
+                "room would silently make that record unverifiable."
+            )
+        mints.append({"at": self._clock(), "client_id": self.client_id, **details})
 
     @staticmethod
     def _clean_reference(value: str, *, field: str) -> str:
