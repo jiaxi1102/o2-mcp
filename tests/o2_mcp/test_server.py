@@ -1353,6 +1353,93 @@ def test_a_malformed_receipt_cannot_silence_an_unpriceable_option():
     assert "not a recognisable" in record["note"]
 
 
+def _short_receipt():
+    table = billing.parse_weight_table(
+        "PartitionName=short TRESBillingWeights=CPU=1,Mem=0.0625G"
+        " TRES=cpu=400,mem=4000G,node=10 State=UP AllowGroups=ALL"
+    )
+    return billing.price_receipt(billing.price(billing.Request(cpus=4, mem_gb=16), table, "short"))
+
+
+def test_a_receipt_for_another_partition_is_not_this_job_s_price():
+    """Weights differ per partition, so the number does not carry across.
+
+    The one part of binding a receipt to a script that needs no script parser:
+    the submission names a partition, the receipt names one, compare them.
+    """
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --partition=long\n",
+            remote_path="/n/x.sh",
+            priced=_short_receipt(),
+        )
+    )
+    assert record["priced"] is False
+    assert "priced for partition 'short'" in record["note"]
+    # The receipt is still reported -- it is evidence about some shape.
+    assert record["receipt"]["partition"] == "short"
+
+
+def test_a_matching_partition_still_prices():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --partition=short\n",
+            remote_path="/n/x.sh",
+            priced=_short_receipt(),
+        )
+    )
+    assert record["priced"] is True
+    assert "note" not in record
+
+
+def test_an_argument_beats_a_directive_when_they_disagree():
+    # sbatch takes the command line, so the argument decides the comparison --
+    # in both directions, or the check would only ever be one of them.
+    conflicting = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --partition=short\n",
+            remote_path="/n/x.sh",
+            sbatch_args=["-plong"],
+            priced=_short_receipt(),
+        )
+    )
+    assert conflicting["priced"] is False
+    agreeing = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --partition=long\n",
+            remote_path="/n/x.sh",
+            sbatch_args=["-pshort"],
+            priced=_short_receipt(),
+        )
+    )
+    assert agreeing["priced"] is True
+
+
+def test_a_partition_list_conflicts_only_when_the_receipt_is_not_in_it():
+    # sbatch picks one of the list; which is not knowable here, so a receipt
+    # priced for any member stays consistent.
+    def rec(value):
+        return o2server._pricing_record(
+            o2server.SubmitInput(
+                script_text=f"#!/bin/bash\n#SBATCH --partition={value}\n",
+                remote_path="/n/x.sh",
+                priced=_short_receipt(),
+            )
+        )
+
+    assert rec("long,short")["priced"] is True
+    assert rec("long,gpu")["priced"] is False
+
+
+def test_a_submission_naming_no_partition_is_not_a_conflict():
+    record = o2server._pricing_record(
+        o2server.SubmitInput(
+            script_text="#!/bin/bash\n#SBATCH --mem=16G\n", remote_path="/n/x.sh", priced=_short_receipt()
+        )
+    )
+    assert record["priced"] is True
+
+
 def test_a_receipt_cannot_silence_an_unpriceable_option():
     """Passing a valid receipt must not buy silence about --exclusive.
 
