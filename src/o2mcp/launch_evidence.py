@@ -547,60 +547,46 @@ def build_launch_evidence(
         "stage": stage,
         "approved_plan": {"sha256": expected_plan_sha256, "attempt_id": plan.get("attempt_id")},
         "submission": {
+            # job_id, account and partition are all bound to what Slurm
+            # accounting reports for the job, read through the broker.
             "job_id": scheduler.get("job_id"),
-            "allocated_hostnames": scheduler.get("allocated_hostnames"),
             "account": environment.get("SLURM_JOB_ACCOUNT"),
             "partition": environment.get("SLURM_JOB_PARTITION"),
-            # What Slurm accounting reports, read through the broker. The state
-            # is recorded but deliberately not gated on: a mint can legitimately
+            # What accounting itself said. The state is recorded but not gated
+            # on beyond refusing a job that did not run: a mint can legitimately
             # race a job's final accounting transition, and refusing on that
             # would fail correct runs for their timing rather than their content.
             "scheduler_accounting": dict(scheduler_record),
         },
         "runtime_identities": {
-            # Every digest at this level is bound to the approved plan by
-            # _BINDINGS, so a run that differs from what was approved cannot
-            # produce a record carrying them.
+            # Every digest here is bound to the approved plan by _BINDINGS, so a
+            # run that differs from what was approved cannot carry them.
             "source_bundle_sha256": _dig(diagnostic, ("runtime", "source_bundle", "bundle_sha256")),
             "runtime_wrapper_sha256": _dig(diagnostic, ("runtime", "runtime_wrapper_sha256")),
             "interpreter_sha256": interpreter.get("sha256"),
             "interpreter_closure_sha256": closure.get("closure_sha256"),
             "interpreter_replay_context_sha256": interpreter.get("runtime_context_sha256"),
-            "unbound_run_reported": {
-                # These are NOT authenticated claims. The plan approves no
-                # counterpart for either, and the server observes neither, so a
-                # compromised run could put any value here -- the loaded closure
-                # in particular could name a set of libraries that were never
-                # loaded. They are kept because they are useful context, and
-                # separated because everything above them is bound and they are
-                # not; a reader must not mistake one for the other.
-                "note": (
-                    "reported by the executed process, bound to nothing the plan approved or the "
-                    "server observed; not part of this record's authenticated claims"
-                ),
-                "interpreter_path": interpreter.get("approved_path"),
-                "loaded_closure_sha256": _dig(
-                    diagnostic, ("launch", "loaded_library_closure", "loaded_closure_sha256")
-                ),
-            },
         },
         "destination": {
+            # package, inode and mount_point are bound to the plan; the two
+            # read-back paths are the server's own, one of them observed on the
+            # cluster.
             "package": _dig(diagnostic, ("output", "package")),
             "read_back_package_path": read_back_package_path,
             "resolved_package_path": resolved_package_path,
             "inode": binding.get("inode"),
             "mount_point": mountinfo.get("mount_point"),
-            "mount_source": mountinfo.get("mount_source"),
             # st_dev is assigned per host for network filesystems -- the same NFS
             # mount reports different numbers on the login and compute nodes --
-            # so binding it would fail a correct run. Inode and mount source are
-            # server-issued and stable.
+            # so binding it would fail a correct run. The inode is stable.
             "device_note": "st_dev is host-local for NFS and is deliberately not bound",
         },
         "verified_package": {
+            # The status is required to be "success" and the payload count is
+            # bound to the manifest length; the digests below are the server's
+            # own, computed by reading the package back.
             "verification_status": verification_status,
             "n_payloads": _dig(diagnostic, ("output", "verification", "n_payloads")),
-            "reopened_output_sha256": _dig(diagnostic, ("output", "reopened_output_sha256")),
             "file_digests": dict(package_digests),
             "payload_reverification": {
                 "manifest": "SHA256SUMS",
@@ -612,10 +598,36 @@ def build_launch_evidence(
                 ),
             },
         },
-        "run_diagnostic": {
-            "status": diagnostic.get("status"),
+        "run_diagnostic": {"status": diagnostic.get("status")},
+        # Everything the executed process reported that nothing here checks. A
+        # compromised run can put any value in any of these, so they are kept
+        # apart from the authenticated claims rather than mixed in with them: a
+        # reader must never have to know which fields of a section were verified.
+        # Moving a field out of here means adding a binding or a server-side
+        # observation for it, not relabelling it.
+        "unbound_run_reported": {
+            "note": (
+                "reported by the executed process and bound to nothing the plan approved, the "
+                "scheduler confirmed, or the server observed; not part of this record's "
+                "authenticated claims"
+            ),
+            # No approved counterpart exists for either of these.
+            "interpreter_path": interpreter.get("approved_path"),
+            "loaded_closure_sha256": _dig(diagnostic, ("launch", "loaded_library_closure", "loaded_closure_sha256")),
+            # The accounting query does not ask for a node list: Slurm returns a
+            # compact hostlist expression that would have to be expanded to
+            # compare, and expanding it wrongly would refuse correct runs.
+            "allocated_hostnames": scheduler.get("allocated_hostnames"),
+            # The mount point is bound; the source backing it is not observed.
+            "mount_source": mountinfo.get("mount_source"),
+            # Never recomputed here -- the payloads are rehashed against
+            # SHA256SUMS instead, which is what the package's integrity rests on.
+            "reopened_output_sha256": _dig(diagnostic, ("output", "reopened_output_sha256")),
+            # `false` is the expected value and is deliberately not treated as a
+            # failure: it is the run asserting it cannot authenticate its own
+            # launch, which is why this record exists.
             "continuation_authorized": diagnostic.get("continuation_authorized"),
-            "schema_version": diagnostic.get("schema_version"),
+            "diagnostic_schema_version": diagnostic.get("schema_version"),
         },
         "operator_approval": dict(approval),
         "binding_check": {"all_links_agree": True, "checked": checks},

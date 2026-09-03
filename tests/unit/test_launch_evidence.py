@@ -13,7 +13,6 @@ import hashlib
 import pytest
 
 from o2mcp.launch_evidence import (
-    _BINDINGS,
     EXPECTED_DIAGNOSTIC_STATUS,
     LAUNCH_EVIDENCE_SCHEMA,
     SACCT_RETENTION_DAYS,
@@ -132,7 +131,7 @@ def test_intact_chain_mints_a_record() -> None:
     # The count is what was actually checked, payload by payload, not a constant.
     assert record["binding_check"]["checked"] > len(_manifest())
     assert record["submission"]["job_id"] == "52085188"
-    assert record["runtime_identities"]["unbound_run_reported"]["loaded_closure_sha256"] == "l" * 64
+    assert record["unbound_run_reported"]["loaded_closure_sha256"] == "l" * 64
     assert record["operator_approval"]["approval_reference"] == "operator approved"
 
 
@@ -490,7 +489,7 @@ def test_an_unauthorized_continuation_is_not_a_failure() -> None:
     diagnostic = _diagnostic(_PLAN)
     assert diagnostic["continuation_authorized"] is False
     record = _build(diagnostic=diagnostic)
-    assert record["run_diagnostic"]["continuation_authorized"] is False
+    assert record["unbound_run_reported"]["continuation_authorized"] is False
     assert record["run_diagnostic"]["status"] == EXPECTED_DIAGNOSTIC_STATUS
 
 
@@ -763,28 +762,89 @@ def test_a_record_without_an_approval_cannot_be_verified() -> None:
 
 # --- unbound values must not sit among the authenticated ones -----------------
 def test_run_reported_values_are_separated_from_the_bound_ones() -> None:
-    """The plan approves no counterpart for either, so neither is a claim.
+    """Nothing checks any of these, so none of them is a claim this record makes.
 
-    A compromised run can put any digest in `loaded_closure_sha256`; leaving it
-    alongside the bound identities made the record look like it attested a set
-    of libraries it had never checked.
+    A compromised run can put any value in each. Keeping them among the bound
+    fields made the record look like it attested a loaded library set, an
+    allocation, a filesystem and a reopened output it had never checked.
     """
 
-    identities = _build()["runtime_identities"]
-    assert "loaded_closure_sha256" not in identities
-    assert "interpreter_path" not in identities
-    unbound = identities["unbound_run_reported"]
-    assert unbound["loaded_closure_sha256"] == "l" * 64
-    assert unbound["interpreter_path"] == "/usr/bin/python3"
+    record = _build()
+    unbound = record["unbound_run_reported"]
+    assert set(unbound) == {
+        "note",
+        "interpreter_path",
+        "loaded_closure_sha256",
+        "allocated_hostnames",
+        "mount_source",
+        "reopened_output_sha256",
+        "continuation_authorized",
+        "diagnostic_schema_version",
+    }
     assert "not part of this record's authenticated claims" in unbound["note"]
+    assert unbound["loaded_closure_sha256"] == "l" * 64
+    assert unbound["mount_source"] == "server:/scratch"
+    assert unbound["reopened_output_sha256"] == "r" * 64
+    assert unbound["allocated_hostnames"] == ["compute-b-16-192"]
+    # And none of them is left behind in a section that reads as authenticated.
+    assert "mount_source" not in record["destination"]
+    assert "reopened_output_sha256" not in record["verified_package"]
+    assert "allocated_hostnames" not in record["submission"]
+    assert "loaded_closure_sha256" not in record["runtime_identities"]
 
 
-def test_every_digest_left_at_the_top_of_runtime_identities_is_bound() -> None:
-    """If a field is added there without a binding, this fails."""
+def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> None:
+    """A field added to an authenticated section without a check must fail here.
 
-    bound_labels = {label for label, _, _ in _BINDINGS}
-    identities = _build()["runtime_identities"]
-    for field in identities:
-        if field == "unbound_run_reported":
+    This is the guard that keeps the previous test true. Every leaf outside
+    `unbound_run_reported` is listed with what makes it trustworthy; adding one
+    without deciding forces this assertion rather than quietly extending what
+    the record appears to attest.
+    """
+
+    accounted = {
+        # bound to the approved plan by _BINDINGS
+        ("approved_plan", "attempt_id"),
+        ("runtime_identities", "source_bundle_sha256"),
+        ("runtime_identities", "runtime_wrapper_sha256"),
+        ("runtime_identities", "interpreter_sha256"),
+        ("runtime_identities", "interpreter_closure_sha256"),
+        ("runtime_identities", "interpreter_replay_context_sha256"),
+        ("destination", "package"),
+        ("destination", "inode"),
+        ("destination", "mount_point"),
+        # confirmed against Slurm accounting
+        ("submission", "job_id"),
+        ("submission", "account"),
+        ("submission", "partition"),
+        # required to hold a specific value
+        ("verified_package", "verification_status"),
+        ("run_diagnostic", "status"),
+        # bound to the manifest the server read and rehashed
+        ("verified_package", "n_payloads"),
+        # computed or observed by the server itself
+        ("schema",),
+        ("stage",),
+        ("approved_plan", "sha256"),
+        ("destination", "read_back_package_path"),
+        ("destination", "resolved_package_path"),
+        ("destination", "device_note"),
+        ("binding_check", "all_links_agree"),
+        ("binding_check", "checked"),
+    }
+    record = _build()
+    leaves = set()
+    for key, value in record.items():
+        if key in {"unbound_run_reported", "operator_approval"}:
             continue
-        assert field in bound_labels, f"{field} sits among the bound identities but nothing binds it"
+        # These subtrees are wholly server-computed; their contents are not
+        # individually enumerated here.
+        if key == "submission":
+            leaves.update((key, field) for field in value if field != "scheduler_accounting")
+        elif key == "verified_package":
+            leaves.update((key, field) for field in value if field not in {"file_digests", "payload_reverification"})
+        elif isinstance(value, dict):
+            leaves.update((key, field) for field in value)
+        else:
+            leaves.add((key,))
+    assert leaves == accounted
