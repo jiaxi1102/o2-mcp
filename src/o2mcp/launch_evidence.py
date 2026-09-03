@@ -760,10 +760,19 @@ def verify_launch_evidence(record: Mapping[str, Any], ledger_entry: Mapping[str,
             f"evidence_sha256: record={approval.get('evidence_sha256')!r} "
             f"ledger={ledger_entry.get('evidence_sha256')!r}"
         )
-    for field, key in (("stage", "stage"), ("package", "package")):
-        claimed = record.get(field) if field == "stage" else _dig(record, ("destination", "package"))
-        if claimed != ledger_entry.get(key):
-            disagreements.append(f"{field}: record={claimed!r} ledger={ledger_entry.get(key)!r}")
+    # The ledger's own identifying fields, all three of them. Comparing only
+    # some would let the entry name a different job than the record does while
+    # still reporting success -- and it is the sole durable approval, so nothing
+    # else would catch it. The job id is stringified because the ledger stores
+    # text while a diagnostic may report the id as a number.
+    identity = (
+        ("stage", record.get("stage"), ledger_entry.get("stage")),
+        ("package", _dig(record, ("destination", "package")), ledger_entry.get("package")),
+        ("job_id", str(_dig(record, ("submission", "job_id"))), ledger_entry.get("job_id")),
+    )
+    for field, claimed, recorded in identity:
+        if claimed != recorded:
+            disagreements.append(f"{field}: record={claimed!r} ledger={recorded!r}")
     if disagreements:
         raise LaunchEvidenceError(
             "this record does not match the approval recorded for it: " + "; ".join(disagreements)

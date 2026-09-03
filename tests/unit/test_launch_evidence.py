@@ -768,12 +768,20 @@ def test_a_rewritten_approval_field_fails_verification(field) -> None:
         verify_launch_evidence(record, entry)
 
 
-def test_a_record_reassigned_to_another_stage_or_package_fails_verification() -> None:
+def test_a_record_reassigned_to_another_stage_package_or_job_fails_verification() -> None:
+    """Every identifying field the ledger records has to be compared.
+
+    Comparing only some would let the sole durable approval name a different job
+    than the record does while still reporting success.
+    """
+
     record = _approved_record()
     with pytest.raises(LaunchEvidenceError, match="stage"):
         verify_launch_evidence(record, _ledger_entry(record, stage="acquisition"))
     with pytest.raises(LaunchEvidenceError, match="package"):
         verify_launch_evidence(record, _ledger_entry(record, package="/pkg/other"))
+    with pytest.raises(LaunchEvidenceError, match="job_id"):
+        verify_launch_evidence(record, _ledger_entry(record, job_id="99999999"))
 
 
 def test_a_record_without_an_approval_cannot_be_verified() -> None:
