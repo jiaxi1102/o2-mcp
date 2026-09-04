@@ -14,10 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from o2mcp.policy import (
-    SUPPORTED_SCHEMA_VERSIONS,
     DEFAULT_GRANT_TTL_SECONDS,
     MAX_LAUNCH_EVIDENCE_MINTS,
     SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
     O2LoginGrantError,
     O2PolicyConflictError,
     O2PolicyDeniedError,
@@ -758,7 +758,7 @@ def test_the_written_schema_is_the_oldest_one_still_accepted():
     failed every command against it. Accept first, write later.
     """
 
-    assert SCHEMA_VERSION == min(SUPPORTED_SCHEMA_VERSIONS)
+    assert min(SUPPORTED_SCHEMA_VERSIONS) == SCHEMA_VERSION
 
 
 def test_a_schema_2_file_keeps_its_ledger_when_normalised(tmp_path):
