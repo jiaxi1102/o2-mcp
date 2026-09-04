@@ -1302,7 +1302,13 @@ def open_root(path):
         if parts:
             # The package directory itself is the one being attested, and its
             # inode is reported from this very descriptor.
-            last = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            # Search-only here too: the package directory is never listed, only
+            # traversed and fstat'd for its inode, both of which an O_PATH
+            # descriptor serves. Demanding read made an execute-only package
+            # root unmintable for no benefit.
+            last = os.open(
+                parts[-1], os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd
+            )
             os.close(fd)
             fd = last
     except BaseException:
@@ -1388,7 +1394,13 @@ def open_root(path):
             os.close(fd)
             fd = nxt
         if parts:
-            last = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            # Search-only here too: the package directory is never listed, only
+            # traversed and fstat'd for its inode, both of which an O_PATH
+            # descriptor serves. Demanding read made an execute-only package
+            # root unmintable for no benefit.
+            last = os.open(
+                parts[-1], os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd
+            )
             os.close(fd)
             fd = last
     except BaseException:
@@ -1840,7 +1852,12 @@ def _hash_batches(names: list[str]) -> Iterator[list[str]]:
     batch: list[str] = []
     used = 0
     for name in names:
-        cost = len(name.encode("utf-8")) * 2 + 80
+        # Each name is emitted twice -- once in digests with a 64-character
+        # digest, once in stats with four integers that can each run to 19 or 20
+        # digits -- plus JSON punctuation for both. Budgeting 80 fixed bytes
+        # covered only the digest entry, so a package of several thousand short
+        # names could pass this estimate and still overrun the broker's cap.
+        cost = len(name.encode("utf-8")) * 2 + 176
         if cost > _HASH_REPLY_BUDGET:
             raise LaunchEvidenceError(f"payload name is too long to hash in one call: {name!r}")
         if batch and used + cost > _HASH_REPLY_BUDGET:

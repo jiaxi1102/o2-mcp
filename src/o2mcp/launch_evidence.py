@@ -688,6 +688,18 @@ def build_launch_evidence(
                     "every path SHA256SUMS names was hashed on the cluster and compared here, so this "
                     "record does not rest on the run's own verification verdict"
                 ),
+                # Say what the guarantee is, rather than letting a reader infer a
+                # stronger one. Every payload is re-read in a single pass after
+                # hashing and before this record is approved, which is what rules
+                # out a payload rewritten between its own digest and the ledger
+                # entry. It is a point-in-time check, not a lock: nothing here can
+                # hold an NFS package still, so bytes rewritten after the final
+                # pass are outside what this attests.
+                "stability": (
+                    "identity of every payload re-read in one pass after hashing and before approval; "
+                    "point-in-time, not a lock -- an NFS package cannot be held still, so a rewrite "
+                    "after the final pass is outside what this record attests"
+                ),
             },
         },
         "run_diagnostic": {"status": diagnostic.get("status")},

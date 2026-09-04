@@ -1193,3 +1193,46 @@ def test_the_hasher_traverses_an_execute_only_ancestor(tmp_path):
     assert out["errors"] == {}
     assert out["digests"]["payload.txt"] == hashlib.sha256(b"contents").hexdigest()
     assert out["package_inode"] == os.stat(package).st_ino
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="O_PATH is Linux-only")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_the_hasher_reads_a_package_whose_own_root_is_execute_only(tmp_path):
+    """The package directory is traversed and fstat'd, never listed.
+
+    Converting only the ancestors left this one level down: an execute-only
+    package root still failed the O_RDONLY open, so a package whose payloads
+    were perfectly readable could not be attested.
+    """
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "payload.txt").write_bytes(b"contents")
+    os.chmod(package, 0o711)
+    try:
+        out = _run_hasher(package, ["payload.txt"])
+    finally:
+        os.chmod(package, 0o755)
+
+    assert out["errors"] == {}
+    assert out["digests"]["payload.txt"] == hashlib.sha256(b"contents").hexdigest()
+    assert out["package_inode"] == os.stat(package).st_ino
+
+
+def test_the_hash_batch_budget_covers_both_reply_entries():
+    """Each name is emitted twice, with a digest and with four integers.
+
+    Budgeting only for the digest entry let a package of several thousand short
+    names pass the estimate and still overrun the broker's output cap.
+    """
+
+    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
+    from o2mcp.server import _hash_batches
+
+    names = [f"payloads/{index:05d}.ims" for index in range(7000)]
+    for batch in _hash_batches(names):
+        # Model the reply the hasher actually sends back for this batch.
+        modelled = sum(
+            len(name.encode("utf-8")) * 2 + len('"": "",') + len('"": [,,,],') + 64 + 4 * 20 for name in batch
+        )
+        assert modelled <= MAX_OUTPUT_BYTES
