@@ -1274,7 +1274,7 @@ _NOFOLLOW_HASHER = """
 import errno, hashlib, json, os, stat, sys
 root = sys.argv[1]
 names = [n for n in sys.stdin.read().split(chr(10)) if n]
-out = {"digests": {}, "errors": {}, "package_inode": 0}
+out = {"digests": {}, "errors": {}, "stats": {}, "package_inode": 0}
 O_SEARCH = getattr(os, "O_PATH", 0)
 def open_root(path):
     # O_NOFOLLOW on the absolute path guards only the FINAL component, so an
@@ -1337,6 +1337,76 @@ try:
                     break
                 h.update(chunk)
             out["digests"][name] = h.hexdigest()
+            # Record what was read, from the same descriptor the bytes came
+            # through, so a later pass can prove the payload did not change
+            # after it was hashed.
+            st = os.fstat(fd)
+            out["stats"][name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+        except OSError as exc:
+            out["errors"][name] = (
+                "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+            )
+        finally:
+            for f in opened:
+                os.close(f)
+finally:
+    os.close(rfd)
+sys.stdout.write(json.dumps(out))
+"""
+
+# Stat-only twin of the hasher: the same no-follow walk, no reads. Used to prove
+# no payload changed between being hashed and the approval being recorded --
+# hashing a large package takes several round trips, so a publisher that can
+# write regular files could otherwise overwrite an early payload after its
+# digest was taken. Overwriting a file does not replace its parent directory, so
+# neither package-inode check would notice.
+_NOFOLLOW_RESTAT = """
+import errno, hashlib, json, os, stat, sys
+root = sys.argv[1]
+names = [n for n in sys.stdin.read().split(chr(10)) if n]
+out = {"stats": {}, "errors": {}, "package_inode": 0}
+O_SEARCH = getattr(os, "O_PATH", 0)
+def open_root(path):
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", os.O_DIRECTORY | (O_SEARCH or os.O_RDONLY))
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if parts:
+            last = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = last
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+try:
+    rfd = open_root(root)
+except OSError as exc:
+    out["errors"][root] = (
+        "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+    )
+    sys.stdout.write(json.dumps(out))
+    raise SystemExit(0)
+try:
+    out["package_inode"] = os.fstat(rfd).st_ino
+    for name in names:
+        parts = name.split("/")
+        opened = []
+        try:
+            cur = rfd
+            for part in parts[:-1]:
+                cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+                opened.append(cur)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+            opened.append(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                out["errors"][name] = "not a regular file"
+                continue
+            out["stats"][name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
         except OSError as exc:
             out["errors"][name] = (
                 "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
@@ -1354,16 +1424,21 @@ sys.stdout.write(json.dumps(out))
 _NOFOLLOW_PYTHON = "/usr/bin/python3"
 
 
-def _hash_without_following(*, package_path: str, names: list[str], timeout: float) -> tuple[dict[str, str], int]:
+def _hash_without_following(
+    *, package_path: str, names: list[str], timeout: float
+) -> tuple[dict[str, str], int, dict[str, list[int]]]:
     """Hash each name through an O_NOFOLLOW descriptor, and report the package inode.
 
-    Returns the digests and the inode of the directory the hashes were read
-    through, so the caller can bind that identity to the one the run recorded.
+    Returns the digests, the inode of the directory the hashes were read
+    through -- so the caller can bind that identity to the one the run recorded
+    -- and the identity of each payload as it was read, for
+    :func:`_refuse_if_payloads_changed` to re-check before anything is recorded.
     """
 
     program = shlex.quote(_NOFOLLOW_HASHER)
     command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
     digests: dict[str, str] = {}
+    stats: dict[str, list[int]] = {}
     inodes: set[int] = set()
     for batch in _hash_batches(names):
         result = _connection().run(command, timeout=timeout, input_text="\n".join(batch) + "\n")
@@ -1391,12 +1466,70 @@ def _hash_without_following(*, package_path: str, names: list[str], timeout: flo
             if name not in batch:
                 raise LaunchEvidenceError(f"the hash output named {name!r}, which was not requested")
             digests[name] = digest
+        for name, identity in (payload.get("stats") or {}).items():
+            if name in batch:
+                stats[name] = list(identity)
     missing = [name for name in names if name not in digests]
     if missing:
         raise LaunchEvidenceError("the package hash returned nothing for: {}".format(", ".join(sorted(missing)[:5])))
     if len(inodes) != 1:
         raise LaunchEvidenceError("the package directory changed identity while it was being read")
-    return digests, inodes.pop()
+    return digests, inodes.pop(), stats
+
+
+def _refuse_if_payloads_changed(
+    *, package_path: str, expected: dict[str, list[int]], package_inode: int, timeout: float
+) -> None:
+    """Refuse if any payload is not byte-for-byte the one that was hashed.
+
+    Hashing a package takes several round trips, so a publisher able to write
+    regular files could overwrite an early payload after its digest was taken.
+    The cached digest would still match SHA256SUMS, and neither package-inode
+    check would notice, because overwriting a file does not replace its parent
+    directory -- so the record would authenticate bytes no longer published.
+
+    A stat-only pass over the same no-follow walk closes that: inode, size and
+    both timestamps must be exactly what was read.
+    """
+
+    if not expected:
+        return
+    program = shlex.quote(_NOFOLLOW_RESTAT)
+    command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
+    observed: dict[str, list[int]] = {}
+    for batch in _hash_batches(sorted(expected)):
+        result = _connection().run(command, timeout=timeout, input_text="\n".join(batch) + "\n")
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not re-check the package on O2 after hashing it: {}".format((result.stderr or "").strip()[:400])
+            )
+        _refuse_truncated_read(result, label="the package re-check read")
+        payload = parse_json_artifact(result.stdout, label="the no-follow re-check output")
+        errors = payload.get("errors") or {}
+        if errors:
+            shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
+            raise LaunchEvidenceError(
+                f"refusing to mint launch evidence; the package could not be re-read after hashing: {shown}"
+            )
+        if payload.get("package_inode") != package_inode:
+            raise LaunchEvidenceError("the package directory changed identity between hashing and recording")
+        for name, identity in (payload.get("stats") or {}).items():
+            if name in batch:
+                observed[name] = list(identity)
+    changed = sorted(name for name, identity in expected.items() if observed.get(name) != identity)
+    if changed:
+        shown = ", ".join(changed[:5])
+        more = f" (and {len(changed) - 5} more)" if len(changed) > 5 else ""
+        raise LaunchEvidenceError(
+            "refusing to mint launch evidence; these payloads changed after they were hashed, so the record "
+            f"would attest bytes that are no longer in the package: {shown}{more}"
+        )
+    missing = sorted(set(expected) - set(observed))
+    if missing:
+        raise LaunchEvidenceError(
+            "refusing to mint launch evidence; these payloads disappeared after they were hashed: "
+            + ", ".join(missing[:5])
+        )
 
 
 def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
@@ -1469,7 +1602,7 @@ def _read_launch_artifacts(
 
     # The required package files are hashed through no-follow descriptors, which
     # is also where the package directory's own inode is observed.
-    package_digests, package_inode = _hash_without_following(
+    package_digests, package_inode, package_stats = _hash_without_following(
         package_path=package_path, names=list(required_package_files()), timeout=timeout
     )
     # The manifest is read and hashed by different commands, so the bytes that
@@ -1522,12 +1655,13 @@ def _read_launch_artifacts(
         ),
         "checksum_manifest": manifest,
         "package_digests": package_digests,
+        "package_stats": package_stats,
     }
 
 
 def _hash_package_payloads(
     *, package_path: str, manifest: dict[str, str], timeout: float
-) -> tuple[dict[str, str], int]:
+) -> tuple[dict[str, str], int, dict[str, list[int]]]:
     """Hash every payload SHA256SUMS names through a no-follow descriptor.
 
     This is a second pass because it has to be: the payload list only exists
@@ -1734,7 +1868,7 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             package_path=package_path,
             timeout=params.timeout_seconds,
         )
-        payload_digests, payload_pass_inode = _hash_package_payloads(
+        payload_digests, payload_pass_inode, payload_stats = _hash_package_payloads(
             package_path=package_path,
             manifest=artifacts["checksum_manifest"],
             timeout=params.timeout_seconds,
@@ -1747,6 +1881,18 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
             )
         scheduler_record = _read_scheduler_record(
             job_id=claimed_job_id(artifacts["diagnostic"]), timeout=params.timeout_seconds
+        )
+        # Last thing before anything is recorded: prove no payload was rewritten
+        # while the package was being read. Hashing takes several round trips,
+        # so a publisher able to write regular files could overwrite an early
+        # payload after its digest was taken -- the digest would still match
+        # SHA256SUMS, and neither inode check would notice, because overwriting
+        # a file does not replace its parent directory.
+        _refuse_if_payloads_changed(
+            package_path=package_path,
+            expected={**artifacts["package_stats"], **payload_stats},
+            package_inode=artifacts["package_inode"],
+            timeout=params.timeout_seconds,
         )
 
         def mint(approval: dict[str, Any]) -> dict[str, Any]:

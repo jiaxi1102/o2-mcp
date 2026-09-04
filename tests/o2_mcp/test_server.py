@@ -1590,6 +1590,7 @@ def _launch_evidence_responder(
     n_payloads=None,
     resolved_package=None,
     unreadable=None,
+    mutated=None,
     package_inode=None,
     observed_inode=None,
     diagnostic_edit=None,
@@ -1699,14 +1700,24 @@ def _launch_evidence_responder(
             known["PUBLICATION_OWNER.json"] = (
                 _hashlib.sha256(owner_bytes).hexdigest() if owner_sha256 is None else owner_sha256
             )
+            # The stat-only re-check is the same interpreter with a different
+            # program; tell them apart by the shape each one declares.
+            restat = '"stats": {}, "errors"' in command
             if root_error is not None:
-                return _json.dumps({"digests": {}, "errors": {package: root_error}, "package_inode": 0}), "", 0
-            reply = {"digests": {}, "errors": {}, "package_inode": inode_reported}
+                empty = {"stats": {}} if restat else {"digests": {}}
+                empty.update({"errors": {package: root_error}, "package_inode": 0})
+                return _json.dumps(empty), "", 0
+            reply = {"digests": {}, "errors": {}, "stats": {}, "package_inode": inode_reported}
             for name in asked:
                 if name in (unreadable or {}):
                     reply["errors"][name] = (unreadable or {})[name]
                 elif name in known:
-                    reply["digests"][name] = known[name]
+                    if not restat:
+                        reply["digests"][name] = known[name]
+                    # A payload rewritten between hashing and recording keeps its
+                    # name and its parent directory, so only its own identity moves.
+                    bump = 1 if (restat and name in (mutated or ())) else 0
+                    reply["stats"][name] = [11, 20, 300 + bump, 400 + bump]
                 else:
                     reply["errors"][name] = "ENOENT"
             return _json.dumps(reply), "", 0
@@ -2457,6 +2468,47 @@ async def test_mint_refuses_a_manifest_that_grew_after_it_was_sized(monkeypatch,
     assert "grew while it was being read" in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_payload_rewritten_after_it_was_hashed(monkeypatch, tmp_path):
+    """Hashing takes several round trips; the bytes must still be there at the end.
+
+    A publisher able to write regular files can overwrite an early payload once
+    its digest has been taken. The digest still matches SHA256SUMS, and neither
+    package-inode check notices, because overwriting a file does not replace its
+    parent directory -- so the record would authenticate bytes that are no
+    longer published.
+    """
+
+    _patch_connection(
+        monkeypatch,
+        tmp_path,
+        responder=_launch_evidence_responder(mutated={"payloads/frame002.ims"}),
+    )
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert refused["error"] == "launch_evidence_refused"
+    assert "changed after they were hashed" in refused["message"]
+    assert "payloads/frame002.ims" in refused["message"]
+    after = await _call("o2_local_status", {})
+    assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_mint_refuses_a_required_file_rewritten_after_it_was_hashed(monkeypatch, tmp_path):
+    """The same protection covers the required files, not only the payloads."""
+
+    _patch_connection(
+        monkeypatch,
+        tmp_path,
+        responder=_launch_evidence_responder(mutated={"conversion_manifest.json"}),
+    )
+    snapshot = await _call("o2_local_status", {})
+    refused = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert refused["ok"] is False
+    assert "changed after they were hashed" in refused["message"]
 
 
 @pytest.mark.anyio
