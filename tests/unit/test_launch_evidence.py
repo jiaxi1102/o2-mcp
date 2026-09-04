@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -1072,3 +1073,90 @@ def test_the_attempt_is_matched_in_the_form_the_engine_writes_it() -> None:
     record = _build(scheduler_record=_scheduler_record(comment=_engine_comment(attempt=2)))
     assert record["approved_plan"]["attempt_id"] == "002"
     assert record["binding_check"]["scheduler_comment_bound"] is True
+
+
+def _run_hasher(root, names):
+    """Execute the real no-follow hasher the way the cluster does."""
+
+    import json as _json
+    import subprocess
+    import sys
+
+    from o2mcp.server import _NOFOLLOW_HASHER
+
+    done = subprocess.run(
+        [sys.executable, "-c", _NOFOLLOW_HASHER, str(root)],
+        input="\n".join(names),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    return _json.loads(done.stdout)
+
+
+def test_the_hasher_reads_a_plain_package(tmp_path):
+    """Baseline: with no links anywhere, every payload hashes."""
+
+    package = tmp_path / "real" / "pkg"
+    package.mkdir(parents=True)
+    (package / "payload.txt").write_bytes(b"contents")
+    out = _run_hasher(package, ["payload.txt"])
+    assert out["errors"] == {}
+    assert out["digests"]["payload.txt"] == hashlib.sha256(b"contents").hexdigest()
+    assert out["package_inode"] == os.stat(package).st_ino
+
+
+def test_the_hasher_refuses_a_symlinked_ancestor_of_the_package(tmp_path):
+    """O_NOFOLLOW on the absolute path guards only the final component.
+
+    realpath runs before this, so a publisher controlling an ancestor can rename
+    it and drop a symlink in its place afterwards. The final component is still
+    a real directory, so a single O_NOFOLLOW open follows the new ancestor,
+    reaches the approved inode, and passes every inode check while the approved
+    pathname now resolves elsewhere. Walking down from "/" refuses it.
+    """
+
+    (tmp_path / "real" / "pkg").mkdir(parents=True)
+    (tmp_path / "real" / "pkg" / "payload.txt").write_bytes(b"contents")
+    (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+
+    through_link = tmp_path / "link" / "pkg"
+    # The leaf really is a directory, which is exactly why a leaf-only check passes.
+    assert through_link.is_dir() and not through_link.is_symlink()
+
+    out = _run_hasher(through_link, ["payload.txt"])
+    assert out["digests"] == {}
+    # Nothing was read, so nothing can be attested -- this is the property that
+    # matters. The errno label is platform-dependent: O_NOFOLLOW on a symlink
+    # gives ELOOP ("symlink"), but combined with O_DIRECTORY macOS reports
+    # ENOTDIR instead. Either way the open is refused and no inode is claimed.
+    assert out["package_inode"] == 0
+    assert set(out["errors"]) == {str(through_link)}
+    assert out["errors"][str(through_link)] in {"symlink", "ENOTDIR"}
+
+
+def test_the_scheduler_read_pins_the_comment_width(monkeypatch):
+    """The comment carries a 64-char digest, so never inherit a display default.
+
+    Measured on O2 (Slurm 25.11.7) the width suffix is inert under ``-P``:
+    default, ``%20`` and ``%512`` all returned the same untruncated value while
+    the non-parsable form truncated with a ``+``. It is pinned anyway, because a
+    build that did apply widths would cut the digest and silently refuse
+    otherwise valid evidence.
+    """
+
+    from o2mcp import server
+
+    seen = {}
+
+    class _Stub:
+        def run(self, command, timeout=None):
+            seen["command"] = command
+            raise AssertionError("stop after capturing the command")
+
+    monkeypatch.setattr(server, "_connection", lambda: _Stub())
+    with pytest.raises(AssertionError):
+        server._read_scheduler_record(job_id="52085188", timeout=5.0)
+    assert "Comment%256" in seen["command"]
+    assert " -P " in seen["command"]

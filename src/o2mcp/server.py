@@ -1275,8 +1275,25 @@ import errno, hashlib, json, os, stat, sys
 root = sys.argv[1]
 names = [n for n in sys.stdin.read().split(chr(10)) if n]
 out = {"digests": {}, "errors": {}, "package_inode": 0}
+def open_root(path):
+    # O_NOFOLLOW on the absolute path guards only the FINAL component, so an
+    # ancestor the publisher controls could be renamed and replaced with a
+    # symlink after realpath ran; the open would follow it and still reach the
+    # approved inode. Walk down from "/" instead, refusing a link at every
+    # step, exactly as the payload paths below are walked. "/" itself cannot
+    # be a symlink, so it is the one component opened without O_NOFOLLOW.
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [p for p in path.split("/") if p]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 try:
-    rfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    rfd = open_root(root)
 except OSError as exc:
     out["errors"][root] = (
         "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
@@ -1645,7 +1662,13 @@ def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
     field rather than as agreement. A non-empty one must match.
     """
 
-    fields = "JobID,State,Account,Partition,Comment"
+    # Comment carries a 64-character digest plus stage and attempt, so pin its
+    # width rather than trusting the display default. Measured on O2 (Slurm
+    # 25.11.7) the suffix is inert under -P: default, %20 and %512 all returned
+    # the same full 44-character JobName, while the non-parsable form truncated
+    # it to "gem_segme+". It is kept anyway as portability insurance, since a
+    # build that did apply widths would silently truncate the digest.
+    fields = "JobID,State,Account,Partition,Comment%256"
     command = f"sacct -j {shlex.quote(job_id)} -X -n -P -o {shlex.quote(fields)}"
     result = _connection().run(command, timeout=timeout)
     if not result.ok:
