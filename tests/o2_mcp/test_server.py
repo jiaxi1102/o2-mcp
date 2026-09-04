@@ -2527,6 +2527,29 @@ async def test_the_recheck_reads_the_whole_package_in_one_pass(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
+async def test_the_recheck_is_the_last_thing_done_before_the_ledger_write(monkeypatch, tmp_path):
+    """No remote call may follow the re-check.
+
+    Be precise about what this does and does not establish. It does NOT
+    distinguish the re-check sitting before or after ``mint({})``: that call is
+    pure local computation, so the re-check is the last remote call either way,
+    and this test passes with the check in either position. It is a regression
+    guard for the thing that WOULD matter -- a future remote read added after the
+    re-check, which would put an unverified round trip between the last
+    observation of the package and the ledger entry.
+    """
+
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder())
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True, minted.get("message")
+
+    assert (
+        '"aggregate"' in runner.calls[-1]["argv"][-1]
+    ), "the payload re-check must be the final remote call; anything after it reopens the window"
+
+
+@pytest.mark.anyio
 async def test_mint_refuses_a_payload_rewritten_after_it_was_hashed(monkeypatch, tmp_path):
     """Hashing takes several round trips; the bytes must still be there at the end.
 

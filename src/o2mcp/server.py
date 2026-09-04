@@ -1955,18 +1955,6 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
         scheduler_record = _read_scheduler_record(
             job_id=claimed_job_id(artifacts["diagnostic"]), timeout=params.timeout_seconds
         )
-        # Last thing before anything is recorded: prove no payload was rewritten
-        # while the package was being read. Hashing takes several round trips,
-        # so a publisher able to write regular files could overwrite an early
-        # payload after its digest was taken -- the digest would still match
-        # SHA256SUMS, and neither inode check would notice, because overwriting
-        # a file does not replace its parent directory.
-        _refuse_if_payloads_changed(
-            package_path=package_path,
-            expected={**artifacts["package_stats"], **payload_stats},
-            package_inode=artifacts["package_inode"],
-            timeout=params.timeout_seconds,
-        )
 
         def mint(approval: dict[str, Any]) -> dict[str, Any]:
             return build_launch_evidence(
@@ -1987,6 +1975,24 @@ async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
         # Verify BEFORE recording an approval: a chain that does not agree must
         # not leave an audit entry implying it did.
         preliminary = mint({})
+        # The last remote act before the ledger entry, deliberately placed after
+        # the record is built rather than before. Hashing takes several round
+        # trips, so a publisher able to write regular files could overwrite an
+        # early payload once its digest was taken: the digest would still match
+        # SHA256SUMS, and neither inode check would notice, because overwriting a
+        # file does not replace its parent directory. Running this after mint({})
+        # leaves only local work between the check and the write.
+        #
+        # It does not make the package immutable, and nothing here can: these
+        # live on NFS, which offers no snapshot or lease to hold. Every check has
+        # an "after", so the record says which guarantee it carries rather than
+        # implying the stronger one -- see payload_reverification.stability.
+        _refuse_if_payloads_changed(
+            package_path=package_path,
+            expected={**artifacts["package_stats"], **payload_stats},
+            package_inode=artifacts["package_inode"],
+            timeout=params.timeout_seconds,
+        )
         approval = _connection().policy.record_launch_evidence_mint(
             expected_revision=params.expected_revision,
             expected_generation=params.expected_generation,
