@@ -1689,7 +1689,13 @@ def _launch_evidence_responder(
         command = argv[-1]
         if command.startswith("/usr/bin/python3 -c "):
             # The no-follow hasher: names arrive on stdin, JSON comes back.
-            asked = [name for name in (input_text or "").split("\n") if name]
+            raw = input_text or ""
+            if raw[:2] == "Z:":
+                import base64 as _b64
+                import zlib as _zlib
+
+                raw = _zlib.decompress(_b64.b64decode(raw[2:])).decode("utf-8")
+            asked = [name for name in raw.split("\n") if name]
             known = dict(on_disk)
             known.update({name: "d" * 64 for name in _REQUIRED_FILES})
             # These two are also read for their contents, and those bytes are
@@ -1702,12 +1708,13 @@ def _launch_evidence_responder(
             )
             # The stat-only re-check is the same interpreter with a different
             # program; tell them apart by the shape each one declares.
-            restat = '"stats": {}, "errors"' in command
+            restat = '"aggregate"' in command
             if root_error is not None:
                 empty = {"stats": {}} if restat else {"digests": {}}
                 empty.update({"errors": {package: root_error}, "package_inode": 0})
                 return _json.dumps(empty), "", 0
             reply = {"digests": {}, "errors": {}, "stats": {}, "package_inode": inode_reported}
+            seen = []
             for name in asked:
                 if name in (unreadable or {}):
                     reply["errors"][name] = (unreadable or {})[name]
@@ -1717,9 +1724,22 @@ def _launch_evidence_responder(
                     # A payload rewritten between hashing and recording keeps its
                     # name and its parent directory, so only its own identity moves.
                     bump = 1 if (restat and name in (mutated or ())) else 0
-                    reply["stats"][name] = [11, 20, 300 + bump, 400 + bump]
+                    identity = [11, 20, 300 + bump, 400 + bump]
+                    reply["stats"][name] = identity
+                    seen.append("\0".join([name, *(str(v) for v in identity)]) + "\n")
                 else:
                     reply["errors"][name] = "ENOENT"
+            if restat:
+                # The re-check answers with one constant-size aggregate rather
+                # than per-name identities, so a package of any size is read in
+                # a single pass with no window between batches.
+                seen.sort()
+                reply = {
+                    "errors": reply["errors"],
+                    "package_inode": inode_reported,
+                    "named": dict(reply["stats"]),
+                    "aggregate": _hashlib.sha256("".join(seen).encode("utf-8")).hexdigest(),
+                }
             return _json.dumps(reply), "", 0
         if command.startswith("tail -c +") and command.endswith("| wc -c"):
             # The end-of-file probe: one byte past the size that was stat'd.
@@ -2295,7 +2315,7 @@ async def test_mint_reads_a_manifest_larger_than_the_broker_output_cap(monkeypat
     recorded for that filename.
     """
 
-    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
+    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES, MAX_STDIN_BYTES
 
     payloads = {f"payloads/{'segment-' * 12}{index:05d}.ome.tif": f"{index:064d}" for index in range(9000)}
     runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_payloads=payloads))
@@ -2304,6 +2324,14 @@ async def test_mint_reads_a_manifest_larger_than_the_broker_output_cap(monkeypat
     assert minted["ok"] is True
     reverified = minted["launch_evidence"]["verified_package"]["payload_reverification"]
     assert reverified["n_payloads_reverified"] == 9000
+
+    # Even at this size the re-check stays a single pass: the name list is
+    # compressed rather than split, because batching it would reopen the window
+    # between an early stat and the ledger write.
+    rechecks = [call for call in runner.calls if '"aggregate"' in call["argv"][-1]]
+    assert len(rechecks) == 1
+    assert rechecks[0]["input"].startswith("Z:"), "9000 names should not have fitted uncompressed"
+    assert len(rechecks[0]["input"].encode("utf-8")) <= MAX_STDIN_BYTES
 
     reads = [call["argv"][-1] for call in runner.calls if call["argv"][-1].startswith("tail -c +")]
     assert len(reads) > 1, "a manifest this size should have needed more than one read"
@@ -2468,6 +2496,34 @@ async def test_mint_refuses_a_manifest_that_grew_after_it_was_sized(monkeypatch,
     assert "grew while it was being read" in refused["message"]
     after = await _call("o2_local_status", {})
     assert not any(e.get("event") == "launch_evidence_minted" for e in after["policy"]["recent_events"])
+
+
+@pytest.mark.anyio
+async def test_the_recheck_reads_the_whole_package_in_one_pass(monkeypatch, tmp_path):
+    """A batched re-check carries the very defect it exists to close.
+
+    Batching caches an early batch's identities while later batches are still
+    being read, so a payload overwritten in between compares equal against the
+    stale copy. The reply is a single constant-size aggregate precisely so the
+    whole package is read by one process in one pass, however many payloads it
+    holds -- note the hashing itself still batches, because it must carry a
+    digest per file.
+    """
+
+    many = {f"payloads/frame{index:04d}.ims": f"{index:064x}" for index in range(400)}
+    runner = _patch_connection(monkeypatch, tmp_path, responder=_launch_evidence_responder(manifest_payloads=many))
+    snapshot = await _call("o2_local_status", {})
+    minted = await _call("o2_mint_launch_evidence", _mint_params(snapshot["policy"]))
+    assert minted["ok"] is True, minted.get("message")
+
+    rechecks = [c for c in runner.calls if '"aggregate"' in c["argv"][-1]]
+    assert len(rechecks) == 1
+    # And that single pass really did cover every payload, not a prefix of them.
+    asked = [n for n in (rechecks[0]["input"] or "").split("\n") if n]
+    assert set(many) <= set(asked)
+
+    hashes = [c for c in runner.calls if '"digests"' in c["argv"][-1]]
+    assert len(hashes) > 1, "the hashing pass is expected to batch; only the re-check must not"
 
 
 @pytest.mark.anyio

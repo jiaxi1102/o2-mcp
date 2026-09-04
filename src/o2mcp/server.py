@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 import shlex
@@ -39,6 +40,7 @@ import stat
 import subprocess
 import sys
 import time
+import zlib
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
@@ -68,7 +70,7 @@ from o2mcp import (
     billing,
     transfer_tools,
 )
-from o2mcp.broker_protocol import MAX_COMMAND_BYTES
+from o2mcp.broker_protocol import MAX_COMMAND_BYTES, MAX_STDIN_BYTES
 from o2mcp.connection import BROKER_TRUNCATION_NOTE
 from o2mcp.launch_evidence import (
     LaunchEvidenceError,
@@ -1313,7 +1315,7 @@ except OSError as exc:
     out["errors"][root] = (
         "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
     )
-    sys.stdout.write(json.dumps(out))
+    sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
     raise SystemExit(0)
 try:
     out["package_inode"] = os.fstat(rfd).st_ino
@@ -1323,7 +1325,9 @@ try:
         try:
             cur = rfd
             for part in parts[:-1]:
-                cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+                cur = os.open(
+                    part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=cur
+                )
                 opened.append(cur)
             fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
             opened.append(fd)
@@ -1351,7 +1355,7 @@ try:
                 os.close(f)
 finally:
     os.close(rfd)
-sys.stdout.write(json.dumps(out))
+sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
 """
 
 # Stat-only twin of the hasher: the same no-follow walk, no reads. Used to prove
@@ -1361,10 +1365,19 @@ sys.stdout.write(json.dumps(out))
 # digest was taken. Overwriting a file does not replace its parent directory, so
 # neither package-inode check would notice.
 _NOFOLLOW_RESTAT = """
-import errno, hashlib, json, os, stat, sys
+import base64, errno, hashlib, json, os, stat, sys, zlib
 root = sys.argv[1]
-names = [n for n in sys.stdin.read().split(chr(10)) if n]
-out = {"stats": {}, "errors": {}, "package_inode": 0}
+# The name list is compressed when it would not otherwise fit one call. Package
+# paths repeat heavily, so this keeps even a nine-thousand-payload package in a
+# single pass -- which is the whole point: batching would reopen the window
+# between an early stat and the ledger write.
+data = sys.stdin.read()
+if data[:2] == "Z:":
+    data = zlib.decompress(base64.b64decode(data[2:])).decode("utf-8")
+names = [n for n in data.split(chr(10)) if n]
+out = {"errors": {}, "package_inode": 0, "aggregate": "", "named": {}}
+seen = []
+named = {}
 O_SEARCH = getattr(os, "O_PATH", 0)
 def open_root(path):
     parts = [p for p in path.split("/") if p]
@@ -1388,7 +1401,7 @@ except OSError as exc:
     out["errors"][root] = (
         "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
     )
-    sys.stdout.write(json.dumps(out))
+    sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
     raise SystemExit(0)
 try:
     out["package_inode"] = os.fstat(rfd).st_ino
@@ -1398,7 +1411,9 @@ try:
         try:
             cur = rfd
             for part in parts[:-1]:
-                cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+                cur = os.open(
+                    part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=cur
+                )
                 opened.append(cur)
             fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
             opened.append(fd)
@@ -1406,7 +1421,13 @@ try:
             if not stat.S_ISREG(st.st_mode):
                 out["errors"][name] = "not a regular file"
                 continue
-            out["stats"][name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+            seen.append("%s\0%d\0%d\0%d\0%d\n" % (name, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            # Keep per-name identities too, but only while they stay small. The
+            # aggregate is the verdict; these exist so a refusal can say WHICH
+            # payload moved. Capping them is what keeps this reply bounded, which
+            # is what lets the whole package be checked in a single pass.
+            if len(named) < 200:
+                named[name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
         except OSError as exc:
             out["errors"][name] = (
                 "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
@@ -1416,7 +1437,10 @@ try:
                 os.close(f)
 finally:
     os.close(rfd)
-sys.stdout.write(json.dumps(out))
+seen.sort()
+out["named"] = named if len(named) == len(seen) else {}
+out["aggregate"] = hashlib.sha256("".join(seen).encode("utf-8")).hexdigest()
+sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
 """
 
 # The interpreter is named absolutely so no PATH or module environment can
@@ -1477,6 +1501,15 @@ def _hash_without_following(
     return digests, inodes.pop(), stats
 
 
+def _payload_identity_aggregate(stats: dict[str, list[int]]) -> str:
+    """The digest the cluster computes over the same identities, in the same order."""
+
+    # Must match the remote script byte for byte; it uses %-formatting because it
+    # is 3.9-compatible source shipped as a string, not because the shapes differ.
+    seen = ["\0".join([name, *(str(int(field)) for field in stats[name])]) + "\n" for name in sorted(stats)]
+    return hashlib.sha256("".join(seen).encode("utf-8")).hexdigest()
+
+
 def _refuse_if_payloads_changed(
     *, package_path: str, expected: dict[str, list[int]], package_inode: int, timeout: float
 ) -> None:
@@ -1488,48 +1521,71 @@ def _refuse_if_payloads_changed(
     check would notice, because overwriting a file does not replace its parent
     directory -- so the record would authenticate bytes no longer published.
 
-    A stat-only pass over the same no-follow walk closes that: inode, size and
-    both timestamps must be exactly what was read.
+    The re-check is one call, not a batched sweep. A batched one carries the
+    same defect it exists to close: an early batch's identities are already
+    cached while later batches are still being read, so a payload overwritten in
+    between compares equal against the stale copy. Returning a single aggregate
+    over every payload keeps the reply constant-size no matter how many files
+    there are, so the whole package is read by one process in one pass and there
+    is no window between batches to exploit.
+
+    What remains is the span of that single walk, which cannot be closed without
+    an immutable snapshot; NFS offers none.
     """
 
     if not expected:
         return
     program = shlex.quote(_NOFOLLOW_RESTAT)
     command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
-    observed: dict[str, list[int]] = {}
-    for batch in _hash_batches(sorted(expected)):
-        result = _connection().run(command, timeout=timeout, input_text="\n".join(batch) + "\n")
-        if not result.ok:
-            raise LaunchEvidenceError(
-                "could not re-check the package on O2 after hashing it: {}".format((result.stderr or "").strip()[:400])
-            )
-        _refuse_truncated_read(result, label="the package re-check read")
-        payload = parse_json_artifact(result.stdout, label="the no-follow re-check output")
-        errors = payload.get("errors") or {}
-        if errors:
-            shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
-            raise LaunchEvidenceError(
-                f"refusing to mint launch evidence; the package could not be re-read after hashing: {shown}"
-            )
-        if payload.get("package_inode") != package_inode:
-            raise LaunchEvidenceError("the package directory changed identity between hashing and recording")
-        for name, identity in (payload.get("stats") or {}).items():
-            if name in batch:
-                observed[name] = list(identity)
-    changed = sorted(name for name, identity in expected.items() if observed.get(name) != identity)
-    if changed:
+    names = sorted(expected)
+    raw = ("\n".join(names) + "\n").encode("utf-8")
+    stdin = raw.decode("utf-8")
+    if len(raw) > MAX_STDIN_BYTES // 2:
+        # Package paths repeat heavily, so compressing keeps even a very large
+        # package inside one call. Batching instead would reopen precisely the
+        # window between an early stat and the ledger write that this closes.
+        stdin = "Z:" + base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+    if len(stdin.encode("utf-8")) > MAX_STDIN_BYTES:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; {len(names)} payload names exceed the one-pass re-check "
+            "budget even compressed, and re-checking them in batches would not prove the package held still"
+        )
+    result = _connection().run(command, timeout=timeout, input_text=stdin)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not re-check the package on O2 after hashing it: {}".format((result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the package re-check read")
+    payload = parse_json_artifact(result.stdout, label="the no-follow re-check output")
+    errors = payload.get("errors") or {}
+    if errors:
+        shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; the package could not be re-read after hashing: {shown}"
+        )
+    if payload.get("package_inode") != package_inode:
+        raise LaunchEvidenceError("the package directory changed identity between hashing and recording")
+    observed = payload.get("aggregate")
+    wanted = _payload_identity_aggregate(expected)
+    if isinstance(observed, str) and observed == wanted:
+        return
+    # The aggregate is the verdict; these only make the refusal actionable by
+    # saying which payload moved. They are absent for a package too large to
+    # report them, and the refusal still stands without them.
+    named = payload.get("named") or {}
+    changed = sorted(name for name, identity in expected.items() if list(named.get(name, identity)) != identity)
+    if named and changed:
         shown = ", ".join(changed[:5])
         more = f" (and {len(changed) - 5} more)" if len(changed) > 5 else ""
         raise LaunchEvidenceError(
             "refusing to mint launch evidence; these payloads changed after they were hashed, so the record "
             f"would attest bytes that are no longer in the package: {shown}{more}"
         )
-    missing = sorted(set(expected) - set(observed))
-    if missing:
-        raise LaunchEvidenceError(
-            "refusing to mint launch evidence; these payloads disappeared after they were hashed: "
-            + ", ".join(missing[:5])
-        )
+    raise LaunchEvidenceError(
+        "refusing to mint launch evidence; the package changed after it was hashed, so the record would "
+        f"attest bytes that are no longer in it (expected identity {wanted[:12]}, found "
+        f"{str(observed)[:12]} over {len(names)} payloads)"
+    )
 
 
 def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
