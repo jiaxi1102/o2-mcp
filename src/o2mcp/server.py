@@ -1852,12 +1852,17 @@ def _hash_batches(names: list[str]) -> Iterator[list[str]]:
     batch: list[str] = []
     used = 0
     for name in names:
-        # Each name is emitted twice -- once in digests with a 64-character
-        # digest, once in stats with four integers that can each run to 19 or 20
-        # digits -- plus JSON punctuation for both. Budgeting 80 fixed bytes
-        # covered only the digest entry, so a package of several thousand short
-        # names could pass this estimate and still overrun the broker's cap.
-        cost = len(name.encode("utf-8")) * 2 + 176
+        # Size from the SERIALIZED key, not the raw name. ensure_ascii=False stops
+        # non-ASCII being expanded to \uXXXX, but json.dumps still escapes quotes,
+        # backslashes and control characters, so a quote-heavy path costs about
+        # twice its raw length and a batch estimated under the budget could
+        # serialize to well over the broker's cap and come back truncated.
+        # json.dumps does that escaping, so ask it rather than model it.
+        key = len(json.dumps(name, ensure_ascii=False).encode("utf-8"))
+        # The name is emitted twice: in digests against a 64-character digest,
+        # and in stats against four integers that can each run to 20 digits,
+        # plus the punctuation of both entries.
+        cost = key * 2 + 176
         if cost > _HASH_REPLY_BUDGET:
             raise LaunchEvidenceError(f"payload name is too long to hash in one call: {name!r}")
         if batch and used + cost > _HASH_REPLY_BUDGET:

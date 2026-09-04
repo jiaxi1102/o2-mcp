@@ -1236,3 +1236,31 @@ def test_the_hash_batch_budget_covers_both_reply_entries():
             len(name.encode("utf-8")) * 2 + len('"": "",') + len('"": [,,,],') + 64 + 4 * 20 for name in batch
         )
         assert modelled <= MAX_OUTPUT_BYTES
+
+
+def test_the_hash_batch_budget_survives_quote_heavy_names():
+    """ensure_ascii=False does not stop JSON escaping quotes and backslashes.
+
+    A path full of them serializes to roughly twice its raw length, so sizing
+    batches by raw UTF-8 length let a batch pass the estimate and still overrun
+    the broker's output cap, truncating the reply and making a readable package
+    unmintable.
+    """
+
+    import json as _json
+
+    from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
+    from o2mcp.server import _hash_batches
+
+    nasty = "payloads/" + ('"\\\\' * 2000) + ".ims"
+    names = [f"{nasty}{index}" for index in range(200)]
+    for batch in _hash_batches(names):
+        modelled = sum(
+            len(_json.dumps(name, ensure_ascii=False).encode("utf-8")) * 2
+            + len(': "",')
+            + len(": [,,,],")
+            + 64
+            + 4 * 20
+            for name in batch
+        )
+        assert modelled <= MAX_OUTPUT_BYTES, f"batch of {len(batch)} serializes to {modelled}"
