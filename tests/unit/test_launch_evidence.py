@@ -1082,6 +1082,10 @@ def _run_hasher(root, names):
     import subprocess
     import sys
 
+    # o2mcp.server pulls in mcp/anyio, which the 3.9 lane deliberately does not
+    # install; the hasher script itself is stdlib and 3.9-compatible by design.
+    pytest.importorskip("mcp")
+    pytest.importorskip("anyio")
     from o2mcp.server import _NOFOLLOW_HASHER
 
     done = subprocess.run(
@@ -1146,6 +1150,8 @@ def test_the_scheduler_read_pins_the_comment_width(monkeypatch):
     otherwise valid evidence.
     """
 
+    pytest.importorskip("mcp")
+    pytest.importorskip("anyio")
     from o2mcp import server
 
     seen = {}
@@ -1160,3 +1166,30 @@ def test_the_scheduler_read_pins_the_comment_width(monkeypatch):
         server._read_scheduler_record(job_id="52085188", timeout=5.0)
     assert "Comment%256" in seen["command"]
     assert " -P " in seen["command"]
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="O_PATH is Linux-only")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_the_hasher_traverses_an_execute_only_ancestor(tmp_path):
+    """Ancestors are searched, not read, so do not demand read permission.
+
+    Mode 0711 is ordinary for a shared parent: pathname resolution needs only
+    the execute bit. Opening ancestors O_RDONLY asked for read as well, which
+    made a perfectly readable package underneath such a directory unmintable.
+    """
+
+    import hashlib
+
+    ancestor = tmp_path / "shared"
+    package = ancestor / "pkg"
+    package.mkdir(parents=True)
+    (package / "payload.txt").write_bytes(b"contents")
+    os.chmod(ancestor, 0o711)  # --x for group/other, and no read even for the owner
+    try:
+        out = _run_hasher(package, ["payload.txt"])
+    finally:
+        os.chmod(ancestor, 0o755)
+
+    assert out["errors"] == {}
+    assert out["digests"]["payload.txt"] == hashlib.sha256(b"contents").hexdigest()
+    assert out["package_inode"] == os.stat(package).st_ino

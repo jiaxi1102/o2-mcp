@@ -1275,6 +1275,7 @@ import errno, hashlib, json, os, stat, sys
 root = sys.argv[1]
 names = [n for n in sys.stdin.read().split(chr(10)) if n]
 out = {"digests": {}, "errors": {}, "package_inode": 0}
+O_SEARCH = getattr(os, "O_PATH", 0)
 def open_root(path):
     # O_NOFOLLOW on the absolute path guards only the FINAL component, so an
     # ancestor the publisher controls could be renamed and replaced with a
@@ -1282,12 +1283,26 @@ def open_root(path):
     # approved inode. Walk down from "/" instead, refusing a link at every
     # step, exactly as the payload paths below are walked. "/" itself cannot
     # be a symlink, so it is the one component opened without O_NOFOLLOW.
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    #
+    # Ancestors are only traversed, never read, so ask for a search-only
+    # descriptor. Opening them O_RDONLY would demand read permission that plain
+    # pathname resolution never needs, and an execute-only ancestor -- mode 0711
+    # is ordinary for shared parents -- would make a perfectly valid package
+    # unmintable. O_PATH is Linux-only and degrades to a normal open elsewhere,
+    # which only affects local development.
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", os.O_DIRECTORY | (O_SEARCH or os.O_RDONLY))
     try:
-        for part in [p for p in path.split("/") if p]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd)
             os.close(fd)
             fd = nxt
+        if parts:
+            # The package directory itself is the one being attested, and its
+            # inode is reported from this very descriptor.
+            last = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = last
     except BaseException:
         os.close(fd)
         raise
