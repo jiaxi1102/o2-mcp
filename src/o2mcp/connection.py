@@ -93,6 +93,11 @@ class CommandResult:
         return self.returncode == 0
 
 
+# The broker caps captured output; a cut is reported only as this note on
+# stderr, with the return code left untouched. Callers that must not act on a
+# partial read look for it, so it lives here rather than in two string literals.
+BROKER_TRUNCATION_NOTE = "truncated by persistent broker"
+
 # A runner takes (argv, timeout, input_text) and returns a CommandResult.
 Runner = Callable[[list[str], Optional[float], Optional[str]], CommandResult]
 
@@ -1237,9 +1242,9 @@ class O2Connection:
             result = broker.execute(command, timeout=remote_timeout, input_text=input_text)
             truncation_notes: list[str] = []
             if result.stdout_truncated:
-                truncation_notes.append("stdout truncated by persistent broker")
+                truncation_notes.append(f"stdout {BROKER_TRUNCATION_NOTE}")
             if result.stderr_truncated:
-                truncation_notes.append("stderr truncated by persistent broker")
+                truncation_notes.append(f"stderr {BROKER_TRUNCATION_NOTE}")
             stderr = result.stderr
             if truncation_notes:
                 stderr += ("\n" if stderr else "") + "; ".join(truncation_notes)

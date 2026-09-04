@@ -43,10 +43,30 @@ PolicyMode = Literal["disabled", "reuse_only"]
 LoginTarget = Literal["login", "transfer"]
 LoginAuthorizationMethod = Literal["explicit_user_approval", "standing_on_vpn"]
 
+# The version we WRITE. The mint ledger is a purely additive key, and every
+# released reader ignores keys it does not know -- so the file does not need a
+# bump to carry it. Writing 2 while an older reader was still live did not make
+# that reader ignore one key: it made the reader refuse the whole file, which
+# took out every already-running process that had loaded the older module. A
+# broker start rewrote the file to 2 and the long-lived server, one vintage
+# behind, then failed every command against it.
+#
+# So this stays at 1 until every deployed reader is known to accept 2. Accept
+# first, write later -- the reverse order is an outage, not a migration.
 SCHEMA_VERSION = 1
+# The versions we ACCEPT. 2 is accepted because it was briefly written and
+# those files exist; reading one normalises it back down to 1 without losing
+# the ledger. Raise SCHEMA_VERSION to 2 only once no reader below it survives.
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 DEFAULT_GRANT_TTL_SECONDS = 300.0
 DEFAULT_LOGIN_COOLDOWN_SECONDS = 300.0
 MAX_EVENTS = 64
+# The durable mint ledger is bounded too, but by refusing rather than evicting;
+# see _append_launch_evidence_mint for why silently dropping one is the defect.
+MAX_LAUNCH_EVIDENCE_MINTS = 256
+
+# Digests recorded in the audit ledger must be literal hex, never a label.
+_HEX_DIGITS = "0123456789abcdef"
 
 # All connections created by one MCP server process share an identity.  Binding a
 # grant to this value prevents another concurrently running task from consuming a
@@ -310,6 +330,96 @@ class O2PolicyStore:
             state["mode"] = "reuse_only"
             self._append_event(state, "policy_reuse_enabled", approval_reference=reference)
             return self._write_next_revision(state)
+
+    def record_launch_evidence_mint(
+        self,
+        *,
+        expected_revision: int,
+        expected_generation: str,
+        approval_reference: str,
+        stage: str,
+        job_id: str,
+        package: str,
+        evidence_sha256: str,
+        plan_sha256: str,
+    ) -> dict[str, Any]:
+        """Record one operator-approved launch-evidence mint in the audit ledger.
+
+        This is what authenticates the record. The caller must quote the current
+        generation and revision -- obtainable only from a fresh status snapshot,
+        so an approval cannot be replayed across an intervening policy write --
+        together with a human approval reference. Minting is otherwise an
+        ordinary read of cluster artifacts and would attest nothing.
+
+        ``evidence_sha256`` is the digest of the *complete* evidence record this
+        approval covers, and storing it here is what ties the approval to that
+        exact content. Recording only the stage, job, and package would leave a
+        holder of a legitimate record free to alter its runtime identities or
+        package digests, recompute the record's own unkeyed digest, and keep an
+        approval object that still agreed with the ledger. With the digest
+        stored, that edit no longer matches the entry that approved it.
+
+        The digest goes into ``launch_evidence_mints``, which event eviction
+        never touches, as well as into the rolling event log. An attestation
+        recorded only in a buffer bounded to MAX_EVENTS would stop being
+        verifiable after enough unrelated policy traffic.
+
+        It deliberately does NOT consume a login grant or change mode: attesting
+        a finished run is not authority to start another one.
+        """
+
+        # The approval reference is free text and only ever lives here, so
+        # collapsing its whitespace is right. The other three are also stored
+        # verbatim in the evidence record and compared exactly by
+        # verify_launch_evidence, so normalizing them here would make a freshly
+        # minted record fail its own verification.
+        reference = self._clean_reference(approval_reference, field="approval_reference")
+        clean_stage = self._clean_literal(stage, field="stage", max_length=240)
+        clean_job = self._clean_literal(job_id, field="job_id", max_length=240)
+        clean_package = self._clean_literal(package, field="package", max_length=4096)
+        evidence_digest = self._clean_digest(evidence_sha256, field="evidence_sha256")
+        approved_plan_digest = self._clean_digest(plan_sha256, field="plan_sha256")
+        with self._locked():
+            state = self._read_valid_state()
+            self._require_revision(state, expected_revision, expected_generation)
+            # Every field the returned approval carries is built from this one
+            # entry, so the record's operator_approval cannot name a reference,
+            # client, revision or time the ledger does not also record. Editing
+            # any of them in a record in hand then disagrees with the ledger.
+            entry = {
+                "at": self._clock(),
+                "client_id": self.client_id,
+                "approval_reference": reference,
+                "stage": clean_stage,
+                "job_id": clean_job,
+                "package": clean_package,
+                "evidence_sha256": evidence_digest,
+                "plan_sha256": approved_plan_digest,
+                # The revision this write is about to produce, so the entry names
+                # the policy state the approval belongs to.
+                "policy_revision": int(state.get("revision", 0)) + 1,
+                "policy_generation": state.get("generation"),
+            }
+            # The durable ledger first: if it is full this raises before anything
+            # is written, so a refused mint leaves no event claiming otherwise.
+            self._append_launch_evidence_mint(state, entry)
+            # The rolling event stays as the operational log; the ledger above is
+            # what a record is verified against.
+            self._append_event(
+                state,
+                "launch_evidence_minted",
+                **{key: value for key, value in entry.items() if key not in {"at", "client_id"}},
+            )
+            self._write_next_revision(state)
+        return {
+            "approval_reference": entry["approval_reference"],
+            "evidence_sha256": entry["evidence_sha256"],
+            "plan_sha256": entry["plan_sha256"],
+            "policy_revision": entry["policy_revision"],
+            "policy_generation": entry["policy_generation"],
+            "client_id": entry["client_id"],
+            "approved_at": entry["at"],
+        }
 
     def authorize_login(
         self,
@@ -612,11 +722,45 @@ class O2PolicyStore:
             raise O2PolicyInvalidError(f"Cannot inspect O2 policy at {self.path}: {exc}") from exc
         self._validate_file_metadata(self.path, metadata)
         try:
-            return self._validate_state(json.loads(self.path.read_text()))
-        except (OSError, ValueError, O2PolicyInvalidError):
-            return self._conservative_repair_state(metadata)
+            payload = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            # Nothing parsed, so there is nothing to salvage.
+            return self._conservative_repair_state(metadata, salvaged_mints=[])
+        try:
+            return self._validate_state(payload)
+        except O2PolicyInvalidError:
+            # The JSON parsed but something in it is invalid. One malformed mint
+            # must not cost every other attestation, so keep the entries that
+            # stand on their own.
+            return self._conservative_repair_state(metadata, salvaged_mints=self._salvage_mints(payload))
 
-    def _conservative_repair_state(self, metadata: os.stat_result) -> dict[str, Any]:
+    def _salvage_mints(self, payload: Any) -> list[dict[str, Any]]:
+        """Keep the mint entries that are individually valid, drop the rest.
+
+        Repair replaces the whole file, so without this a single malformed entry
+        would erase every other attestation in the ledger -- and those entries
+        are the only durable authenticators their evidence records have. An
+        entry that does not validate on its own authenticates nothing and is
+        dropped; one that does is worth keeping regardless of what damaged its
+        neighbour.
+        """
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("launch_evidence_mints"), list):
+            return []
+        salvaged: list[dict[str, Any]] = []
+        for entry in payload["launch_evidence_mints"]:
+            if len(salvaged) >= MAX_LAUNCH_EVIDENCE_MINTS:
+                break
+            try:
+                self._validate_launch_evidence_mints([entry])
+            except O2PolicyInvalidError:
+                continue
+            salvaged.append(json.loads(json.dumps(entry)))
+        return salvaged
+
+    def _conservative_repair_state(
+        self, metadata: os.stat_result, *, salvaged_mints: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """Replace malformed JSON while retaining a file-age retry cooldown.
 
         Truncation destroys the exact login-attempt receipt, so repair cannot
@@ -633,6 +777,7 @@ class O2PolicyStore:
             modification_time = now
         started_at = max(0.0, min(modification_time, now))
         state = self._initial_state()
+        state["launch_evidence_mints"] = salvaged_mints
         repair_id = f"repair-{uuid.uuid4()}"
         state["login_attempt"] = {
             "grant_id": repair_id,
@@ -652,6 +797,10 @@ class O2PolicyStore:
             "policy_repaired_with_conservative_cooldown",
             repair_id=repair_id,
             source_modified_at=modification_time,
+            # Say how much of the attestation ledger survived, so a repair that
+            # silently emptied it is distinguishable from one that had nothing
+            # to keep.
+            launch_evidence_mints_kept=len(salvaged_mints),
         )
         return state
 
@@ -660,10 +809,25 @@ class O2PolicyStore:
 
         if not isinstance(payload, dict):
             raise O2PolicyInvalidError("O2 policy root must be a JSON object")
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        version = payload.get("schema_version")
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
             raise O2PolicyInvalidError(
-                f"Unsupported O2 policy schema {payload.get('schema_version')!r}; expected {SCHEMA_VERSION}."
+                f"Unsupported O2 policy schema {version!r}; expected one of {SUPPORTED_SCHEMA_VERSIONS}."
             )
+        # Detach before migrating so no caller's structure -- or a JSON decoder
+        # cache -- is mutated by reading.
+        payload = json.loads(json.dumps(payload))
+        # Ensure the ledger key regardless of version. Tying this to a version
+        # mismatch meant that once the written version matched the file's, the
+        # key stopped being seeded and the next write dropped it -- the ledger
+        # has to exist for every accepted version, not only for migrated ones.
+        # setdefault only fills an absent key, so a file that already carries a
+        # ledger keeps it verbatim.
+        payload.setdefault("launch_evidence_mints", [])
+        if version != SCHEMA_VERSION:
+            # Normalise an accepted version to the one we write, in memory only.
+            # Nothing is rewritten merely to read and no state is invalidated.
+            payload["schema_version"] = SCHEMA_VERSION
         revision = payload.get("revision")
         if type(revision) is not int or revision < 0:
             raise O2PolicyInvalidError("O2 policy revision must be a non-negative integer")
@@ -686,9 +850,8 @@ class O2PolicyStore:
             self._validate_login_attempt(payload["login_attempt"])
         if not isinstance(payload.get("events", []), list):
             raise O2PolicyInvalidError("events must be an array")
-        # Return a detached mutable copy so callers cannot accidentally mutate a
-        # structure shared with an input fixture or JSON decoder cache.
-        return json.loads(json.dumps(payload))
+        self._validate_launch_evidence_mints(payload.get("launch_evidence_mints", []))
+        return payload
 
     @staticmethod
     def _validate_login_attempt(attempt: dict[str, Any]) -> None:
@@ -940,6 +1103,7 @@ class O2PolicyStore:
             "login_grant": None,
             "login_attempt": None,
             "events": [],
+            "launch_evidence_mints": [],
         }
 
     def _require_revision(
@@ -1022,6 +1186,29 @@ class O2PolicyStore:
         events.append({"at": self._clock(), "event": event, "client_id": self.client_id, **details})
         del events[:-MAX_EVENTS]
 
+    def _append_launch_evidence_mint(self, state: dict[str, Any], entry: dict[str, Any]) -> None:
+        """Append one mint to the ledger that ordinary event eviction never touches.
+
+        Deliberately not `_append_event`. That list is a rolling buffer capped at
+        MAX_EVENTS, and this ledger sees many events per session, so an approval
+        recorded only there stops being verifiable once unrelated policy traffic
+        pushes it out -- tamper-evidence with a shelf life, which is worse than
+        not claiming any.
+
+        This list is bounded too, but by refusing rather than evicting. Dropping
+        the oldest attestation to make room is exactly the defect being fixed, so
+        a full ledger is a loud and recoverable failure instead of a silent one.
+        """
+
+        mints = state.setdefault("launch_evidence_mints", [])
+        if len(mints) >= MAX_LAUNCH_EVIDENCE_MINTS:
+            raise O2PolicyInvalidError(
+                f"the launch-evidence ledger already holds its maximum of {MAX_LAUNCH_EVIDENCE_MINTS} mints. "
+                f"Archive and prune {self.path} before minting again: evicting an older attestation to make "
+                "room would silently make that record unverifiable."
+            )
+        mints.append(dict(entry))
+
     @staticmethod
     def _clean_reference(value: str, *, field: str) -> str:
         """Validate short audit metadata without storing an entire chat transcript."""
@@ -1031,4 +1218,84 @@ class O2PolicyStore:
         cleaned = " ".join(value.split())
         if len(cleaned) > 240:
             raise O2PolicyInvalidError(f"{field} must be at most 240 characters")
+        return cleaned
+
+    @staticmethod
+    def _validate_launch_evidence_mints(mints: Any) -> None:
+        """Validate the durable ledger, not merely its shape.
+
+        These entries are the sole durable authenticators for evidence records:
+        `verify_launch_evidence` compares a record field by field against one of
+        them. An entry that is a JSON object but missing fields, or carrying a
+        malformed digest, would therefore be surfaced through status and
+        preserved across writes while authenticating nothing -- and a record
+        checked against it could pass on absent-equals-absent. Refusing makes a
+        damaged ledger loud rather than quietly useless.
+        """
+
+        if not isinstance(mints, list):
+            raise O2PolicyInvalidError("launch_evidence_mints must be an array")
+        if len(mints) > MAX_LAUNCH_EVIDENCE_MINTS:
+            raise O2PolicyInvalidError(
+                f"launch_evidence_mints holds {len(mints)} entries, more than the {MAX_LAUNCH_EVIDENCE_MINTS} maximum"
+            )
+        for index, entry in enumerate(mints):
+            if not isinstance(entry, dict):
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}] must be an object")
+            for field in ("approval_reference", "stage", "job_id", "package", "client_id", "policy_generation"):
+                value = entry.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].{field} must be a non-empty string")
+            for field in ("evidence_sha256", "plan_sha256"):
+                value = entry.get(field)
+                if not isinstance(value, str) or len(value) != 64 or value.strip(_HEX_DIGITS):
+                    raise O2PolicyInvalidError(
+                        f"launch_evidence_mints[{index}].{field} must be a 64-character SHA-256 hex digest"
+                    )
+            recorded_at = entry.get("at")
+            if not isinstance(recorded_at, (int, float)) or isinstance(recorded_at, bool):
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].at must be a number")
+            if not math.isfinite(float(recorded_at)) or float(recorded_at) < 0:
+                raise O2PolicyInvalidError(f"launch_evidence_mints[{index}].at must be a finite, non-negative time")
+            revision = entry.get("policy_revision")
+            if type(revision) is not int or revision < 0:
+                raise O2PolicyInvalidError(
+                    f"launch_evidence_mints[{index}].policy_revision must be a non-negative integer"
+                )
+            try:
+                uuid.UUID(entry["policy_generation"])
+            except ValueError as exc:
+                raise O2PolicyInvalidError(
+                    f"launch_evidence_mints[{index}].policy_generation must be a valid UUID"
+                ) from exc
+
+    @staticmethod
+    def _clean_literal(value: str, *, field: str, max_length: int) -> str:
+        """Validate an audited value without normalizing the characters in it.
+
+        `_clean_reference` collapses runs of whitespace, which is right for a
+        free-text approval note and wrong for anything the evidence record also
+        stores verbatim: the ledger would file the mint under a value the record
+        does not carry, and `verify_launch_evidence` compares them exactly, so a
+        freshly minted record would fail its own verification. Control
+        characters are still refused -- they cannot appear in a value this
+        server accepted, and would corrupt an audit line.
+        """
+
+        if not isinstance(value, str) or not value.strip():
+            raise O2PolicyInvalidError(f"{field} must be a non-empty string")
+        cleaned = value.strip()
+        if len(cleaned) > max_length:
+            raise O2PolicyInvalidError(f"{field} must be at most {max_length} characters")
+        if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+            raise O2PolicyInvalidError(f"{field} must not contain control characters")
+        return cleaned
+
+    @staticmethod
+    def _clean_digest(value: str, *, field: str) -> str:
+        """Require a literal SHA-256 hex digest for a binding the ledger records."""
+
+        cleaned = value.strip().lower() if isinstance(value, str) else ""
+        if len(cleaned) != 64 or cleaned.strip(_HEX_DIGITS):
+            raise O2PolicyInvalidError(f"{field} must be a 64-character SHA-256 hex digest")
         return cleaned

@@ -30,6 +30,9 @@ unit-tested without it.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import re
 import shlex
@@ -37,7 +40,9 @@ import stat
 import subprocess
 import sys
 import time
-from pathlib import Path
+import zlib
+from collections.abc import Iterator
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
 import anyio
@@ -64,6 +69,20 @@ from o2mcp import (
     O2Workspace,
     billing,
     transfer_tools,
+)
+from o2mcp.broker_protocol import MAX_COMMAND_BYTES, MAX_STDIN_BYTES
+from o2mcp.connection import BROKER_TRUNCATION_NOTE
+from o2mcp.launch_evidence import (
+    LaunchEvidenceError,
+    build_launch_evidence,
+    claimed_job_id,
+    evidence_content_digest,
+    launch_evidence_digest,
+    parse_encoded_checksum_manifest,
+    parse_encoded_json_artifact,
+    parse_json_artifact,
+    parse_scheduler_record,
+    required_package_files,
 )
 from o2mcp.policy import LoginTarget
 from o2mcp.slurm import _quote_remote_path
@@ -122,6 +141,10 @@ async def _run_tool(fn: Callable[[], dict[str, Any]]) -> str:
         payload = {"ok": False, "error": "broker_start_failed", "message": str(exc)}
     except O2BrokerError as exc:
         payload = {"ok": False, "error": "broker_error", "message": str(exc)}
+    except LaunchEvidenceError as exc:
+        # Refusing to mint is this tool working as intended, so it gets a named
+        # code rather than falling into the defensive catch-all below.
+        payload = {"ok": False, "error": "launch_evidence_refused", "message": str(exc)}
     except subprocess.TimeoutExpired as exc:
         payload = {"ok": False, "error": "operation_timeout", "message": str(exc)}
     except Exception as exc:  # pragma: no cover - defensive
@@ -256,6 +279,41 @@ class AuthorizeLoginInput(BaseModel):
         description="Whether this exact one-shot login may proceed without a proven HMS VPN route.",
     )
     approval_reference: str = Field(..., min_length=1, max_length=240)
+
+
+class MintLaunchEvidenceInput(BaseModel):
+    """Bind one finished governed stage into an operator-approved record."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    diagnostic_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the stage's run diagnostic JSON (the job's stdout).",
+    )
+    plan_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the frozen execution plan JSON that was approved.",
+    )
+    package_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute O2 path to the published package directory the stage verified.",
+    )
+    stage: str = Field(default="platform-canary", min_length=1, max_length=120)
+    expected_revision: int = Field(..., ge=0)
+    expected_generation: str = Field(
+        ...,
+        min_length=1,
+        description="Generation UUID from the same o2_local_status snapshot as expected_revision.",
+    )
+    approval_reference: str = Field(
+        ...,
+        min_length=1,
+        max_length=240,
+        description="The operator's explicit approval of this exact record; it is what authenticates it.",
+    )
+    timeout_seconds: float = Field(default=60.0, gt=0, le=60.0)
 
 
 class ProbeInput(BaseModel):
@@ -565,6 +623,15 @@ def _local_status_payload() -> dict[str, Any]:
             "login_grant": grant,
             "login_attempt": state.get("login_attempt") if isinstance(state, dict) else None,
             "recent_events": state.get("events", [])[-10:] if isinstance(state, dict) else [],
+            # The durable attestation ledger. Unlike recent_events this is never
+            # evicted, so a record minted long ago is still verifiable against
+            # it; only the newest few are surfaced here, the rest live in the file.
+            "launch_evidence_mint_count": (
+                len(state.get("launch_evidence_mints", [])) if isinstance(state, dict) else 0
+            ),
+            "recent_launch_evidence_mints": (
+                state.get("launch_evidence_mints", [])[-10:] if isinstance(state, dict) else []
+            ),
         },
         "control_sockets": _local_socket_inventory(),
         # Keep the singular login-broker key for clients written against the
@@ -1287,6 +1354,790 @@ def _pricing_record(
             "accompanied it. Price the shape with o2_price_job if it does."
         )
     return record
+
+
+def _absolute_remote_path(value: str, *, label: str) -> str:
+    """Require an absolute, traversal-free remote path before it reaches a shell."""
+
+    cleaned = value.strip()
+    if not cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+        raise LaunchEvidenceError(f"{label} must be an absolute normalized O2 path")
+    return cleaned
+
+
+_MARKER_DIAGNOSTIC_SIZE = "===DIAGNOSTICSIZE==="
+_MARKER_PLAN_SIZE = "===PLANSIZE==="
+_MARKER_OWNER_SIZE = "===OWNERSIZE==="
+_MARKER_MANIFEST_SIZE = "===MANIFESTSIZE==="
+_MARKER_RESOLVED = "===RESOLVED==="
+_LAUNCH_EVIDENCE_MARKERS = (
+    _MARKER_DIAGNOSTIC_SIZE,
+    _MARKER_PLAN_SIZE,
+    _MARKER_OWNER_SIZE,
+    _MARKER_MANIFEST_SIZE,
+    _MARKER_RESOLVED,
+)
+
+
+# Opening each payload with O_NOFOLLOW and hashing that descriptor is the only
+# way to make identity and content one act. `sha256sum` has no no-follow mode and
+# a shell cannot hold a descriptor across two commands, so this runs a small
+# program on the cluster instead -- a command like any other, staging nothing.
+# It walks each relative path component by component with openat(O_NOFOLLOW), so
+# a symlinked ancestor is refused as well as a symlinked leaf, and reports the
+# package directory's inode from the very descriptor it read through. The root
+# is opened O_NOFOLLOW too: `realpath` runs earlier, so a package path replaced
+# with a symlink after that would otherwise be followed here and report the
+# target's inode as though it were the package's.
+#
+# /usr/bin/python3 on O2 is 3.9, so this stays 3.9 syntax.
+_NOFOLLOW_HASHER = """
+import errno, hashlib, json, os, stat, sys
+root = sys.argv[1]
+names = [n for n in sys.stdin.read().split(chr(10)) if n]
+out = {"digests": {}, "errors": {}, "stats": {}, "package_inode": 0}
+O_SEARCH = getattr(os, "O_PATH", 0)
+def open_root(path):
+    # O_NOFOLLOW on the absolute path guards only the FINAL component, so an
+    # ancestor the publisher controls could be renamed and replaced with a
+    # symlink after realpath ran; the open would follow it and still reach the
+    # approved inode. Walk down from "/" instead, refusing a link at every
+    # step, exactly as the payload paths below are walked. "/" itself cannot
+    # be a symlink, so it is the one component opened without O_NOFOLLOW.
+    #
+    # Ancestors are only traversed, never read, so ask for a search-only
+    # descriptor. Opening them O_RDONLY would demand read permission that plain
+    # pathname resolution never needs, and an execute-only ancestor -- mode 0711
+    # is ordinary for shared parents -- would make a perfectly valid package
+    # unmintable. O_PATH is Linux-only and degrades to a normal open elsewhere,
+    # which only affects local development.
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", os.O_DIRECTORY | (O_SEARCH or os.O_RDONLY))
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if parts:
+            # The package directory itself is the one being attested, and its
+            # inode is reported from this very descriptor.
+            # Search-only here too: the package directory is never listed, only
+            # traversed and fstat'd for its inode, both of which an O_PATH
+            # descriptor serves. Demanding read made an execute-only package
+            # root unmintable for no benefit.
+            last = os.open(
+                parts[-1], os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd
+            )
+            os.close(fd)
+            fd = last
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+try:
+    rfd = open_root(root)
+except OSError as exc:
+    out["errors"][root] = (
+        "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+    )
+    sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    raise SystemExit(0)
+try:
+    out["package_inode"] = os.fstat(rfd).st_ino
+    for name in names:
+        parts = name.split("/")
+        opened = []
+        try:
+            cur = rfd
+            for part in parts[:-1]:
+                cur = os.open(
+                    part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=cur
+                )
+                opened.append(cur)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+            opened.append(fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                out["errors"][name] = "not a regular file"
+                continue
+            h = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1048576)
+                if not chunk:
+                    break
+                h.update(chunk)
+            out["digests"][name] = h.hexdigest()
+            # Record what was read, from the same descriptor the bytes came
+            # through, so a later pass can prove the payload did not change
+            # after it was hashed.
+            st = os.fstat(fd)
+            out["stats"][name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+        except OSError as exc:
+            out["errors"][name] = (
+                "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+            )
+        finally:
+            for f in opened:
+                os.close(f)
+finally:
+    os.close(rfd)
+sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+"""
+
+# Stat-only twin of the hasher: the same no-follow walk, no reads. Used to prove
+# no payload changed between being hashed and the approval being recorded --
+# hashing a large package takes several round trips, so a publisher that can
+# write regular files could otherwise overwrite an early payload after its
+# digest was taken. Overwriting a file does not replace its parent directory, so
+# neither package-inode check would notice.
+_NOFOLLOW_RESTAT = """
+import base64, errno, hashlib, json, os, stat, sys, zlib
+root = sys.argv[1]
+# The name list is compressed when it would not otherwise fit one call. Package
+# paths repeat heavily, so this keeps even a nine-thousand-payload package in a
+# single pass -- which is the whole point: batching would reopen the window
+# between an early stat and the ledger write.
+data = sys.stdin.read()
+if data[:2] == "Z:":
+    data = zlib.decompress(base64.b64decode(data[2:])).decode("utf-8")
+names = [n for n in data.split(chr(10)) if n]
+out = {"errors": {}, "package_inode": 0, "aggregate": "", "named": {}}
+seen = []
+named = {}
+O_SEARCH = getattr(os, "O_PATH", 0)
+def open_root(path):
+    parts = [p for p in path.split("/") if p]
+    fd = os.open("/", os.O_DIRECTORY | (O_SEARCH or os.O_RDONLY))
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if parts:
+            # Search-only here too: the package directory is never listed, only
+            # traversed and fstat'd for its inode, both of which an O_PATH
+            # descriptor serves. Demanding read made an execute-only package
+            # root unmintable for no benefit.
+            last = os.open(
+                parts[-1], os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=fd
+            )
+            os.close(fd)
+            fd = last
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+try:
+    rfd = open_root(root)
+except OSError as exc:
+    out["errors"][root] = (
+        "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+    )
+    sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    raise SystemExit(0)
+try:
+    out["package_inode"] = os.fstat(rfd).st_ino
+    for name in names:
+        parts = name.split("/")
+        opened = []
+        try:
+            cur = rfd
+            for part in parts[:-1]:
+                cur = os.open(
+                    part, os.O_DIRECTORY | os.O_NOFOLLOW | (O_SEARCH or os.O_RDONLY), dir_fd=cur
+                )
+                opened.append(cur)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+            opened.append(fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                out["errors"][name] = "not a regular file"
+                continue
+            seen.append("%s\0%d\0%d\0%d\0%d\n" % (name, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            # Keep per-name identities too, but only while they stay small. The
+            # aggregate is the verdict; these exist so a refusal can say WHICH
+            # payload moved. Capping them is what keeps this reply bounded, which
+            # is what lets the whole package be checked in a single pass.
+            if len(named) < 200:
+                named[name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+        except OSError as exc:
+            out["errors"][name] = (
+                "symlink" if exc.errno == errno.ELOOP else errno.errorcode.get(exc.errno, str(exc.errno))
+            )
+        finally:
+            for f in opened:
+                os.close(f)
+finally:
+    os.close(rfd)
+seen.sort()
+out["named"] = named if len(named) == len(seen) else {}
+out["aggregate"] = hashlib.sha256("".join(seen).encode("utf-8")).hexdigest()
+sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+"""
+
+# The interpreter is named absolutely so no PATH or module environment can
+# substitute another one; it is present on O2 without sourcing anything.
+_NOFOLLOW_PYTHON = "/usr/bin/python3"
+
+
+def _hash_without_following(
+    *, package_path: str, names: list[str], timeout: float
+) -> tuple[dict[str, str], int, dict[str, list[int]]]:
+    """Hash each name through an O_NOFOLLOW descriptor, and report the package inode.
+
+    Returns the digests, the inode of the directory the hashes were read
+    through -- so the caller can bind that identity to the one the run recorded
+    -- and the identity of each payload as it was read, for
+    :func:`_refuse_if_payloads_changed` to re-check before anything is recorded.
+    """
+
+    program = shlex.quote(_NOFOLLOW_HASHER)
+    command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
+    digests: dict[str, str] = {}
+    stats: dict[str, list[int]] = {}
+    inodes: set[int] = set()
+    for batch in _hash_batches(names):
+        result = _connection().run(command, timeout=timeout, input_text="\n".join(batch) + "\n")
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not hash the package on O2 without following links: {}".format(
+                    (result.stderr or "").strip()[:400]
+                )
+            )
+        _refuse_truncated_read(result, label="the package hash read")
+        payload = parse_json_artifact(result.stdout, label="the no-follow hash output")
+        errors = payload.get("errors") or {}
+        if errors:
+            shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
+            more = f" (and {len(errors) - 5} more)" if len(errors) > 5 else ""
+            raise LaunchEvidenceError(
+                "refusing to mint launch evidence; these package entries could not be read as ordinary "
+                f"files through a no-follow open, so the package is not one this can attest: {shown}{more}"
+            )
+        inode = payload.get("package_inode")
+        if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
+            raise LaunchEvidenceError("the package directory reported no usable inode")
+        inodes.add(inode)
+        for name, digest in (payload.get("digests") or {}).items():
+            if name not in batch:
+                raise LaunchEvidenceError(f"the hash output named {name!r}, which was not requested")
+            digests[name] = digest
+        for name, identity in (payload.get("stats") or {}).items():
+            if name in batch:
+                stats[name] = list(identity)
+    missing = [name for name in names if name not in digests]
+    if missing:
+        raise LaunchEvidenceError("the package hash returned nothing for: {}".format(", ".join(sorted(missing)[:5])))
+    if len(inodes) != 1:
+        raise LaunchEvidenceError("the package directory changed identity while it was being read")
+    return digests, inodes.pop(), stats
+
+
+def _payload_identity_aggregate(stats: dict[str, list[int]]) -> str:
+    """The digest the cluster computes over the same identities, in the same order."""
+
+    # Must match the remote script byte for byte; it uses %-formatting because it
+    # is 3.9-compatible source shipped as a string, not because the shapes differ.
+    seen = ["\0".join([name, *(str(int(field)) for field in stats[name])]) + "\n" for name in sorted(stats)]
+    return hashlib.sha256("".join(seen).encode("utf-8")).hexdigest()
+
+
+def _refuse_if_payloads_changed(
+    *, package_path: str, expected: dict[str, list[int]], package_inode: int, timeout: float
+) -> None:
+    """Refuse if any payload is not byte-for-byte the one that was hashed.
+
+    Hashing a package takes several round trips, so a publisher able to write
+    regular files could overwrite an early payload after its digest was taken.
+    The cached digest would still match SHA256SUMS, and neither package-inode
+    check would notice, because overwriting a file does not replace its parent
+    directory -- so the record would authenticate bytes no longer published.
+
+    The re-check is one call, not a batched sweep. A batched one carries the
+    same defect it exists to close: an early batch's identities are already
+    cached while later batches are still being read, so a payload overwritten in
+    between compares equal against the stale copy. Returning a single aggregate
+    over every payload keeps the reply constant-size no matter how many files
+    there are, so the whole package is read by one process in one pass and there
+    is no window between batches to exploit.
+
+    What remains is the span of that single walk, which cannot be closed without
+    an immutable snapshot; NFS offers none.
+    """
+
+    if not expected:
+        return
+    program = shlex.quote(_NOFOLLOW_RESTAT)
+    command = f"{_NOFOLLOW_PYTHON} -c {program} {shlex.quote(package_path)}"
+    names = sorted(expected)
+    raw = ("\n".join(names) + "\n").encode("utf-8")
+    stdin = raw.decode("utf-8")
+    if len(raw) > MAX_STDIN_BYTES // 2:
+        # Package paths repeat heavily, so compressing keeps even a very large
+        # package inside one call. Batching instead would reopen precisely the
+        # window between an early stat and the ledger write that this closes.
+        stdin = "Z:" + base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+    if len(stdin.encode("utf-8")) > MAX_STDIN_BYTES:
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; {len(names)} payload names exceed the one-pass re-check "
+            "budget even compressed, and re-checking them in batches would not prove the package held still"
+        )
+    result = _connection().run(command, timeout=timeout, input_text=stdin)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not re-check the package on O2 after hashing it: {}".format((result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the package re-check read")
+    payload = parse_json_artifact(result.stdout, label="the no-follow re-check output")
+    errors = payload.get("errors") or {}
+    if errors:
+        shown = "; ".join(f"{name}: {reason}" for name, reason in sorted(errors.items())[:5])
+        raise LaunchEvidenceError(
+            f"refusing to mint launch evidence; the package could not be re-read after hashing: {shown}"
+        )
+    if payload.get("package_inode") != package_inode:
+        raise LaunchEvidenceError("the package directory changed identity between hashing and recording")
+    observed = payload.get("aggregate")
+    wanted = _payload_identity_aggregate(expected)
+    if isinstance(observed, str) and observed == wanted:
+        return
+    # The aggregate is the verdict; these only make the refusal actionable by
+    # saying which payload moved. They are absent for a package too large to
+    # report them, and the refusal still stands without them.
+    named = payload.get("named") or {}
+    changed = sorted(name for name, identity in expected.items() if list(named.get(name, identity)) != identity)
+    if named and changed:
+        shown = ", ".join(changed[:5])
+        more = f" (and {len(changed) - 5} more)" if len(changed) > 5 else ""
+        raise LaunchEvidenceError(
+            "refusing to mint launch evidence; these payloads changed after they were hashed, so the record "
+            f"would attest bytes that are no longer in the package: {shown}{more}"
+        )
+    raise LaunchEvidenceError(
+        "refusing to mint launch evidence; the package changed after it was hashed, so the record would "
+        f"attest bytes that are no longer in it (expected identity {wanted[:12]}, found "
+        f"{str(observed)[:12]} over {len(names)} payloads)"
+    )
+
+
+def _refuse_truncated_read(result: CommandResult, *, label: str) -> None:
+    """Refuse an artifact the broker cut short.
+
+    The broker caps captured output and reports the cut only as a note on
+    stderr, leaving the return code 0. A partial digest listing is
+    indistinguishable from a package missing files, so a truncated read must
+    end the mint rather than quietly shrink what the record covers.
+    """
+
+    if BROKER_TRUNCATION_NOTE in (result.stderr or ""):
+        raise LaunchEvidenceError(f"{label} was truncated by the broker's output cap, so it cannot be bound")
+
+
+def _read_launch_artifacts(
+    *, diagnostic_path: str, plan_path: str, package_path: str, timeout: float
+) -> dict[str, Any]:
+    """Read every artifact back off the cluster through the authenticated broker.
+
+    Reading them here rather than accepting caller-supplied content is the point:
+    the record must attest what is actually on O2. One command keeps this to a
+    single hold on the shared channel; hashing the payloads the manifest names
+    needs a second one, because that list only exists once this has returned.
+    """
+
+    manifest_path = str(PurePosixPath(package_path) / "SHA256SUMS")
+    owner_path = str(PurePosixPath(package_path) / "PUBLICATION_OWNER.json")
+    command = "; ".join(
+        [
+            f"printf '%s\\n' {shlex.quote(_MARKER_DIAGNOSTIC_SIZE)}",
+            f"stat -c %s -- {shlex.quote(diagnostic_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_PLAN_SIZE)}",
+            f"stat -c %s -- {shlex.quote(plan_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_MANIFEST_SIZE)}",
+            f"stat -c %s -- {shlex.quote(manifest_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_OWNER_SIZE)}",
+            f"stat -c %s -- {shlex.quote(owner_path)}",
+            f"printf '\\n%s\\n' {shlex.quote(_MARKER_RESOLVED)}",
+            f"realpath -- {shlex.quote(package_path)}",
+        ]
+    )
+    # This one is not batched, so a package path long enough to overrun the
+    # broker's limit would be rejected as an opaque ValueError. Name it instead.
+    if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
+        raise LaunchEvidenceError(f"the artifact read for {package_path!r} does not fit in one broker command")
+    result = _connection().run(command, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not read the launch artifacts from O2: {}".format((result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the launch artifact read")
+
+    sections: dict[str, str] = {}
+    current: str | None = None
+    collected: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.strip() in _LAUNCH_EVIDENCE_MARKERS:
+            if current is not None:
+                sections[current] = "\n".join(collected)
+            current = line.strip()
+            collected = []
+            continue
+        collected.append(line)
+    if current is not None:
+        sections[current] = "\n".join(collected)
+    missing = [marker for marker in _LAUNCH_EVIDENCE_MARKERS if marker not in sections]
+    if missing:
+        raise LaunchEvidenceError("artifact read returned no {} section".format(", ".join(missing)))
+
+    # The required package files are hashed through no-follow descriptors, which
+    # is also where the package directory's own inode is observed.
+    package_digests, package_inode, package_stats = _hash_without_following(
+        package_path=package_path, names=list(required_package_files()), timeout=timeout
+    )
+    # The manifest is read and hashed by different commands, so the bytes that
+    # choose the payloads must be proven to be the file whose digest the record
+    # reports. That check lives in parse_encoded_checksum_manifest.
+    manifest = parse_encoded_checksum_manifest(
+        _read_artifact_base64(
+            path=manifest_path,
+            size_section=sections[_MARKER_MANIFEST_SIZE],
+            timeout=timeout,
+            label="SHA256SUMS",
+            ceiling=_MAX_MANIFEST_BYTES,
+        ),
+        expected_sha256=package_digests.get("SHA256SUMS"),
+    )
+    # The pathname the caller spelled can reach a different directory than it
+    # names, so the record says what the cluster resolved it to.
+    resolved = [line.strip() for line in sections[_MARKER_RESOLVED].splitlines() if line.strip()]
+    if len(resolved) != 1:
+        raise LaunchEvidenceError("the package directory did not resolve to exactly one path on the cluster")
+    # The diagnostic and the plan are read the same way. Neither has a size
+    # bound in its own schema, and together they shared the artifact read's one
+    # 1 MiB stream, so a large but legitimate plan made a package unmintable.
+    diagnostic_text = _decoded_artifact(
+        path=diagnostic_path,
+        size_section=sections[_MARKER_DIAGNOSTIC_SIZE],
+        timeout=timeout,
+        label="run diagnostic",
+    )
+    plan_text = _decoded_artifact(
+        path=plan_path, size_section=sections[_MARKER_PLAN_SIZE], timeout=timeout, label="execution plan"
+    )
+    return {
+        "resolved_package_path": resolved[0],
+        "package_inode": package_inode,
+        "diagnostic": parse_json_artifact(diagnostic_text, label="run diagnostic"),
+        "plan": parse_json_artifact(plan_text, label="execution plan"),
+        # The owner marker is the artifact tying the package to this plan, so
+        # like SHA256SUMS the bytes parsed must be the file that was hashed.
+        "owner": parse_encoded_json_artifact(
+            _read_artifact_base64(
+                path=owner_path,
+                size_section=sections[_MARKER_OWNER_SIZE],
+                timeout=timeout,
+                label="publication owner",
+                ceiling=_MAX_JSON_ARTIFACT_BYTES,
+            ),
+            expected_sha256=package_digests.get("PUBLICATION_OWNER.json"),
+            label="publication owner",
+        ),
+        "checksum_manifest": manifest,
+        "package_digests": package_digests,
+        "package_stats": package_stats,
+    }
+
+
+def _hash_package_payloads(
+    *, package_path: str, manifest: dict[str, str], timeout: float
+) -> tuple[dict[str, str], int, dict[str, list[int]]]:
+    """Hash every payload SHA256SUMS names through a no-follow descriptor.
+
+    This is a second pass because it has to be: the payload list only exists
+    once the manifest has been read. Running ``sha256sum -c`` remotely would
+    avoid it at the cost of putting the comparison back inside a process whose
+    verdict this record exists to check, so the digests come back raw and
+    ``build_launch_evidence`` decides.
+
+    The package inode comes back with them, observed through the same descriptor
+    the payloads were read under, so the caller can confirm the directory did not
+    change identity between the two passes.
+    """
+
+    return _hash_without_following(package_path=package_path, names=sorted(manifest), timeout=timeout)
+
+
+# base64 expands by 4/3, and the broker caps captured output at 1 MiB, so a file
+# read whole overruns it somewhere above ~750 KiB. Packages with several thousand
+# files reach that for SHA256SUMS, and a plan with a large dataset list reaches it
+# too, so both are chunked rather than being the thing that makes a large but
+# legitimate package unmintable.
+_ARTIFACT_CHUNK_BYTES = 384 * 1024
+# The size that drives the read loop comes from `stat` on a file the package
+# controls, so it is untrusted input to a resource decision. A sparse manifest
+# claiming a terabyte would otherwise mean millions of sequential broker commands
+# and an attempt to accumulate that much base64 in memory. 8 MiB is about 30,000
+# manifest entries at typical path lengths, far beyond any real package.
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+# A run diagnostic or a frozen plan is JSON describing one stage; 4 MiB of it is
+# already far past anything a stage legitimately produces.
+_MAX_JSON_ARTIFACT_BYTES = 4 * 1024 * 1024
+
+
+def _read_artifact_base64(*, path: str, size_section: str, timeout: float, label: str, ceiling: int) -> str:
+    """Read one artifact in bounded pieces and return its base64.
+
+    Every artifact read this way is larger than the broker's 1 MiB output cap
+    for some legitimate input -- a package with thousands of payloads, a plan
+    with a large dataset list -- and reading one whole turns that into an
+    unmintable package rather than a slower read. The size comes from `stat` on
+    a file the package controls, so it is bounded before it drives the loop.
+
+    No per-chunk check is needed: SHA256SUMS is verified against the digest
+    recorded for that filename and the plan against `diagnostic.plan_sha256`, so
+    anything that changed mid-read fails where a whole-file read would have.
+    """
+
+    reported = [line.strip() for line in size_section.splitlines() if line.strip()]
+    if len(reported) != 1 or not reported[0].isdigit():
+        raise LaunchEvidenceError(f"the size of {label} could not be read from the cluster")
+    size = int(reported[0])
+    if size == 0:
+        raise LaunchEvidenceError(f"{label} is empty")
+    if size > ceiling:
+        raise LaunchEvidenceError(
+            f"{label} is {size} bytes, over the {ceiling}-byte ceiling this reads. Something that large is "
+            "not part of a package this tool can attest, and reading it would hold the shared channel for "
+            "thousands of commands"
+        )
+    encoded: list[str] = []
+    for start in range(0, size, _ARTIFACT_CHUNK_BYTES):
+        count = min(_ARTIFACT_CHUNK_BYTES, size - start)
+        command = f"tail -c +{start + 1} -- {shlex.quote(path)} | head -c {count} | base64"
+        result = _connection().run(command, timeout=timeout)
+        if not result.ok:
+            raise LaunchEvidenceError(
+                "could not read {} from O2: {}".format(label, (result.stderr or "").strip()[:400])
+            )
+        _refuse_truncated_read(result, label=f"the {label} read")
+        encoded.append("".join(result.stdout.split()))
+    # The size was taken once, before the digest was computed and before these
+    # reads. A file that grew afterwards would still hand back a prefix that
+    # hashes to the recorded digest, so the manifest could be extended with
+    # entries this never sees. Probing one byte past the end refuses that.
+    probe = f"tail -c +{size + 1} -- {shlex.quote(path)} | head -c 1 | wc -c"
+    result = _connection().run(probe, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not confirm the end of {} on O2: {}".format(label, (result.stderr or "").strip()[:400])
+        )
+    if result.stdout.strip() != "0":
+        raise LaunchEvidenceError(
+            f"{label} grew while it was being read, so the bytes hashed are only a prefix of the file now " "on disk"
+        )
+    return "".join(encoded)
+
+
+def _decoded_artifact(*, path: str, size_section: str, timeout: float, label: str) -> str:
+    """Read one JSON artifact in bounded pieces and return its text."""
+
+    encoded = _read_artifact_base64(
+        path=path,
+        size_section=size_section,
+        timeout=timeout,
+        label=label,
+        ceiling=_MAX_JSON_ARTIFACT_BYTES,
+    )
+    try:
+        return base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError) as error:
+        raise LaunchEvidenceError(f"{label} did not come back as decodable UTF-8: {error}") from error
+
+
+# One call per payload would be correct but would take a hold on the shared
+# channel per file. Batching bounds what comes back instead: each name costs its
+# own length plus a 64-character digest and a little JSON, and the broker caps
+# captured output at 1 MiB. The names go out on stdin, which has its own 1 MiB
+# cap and is the smaller side, so bounding the reply bounds both.
+_HASH_REPLY_BUDGET = 600 * 1024
+
+
+def _hash_batches(names: list[str]) -> Iterator[list[str]]:
+    """Group payload names into calls whose replies the broker will carry.
+
+    A package with thousands of files overruns the output cap in one call and
+    the whole reply is truncated, so an entirely legitimate package could never
+    be attested.
+    """
+
+    batch: list[str] = []
+    used = 0
+    for name in names:
+        # Size from the SERIALIZED key, not the raw name. ensure_ascii=False stops
+        # non-ASCII being expanded to \uXXXX, but json.dumps still escapes quotes,
+        # backslashes and control characters, so a quote-heavy path costs about
+        # twice its raw length and a batch estimated under the budget could
+        # serialize to well over the broker's cap and come back truncated.
+        # json.dumps does that escaping, so ask it rather than model it.
+        key = len(json.dumps(name, ensure_ascii=False).encode("utf-8"))
+        # The name is emitted twice: in digests against a 64-character digest,
+        # and in stats against four integers that can each run to 20 digits,
+        # plus the punctuation of both entries.
+        cost = key * 2 + 176
+        if cost > _HASH_REPLY_BUDGET:
+            raise LaunchEvidenceError(f"payload name is too long to hash in one call: {name!r}")
+        if batch and used + cost > _HASH_REPLY_BUDGET:
+            yield batch
+            batch, used = [], 0
+        batch.append(name)
+        used += cost
+    if batch:
+        yield batch
+
+
+def _read_scheduler_record(*, job_id: str, timeout: float) -> dict[str, str]:
+    """Ask Slurm accounting who actually ran the job the diagnostic claims.
+
+    Every other field in the record is anchored outside the executed process --
+    the plan by digest, the package by rehashing, the directory by cluster-side
+    resolution -- and this is what stops the job identity from being the one
+    exception. ``-X`` returns the allocation rather than its steps, so a normal
+    job is exactly one row.
+
+    ``Comment`` is requested because the plan builder sets it to the plan digest.
+    It is not required: jobs submitted before that lands have none, and
+    ``build_launch_evidence`` treats an empty comment as an explicit unbound
+    field rather than as agreement. A non-empty one must match.
+    """
+
+    # Comment carries a 64-character digest plus stage and attempt, so pin its
+    # width rather than trusting the display default. Measured on O2 (Slurm
+    # 25.11.7) the suffix is inert under -P: default, %20 and %512 all returned
+    # the same full 44-character JobName, while the non-parsable form truncated
+    # it to "gem_segme+". It is kept anyway as portability insurance, since a
+    # build that did apply widths would silently truncate the digest.
+    fields = "JobID,State,Account,Partition,Comment%256"
+    command = f"sacct -j {shlex.quote(job_id)} -X -n -P -o {shlex.quote(fields)}"
+    result = _connection().run(command, timeout=timeout)
+    if not result.ok:
+        raise LaunchEvidenceError(
+            "could not read Slurm accounting for job {}: {}".format(job_id, (result.stderr or "").strip()[:400])
+        )
+    _refuse_truncated_read(result, label="the Slurm accounting read")
+    return parse_scheduler_record(result.stdout, job_id=job_id)
+
+
+@mcp.tool(
+    name="o2_mint_launch_evidence",
+    annotations={
+        "title": "Mint authenticated O2 launch evidence",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        # This reads files from O2 and queries Slurm through the broker, so it
+        # does interact with entities outside this process, whatever the local
+        # policy write alongside it might suggest.
+        "openWorldHint": True,
+    },
+)
+async def o2_mint_launch_evidence(params: MintLaunchEvidenceInput) -> str:
+    """Bind a finished governed stage into one operator-approved evidence record.
+
+    A repository canary can verify its own scientific path but cannot
+    authenticate its own launch, so the authority has to come from outside the
+    executed process. This reads the run diagnostic, the frozen plan, the
+    publication owner marker, the package's SHA256SUMS, and the package digests
+    back off the cluster through the authenticated broker, rehashes every
+    payload the manifest names rather than trusting the run's own "verified"
+    verdict, confirms the claimed job against Slurm accounting, checks that every
+    link agrees -- including that the directory read
+    is the package the plan approved -- and records the mint, with the digest of
+    the record it approves, in the policy audit ledger.
+
+    Minting attests a finished run. It is deliberately NOT authority to start
+    another one: it consumes no login grant and changes no policy mode.
+    """
+
+    def work() -> dict[str, Any]:
+        diagnostic_path = _absolute_remote_path(params.diagnostic_path, label="diagnostic_path")
+        plan_path = _absolute_remote_path(params.plan_path, label="plan_path")
+        package_path = _absolute_remote_path(params.package_path, label="package_path")
+        artifacts = _read_launch_artifacts(
+            diagnostic_path=diagnostic_path,
+            plan_path=plan_path,
+            package_path=package_path,
+            timeout=params.timeout_seconds,
+        )
+        payload_digests, payload_pass_inode, payload_stats = _hash_package_payloads(
+            package_path=package_path,
+            manifest=artifacts["checksum_manifest"],
+            timeout=params.timeout_seconds,
+        )
+        if payload_pass_inode != artifacts["package_inode"]:
+            raise LaunchEvidenceError(
+                "refusing to mint launch evidence; the package directory changed identity between the "
+                f"metadata read (inode {artifacts['package_inode']}) and the payload read "
+                f"(inode {payload_pass_inode})"
+            )
+        scheduler_record = _read_scheduler_record(
+            job_id=claimed_job_id(artifacts["diagnostic"]), timeout=params.timeout_seconds
+        )
+
+        def mint(approval: dict[str, Any]) -> dict[str, Any]:
+            return build_launch_evidence(
+                diagnostic=artifacts["diagnostic"],
+                plan=artifacts["plan"],
+                package_digests=artifacts["package_digests"],
+                checksum_manifest=artifacts["checksum_manifest"],
+                payload_digests=payload_digests,
+                owner=artifacts["owner"],
+                approval=approval,
+                stage=params.stage,
+                read_back_package_path=package_path,
+                resolved_package_path=artifacts["resolved_package_path"],
+                observed_package_inode=artifacts["package_inode"],
+                scheduler_record=scheduler_record,
+            )
+
+        # Verify BEFORE recording an approval: a chain that does not agree must
+        # not leave an audit entry implying it did.
+        preliminary = mint({})
+        # The last remote act before the ledger entry, deliberately placed after
+        # the record is built rather than before. Hashing takes several round
+        # trips, so a publisher able to write regular files could overwrite an
+        # early payload once its digest was taken: the digest would still match
+        # SHA256SUMS, and neither inode check would notice, because overwriting a
+        # file does not replace its parent directory. Running this after mint({})
+        # leaves only local work between the check and the write.
+        #
+        # It does not make the package immutable, and nothing here can: these
+        # live on NFS, which offers no snapshot or lease to hold. Every check has
+        # an "after", so the record says which guarantee it carries rather than
+        # implying the stronger one -- see payload_reverification.stability.
+        _refuse_if_payloads_changed(
+            package_path=package_path,
+            expected={**artifacts["package_stats"], **payload_stats},
+            package_inode=artifacts["package_inode"],
+            timeout=params.timeout_seconds,
+        )
+        approval = _connection().policy.record_launch_evidence_mint(
+            expected_revision=params.expected_revision,
+            expected_generation=params.expected_generation,
+            approval_reference=params.approval_reference,
+            stage=params.stage,
+            job_id=str(preliminary["submission"]["job_id"]),
+            package=str(preliminary["destination"]["package"]),
+            # The ledger entry records the digest of the record it approves, so
+            # an edited copy no longer matches the approval it carries.
+            evidence_sha256=evidence_content_digest(preliminary),
+            plan_sha256=str(preliminary["approved_plan"]["sha256"]),
+        )
+        record = mint(approval)
+        return {
+            "ok": True,
+            "launch_evidence": record,
+            "launch_evidence_sha256": launch_evidence_digest(record),
+            "evidence_content_sha256": evidence_content_digest(record),
+        }
+
+    return await _run_tool(work)
 
 
 @mcp.tool(
