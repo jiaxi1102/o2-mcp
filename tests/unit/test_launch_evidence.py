@@ -1226,6 +1226,10 @@ def test_the_hash_batch_budget_covers_both_reply_entries():
     names pass the estimate and still overrun the broker's output cap.
     """
 
+    # o2mcp.server pulls in mcp/anyio, which the 3.9 lane deliberately does not
+    # install; import it the same guarded way the other server-touching tests do.
+    pytest.importorskip("mcp")
+    pytest.importorskip("anyio")
     from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
     from o2mcp.server import _hash_batches
 
@@ -1249,6 +1253,8 @@ def test_the_hash_batch_budget_survives_quote_heavy_names():
 
     import json as _json
 
+    pytest.importorskip("mcp")
+    pytest.importorskip("anyio")
     from o2mcp.broker_protocol import MAX_OUTPUT_BYTES
     from o2mcp.server import _hash_batches
 
