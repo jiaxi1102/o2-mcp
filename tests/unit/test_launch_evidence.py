@@ -827,6 +827,11 @@ def test_every_authenticated_field_is_bound_observed_or_the_servers_own() -> Non
         # required to hold a specific value
         ("verified_package", "verification_status"),
         ("run_diagnostic", "status"),
+        # a constant the server writes, stating how far its own checks reach:
+        # the diagnostic's FIELDS are confirmed against accounting, the FILE's
+        # provenance is not. It attests nothing about the run, so it cannot
+        # overstate what the record proves.
+        ("run_diagnostic", "binding"),
         # bound to the manifest the server read and rehashed
         ("verified_package", "n_payloads"),
         # computed or observed by the server itself

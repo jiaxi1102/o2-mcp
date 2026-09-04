@@ -702,7 +702,27 @@ def build_launch_evidence(
                 ),
             },
         },
-        "run_diagnostic": {"status": diagnostic.get("status")},
+        "run_diagnostic": {
+            "status": diagnostic.get("status"),
+            # Say how far the binding actually reaches. Every field taken from
+            # this file is cross-checked against Slurm accounting, but the FILE
+            # is chosen by the caller and its provenance is not established: an
+            # actor able to write the approved package location could point at a
+            # fabricated diagnostic whose fields were copied from a real job for
+            # the same plan, and every check here would agree.
+            #
+            # No additional content check closes that. Job id, account,
+            # partition, comment, node and times are all readable by whoever can
+            # write the package, so any of them can be copied. Closing it needs
+            # something that actor cannot produce -- a secret the job embeds at
+            # submission, or an artifact only the scheduler can write -- which is
+            # a change to the submission path, not to minting.
+            "binding": (
+                "fields cross-checked against Slurm accounting; the diagnostic file itself is "
+                "caller-selected and its provenance is not established, so an actor with write "
+                "access to the approved package location could substitute one whose fields match"
+            ),
+        },
         # Everything the executed process reported that nothing here checks. A
         # compromised run can put any value in any of these, so they are kept
         # apart from the authenticated claims rather than mixed in with them: a
